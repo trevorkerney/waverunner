@@ -1,0 +1,39 @@
+div#titlebar {
+  width: 100%;
+  height: var(--tb-height);
+  background-color: #080808;
+  display: flex;
+  justify-content: right;
+  align-items: center;
+
+  div#win-btn-box {
+    height: 100%;
+    margin-right: 0.2rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+
+    button {
+      height: 100%;
+      background-color: transparent;
+      border: none;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      margin: 0 .5rem;
+
+      &:hover {
+        opacity: 0.8;
+      }
+
+      &:active {
+        opacity: 0.6;
+      }
+
+      img {
+        height: 50%;
+      }
+    }
+  }
+}
