@@ -10,6 +10,8 @@ pub struct Library {
     pub path: String,
     pub format: String,
     pub portable: bool,
+    pub db_filename: String,
+    pub default_sort_mode: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -21,6 +23,65 @@ pub struct MediaEntry {
     pub parent_id: Option<i64>,
     pub is_collection: bool,
     pub covers: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EntriesResponse {
+    pub entries: Vec<MediaEntry>,
+    pub sort_mode: String,
+}
+
+fn sanitize_filename(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c.to_ascii_lowercase()
+            } else if c == ' ' {
+                '-'
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = sanitized.trim_matches(|c| c == '-' || c == '_').to_string();
+    if trimmed.is_empty() {
+        "library".to_string()
+    } else {
+        trimmed
+    }
+}
+
+fn unique_db_filename(app_data_dir: &PathBuf, base: &str) -> String {
+    let candidate = format!("{}.db", base);
+    if !app_data_dir.join(&candidate).exists() {
+        return candidate;
+    }
+    let mut n = 2;
+    loop {
+        let candidate = format!("{}-{}.db", base, n);
+        if !app_data_dir.join(&candidate).exists() {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+fn uuid_simple() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("{:x}", now)
+}
+
+fn get_library_db_path(app_data_dir: &PathBuf, lib: &Library) -> PathBuf {
+    if lib.portable {
+        PathBuf::from(&lib.path).join(".waverunner.db")
+    } else {
+        app_data_dir.join(&lib.db_filename)
+    }
 }
 
 #[tauri::command]
@@ -39,46 +100,88 @@ pub async fn create_library(
 
     let id = uuid_simple();
 
-    // Determine DB location
-    let db_path = if portable {
-        lib_path.join(".waverunner.db")
+    let db_filename = if portable {
+        ".waverunner.db".to_string()
     } else {
-        let app_data = state.app_data_dir.clone();
-        std::fs::create_dir_all(&app_data).map_err(|e| e.to_string())?;
-        app_data.join(format!("{}.db", id))
+        let base = sanitize_filename(&name);
+        unique_db_filename(&state.app_data_dir, &base)
     };
 
-    // Create the library database and scan
-    let pool = crate::db::create_pool(&db_path)
+    let db_path = get_library_db_path(
+        &state.app_data_dir,
+        &Library {
+            id: id.clone(),
+            name: name.clone(),
+            path: path.clone(),
+            format: format.clone(),
+            portable,
+            db_filename: db_filename.clone(),
+            default_sort_mode: "alpha".to_string(),
+        },
+    );
+
+    let pool = crate::db::create_library_pool(&db_path)
         .await
         .map_err(|e| e.to_string())?;
 
-    // Clear any existing data (in case DB file persisted) and scan
-    sqlx::query("DELETE FROM media").execute(&pool).await.map_err(|e| e.to_string())?;
-    scan_folder(&app, &pool, &lib_path, None).await.map_err(|e| e.to_string())?;
+    sqlx::query("DELETE FROM media")
+        .execute(&pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    scan_folder(&app, &pool, &lib_path, None)
+        .await
+        .map_err(|e| e.to_string())?;
 
     pool.close().await;
 
     let library = Library {
         id: id.clone(),
-        name,
-        path,
-        format,
+        name: name.clone(),
+        path: path.clone(),
+        format: format.clone(),
         portable,
+        db_filename: db_filename.clone(),
+        default_sort_mode: "alpha".to_string(),
     };
 
-    // Save library to the app config
-    let mut libs = state.libraries.lock().await;
-    libs.push(library.clone());
-    save_config(&state.app_data_dir, &libs).map_err(|e| e.to_string())?;
+    sqlx::query(
+        "INSERT INTO libraries (id, name, path, format, portable, db_filename, default_sort_mode) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&library.id)
+    .bind(&library.name)
+    .bind(&library.path)
+    .bind(&library.format)
+    .bind(library.portable as i32)
+    .bind(&library.db_filename)
+    .bind(&library.default_sort_mode)
+    .execute(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
 
     Ok(library)
 }
 
 #[tauri::command]
 pub async fn get_libraries(state: tauri::State<'_, AppState>) -> Result<Vec<Library>, String> {
-    let libs = state.libraries.lock().await;
-    Ok(libs.clone())
+    let rows: Vec<(String, String, String, String, i32, String, String)> = sqlx::query_as(
+        "SELECT id, name, path, format, portable, db_filename, default_sort_mode FROM libraries ORDER BY name",
+    )
+    .fetch_all(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(id, name, path, format, portable, db_filename, default_sort_mode)| Library {
+            id,
+            name,
+            path,
+            format,
+            portable: portable != 0,
+            db_filename,
+            default_sort_mode,
+        })
+        .collect())
 }
 
 #[tauri::command]
@@ -86,30 +189,39 @@ pub async fn delete_library(
     state: tauri::State<'_, AppState>,
     library_id: String,
 ) -> Result<(), String> {
-    let mut libs = state.libraries.lock().await;
-    let lib = libs
-        .iter()
-        .find(|l| l.id == library_id)
-        .ok_or("Library not found")?
-        .clone();
+    let row: Option<(String, String, i32, String)> = sqlx::query_as(
+        "SELECT id, path, portable, db_filename FROM libraries WHERE id = ?",
+    )
+    .bind(&library_id)
+    .fetch_optional(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
 
-    // Delete the DB file
-    let db_path = if lib.portable {
-        PathBuf::from(&lib.path).join(".waverunner.db")
+    let (_, path, portable, db_filename) = row.ok_or("Library not found")?;
+
+    let db_path = if portable != 0 {
+        PathBuf::from(&path).join(".waverunner.db")
     } else {
-        state.app_data_dir.join(format!("{}.db", lib.id))
+        state.app_data_dir.join(&db_filename)
     };
+
     let db_deleted = if db_path.exists() {
         std::fs::remove_file(&db_path).is_ok()
     } else {
         true
     };
 
-    libs.retain(|l| l.id != library_id);
-    save_config(&state.app_data_dir, &libs).map_err(|e| e.to_string())?;
+    sqlx::query("DELETE FROM libraries WHERE id = ?")
+        .bind(&library_id)
+        .execute(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
 
     if !db_deleted {
-        return Err(format!("Library removed but the database file could not be deleted: {}", db_path.display()));
+        return Err(format!(
+            "Library removed but the database file could not be deleted: {}",
+            db_path.display()
+        ));
     }
 
     Ok(())
@@ -120,43 +232,75 @@ pub async fn get_entries(
     state: tauri::State<'_, AppState>,
     library_id: String,
     parent_id: Option<i64>,
-) -> Result<Vec<MediaEntry>, String> {
-    let libs = state.libraries.lock().await;
-    let lib = libs
-        .iter()
-        .find(|l| l.id == library_id)
-        .ok_or("Library not found")?;
+) -> Result<EntriesResponse, String> {
+    let row: Option<(String, i32, String, String)> = sqlx::query_as(
+        "SELECT path, portable, db_filename, default_sort_mode FROM libraries WHERE id = ?",
+    )
+    .bind(&library_id)
+    .fetch_optional(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
 
-    let db_path = if lib.portable {
-        PathBuf::from(&lib.path).join(".waverunner.db")
+    let (path, portable, db_filename, default_sort_mode) = row.ok_or("Library not found")?;
+
+    let db_path = if portable != 0 {
+        PathBuf::from(&path).join(".waverunner.db")
     } else {
-        state.app_data_dir.join(format!("{}.db", lib.id))
+        state.app_data_dir.join(&db_filename)
     };
 
-    let pool = crate::db::create_pool(&db_path)
+    let pool = crate::db::create_library_pool(&db_path)
         .await
         .map_err(|e| e.to_string())?;
 
-    let rows: Vec<(i64, String, Option<String>, String, Option<i64>, i32)> = match parent_id {
+    // Determine sort mode: if inside a collection, use its sort_mode; otherwise use library default
+    let sort_mode = match parent_id {
         Some(pid) => {
-            sqlx::query_as(
-                "SELECT id, title, year, folder_path, parent_id, is_collection FROM media WHERE parent_id = ? ORDER BY sort_order, title",
+            let row: Option<(String,)> = sqlx::query_as(
+                "SELECT sort_mode FROM media WHERE id = ?",
             )
             .bind(pid)
-            .fetch_all(&pool)
+            .fetch_optional(&pool)
             .await
+            .map_err(|e| e.to_string())?;
+            row.map(|(m,)| m).unwrap_or(default_sort_mode)
+        }
+        None => default_sort_mode,
+    };
+
+    let order_clause = match sort_mode.as_str() {
+        "year" => "ORDER BY year ASC, title ASC",
+        "custom" => "ORDER BY sort_order ASC, title ASC",
+        _ => "ORDER BY title ASC",
+    };
+
+    let query_str = match parent_id {
+        Some(_) => format!(
+            "SELECT id, title, year, folder_path, parent_id, is_collection FROM media WHERE parent_id = ? {}",
+            order_clause
+        ),
+        None => format!(
+            "SELECT id, title, year, folder_path, parent_id, is_collection FROM media WHERE parent_id IS NULL {}",
+            order_clause
+        ),
+    };
+
+    let rows: Vec<(i64, String, Option<String>, String, Option<i64>, i32)> = match parent_id {
+        Some(pid) => {
+            sqlx::query_as(&query_str)
+                .bind(pid)
+                .fetch_all(&pool)
+                .await
         }
         None => {
-            sqlx::query_as(
-                "SELECT id, title, year, folder_path, parent_id, is_collection FROM media WHERE parent_id IS NULL ORDER BY sort_order, title",
-            )
-            .fetch_all(&pool)
-            .await
+            sqlx::query_as(&query_str)
+                .fetch_all(&pool)
+                .await
         }
     }
     .map_err(|e| e.to_string())?;
 
-    let lib_path = PathBuf::from(&lib.path);
+    let lib_path = PathBuf::from(&path);
     let entries: Vec<MediaEntry> = rows
         .into_iter()
         .map(|(id, title, year, folder_path, parent_id, is_collection)| {
@@ -175,7 +319,103 @@ pub async fn get_entries(
         .collect();
 
     pool.close().await;
-    Ok(entries)
+    Ok(EntriesResponse { entries, sort_mode })
+}
+
+#[tauri::command]
+pub async fn set_sort_mode(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    entry_id: Option<i64>,
+    sort_mode: String,
+) -> Result<(), String> {
+    if !["alpha", "year", "custom"].contains(&sort_mode.as_str()) {
+        return Err("Invalid sort mode".to_string());
+    }
+
+    match entry_id {
+        Some(eid) => {
+            // Set sort_mode on a collection entry
+            let row: Option<(String, i32, String)> = sqlx::query_as(
+                "SELECT path, portable, db_filename FROM libraries WHERE id = ?",
+            )
+            .bind(&library_id)
+            .fetch_optional(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+
+            let (path, portable, db_filename) = row.ok_or("Library not found")?;
+
+            let db_path = if portable != 0 {
+                PathBuf::from(&path).join(".waverunner.db")
+            } else {
+                state.app_data_dir.join(&db_filename)
+            };
+
+            let pool = crate::db::create_library_pool(&db_path)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            sqlx::query("UPDATE media SET sort_mode = ? WHERE id = ?")
+                .bind(&sort_mode)
+                .bind(eid)
+                .execute(&pool)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            pool.close().await;
+        }
+        None => {
+            // Set default_sort_mode on the library (for root level)
+            sqlx::query("UPDATE libraries SET default_sort_mode = ? WHERE id = ?")
+                .bind(&sort_mode)
+                .bind(&library_id)
+                .execute(&state.app_db)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn update_sort_order(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    entry_ids: Vec<i64>,
+) -> Result<(), String> {
+    let row: Option<(String, i32, String)> = sqlx::query_as(
+        "SELECT path, portable, db_filename FROM libraries WHERE id = ?",
+    )
+    .bind(&library_id)
+    .fetch_optional(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let (path, portable, db_filename) = row.ok_or("Library not found")?;
+
+    let db_path = if portable != 0 {
+        PathBuf::from(&path).join(".waverunner.db")
+    } else {
+        state.app_data_dir.join(&db_filename)
+    };
+
+    let pool = crate::db::create_library_pool(&db_path)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    for (i, id) in entry_ids.iter().enumerate() {
+        sqlx::query("UPDATE media SET sort_order = ? WHERE id = ?")
+            .bind(i as i32)
+            .bind(id)
+            .execute(&pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    pool.close().await;
+    Ok(())
 }
 
 fn find_covers(folder_path: &PathBuf) -> Vec<String> {
@@ -235,7 +475,6 @@ async fn scan_dir(
 
         let _ = app.emit("scan-progress", &name);
 
-        // Determine if this is a collection (has subdirs that aren't covers/extras)
         let has_subdirs = std::fs::read_dir(&path)
             .map(|rd| {
                 rd.filter_map(|e| e.ok()).any(|e| {
@@ -245,7 +484,6 @@ async fn scan_dir(
             })
             .unwrap_or(false);
 
-        // Parse title and year from folder name like "Movie Title (2024)"
         let (title, year) = parse_folder_name(&name);
 
         let rel_path = path
@@ -277,7 +515,6 @@ async fn scan_dir(
 }
 
 fn parse_folder_name(name: &str) -> (String, Option<String>) {
-    // Match "Title (Year)" pattern
     if let Some(paren_start) = name.rfind('(') {
         if let Some(paren_end) = name.rfind(')') {
             if paren_end > paren_start {
@@ -290,31 +527,4 @@ fn parse_folder_name(name: &str) -> (String, Option<String>) {
         }
     }
     (name.to_string(), None)
-}
-
-fn uuid_simple() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    format!("{:x}", now)
-}
-
-pub fn save_config(app_data_dir: &PathBuf, libraries: &[Library]) -> Result<(), std::io::Error> {
-    let config_path = app_data_dir.join("config.json");
-    std::fs::create_dir_all(app_data_dir)?;
-    let json = serde_json::to_string_pretty(libraries).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::Other, e)
-    })?;
-    std::fs::write(config_path, json)
-}
-
-pub fn load_config(app_data_dir: &PathBuf) -> Vec<Library> {
-    let config_path = app_data_dir.join("config.json");
-    if let Ok(data) = std::fs::read_to_string(config_path) {
-        serde_json::from_str(&data).unwrap_or_default()
-    } else {
-        Vec::new()
-    }
 }

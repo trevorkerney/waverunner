@@ -5231,6 +5231,7 @@ name = "waverunner"
 version = "0.1.0"
 dependencies = [
  "async-recursion",
+ "dirs",
  "serde",
  "serde_json",
  "sqlx",

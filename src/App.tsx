@@ -5,7 +5,7 @@ import { Titlebar } from "@/components/Titlebar";
 import { Sidebar } from "@/components/Sidebar";
 import { MainContent } from "@/components/MainContent";
 import { Toaster } from "@/components/ui/sonner";
-import { Library, MediaEntry, BreadcrumbItem } from "@/types";
+import { Library, MediaEntry, EntriesResponse, BreadcrumbItem } from "@/types";
 
 function App() {
   const [libraries, setLibraries] = useState<Library[]>([]);
@@ -13,6 +13,7 @@ function App() {
   const [entries, setEntries] = useState<MediaEntry[]>([]);
   const [breadcrumbs, setBreadcrumbs] = useState<BreadcrumbItem[]>([]);
   const [forwardStack, setForwardStack] = useState<BreadcrumbItem[]>([]);
+  const [sortMode, setSortMode] = useState("alpha");
   const [coverSize, setCoverSize] = useState(200);
   const [search, setSearch] = useState("");
 
@@ -32,11 +33,12 @@ function App() {
   const loadEntries = useCallback(
     async (library: Library, parentId: number | null, breadcrumb: BreadcrumbItem[]) => {
       try {
-        const items = await invoke<MediaEntry[]>("get_entries", {
+        const res = await invoke<EntriesResponse>("get_entries", {
           libraryId: library.id,
           parentId,
         });
-        setEntries(items);
+        setEntries(res.entries);
+        setSortMode(res.sort_mode);
         setBreadcrumbs(breadcrumb);
       } catch (e) {
         console.error("Failed to load entries:", e);
@@ -92,6 +94,43 @@ function App() {
     loadEntries(selectedLibrary, next.id, newBreadcrumbs);
   }, [selectedLibrary, forwardStack, breadcrumbs, loadEntries]);
 
+  const changeSortMode = useCallback(
+    async (mode: string) => {
+      if (!selectedLibrary) return;
+      const parentId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
+      try {
+        await invoke("set_sort_mode", {
+          libraryId: selectedLibrary.id,
+          entryId: parentId,
+          sortMode: mode,
+        });
+        setSortMode(mode);
+        loadEntries(selectedLibrary, parentId, breadcrumbs);
+      } catch (e) {
+        console.error("Failed to set sort mode:", e);
+      }
+    },
+    [selectedLibrary, breadcrumbs, loadEntries]
+  );
+
+  const updateSortOrder = useCallback(
+    async (reordered: MediaEntry[]) => {
+      if (!selectedLibrary) return;
+      setEntries(reordered);
+      try {
+        await invoke("update_sort_order", {
+          libraryId: selectedLibrary.id,
+          entryIds: reordered.map((e) => e.id),
+        });
+      } catch (e) {
+        console.error("Failed to update sort order:", e);
+        const parentId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
+        loadEntries(selectedLibrary, parentId, breadcrumbs);
+      }
+    },
+    [selectedLibrary, breadcrumbs, loadEntries]
+  );
+
   useEffect(() => {
     const onMouseDown = (e: MouseEvent) => {
       if (e.button === 3) {
@@ -132,6 +171,9 @@ function App() {
           onNavigate={navigateTo}
           onBreadcrumbClick={navigateBreadcrumb}
           selectedLibrary={selectedLibrary}
+          sortMode={sortMode}
+          onSortModeChange={changeSortMode}
+          onSortOrderChange={updateSortOrder}
         />
       </div>
       <Toaster />

@@ -155,7 +155,7 @@ export function CreateLibraryDialog({
               <Tooltip>
                 <TooltipTrigger render={<CircleHelp size={13} className="text-muted-foreground cursor-help" />} />
                 <TooltipContent>
-                  Store the library index alongside your media files so it travels with them and can be imported on other devices without re-scanning. Ideal for portable, external drives. When the library is located on a slower drive than the one where this client is installed, keep this setting off to store the index locally for better performance.
+                  Store the library index alongside your media files so it travels with them and can be imported on other devices without re-scanning. Ideal for portable, external drives. When the library is located on a slower drive than the one where waverunner is installed, keep this setting off to store the index locally for better performance.
                 </TooltipContent>
               </Tooltip>
             </TooltipProvider>

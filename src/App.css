@@ -127,6 +127,7 @@
     }
   html {
     @apply font-sans;
+    overflow: hidden;
     }
 
   /* Scrollbar styling */

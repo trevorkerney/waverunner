@@ -2,12 +2,12 @@ mod commands;
 mod db;
 
 use std::path::PathBuf;
+use sqlx::SqlitePool;
 use tauri::Manager;
-use tokio::sync::Mutex;
 
 pub struct AppState {
     pub app_data_dir: PathBuf,
-    pub libraries: Mutex<Vec<commands::Library>>,
+    pub app_db: SqlitePool,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -16,16 +16,19 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            let app_data_dir = app
-                .path()
-                .app_data_dir()
-                .expect("failed to get app data dir");
+            let app_data_dir = dirs::data_local_dir()
+                .expect("failed to get local app data dir")
+                .join("waverunner");
+            std::fs::create_dir_all(&app_data_dir)
+                .expect("failed to create app data dir");
 
-            let libraries = commands::load_config(&app_data_dir);
+            let db_path = app_data_dir.join("waverunner.db");
+            let app_db = tauri::async_runtime::block_on(db::create_app_pool(&db_path))
+                .expect("failed to create app database");
 
             app.manage(AppState {
                 app_data_dir,
-                libraries: Mutex::new(libraries),
+                app_db,
             });
 
             Ok(())
@@ -35,6 +38,8 @@ pub fn run() {
             commands::delete_library,
             commands::get_libraries,
             commands::get_entries,
+            commands::set_sort_mode,
+            commands::update_sort_order,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

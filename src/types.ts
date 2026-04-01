@@ -4,6 +4,13 @@ export interface Library {
   path: string;
   format: string;
   portable: boolean;
+  db_filename: string;
+  default_sort_mode: string;
+}
+
+export interface EntriesResponse {
+  entries: MediaEntry[];
+  sort_mode: string;
 }
 
 export interface MediaEntry {
