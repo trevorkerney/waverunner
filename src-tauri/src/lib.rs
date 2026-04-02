@@ -40,6 +40,9 @@ pub fn run() {
             commands::get_entries,
             commands::set_sort_mode,
             commands::update_sort_order,
+            commands::rename_entry,
+            commands::set_cover,
+            commands::rescan_library,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -131,6 +131,46 @@ function App() {
     [selectedLibrary, breadcrumbs, loadEntries]
   );
 
+  const renameEntry = useCallback(
+    async (entryId: number, newTitle: string): Promise<string | null> => {
+      if (!selectedLibrary) return "No library selected";
+      try {
+        await invoke("rename_entry", {
+          libraryId: selectedLibrary.id,
+          entryId,
+          newTitle,
+        });
+        const parentId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
+        await loadEntries(selectedLibrary, parentId, breadcrumbs);
+        return null;
+      } catch (e) {
+        return String(e);
+      }
+    },
+    [selectedLibrary, breadcrumbs, loadEntries]
+  );
+
+  const setCover = useCallback(
+    async (entryId: number, coverPath: string | null) => {
+      if (!selectedLibrary) return;
+      setEntries((prev) =>
+        prev.map((e) => (e.id === entryId ? { ...e, selected_cover: coverPath } : e))
+      );
+      try {
+        await invoke("set_cover", {
+          libraryId: selectedLibrary.id,
+          entryId,
+          coverPath,
+        });
+      } catch (e) {
+        console.error("Failed to set cover:", e);
+        const parentId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
+        loadEntries(selectedLibrary, parentId, breadcrumbs);
+      }
+    },
+    [selectedLibrary, breadcrumbs, loadEntries]
+  );
+
   useEffect(() => {
     const onMouseDown = (e: MouseEvent) => {
       if (e.button === 3) {
@@ -141,8 +181,15 @@ function App() {
         goForward();
       }
     };
+    const onContextMenu = (e: MouseEvent) => {
+      e.preventDefault();
+    };
     window.addEventListener("mousedown", onMouseDown);
-    return () => window.removeEventListener("mousedown", onMouseDown);
+    window.addEventListener("contextmenu", onContextMenu);
+    return () => {
+      window.removeEventListener("mousedown", onMouseDown);
+      window.removeEventListener("contextmenu", onContextMenu);
+    };
   }, [goBack, goForward]);
 
   return (
@@ -160,6 +207,12 @@ function App() {
             setEntries([]);
             setBreadcrumbs([]);
           }}
+          onLibraryRescanned={() => {
+            if (selectedLibrary) {
+              const parentId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
+              loadEntries(selectedLibrary, parentId, breadcrumbs);
+            }
+          }}
         />
         <MainContent
           entries={entries}
@@ -174,9 +227,11 @@ function App() {
           sortMode={sortMode}
           onSortModeChange={changeSortMode}
           onSortOrderChange={updateSortOrder}
+          onRenameEntry={renameEntry}
+          onSetCover={setCover}
         />
       </div>
-      <Toaster />
+      <Toaster position="top-center" />
     </div>
   );
 }

@@ -124,6 +124,8 @@
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     text-rendering: optimizeLegibility;
+    -webkit-user-select: none;
+    user-select: none;
     }
   html {
     @apply font-sans;

@@ -24,7 +24,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { Spinner } from "@/components/ui/spinner";
-import { FolderOpen, Film, Tv, Music, CircleHelp } from "lucide-react";
+import { FolderOpen, Film, Tv, Music, CircleHelp, FolderSync, FolderSearch } from "lucide-react";
 
 interface CreateLibraryDialogProps {
   open: boolean;
@@ -37,6 +37,7 @@ export function CreateLibraryDialog({
   onOpenChange,
   onCreated,
 }: CreateLibraryDialogProps) {
+  const [managed, setManaged] = useState(true);
   const [name, setName] = useState("");
   const [path, setPath] = useState("");
   const [format, setFormat] = useState("movies");
@@ -68,9 +69,10 @@ export function CreateLibraryDialog({
     setCreating(true);
     setScanProgress("");
     try {
-      await invoke("create_library", { name, path, format, portable });
+      await invoke("create_library", { name, path, format, portable, managed });
       onCreated();
       onOpenChange(false);
+      setManaged(true);
       setName("");
       setPath("");
       setFormat("movies");
@@ -89,6 +91,30 @@ export function CreateLibraryDialog({
           <DialogTitle>Create Library</DialogTitle>
         </DialogHeader>
         <div className="grid gap-6 py-4">
+          <div className="grid gap-3">
+            <Label>Library Type</Label>
+            <ToggleGroup
+              value={[managed ? "managed" : "unmanaged"]}
+              onValueChange={(v) => { if (v.length) setManaged(v[v.length - 1] === "managed"); }}
+              spacing={1}
+              className="grid w-full grid-cols-2 gap-3"
+            >
+              <ToggleGroupItem
+                value="managed"
+                className="flex h-auto flex-col items-center gap-2 rounded border border-border px-4 py-5 data-[state=on]:border-primary data-[state=on]:bg-accent"
+              >
+                <FolderSync size={32} />
+                <span className="text-sm font-medium">Managed</span>
+              </ToggleGroupItem>
+              <ToggleGroupItem
+                value="unmanaged"
+                className="flex h-auto flex-col items-center gap-2 rounded border border-border px-4 py-5 data-[state=on]:border-primary data-[state=on]:bg-accent"
+              >
+                <FolderSearch size={32} />
+                <span className="text-sm font-medium">Unmanaged</span>
+              </ToggleGroupItem>
+            </ToggleGroup>
+          </div>
           <div className="grid gap-3">
             <Label>Format</Label>
             <ToggleGroup

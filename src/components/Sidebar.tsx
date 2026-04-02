@@ -1,7 +1,14 @@
 import { useCallback, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
-import { ChevronLeft, ChevronRight, Plus, Trash2 } from "lucide-react";
+import { ChevronLeft, ChevronRight, Plus, Trash2, RefreshCw } from "lucide-react";
+import {
+  ContextMenu,
+  ContextMenuTrigger,
+  ContextMenuContent,
+  ContextMenuItem,
+} from "@/components/ui/context-menu";
 import { CreateLibraryDialog } from "@/components/CreateLibraryDialog";
 import { Library } from "@/types";
 
@@ -15,6 +22,7 @@ interface SidebarProps {
   onSelectLibrary: (library: Library) => void;
   onLibraryCreated: () => void;
   onLibraryDeleted: () => void;
+  onLibraryRescanned: () => void;
 }
 
 export function Sidebar({
@@ -23,6 +31,7 @@ export function Sidebar({
   onSelectLibrary,
   onLibraryCreated,
   onLibraryDeleted,
+  onLibraryRescanned,
 }: SidebarProps) {
   const [width, setWidth] = useState(DEFAULT_WIDTH);
   const [collapsed, setCollapsed] = useState(false);
@@ -95,35 +104,58 @@ export function Sidebar({
             </p>
           ) : (
             libraries.map((lib) => (
-              <div
-                key={lib.id}
-                className={`group flex items-center rounded-sm ${
-                  selectedLibrary?.id === lib.id
-                    ? "bg-sidebar-accent text-sidebar-accent-foreground"
-                    : "text-sidebar-foreground hover:bg-sidebar-accent/50"
-                }`}
-              >
-                <button
-                  onClick={() => onSelectLibrary(lib)}
-                  className="flex-1 truncate px-2 py-1.5 text-left text-sm"
+              <ContextMenu key={lib.id}>
+                <ContextMenuTrigger
+                  render={
+                    <button
+                      onClick={() => onSelectLibrary(lib)}
+                    />
+                  }
+                  className={`flex w-full items-center rounded-sm truncate px-2 py-1.5 text-left text-sm ${
+                    selectedLibrary?.id === lib.id
+                      ? "bg-sidebar-accent text-sidebar-accent-foreground"
+                      : "text-sidebar-foreground hover:bg-sidebar-accent/50"
+                  }`}
                 >
                   {lib.name}
-                </button>
-                <button
-                  onClick={async (e) => {
-                    e.stopPropagation();
-                    try {
-                      await invoke("delete_library", { libraryId: lib.id });
-                    } catch (err) {
-                      toast.warning(String(err));
-                    }
-                    onLibraryDeleted();
-                  }}
-                  className="mr-1 rounded-sm p-1 text-muted-foreground opacity-0 hover:bg-destructive/20 hover:text-destructive group-hover:opacity-100"
-                >
-                  <Trash2 size={12} />
-                </button>
-              </div>
+                </ContextMenuTrigger>
+                <ContextMenuContent>
+                  <ContextMenuItem
+                    onClick={async () => {
+                      const toastId = toast.loading("Rescanning...");
+                      const unlisten = await listen<string>("scan-progress", (event) => {
+                        toast.loading(event.payload, { id: toastId });
+                      });
+                      try {
+                        await invoke("rescan_library", { libraryId: lib.id });
+                        toast.success("Rescan complete", { id: toastId });
+                        onLibraryRescanned();
+                      } catch (err) {
+                        toast.error(String(err), { id: toastId });
+                      } finally {
+                        unlisten();
+                      }
+                    }}
+                  >
+                    <RefreshCw size={14} />
+                    Rescan
+                  </ContextMenuItem>
+                  <ContextMenuItem
+                    onClick={async () => {
+                      try {
+                        await invoke("delete_library", { libraryId: lib.id });
+                        onLibraryDeleted();
+                      } catch (err) {
+                        toast.error(String(err));
+                      }
+                    }}
+                    className="text-destructive focus:text-destructive"
+                  >
+                    <Trash2 size={14} />
+                    Delete
+                  </ContextMenuItem>
+                </ContextMenuContent>
+              </ContextMenu>
             ))
           )}
         </nav>

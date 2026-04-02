@@ -10,8 +10,6 @@ add some sort of way to choose default library to display
 
 make everything user-select: none;
 
-save local sqlite db files with human readable names instead of something like 18a23028b8416fb0.db
-
 per-collection sort mode (alpha / year / custom) with drag-and-drop reorder behind a button
 
 TMDB metadata integration (toggle per library, title resolution: file metadata > folder name > TMDB search)
@@ -24,3 +22,10 @@ consider how streamed media should be dealt with as opposed to local media (like
 
 context menus
 - move reorder mode button to context menus
+
+settings: sorting language selection (determines which articles like "The", "A", "An" are ignored for alphabetical sort — currently hardcoded to English)
+
+search isnt working for movies inside categories anymore
+
+
+Okay now what about functionality for creating categories, bringing movies into them, and also bringing them out?

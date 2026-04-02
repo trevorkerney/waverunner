@@ -6,6 +6,7 @@ export interface Library {
   portable: boolean;
   db_filename: string;
   default_sort_mode: string;
+  managed: boolean;
 }
 
 export interface EntriesResponse {
@@ -21,6 +22,7 @@ export interface MediaEntry {
   parent_id: number | null;
   is_collection: boolean;
   covers: string[];
+  selected_cover: string | null;
 }
 
 export interface BreadcrumbItem {

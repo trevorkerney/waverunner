@@ -16,7 +16,8 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             format TEXT NOT NULL,
             portable INTEGER NOT NULL DEFAULT 0,
             db_filename TEXT NOT NULL,
-            default_sort_mode TEXT NOT NULL DEFAULT 'alpha'
+            default_sort_mode TEXT NOT NULL DEFAULT 'alpha',
+            managed INTEGER NOT NULL DEFAULT 0
         )",
     )
     .execute(&pool)
@@ -42,6 +43,8 @@ pub async fn create_library_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Err
             is_collection INTEGER NOT NULL DEFAULT 0,
             sort_order INTEGER NOT NULL DEFAULT 0,
             sort_mode TEXT NOT NULL DEFAULT 'alpha',
+            selected_cover TEXT,
+            sort_title TEXT NOT NULL DEFAULT '',
             FOREIGN KEY (parent_id) REFERENCES media(id) ON DELETE CASCADE
         )",
     )

@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import {
   DndContext,
@@ -31,8 +31,46 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { Search, Folder, ArrowUpDown, GripVertical } from "lucide-react";
+import {
+  ContextMenu,
+  ContextMenuTrigger,
+  ContextMenuContent,
+  ContextMenuItem,
+} from "@/components/ui/context-menu";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogFooter,
+} from "@/components/ui/dialog";
+import { Button } from "@/components/ui/button";
+import {
+  Carousel,
+  CarouselContent,
+  CarouselItem,
+  CarouselPrevious,
+  CarouselNext,
+  type CarouselApi,
+} from "@/components/ui/carousel";
+import { Spinner } from "@/components/ui/spinner";
+import {
+  Search,
+  Folder,
+  ArrowUpDown,
+  GripVertical,
+  Pencil,
+  Image as ImageIcon,
+} from "lucide-react";
+import { toast } from "sonner";
 import { Library, MediaEntry, BreadcrumbItem } from "@/types";
+
+function getDisplayCover(entry: MediaEntry): string | null {
+  if (entry.selected_cover && entry.covers.includes(entry.selected_cover)) {
+    return entry.selected_cover;
+  }
+  return entry.covers[0] || null;
+}
 
 interface MainContentProps {
   entries: MediaEntry[];
@@ -47,6 +85,8 @@ interface MainContentProps {
   sortMode: string;
   onSortModeChange: (mode: string) => void;
   onSortOrderChange: (reordered: MediaEntry[]) => void;
+  onRenameEntry: (entryId: number, newTitle: string) => Promise<string | null>;
+  onSetCover: (entryId: number, coverPath: string | null) => void;
 }
 
 export function MainContent({
@@ -62,8 +102,13 @@ export function MainContent({
   sortMode,
   onSortModeChange,
   onSortOrderChange,
+  onRenameEntry,
+  onSetCover,
 }: MainContentProps) {
   const [reordering, setReordering] = useState(false);
+  const [coverDialogEntry, setCoverDialogEntry] = useState<MediaEntry | null>(
+    null
+  );
   const filteredEntries = search
     ? entries.filter((e) =>
         e.title.toLowerCase().includes(search.toLowerCase())
@@ -138,7 +183,11 @@ export function MainContent({
             <DropdownMenu>
               <DropdownMenuTrigger className="flex h-8 items-center gap-1.5 rounded-md border border-input bg-background px-2.5 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground">
                 <ArrowUpDown size={12} />
-                {sortMode === "alpha" ? "A–Z" : sortMode === "year" ? "Year" : "Custom"}
+                {sortMode === "alpha"
+                  ? "A\u2013Z"
+                  : sortMode === "year"
+                    ? "Year"
+                    : "Custom"}
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
                 <DropdownMenuItem onClick={() => changeSortMode("alpha")}>
@@ -168,7 +217,9 @@ export function MainContent({
             <div className="flex w-32 items-center gap-2">
               <Slider
                 value={[coverSize]}
-                onValueChange={(v) => onCoverSizeChange(Array.isArray(v) ? v[0] : v)}
+                onValueChange={(v) =>
+                  onCoverSizeChange(Array.isArray(v) ? v[0] : v)
+                }
                 min={100}
                 max={400}
                 step={10}
@@ -227,11 +278,28 @@ export function MainContent({
                 entry={entry}
                 size={coverSize}
                 onNavigate={onNavigate}
+                onRename={onRenameEntry}
+                onChangeCover={() => setCoverDialogEntry(entry)}
               />
             ))}
           </div>
         )}
       </div>
+
+      {/* Cover Carousel Dialog */}
+      {coverDialogEntry && (
+        <CoverCarouselDialog
+          entry={coverDialogEntry}
+          open={!!coverDialogEntry}
+          onOpenChange={(open) => {
+            if (!open) setCoverDialogEntry(null);
+          }}
+          onSelect={(coverPath) => {
+            onSetCover(coverDialogEntry.id, coverPath);
+            setCoverDialogEntry(null);
+          }}
+        />
+      )}
     </main>
   );
 }
@@ -240,52 +308,134 @@ function CoverCard({
   entry,
   size,
   onNavigate,
+  onRename,
+  onChangeCover,
 }: {
   entry: MediaEntry;
   size: number;
   onNavigate: (entry: MediaEntry) => void;
+  onRename: (entryId: number, newTitle: string) => Promise<string | null>;
+  onChangeCover: () => void;
 }) {
-  const coverPath = entry.covers[0];
+  const [isRenaming, setIsRenaming] = useState(false);
+  const [renameLoading, setRenameLoading] = useState(false);
+  const [renameValue, setRenameValue] = useState("");
+  const renameInputRef = useRef<HTMLInputElement>(null);
+  const submittedRef = useRef(false);
+
+  useEffect(() => {
+    if (isRenaming) {
+      submittedRef.current = false;
+      renameInputRef.current?.focus();
+      renameInputRef.current?.select();
+    }
+  }, [isRenaming]);
+
+  const startRename = () => {
+    setRenameValue(entry.title);
+    setIsRenaming(true);
+  };
+
+  const submitRename = async () => {
+    if (submittedRef.current) return;
+    const trimmed = renameValue.trim();
+    if (!trimmed || trimmed === entry.title) {
+      setIsRenaming(false);
+      return;
+    }
+    submittedRef.current = true;
+    setRenameLoading(true);
+    const error = await onRename(entry.id, trimmed);
+    setRenameLoading(false);
+    setIsRenaming(false);
+    if (error) {
+      toast.error(error);
+    }
+  };
+
+  const coverPath = getDisplayCover(entry);
   const coverSrc = coverPath ? convertFileSrc(coverPath) : null;
 
   return (
-    <button
-      onClick={() => {
-        if (entry.is_collection) {
-          onNavigate(entry);
+    <ContextMenu>
+      <ContextMenuTrigger
+        render={
+          <button
+            onClick={() =>
+              !isRenaming && entry.is_collection && onNavigate(entry)
+            }
+          />
         }
-      }}
-      className="group flex flex-col items-center gap-2 rounded-md p-2 text-left hover:bg-accent"
-    >
-      <div
-        className="relative flex items-center justify-center overflow-hidden rounded-md bg-muted"
-        style={{ width: size, height: size * 1.5 }}
+        className="group flex flex-col items-center gap-2 rounded-md p-2 text-left hover:bg-accent"
       >
-        {coverSrc ? (
-          <img
-            src={coverSrc}
-            alt={entry.title}
-            className="h-full w-full object-cover"
-          />
-        ) : (
-          <Folder
-            size={size * 0.3}
-            className="text-muted-foreground/30"
-          />
+        <div
+          className="relative flex items-center justify-center overflow-hidden rounded-md bg-muted"
+          style={{ width: size, height: size * 1.5 }}
+        >
+          {coverSrc ? (
+            <img
+              src={coverSrc}
+              alt={entry.title}
+              className="h-full w-full object-cover"
+            />
+          ) : (
+            <Folder
+              size={size * 0.3}
+              className="text-muted-foreground/30"
+            />
+          )}
+          {entry.is_collection && (
+            <div className="absolute bottom-1 right-1 rounded-sm bg-black/60 px-1.5 py-0.5 text-xs text-white">
+              Collection
+            </div>
+          )}
+        </div>
+        <div className="w-full" style={{ maxWidth: size }}>
+          {renameLoading ? (
+            <div className="flex items-center gap-1.5 px-1">
+              <Spinner className="size-3" />
+              <span className="truncate text-sm text-muted-foreground">{renameValue}</span>
+            </div>
+          ) : isRenaming ? (
+            <input
+              ref={renameInputRef}
+              value={renameValue}
+              onChange={(e) => setRenameValue(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") submitRename();
+                if (e.key === "Escape") {
+                  submittedRef.current = true;
+                  setIsRenaming(false);
+                }
+              }}
+              onBlur={submitRename}
+              onClick={(e) => e.stopPropagation()}
+              className="w-full rounded bg-transparent px-1 text-sm font-medium outline-none ring-1 ring-primary"
+              style={{ userSelect: "text" }}
+            />
+          ) : (
+            <>
+              <p className="text-sm font-medium">{entry.title}</p>
+              {entry.year && (
+                <p className="text-xs text-muted-foreground">{entry.year}</p>
+              )}
+            </>
+          )}
+        </div>
+      </ContextMenuTrigger>
+      <ContextMenuContent>
+        <ContextMenuItem onClick={startRename}>
+          <Pencil size={14} />
+          Rename
+        </ContextMenuItem>
+        {entry.covers.length > 1 && (
+          <ContextMenuItem onClick={onChangeCover}>
+            <ImageIcon size={14} />
+            Change Cover
+          </ContextMenuItem>
         )}
-        {entry.is_collection && (
-          <div className="absolute bottom-1 right-1 rounded-sm bg-black/60 px-1.5 py-0.5 text-xs text-white">
-            Collection
-          </div>
-        )}
-      </div>
-      <div className="w-full" style={{ maxWidth: size }}>
-        <p className="text-sm font-medium">{entry.title}</p>
-        {entry.year && (
-          <p className="text-xs text-muted-foreground">{entry.year}</p>
-        )}
-      </div>
-    </button>
+      </ContextMenuContent>
+    </ContextMenu>
   );
 }
 
@@ -311,7 +461,7 @@ function SortableCoverCard({
     opacity: isDragging ? 0.5 : 1,
   };
 
-  const coverPath = entry.covers[0];
+  const coverPath = getDisplayCover(entry);
   const coverSrc = coverPath ? convertFileSrc(coverPath) : null;
 
   return (
@@ -350,5 +500,75 @@ function SortableCoverCard({
         )}
       </div>
     </div>
+  );
+}
+
+function CoverCarouselDialog({
+  entry,
+  open,
+  onOpenChange,
+  onSelect,
+}: {
+  entry: MediaEntry;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onSelect: (coverPath: string) => void;
+}) {
+  const currentCover = getDisplayCover(entry);
+  const startIndex = currentCover
+    ? Math.max(0, entry.covers.indexOf(currentCover))
+    : 0;
+  const [selectedIndex, setSelectedIndex] = useState(startIndex);
+  const [api, setApi] = useState<CarouselApi>();
+
+  useEffect(() => {
+    if (!api) return;
+    const onSelectSlide = () => setSelectedIndex(api.selectedScrollSnap());
+    api.on("select", onSelectSlide);
+    return () => {
+      api.off("select", onSelectSlide);
+    };
+  }, [api]);
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>Choose Cover</DialogTitle>
+        </DialogHeader>
+        <div className="px-12">
+          <Carousel setApi={setApi} opts={{ startIndex }}>
+            <CarouselContent>
+              {entry.covers.map((cover, i) => (
+                <CarouselItem key={i}>
+                  <div className="flex items-center justify-center">
+                    <img
+                      src={convertFileSrc(cover)}
+                      alt={`Cover ${i + 1}`}
+                      className="max-h-[400px] rounded-md object-contain"
+                    />
+                  </div>
+                </CarouselItem>
+              ))}
+            </CarouselContent>
+            <CarouselPrevious />
+            <CarouselNext />
+          </Carousel>
+          <p className="mt-2 text-center text-sm text-muted-foreground">
+            {selectedIndex + 1} / {entry.covers.length}
+          </p>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={() => onOpenChange(false)}>
+            Cancel
+          </Button>
+          <Button
+            onClick={() => onSelect(entry.covers[selectedIndex])}
+          >
+            Select
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
