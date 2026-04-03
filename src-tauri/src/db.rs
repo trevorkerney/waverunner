@@ -150,5 +150,25 @@ pub async fn create_library_pool(db_path: &Path, format: &str) -> Result<SqliteP
         }
     }
 
+    // Cached images table — all formats
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS cached_images (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entry_folder_path TEXT NOT NULL,
+            image_type TEXT NOT NULL,
+            source_filename TEXT NOT NULL,
+            cached_path TEXT NOT NULL,
+            UNIQUE(entry_folder_path, image_type, source_filename)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_cached_images_entry ON cached_images(entry_folder_path, image_type)",
+    )
+    .execute(&pool)
+    .await?;
+
     Ok(pool)
 }

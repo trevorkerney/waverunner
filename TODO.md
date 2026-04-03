@@ -32,5 +32,3 @@ settings: sorting language selection (determines which articles like "The", "A",
 search isnt working for movies inside categories anymore
 
 Okay now what about functionality for creating categories, bringing movies into them, and also bringing them out?
-
-things (covers mostly i think) need to be cached on waverunner install drive to prevent responsiveness issues
