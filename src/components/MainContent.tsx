@@ -74,6 +74,7 @@ function getDisplayCover(entry: MediaEntry): string | null {
 
 interface MainContentProps {
   entries: MediaEntry[];
+  loading: boolean;
   breadcrumbs: BreadcrumbItem[];
   coverSize: number;
   onCoverSizeChange: (size: number) => void;
@@ -91,6 +92,7 @@ interface MainContentProps {
 
 export function MainContent({
   entries,
+  loading,
   breadcrumbs,
   coverSize,
   onCoverSizeChange,
@@ -234,6 +236,10 @@ export function MainContent({
       <div className="flex-1 overflow-y-auto overflow-x-hidden p-4">
         {!selectedLibrary ? (
           <div />
+        ) : loading ? (
+          <div className="flex flex-1 items-center justify-center">
+            <Spinner className="size-6" />
+          </div>
         ) : filteredEntries.length === 0 ? (
           <p className="text-sm text-muted-foreground">
             {search ? "No results" : "Empty"}
@@ -277,6 +283,7 @@ export function MainContent({
                 key={entry.id}
                 entry={entry}
                 size={coverSize}
+                format={selectedLibrary?.format ?? "movies"}
                 onNavigate={onNavigate}
                 onRename={onRenameEntry}
                 onChangeCover={() => setCoverDialogEntry(entry)}
@@ -307,12 +314,14 @@ export function MainContent({
 function CoverCard({
   entry,
   size,
+  format,
   onNavigate,
   onRename,
   onChangeCover,
 }: {
   entry: MediaEntry;
   size: number;
+  format: string;
   onNavigate: (entry: MediaEntry) => void;
   onRename: (entryId: number, newTitle: string) => Promise<string | null>;
   onChangeCover: () => void;
@@ -384,7 +393,7 @@ function CoverCard({
               className="text-muted-foreground/30"
             />
           )}
-          {entry.is_collection && (
+          {entry.is_collection && format === "movies" && (
             <div className="absolute bottom-1 right-1 rounded-sm bg-black/60 px-1.5 py-0.5 text-xs text-white">
               Collection
             </div>

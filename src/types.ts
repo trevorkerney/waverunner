@@ -12,6 +12,7 @@ export interface Library {
 export interface EntriesResponse {
   entries: MediaEntry[];
   sort_mode: string;
+  format: string;
 }
 
 export interface MediaEntry {

@@ -56,6 +56,7 @@ pub struct MediaEntry {
 pub struct EntriesResponse {
     pub entries: Vec<MediaEntry>,
     pub sort_mode: String,
+    pub format: String,
 }
 
 fn sanitize_db_filename(name: &str) -> String {
@@ -149,17 +150,24 @@ pub async fn create_library(
         },
     );
 
-    let pool = crate::db::create_library_pool(&db_path)
+    let pool = crate::db::create_library_pool(&db_path, &format)
         .await
         .map_err(|e| e.to_string())?;
 
-    sqlx::query("DELETE FROM media")
-        .execute(&pool)
-        .await
-        .map_err(|e| e.to_string())?;
-    scan_folder(&app, &pool, &lib_path, None)
-        .await
-        .map_err(|e| e.to_string())?;
+    match format.as_str() {
+        "tv" => {
+            sqlx::query("DELETE FROM shows").execute(&pool).await.map_err(|e| e.to_string())?;
+            scan_tv_library(&app, &pool, &lib_path).await.map_err(|e| e.to_string())?;
+        }
+        "music" => {
+            sqlx::query("DELETE FROM artists").execute(&pool).await.map_err(|e| e.to_string())?;
+            scan_music_library(&app, &pool, &lib_path).await.map_err(|e| e.to_string())?;
+        }
+        _ => {
+            sqlx::query("DELETE FROM media").execute(&pool).await.map_err(|e| e.to_string())?;
+            scan_folder(&app, &pool, &lib_path, None).await.map_err(|e| e.to_string())?;
+        }
+    }
 
     pool.close().await;
 
@@ -262,15 +270,15 @@ pub async fn get_entries(
     library_id: String,
     parent_id: Option<i64>,
 ) -> Result<EntriesResponse, String> {
-    let row: Option<(String, i32, String, String)> = sqlx::query_as(
-        "SELECT path, portable, db_filename, default_sort_mode FROM libraries WHERE id = ?",
+    let row: Option<(String, i32, String, String, String)> = sqlx::query_as(
+        "SELECT path, portable, db_filename, default_sort_mode, format FROM libraries WHERE id = ?",
     )
     .bind(&library_id)
     .fetch_optional(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
 
-    let (path, portable, db_filename, default_sort_mode) = row.ok_or("Library not found")?;
+    let (path, portable, db_filename, default_sort_mode, format) = row.ok_or("Library not found")?;
 
     let db_path = if portable != 0 {
         PathBuf::from(&path).join(".waverunner.db")
@@ -278,78 +286,172 @@ pub async fn get_entries(
         state.app_data_dir.join(&db_filename)
     };
 
-    let pool = crate::db::create_library_pool(&db_path)
+    let pool = crate::db::connect_library_pool(&db_path)
         .await
         .map_err(|e| e.to_string())?;
 
-    // Determine sort mode: if inside a collection, use its sort_mode; otherwise use library default
-    let sort_mode = match parent_id {
-        Some(pid) => {
-            let row: Option<(String,)> = sqlx::query_as(
-                "SELECT sort_mode FROM media WHERE id = ?",
-            )
-            .bind(pid)
-            .fetch_optional(&pool)
-            .await
-            .map_err(|e| e.to_string())?;
-            row.map(|(m,)| m).unwrap_or(default_sort_mode)
-        }
-        None => default_sort_mode,
-    };
-
-    let order_clause = match sort_mode.as_str() {
-        "year" => "ORDER BY year ASC, sort_title ASC",
-        "custom" => "ORDER BY sort_order ASC, sort_title ASC",
-        _ => "ORDER BY sort_title ASC",
-    };
-
-    let query_str = match parent_id {
-        Some(_) => format!(
-            "SELECT id, title, year, folder_path, parent_id, is_collection, selected_cover FROM media WHERE parent_id = ? {}",
-            order_clause
-        ),
-        None => format!(
-            "SELECT id, title, year, folder_path, parent_id, is_collection, selected_cover FROM media WHERE parent_id IS NULL {}",
-            order_clause
-        ),
-    };
-
-    let rows: Vec<(i64, String, Option<String>, String, Option<i64>, i32, Option<String>)> = match parent_id {
-        Some(pid) => {
-            sqlx::query_as(&query_str)
-                .bind(pid)
-                .fetch_all(&pool)
-                .await
-        }
-        None => {
-            sqlx::query_as(&query_str)
-                .fetch_all(&pool)
-                .await
-        }
-    }
-    .map_err(|e| e.to_string())?;
-
     let lib_path = PathBuf::from(&path);
-    let entries: Vec<MediaEntry> = rows
-        .into_iter()
-        .map(|(id, title, year, folder_path, parent_id, is_collection, selected_cover)| {
-            let full_path = lib_path.join(&folder_path);
-            let covers = find_covers(&full_path);
-            MediaEntry {
-                id,
-                title,
-                year,
-                folder_path,
-                parent_id,
-                is_collection: is_collection != 0,
-                covers,
-                selected_cover,
+
+    let result = match format.as_str() {
+        "tv" => {
+            let order_clause = match default_sort_mode.as_str() {
+                "year" => "ORDER BY year ASC, sort_title ASC",
+                "custom" => "ORDER BY sort_order ASC, sort_title ASC",
+                _ => "ORDER BY sort_title ASC",
+            };
+
+            let query_str = format!(
+                "SELECT id, title, year, folder_path, selected_cover FROM shows {}",
+                order_clause
+            );
+
+            let rows: Vec<(i64, String, Option<String>, String, Option<String>)> =
+                sqlx::query_as(&query_str)
+                    .fetch_all(&pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+            let entries: Vec<MediaEntry> = rows
+                .into_iter()
+                .map(|(id, title, year, folder_path, selected_cover)| {
+                    let full_path = lib_path.join(&folder_path);
+                    let covers = find_covers(&full_path);
+                    MediaEntry {
+                        id,
+                        title,
+                        year,
+                        folder_path,
+                        parent_id: None,
+                        is_collection: false,
+                        covers,
+                        selected_cover,
+                    }
+                })
+                .collect();
+
+            EntriesResponse {
+                entries,
+                sort_mode: default_sort_mode,
+                format,
             }
-        })
-        .collect();
+        }
+        "music" => {
+            let order_clause = match default_sort_mode.as_str() {
+                "custom" => "ORDER BY sort_order ASC, sort_name ASC",
+                _ => "ORDER BY sort_name ASC",
+            };
+
+            let query_str = format!(
+                "SELECT id, name, folder_path, selected_cover FROM artists {}",
+                order_clause
+            );
+
+            let rows: Vec<(i64, String, String, Option<String>)> =
+                sqlx::query_as(&query_str)
+                    .fetch_all(&pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+            let entries: Vec<MediaEntry> = rows
+                .into_iter()
+                .map(|(id, name, folder_path, selected_cover)| {
+                    let full_path = lib_path.join(&folder_path);
+                    let covers = find_covers(&full_path);
+                    MediaEntry {
+                        id,
+                        title: name,
+                        year: None,
+                        folder_path,
+                        parent_id: None,
+                        is_collection: false,
+                        covers,
+                        selected_cover,
+                    }
+                })
+                .collect();
+
+            EntriesResponse {
+                entries,
+                sort_mode: default_sort_mode,
+                format,
+            }
+        }
+        _ => {
+            // Movies — existing logic
+            let sort_mode = match parent_id {
+                Some(pid) => {
+                    let row: Option<(String,)> = sqlx::query_as(
+                        "SELECT sort_mode FROM media WHERE id = ?",
+                    )
+                    .bind(pid)
+                    .fetch_optional(&pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                    row.map(|(m,)| m).unwrap_or(default_sort_mode)
+                }
+                None => default_sort_mode,
+            };
+
+            let order_clause = match sort_mode.as_str() {
+                "year" => "ORDER BY year ASC, sort_title ASC",
+                "custom" => "ORDER BY sort_order ASC, sort_title ASC",
+                _ => "ORDER BY sort_title ASC",
+            };
+
+            let query_str = match parent_id {
+                Some(_) => format!(
+                    "SELECT id, title, year, folder_path, parent_id, is_collection, selected_cover FROM media WHERE parent_id = ? {}",
+                    order_clause
+                ),
+                None => format!(
+                    "SELECT id, title, year, folder_path, parent_id, is_collection, selected_cover FROM media WHERE parent_id IS NULL {}",
+                    order_clause
+                ),
+            };
+
+            let rows: Vec<(i64, String, Option<String>, String, Option<i64>, i32, Option<String>)> = match parent_id {
+                Some(pid) => {
+                    sqlx::query_as(&query_str)
+                        .bind(pid)
+                        .fetch_all(&pool)
+                        .await
+                }
+                None => {
+                    sqlx::query_as(&query_str)
+                        .fetch_all(&pool)
+                        .await
+                }
+            }
+            .map_err(|e| e.to_string())?;
+
+            let entries: Vec<MediaEntry> = rows
+                .into_iter()
+                .map(|(id, title, year, folder_path, parent_id, is_collection, selected_cover)| {
+                    let full_path = lib_path.join(&folder_path);
+                    let covers = find_covers(&full_path);
+                    MediaEntry {
+                        id,
+                        title,
+                        year,
+                        folder_path,
+                        parent_id,
+                        is_collection: is_collection != 0,
+                        covers,
+                        selected_cover,
+                    }
+                })
+                .collect();
+
+            EntriesResponse {
+                entries,
+                sort_mode,
+                format,
+            }
+        }
+    };
 
     pool.close().await;
-    Ok(EntriesResponse { entries, sort_mode })
+    Ok(result)
 }
 
 #[tauri::command]
@@ -363,10 +465,20 @@ pub async fn set_sort_mode(
         return Err("Invalid sort mode".to_string());
     }
 
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT format FROM libraries WHERE id = ?",
+    )
+    .bind(&library_id)
+    .fetch_optional(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let (format,) = row.ok_or("Library not found")?;
+
     match entry_id {
-        Some(eid) => {
-            // Set sort_mode on a collection entry
-            let row: Option<(String, i32, String)> = sqlx::query_as(
+        Some(eid) if format == "movies" => {
+            // Set sort_mode on a collection entry (movies only)
+            let lib_row: Option<(String, i32, String)> = sqlx::query_as(
                 "SELECT path, portable, db_filename FROM libraries WHERE id = ?",
             )
             .bind(&library_id)
@@ -374,7 +486,7 @@ pub async fn set_sort_mode(
             .await
             .map_err(|e| e.to_string())?;
 
-            let (path, portable, db_filename) = row.ok_or("Library not found")?;
+            let (path, portable, db_filename) = lib_row.ok_or("Library not found")?;
 
             let db_path = if portable != 0 {
                 PathBuf::from(&path).join(".waverunner.db")
@@ -382,7 +494,7 @@ pub async fn set_sort_mode(
                 state.app_data_dir.join(&db_filename)
             };
 
-            let pool = crate::db::create_library_pool(&db_path)
+            let pool = crate::db::connect_library_pool(&db_path)
                 .await
                 .map_err(|e| e.to_string())?;
 
@@ -395,8 +507,8 @@ pub async fn set_sort_mode(
 
             pool.close().await;
         }
-        None => {
-            // Set default_sort_mode on the library (for root level)
+        _ => {
+            // Set default_sort_mode on the library (root level, or any TV/music)
             sqlx::query("UPDATE libraries SET default_sort_mode = ? WHERE id = ?")
                 .bind(&sort_mode)
                 .bind(&library_id)
@@ -415,15 +527,15 @@ pub async fn update_sort_order(
     library_id: String,
     entry_ids: Vec<i64>,
 ) -> Result<(), String> {
-    let row: Option<(String, i32, String)> = sqlx::query_as(
-        "SELECT path, portable, db_filename FROM libraries WHERE id = ?",
+    let row: Option<(String, i32, String, String)> = sqlx::query_as(
+        "SELECT path, portable, db_filename, format FROM libraries WHERE id = ?",
     )
     .bind(&library_id)
     .fetch_optional(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
 
-    let (path, portable, db_filename) = row.ok_or("Library not found")?;
+    let (path, portable, db_filename, format) = row.ok_or("Library not found")?;
 
     let db_path = if portable != 0 {
         PathBuf::from(&path).join(".waverunner.db")
@@ -431,12 +543,19 @@ pub async fn update_sort_order(
         state.app_data_dir.join(&db_filename)
     };
 
-    let pool = crate::db::create_library_pool(&db_path)
+    let pool = crate::db::connect_library_pool(&db_path)
         .await
         .map_err(|e| e.to_string())?;
 
+    let table = match format.as_str() {
+        "tv" => "shows",
+        "music" => "artists",
+        _ => "media",
+    };
+
     for (i, id) in entry_ids.iter().enumerate() {
-        sqlx::query("UPDATE media SET sort_order = ? WHERE id = ?")
+        let q = format!("UPDATE {} SET sort_order = ? WHERE id = ?", table);
+        sqlx::query(&q)
             .bind(i as i32)
             .bind(id)
             .execute(&pool)
@@ -455,15 +574,15 @@ pub async fn rename_entry(
     entry_id: i64,
     new_title: String,
 ) -> Result<(), String> {
-    let row: Option<(String, i32, String, i32)> = sqlx::query_as(
-        "SELECT path, portable, db_filename, managed FROM libraries WHERE id = ?",
+    let row: Option<(String, i32, String, i32, String)> = sqlx::query_as(
+        "SELECT path, portable, db_filename, managed, format FROM libraries WHERE id = ?",
     )
     .bind(&library_id)
     .fetch_optional(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
 
-    let (lib_path, portable, db_filename, managed) = row.ok_or("Library not found")?;
+    let (lib_path, portable, db_filename, managed, format) = row.ok_or("Library not found")?;
 
     let db_path = if portable != 0 {
         PathBuf::from(&lib_path).join(".waverunner.db")
@@ -471,84 +590,242 @@ pub async fn rename_entry(
         state.app_data_dir.join(&db_filename)
     };
 
-    let pool = crate::db::create_library_pool(&db_path)
+    let pool = crate::db::connect_library_pool(&db_path)
         .await
         .map_err(|e| e.to_string())?;
 
-    // If managed, rename the actual folder on disk and update folder_path + children
+    // If managed library, rename the actual folder on disk and update paths
     if managed != 0 {
-        let entry_row: Option<(String, Option<String>)> = sqlx::query_as(
-            "SELECT folder_path, year FROM media WHERE id = ?",
-        )
-        .bind(entry_id)
-        .fetch_optional(&pool)
-        .await
-        .map_err(|e| e.to_string())?;
-
-        let (folder_path, year) = entry_row.ok_or("Entry not found")?;
-
         let lib_base = PathBuf::from(&lib_path);
-        let old_full_path = lib_base.join(&folder_path);
 
-        // Build new folder name: "Title (Year)" or just "Title", stripping invalid FS chars
-        let safe_title = sanitize_filename(&new_title);
-        let new_folder_name = match &year {
-            Some(y) => format!("{} ({})", safe_title, y),
-            None => safe_title,
-        };
-
-        let old_parent = old_full_path.parent().ok_or("Invalid folder path")?;
-        let new_full_path = old_parent.join(&new_folder_name);
-
-        if old_full_path != new_full_path {
-            if new_full_path.exists() {
-                pool.close().await;
-                return Err(format!("A folder named '{}' already exists", new_folder_name));
-            }
-
-            std::fs::rename(&old_full_path, &new_full_path)
-                .map_err(|e| format!("Failed to rename folder: {}", e))?;
-
-            // Update this entry's folder_path
-            let new_rel_path = new_full_path
-                .strip_prefix(&lib_base)
-                .unwrap_or(&new_full_path)
-                .to_string_lossy()
-                .to_string();
-
-            let old_rel_prefix = format!("{}\\", folder_path);
-            let new_rel_prefix = format!("{}\\", new_rel_path);
-
-            sqlx::query("UPDATE media SET folder_path = ? WHERE id = ?")
-                .bind(&new_rel_path)
+        match format.as_str() {
+            "movies" => {
+                let entry_row: Option<(String, Option<String>)> = sqlx::query_as(
+                    "SELECT folder_path, year FROM media WHERE id = ?",
+                )
                 .bind(entry_id)
-                .execute(&pool)
+                .fetch_optional(&pool)
                 .await
                 .map_err(|e| e.to_string())?;
 
-            // Update all descendant folder_paths that start with the old prefix
-            sqlx::query(
-                "UPDATE media SET folder_path = ? || SUBSTR(folder_path, ?) WHERE folder_path LIKE ? AND id != ?",
-            )
-            .bind(&new_rel_prefix)
-            .bind((old_rel_prefix.len() + 1) as i32)
-            .bind(format!("{}%", old_rel_prefix))
-            .bind(entry_id)
-            .execute(&pool)
-            .await
-            .map_err(|e| e.to_string())?;
+                let (folder_path, year) = entry_row.ok_or("Entry not found")?;
+                let old_full_path = lib_base.join(&folder_path);
+
+                let safe_title = sanitize_filename(&new_title);
+                let new_folder_name = match &year {
+                    Some(y) => format!("{} ({})", safe_title, y),
+                    None => safe_title,
+                };
+
+                let old_parent = old_full_path.parent().ok_or("Invalid folder path")?;
+                let new_full_path = old_parent.join(&new_folder_name);
+
+                if old_full_path != new_full_path {
+                    if new_full_path.exists() {
+                        pool.close().await;
+                        return Err(format!("A folder named '{}' already exists", new_folder_name));
+                    }
+
+                    std::fs::rename(&old_full_path, &new_full_path)
+                        .map_err(|e| format!("Failed to rename folder: {}", e))?;
+
+                    let new_rel_path = new_full_path
+                        .strip_prefix(&lib_base)
+                        .unwrap_or(&new_full_path)
+                        .to_string_lossy()
+                        .to_string();
+
+                    let old_rel_prefix = format!("{}\\", folder_path);
+                    let new_rel_prefix = format!("{}\\", new_rel_path);
+
+                    sqlx::query("UPDATE media SET folder_path = ? WHERE id = ?")
+                        .bind(&new_rel_path)
+                        .bind(entry_id)
+                        .execute(&pool)
+                        .await
+                        .map_err(|e| e.to_string())?;
+
+                    sqlx::query(
+                        "UPDATE media SET folder_path = ? || SUBSTR(folder_path, ?) WHERE folder_path LIKE ? AND id != ?",
+                    )
+                    .bind(&new_rel_prefix)
+                    .bind((old_rel_prefix.len() + 1) as i32)
+                    .bind(format!("{}%", old_rel_prefix))
+                    .bind(entry_id)
+                    .execute(&pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                }
+            }
+            "tv" => {
+                let entry_row: Option<(String, Option<String>)> = sqlx::query_as(
+                    "SELECT folder_path, year FROM shows WHERE id = ?",
+                )
+                .bind(entry_id)
+                .fetch_optional(&pool)
+                .await
+                .map_err(|e| e.to_string())?;
+
+                let (folder_path, year) = entry_row.ok_or("Entry not found")?;
+                let old_full_path = lib_base.join(&folder_path);
+
+                let safe_title = sanitize_filename(&new_title);
+                let new_folder_name = match &year {
+                    Some(y) => format!("{} ({})", safe_title, y),
+                    None => safe_title,
+                };
+
+                let new_full_path = old_full_path.parent().ok_or("Invalid folder path")?.join(&new_folder_name);
+
+                if old_full_path != new_full_path {
+                    if new_full_path.exists() {
+                        pool.close().await;
+                        return Err(format!("A folder named '{}' already exists", new_folder_name));
+                    }
+
+                    std::fs::rename(&old_full_path, &new_full_path)
+                        .map_err(|e| format!("Failed to rename folder: {}", e))?;
+
+                    let new_rel_path = new_full_path
+                        .strip_prefix(&lib_base)
+                        .unwrap_or(&new_full_path)
+                        .to_string_lossy()
+                        .to_string();
+
+                    let old_rel_prefix = format!("{}\\", folder_path);
+                    let new_rel_prefix = format!("{}\\", new_rel_path);
+
+                    // Update show folder_path
+                    sqlx::query("UPDATE shows SET folder_path = ? WHERE id = ?")
+                        .bind(&new_rel_path)
+                        .bind(entry_id)
+                        .execute(&pool)
+                        .await
+                        .map_err(|e| e.to_string())?;
+
+                    // Update season folder_paths
+                    sqlx::query(
+                        "UPDATE seasons SET folder_path = ? || SUBSTR(folder_path, ?) WHERE show_id = ?",
+                    )
+                    .bind(&new_rel_prefix)
+                    .bind((old_rel_prefix.len() + 1) as i32)
+                    .bind(entry_id)
+                    .execute(&pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                    // Update episode file_paths
+                    sqlx::query(
+                        "UPDATE episodes SET file_path = ? || SUBSTR(file_path, ?) WHERE season_id IN (SELECT id FROM seasons WHERE show_id = ?)",
+                    )
+                    .bind(&new_rel_prefix)
+                    .bind((old_rel_prefix.len() + 1) as i32)
+                    .bind(entry_id)
+                    .execute(&pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                }
+            }
+            "music" => {
+                let entry_row: Option<(String,)> = sqlx::query_as(
+                    "SELECT folder_path FROM artists WHERE id = ?",
+                )
+                .bind(entry_id)
+                .fetch_optional(&pool)
+                .await
+                .map_err(|e| e.to_string())?;
+
+                let (folder_path,) = entry_row.ok_or("Entry not found")?;
+                let old_full_path = lib_base.join(&folder_path);
+
+                let safe_title = sanitize_filename(&new_title);
+
+                let new_full_path = old_full_path.parent().ok_or("Invalid folder path")?.join(&safe_title);
+
+                if old_full_path != new_full_path {
+                    if new_full_path.exists() {
+                        pool.close().await;
+                        return Err(format!("A folder named '{}' already exists", safe_title));
+                    }
+
+                    std::fs::rename(&old_full_path, &new_full_path)
+                        .map_err(|e| format!("Failed to rename folder: {}", e))?;
+
+                    let new_rel_path = new_full_path
+                        .strip_prefix(&lib_base)
+                        .unwrap_or(&new_full_path)
+                        .to_string_lossy()
+                        .to_string();
+
+                    let old_rel_prefix = format!("{}\\", folder_path);
+                    let new_rel_prefix = format!("{}\\", new_rel_path);
+
+                    // Update artist folder_path
+                    sqlx::query("UPDATE artists SET folder_path = ? WHERE id = ?")
+                        .bind(&new_rel_path)
+                        .bind(entry_id)
+                        .execute(&pool)
+                        .await
+                        .map_err(|e| e.to_string())?;
+
+                    // Update album folder_paths
+                    sqlx::query(
+                        "UPDATE albums SET folder_path = ? || SUBSTR(folder_path, ?) WHERE artist_id = ?",
+                    )
+                    .bind(&new_rel_prefix)
+                    .bind((old_rel_prefix.len() + 1) as i32)
+                    .bind(entry_id)
+                    .execute(&pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                    // Update song file_paths
+                    sqlx::query(
+                        "UPDATE songs SET file_path = ? || SUBSTR(file_path, ?) WHERE album_id IN (SELECT id FROM albums WHERE artist_id = ?)",
+                    )
+                    .bind(&new_rel_prefix)
+                    .bind((old_rel_prefix.len() + 1) as i32)
+                    .bind(entry_id)
+                    .execute(&pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                }
+            }
+            _ => {}
         }
     }
 
     let sort_title = generate_sort_title(&new_title, "en");
 
-    sqlx::query("UPDATE media SET title = ?, sort_title = ? WHERE id = ?")
-        .bind(&new_title)
-        .bind(&sort_title)
-        .bind(entry_id)
-        .execute(&pool)
-        .await
-        .map_err(|e| e.to_string())?;
+    match format.as_str() {
+        "tv" => {
+            sqlx::query("UPDATE shows SET title = ?, sort_title = ? WHERE id = ?")
+                .bind(&new_title)
+                .bind(&sort_title)
+                .bind(entry_id)
+                .execute(&pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        "music" => {
+            sqlx::query("UPDATE artists SET name = ?, sort_name = ? WHERE id = ?")
+                .bind(&new_title)
+                .bind(&sort_title)
+                .bind(entry_id)
+                .execute(&pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        _ => {
+            sqlx::query("UPDATE media SET title = ?, sort_title = ? WHERE id = ?")
+                .bind(&new_title)
+                .bind(&sort_title)
+                .bind(entry_id)
+                .execute(&pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
 
     pool.close().await;
     Ok(())
@@ -561,15 +838,15 @@ pub async fn set_cover(
     entry_id: i64,
     cover_path: Option<String>,
 ) -> Result<(), String> {
-    let row: Option<(String, i32, String)> = sqlx::query_as(
-        "SELECT path, portable, db_filename FROM libraries WHERE id = ?",
+    let row: Option<(String, i32, String, String)> = sqlx::query_as(
+        "SELECT path, portable, db_filename, format FROM libraries WHERE id = ?",
     )
     .bind(&library_id)
     .fetch_optional(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
 
-    let (path, portable, db_filename) = row.ok_or("Library not found")?;
+    let (path, portable, db_filename, format) = row.ok_or("Library not found")?;
 
     let db_path = if portable != 0 {
         PathBuf::from(&path).join(".waverunner.db")
@@ -577,11 +854,18 @@ pub async fn set_cover(
         state.app_data_dir.join(&db_filename)
     };
 
-    let pool = crate::db::create_library_pool(&db_path)
+    let pool = crate::db::connect_library_pool(&db_path)
         .await
         .map_err(|e| e.to_string())?;
 
-    sqlx::query("UPDATE media SET selected_cover = ? WHERE id = ?")
+    let table = match format.as_str() {
+        "tv" => "shows",
+        "music" => "artists",
+        _ => "media",
+    };
+
+    let q = format!("UPDATE {} SET selected_cover = ? WHERE id = ?", table);
+    sqlx::query(&q)
         .bind(&cover_path)
         .bind(entry_id)
         .execute(&pool)
@@ -598,15 +882,15 @@ pub async fn rescan_library(
     state: tauri::State<'_, AppState>,
     library_id: String,
 ) -> Result<(), String> {
-    let row: Option<(String, i32, String)> = sqlx::query_as(
-        "SELECT path, portable, db_filename FROM libraries WHERE id = ?",
+    let row: Option<(String, i32, String, String)> = sqlx::query_as(
+        "SELECT path, portable, db_filename, format FROM libraries WHERE id = ?",
     )
     .bind(&library_id)
     .fetch_optional(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
 
-    let (lib_path, portable, db_filename) = row.ok_or("Library not found")?;
+    let (lib_path, portable, db_filename, format) = row.ok_or("Library not found")?;
 
     let db_path = if portable != 0 {
         PathBuf::from(&lib_path).join(".waverunner.db")
@@ -614,54 +898,65 @@ pub async fn rescan_library(
         state.app_data_dir.join(&db_filename)
     };
 
-    let pool = crate::db::create_library_pool(&db_path)
+    let pool = crate::db::connect_library_pool(&db_path)
         .await
         .map_err(|e| e.to_string())?;
 
     let base_path = PathBuf::from(&lib_path);
 
-    // Collect all folder relative paths currently on disk
-    let mut disk_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
-    collect_disk_paths(&base_path, &base_path, &mut disk_paths)
+    match format.as_str() {
+        "tv" => rescan_tv_library(&app, &pool, &base_path).await?,
+        "music" => rescan_music_library(&app, &pool, &base_path).await?,
+        _ => rescan_movies_library(&app, &pool, &base_path).await?,
+    }
+
+    pool.close().await;
+    Ok(())
+}
+
+async fn rescan_movies_library(
+    app: &tauri::AppHandle,
+    pool: &sqlx::SqlitePool,
+    base_path: &PathBuf,
+) -> Result<(), String> {
+    use std::collections::HashSet;
+
+    let mut disk_paths: HashSet<String> = HashSet::new();
+    collect_disk_paths(base_path, base_path, &mut disk_paths)
         .map_err(|e| e.to_string())?;
 
-    // Get all existing folder_paths from DB
     let db_rows: Vec<(i64, String, Option<i64>)> = sqlx::query_as(
         "SELECT id, folder_path, parent_id FROM media",
     )
-    .fetch_all(&pool)
+    .fetch_all(pool)
     .await
     .map_err(|e| e.to_string())?;
 
-    let db_paths: std::collections::HashSet<String> =
-        db_rows.iter().map(|(_, p, _)| p.clone()).collect();
+    let db_paths: HashSet<String> = db_rows.iter().map(|(_, p, _)| p.clone()).collect();
 
-    // Delete entries whose folders no longer exist on disk
-    // Delete from deepest first to respect foreign keys even without cascade
     let mut to_delete: Vec<(i64, String)> = db_rows
         .iter()
         .filter(|(_, p, _)| !disk_paths.contains(p))
         .map(|(id, p, _)| (*id, p.clone()))
         .collect();
-    // Sort by depth (deepest first) so children are deleted before parents
-    to_delete.sort_by(|a, b| b.1.matches('\\').count().cmp(&a.1.matches('\\').count())
-        .then_with(|| b.1.matches('/').count().cmp(&a.1.matches('/').count())));
+    to_delete.sort_by(|a, b| {
+        b.1.matches('\\').count().cmp(&a.1.matches('\\').count())
+            .then_with(|| b.1.matches('/').count().cmp(&a.1.matches('/').count()))
+    });
 
     for (id, _) in &to_delete {
         sqlx::query("DELETE FROM media WHERE id = ?")
             .bind(id)
-            .execute(&pool)
+            .execute(pool)
             .await
             .map_err(|e| e.to_string())?;
     }
 
-    // Find new paths that aren't in the DB yet
     let mut new_paths: Vec<String> = disk_paths
         .iter()
         .filter(|p| !db_paths.contains(*p))
         .cloned()
         .collect();
-    // Sort by depth (shallowest first) so parents are created before children
     new_paths.sort_by(|a, b| {
         let depth_a = a.matches('\\').count() + a.matches('/').count();
         let depth_b = b.matches('\\').count() + b.matches('/').count();
@@ -680,10 +975,9 @@ pub async fn rescan_library(
 
         let (title, year) = parse_folder_name(&folder_name);
 
-        // Determine parent_id by looking up the parent's folder_path
         let parent_rel = full_path
             .parent()
-            .and_then(|p| p.strip_prefix(&base_path).ok())
+            .and_then(|p| p.strip_prefix(base_path).ok())
             .map(|p| p.to_string_lossy().to_string());
 
         let parent_id: Option<i64> = if let Some(ref parent_path) = parent_rel {
@@ -694,7 +988,7 @@ pub async fn rescan_library(
                     "SELECT id FROM media WHERE folder_path = ?",
                 )
                 .bind(parent_path)
-                .fetch_optional(&pool)
+                .fetch_optional(pool)
                 .await
                 .map_err(|e| e.to_string())?;
                 row.map(|(id,)| id)
@@ -705,25 +999,21 @@ pub async fn rescan_library(
 
         let has_subdirs = std::fs::read_dir(&full_path)
             .map(|rd| {
-                rd.filter_map(|e| e.ok()).any(|e| {
-                    let n = e.file_name().to_string_lossy().to_string();
-                    e.path().is_dir() && n != "covers" && n != "extras" && !n.starts_with('.')
-                })
+                rd.filter_map(|e| e.ok()).any(|e| is_scannable_dir(&e))
             })
             .unwrap_or(false);
 
-        // Get sort_order: place after existing siblings
         let max_order: Option<(i32,)> = if let Some(pid) = parent_id {
             sqlx::query_as("SELECT COALESCE(MAX(sort_order), -1) FROM media WHERE parent_id = ?")
                 .bind(pid)
-                .fetch_optional(&pool)
+                .fetch_optional(pool)
                 .await
                 .map_err(|e| e.to_string())?
         } else {
             sqlx::query_as(
                 "SELECT COALESCE(MAX(sort_order), -1) FROM media WHERE parent_id IS NULL",
             )
-            .fetch_optional(&pool)
+            .fetch_optional(pool)
             .await
             .map_err(|e| e.to_string())?
         };
@@ -741,16 +1031,16 @@ pub async fn rescan_library(
         .bind(has_subdirs as i32)
         .bind(sort_order)
         .bind(&sort_title)
-        .execute(&pool)
+        .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
     }
 
-    // Update is_collection for existing entries that may have gained or lost children
+    // Update is_collection for existing entries
     let all_entries: Vec<(i64, String)> = sqlx::query_as(
         "SELECT id, folder_path FROM media",
     )
-    .fetch_all(&pool)
+    .fetch_all(pool)
     .await
     .map_err(|e| e.to_string())?;
 
@@ -758,22 +1048,456 @@ pub async fn rescan_library(
         let full_path = base_path.join(rel_path);
         let has_subdirs = std::fs::read_dir(&full_path)
             .map(|rd| {
-                rd.filter_map(|e| e.ok()).any(|e| {
-                    let n = e.file_name().to_string_lossy().to_string();
-                    e.path().is_dir() && n != "covers" && n != "extras" && !n.starts_with('.')
-                })
+                rd.filter_map(|e| e.ok()).any(|e| is_scannable_dir(&e))
             })
             .unwrap_or(false);
 
         sqlx::query("UPDATE media SET is_collection = ? WHERE id = ?")
             .bind(has_subdirs as i32)
             .bind(id)
-            .execute(&pool)
+            .execute(pool)
             .await
             .map_err(|e| e.to_string())?;
     }
 
-    pool.close().await;
+    Ok(())
+}
+
+async fn rescan_tv_library(
+    app: &tauri::AppHandle,
+    pool: &sqlx::SqlitePool,
+    base_path: &PathBuf,
+) -> Result<(), String> {
+    use std::collections::HashSet;
+
+    // Level 1: Shows
+    let disk_shows: HashSet<String> = std::fs::read_dir(base_path)
+        .map_err(|e| e.to_string())?
+        .filter_map(|e| e.ok())
+        .filter(|e| is_scannable_dir(e))
+        .map(|e| {
+            e.path()
+                .strip_prefix(base_path)
+                .unwrap_or(&e.path())
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect();
+
+    let db_shows: Vec<(i64, String)> = sqlx::query_as("SELECT id, folder_path FROM shows")
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Delete removed shows
+    for (id, path) in &db_shows {
+        if !disk_shows.contains(path) {
+            sqlx::query("DELETE FROM shows WHERE id = ?")
+                .bind(id)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
+    let existing_show_paths: HashSet<String> = db_shows.iter().map(|(_, p)| p.clone()).collect();
+
+    // Add new shows
+    for rel_path in &disk_shows {
+        if existing_show_paths.contains(rel_path) {
+            continue;
+        }
+        let full_path = base_path.join(rel_path);
+        let name = full_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let _ = app.emit("scan-progress", &name);
+        let (title, year) = parse_folder_name(&name);
+        let sort_title = generate_sort_title(&title, "en");
+
+        let max_order: Option<(i32,)> =
+            sqlx::query_as("SELECT COALESCE(MAX(sort_order), -1) FROM shows")
+                .fetch_optional(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        let sort_order = max_order.map(|(v,)| v + 1).unwrap_or(0);
+
+        sqlx::query(
+            "INSERT INTO shows (title, year, folder_path, sort_order, sort_title) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&title)
+        .bind(&year)
+        .bind(rel_path)
+        .bind(sort_order)
+        .bind(&sort_title)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+
+    // Level 2 & 3: Seasons and episodes for each show
+    let all_shows: Vec<(i64, String)> = sqlx::query_as("SELECT id, folder_path FROM shows")
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    for (show_id, show_rel) in &all_shows {
+        let show_path = base_path.join(show_rel);
+
+        let disk_seasons: HashSet<String> = std::fs::read_dir(&show_path)
+            .map_err(|e| e.to_string())?
+            .filter_map(|e| e.ok())
+            .filter(|e| is_scannable_dir(e))
+            .map(|e| {
+                e.path()
+                    .strip_prefix(base_path)
+                    .unwrap_or(&e.path())
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+
+        let db_seasons: Vec<(i64, String)> =
+            sqlx::query_as("SELECT id, folder_path FROM seasons WHERE show_id = ?")
+                .bind(show_id)
+                .fetch_all(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+
+        for (id, path) in &db_seasons {
+            if !disk_seasons.contains(path) {
+                sqlx::query("DELETE FROM seasons WHERE id = ?")
+                    .bind(id)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+
+        let existing_season_paths: HashSet<String> = db_seasons.iter().map(|(_, p)| p.clone()).collect();
+
+        for rel_path in &disk_seasons {
+            if existing_season_paths.contains(rel_path) {
+                continue;
+            }
+            let full_path = base_path.join(rel_path);
+            let name = full_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+            let (season_title, season_number) = parse_season_folder_name(&name);
+
+            let max_order: Option<(i32,)> =
+                sqlx::query_as("SELECT COALESCE(MAX(sort_order), -1) FROM seasons WHERE show_id = ?")
+                    .bind(show_id)
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            let sort_order = max_order.map(|(v,)| v + 1).unwrap_or(0);
+
+            sqlx::query(
+                "INSERT INTO seasons (show_id, title, season_number, folder_path, sort_order) VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(show_id)
+            .bind(&season_title)
+            .bind(season_number)
+            .bind(rel_path)
+            .bind(sort_order)
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        }
+
+        // Episodes for each season
+        let all_seasons: Vec<(i64, String)> =
+            sqlx::query_as("SELECT id, folder_path FROM seasons WHERE show_id = ?")
+                .bind(show_id)
+                .fetch_all(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+
+        for (season_id, season_rel) in &all_seasons {
+            let season_path = base_path.join(season_rel);
+
+            let disk_episodes: HashSet<String> = std::fs::read_dir(&season_path)
+                .map_err(|e| e.to_string())?
+                .filter_map(|e| e.ok())
+                .filter(|e| is_media_file(&e.path(), VIDEO_EXTENSIONS))
+                .map(|e| {
+                    e.path()
+                        .strip_prefix(base_path)
+                        .unwrap_or(&e.path())
+                        .to_string_lossy()
+                        .to_string()
+                })
+                .collect();
+
+            let db_episodes: Vec<(i64, String)> =
+                sqlx::query_as("SELECT id, file_path FROM episodes WHERE season_id = ?")
+                    .bind(season_id)
+                    .fetch_all(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+            for (id, path) in &db_episodes {
+                if !disk_episodes.contains(path) {
+                    sqlx::query("DELETE FROM episodes WHERE id = ?")
+                        .bind(id)
+                        .execute(pool)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+
+            let existing_ep_paths: HashSet<String> = db_episodes.iter().map(|(_, p)| p.clone()).collect();
+
+            for rel_path in &disk_episodes {
+                if existing_ep_paths.contains(rel_path) {
+                    continue;
+                }
+                let file_name = std::path::Path::new(rel_path)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                let (ep_title, ep_number) = parse_episode_filename(&file_name);
+
+                let max_order: Option<(i32,)> =
+                    sqlx::query_as("SELECT COALESCE(MAX(sort_order), -1) FROM episodes WHERE season_id = ?")
+                        .bind(season_id)
+                        .fetch_optional(pool)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                let sort_order = max_order.map(|(v,)| v + 1).unwrap_or(0);
+
+                sqlx::query(
+                    "INSERT INTO episodes (season_id, title, episode_number, file_path, sort_order) VALUES (?, ?, ?, ?, ?)",
+                )
+                .bind(season_id)
+                .bind(&ep_title)
+                .bind(ep_number)
+                .bind(rel_path)
+                .bind(sort_order)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn rescan_music_library(
+    app: &tauri::AppHandle,
+    pool: &sqlx::SqlitePool,
+    base_path: &PathBuf,
+) -> Result<(), String> {
+    use std::collections::HashSet;
+
+    // Level 1: Artists
+    let disk_artists: HashSet<String> = std::fs::read_dir(base_path)
+        .map_err(|e| e.to_string())?
+        .filter_map(|e| e.ok())
+        .filter(|e| is_scannable_dir(e))
+        .map(|e| {
+            e.path()
+                .strip_prefix(base_path)
+                .unwrap_or(&e.path())
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect();
+
+    let db_artists: Vec<(i64, String)> = sqlx::query_as("SELECT id, folder_path FROM artists")
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    for (id, path) in &db_artists {
+        if !disk_artists.contains(path) {
+            sqlx::query("DELETE FROM artists WHERE id = ?")
+                .bind(id)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
+    let existing_artist_paths: HashSet<String> = db_artists.iter().map(|(_, p)| p.clone()).collect();
+
+    for rel_path in &disk_artists {
+        if existing_artist_paths.contains(rel_path) {
+            continue;
+        }
+        let full_path = base_path.join(rel_path);
+        let name = full_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let _ = app.emit("scan-progress", &name);
+        let sort_name = generate_sort_title(&name, "en");
+
+        let max_order: Option<(i32,)> =
+            sqlx::query_as("SELECT COALESCE(MAX(sort_order), -1) FROM artists")
+                .fetch_optional(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        let sort_order = max_order.map(|(v,)| v + 1).unwrap_or(0);
+
+        sqlx::query(
+            "INSERT INTO artists (name, folder_path, sort_order, sort_name) VALUES (?, ?, ?, ?)",
+        )
+        .bind(&name)
+        .bind(rel_path)
+        .bind(sort_order)
+        .bind(&sort_name)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+
+    // Level 2 & 3: Albums and songs for each artist
+    let all_artists: Vec<(i64, String)> = sqlx::query_as("SELECT id, folder_path FROM artists")
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    for (artist_id, artist_rel) in &all_artists {
+        let artist_path = base_path.join(artist_rel);
+
+        let disk_albums: HashSet<String> = std::fs::read_dir(&artist_path)
+            .map_err(|e| e.to_string())?
+            .filter_map(|e| e.ok())
+            .filter(|e| is_scannable_dir(e))
+            .map(|e| {
+                e.path()
+                    .strip_prefix(base_path)
+                    .unwrap_or(&e.path())
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+
+        let db_albums: Vec<(i64, String)> =
+            sqlx::query_as("SELECT id, folder_path FROM albums WHERE artist_id = ?")
+                .bind(artist_id)
+                .fetch_all(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+
+        for (id, path) in &db_albums {
+            if !disk_albums.contains(path) {
+                sqlx::query("DELETE FROM albums WHERE id = ?")
+                    .bind(id)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+
+        let existing_album_paths: HashSet<String> = db_albums.iter().map(|(_, p)| p.clone()).collect();
+
+        for rel_path in &disk_albums {
+            if existing_album_paths.contains(rel_path) {
+                continue;
+            }
+            let full_path = base_path.join(rel_path);
+            let name = full_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+            let (album_title, album_year) = parse_folder_name(&name);
+            let album_sort_title = generate_sort_title(&album_title, "en");
+
+            let max_order: Option<(i32,)> =
+                sqlx::query_as("SELECT COALESCE(MAX(sort_order), -1) FROM albums WHERE artist_id = ?")
+                    .bind(artist_id)
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            let sort_order = max_order.map(|(v,)| v + 1).unwrap_or(0);
+
+            sqlx::query(
+                "INSERT INTO albums (artist_id, title, year, folder_path, sort_order, sort_title) VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(artist_id)
+            .bind(&album_title)
+            .bind(&album_year)
+            .bind(rel_path)
+            .bind(sort_order)
+            .bind(&album_sort_title)
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        }
+
+        // Songs for each album
+        let all_albums: Vec<(i64, String)> =
+            sqlx::query_as("SELECT id, folder_path FROM albums WHERE artist_id = ?")
+                .bind(artist_id)
+                .fetch_all(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+
+        for (album_id, album_rel) in &all_albums {
+            let album_path = base_path.join(album_rel);
+
+            let disk_songs: HashSet<String> = std::fs::read_dir(&album_path)
+                .map_err(|e| e.to_string())?
+                .filter_map(|e| e.ok())
+                .filter(|e| is_media_file(&e.path(), AUDIO_EXTENSIONS))
+                .map(|e| {
+                    e.path()
+                        .strip_prefix(base_path)
+                        .unwrap_or(&e.path())
+                        .to_string_lossy()
+                        .to_string()
+                })
+                .collect();
+
+            let db_songs: Vec<(i64, String)> =
+                sqlx::query_as("SELECT id, file_path FROM songs WHERE album_id = ?")
+                    .bind(album_id)
+                    .fetch_all(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+            for (id, path) in &db_songs {
+                if !disk_songs.contains(path) {
+                    sqlx::query("DELETE FROM songs WHERE id = ?")
+                        .bind(id)
+                        .execute(pool)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+
+            let existing_song_paths: HashSet<String> = db_songs.iter().map(|(_, p)| p.clone()).collect();
+
+            for rel_path in &disk_songs {
+                if existing_song_paths.contains(rel_path) {
+                    continue;
+                }
+                let file_name = std::path::Path::new(rel_path)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                let (song_title, track_number) = parse_song_filename(&file_name);
+
+                let max_order: Option<(i32,)> =
+                    sqlx::query_as("SELECT COALESCE(MAX(sort_order), -1) FROM songs WHERE album_id = ?")
+                        .bind(album_id)
+                        .fetch_optional(pool)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                let sort_order = max_order.map(|(v,)| v + 1).unwrap_or(0);
+
+                sqlx::query(
+                    "INSERT INTO songs (album_id, title, track_number, file_path, sort_order) VALUES (?, ?, ?, ?, ?)",
+                )
+                .bind(album_id)
+                .bind(&song_title)
+                .bind(track_number)
+                .bind(rel_path)
+                .bind(sort_order)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -820,6 +1544,241 @@ fn find_covers(folder_path: &PathBuf) -> Vec<String> {
     }
 
     covers
+}
+
+async fn scan_tv_library(
+    app: &tauri::AppHandle,
+    pool: &sqlx::SqlitePool,
+    base_path: &PathBuf,
+) -> Result<(), sqlx::Error> {
+    // Level 1: Shows
+    let mut show_dirs: Vec<_> = std::fs::read_dir(base_path)
+        .map_err(|e| sqlx::Error::Protocol(e.to_string()))?
+        .filter_map(|e| e.ok())
+        .filter(|e| is_scannable_dir(e))
+        .collect();
+    show_dirs.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+
+    for (i, show_entry) in show_dirs.iter().enumerate() {
+        let show_path = show_entry.path();
+        let show_name = show_entry.file_name().to_string_lossy().to_string();
+        let _ = app.emit("scan-progress", &show_name);
+
+        let (title, year) = parse_folder_name(&show_name);
+        let sort_title = generate_sort_title(&title, "en");
+        let rel_path = show_path
+            .strip_prefix(base_path)
+            .unwrap_or(&show_path)
+            .to_string_lossy()
+            .to_string();
+
+        let result = sqlx::query(
+            "INSERT INTO shows (title, year, folder_path, sort_order, sort_title) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&title)
+        .bind(&year)
+        .bind(&rel_path)
+        .bind(i as i32)
+        .bind(&sort_title)
+        .execute(pool)
+        .await?;
+
+        let show_id = result.last_insert_rowid();
+
+        // Level 2: Seasons
+        let mut season_dirs: Vec<_> = std::fs::read_dir(&show_path)
+            .map_err(|e| sqlx::Error::Protocol(e.to_string()))?
+            .filter_map(|e| e.ok())
+            .filter(|e| is_scannable_dir(e))
+            .collect();
+
+        // Sort by season number if parseable, else alphabetical
+        season_dirs.sort_by(|a, b| {
+            let (_, a_num) = parse_season_folder_name(&a.file_name().to_string_lossy());
+            let (_, b_num) = parse_season_folder_name(&b.file_name().to_string_lossy());
+            match (a_num, b_num) {
+                (Some(a), Some(b)) => a.cmp(&b),
+                _ => a.file_name().cmp(&b.file_name()),
+            }
+        });
+
+        for (j, season_entry) in season_dirs.iter().enumerate() {
+            let season_path = season_entry.path();
+            let season_name = season_entry.file_name().to_string_lossy().to_string();
+            let (season_title, season_number) = parse_season_folder_name(&season_name);
+            let season_rel = season_path
+                .strip_prefix(base_path)
+                .unwrap_or(&season_path)
+                .to_string_lossy()
+                .to_string();
+
+            let result = sqlx::query(
+                "INSERT INTO seasons (show_id, title, season_number, folder_path, sort_order) VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(show_id)
+            .bind(&season_title)
+            .bind(season_number)
+            .bind(&season_rel)
+            .bind(j as i32)
+            .execute(pool)
+            .await?;
+
+            let season_id = result.last_insert_rowid();
+
+            // Level 3: Episodes (files)
+            let mut episode_files: Vec<_> = std::fs::read_dir(&season_path)
+                .map_err(|e| sqlx::Error::Protocol(e.to_string()))?
+                .filter_map(|e| e.ok())
+                .filter(|e| is_media_file(&e.path(), VIDEO_EXTENSIONS))
+                .collect();
+
+            episode_files.sort_by(|a, b| {
+                let (_, a_num) = parse_episode_filename(&a.file_name().to_string_lossy());
+                let (_, b_num) = parse_episode_filename(&b.file_name().to_string_lossy());
+                match (a_num, b_num) {
+                    (Some(a), Some(b)) => a.cmp(&b),
+                    _ => a.file_name().cmp(&b.file_name()),
+                }
+            });
+
+            for (k, ep_entry) in episode_files.iter().enumerate() {
+                let ep_name = ep_entry.file_name().to_string_lossy().to_string();
+                let (ep_title, ep_number) = parse_episode_filename(&ep_name);
+                let ep_rel = ep_entry
+                    .path()
+                    .strip_prefix(base_path)
+                    .unwrap_or(&ep_entry.path())
+                    .to_string_lossy()
+                    .to_string();
+
+                sqlx::query(
+                    "INSERT INTO episodes (season_id, title, episode_number, file_path, sort_order) VALUES (?, ?, ?, ?, ?)",
+                )
+                .bind(season_id)
+                .bind(&ep_title)
+                .bind(ep_number)
+                .bind(&ep_rel)
+                .bind(k as i32)
+                .execute(pool)
+                .await?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn scan_music_library(
+    app: &tauri::AppHandle,
+    pool: &sqlx::SqlitePool,
+    base_path: &PathBuf,
+) -> Result<(), sqlx::Error> {
+    // Level 1: Artists
+    let mut artist_dirs: Vec<_> = std::fs::read_dir(base_path)
+        .map_err(|e| sqlx::Error::Protocol(e.to_string()))?
+        .filter_map(|e| e.ok())
+        .filter(|e| is_scannable_dir(e))
+        .collect();
+    artist_dirs.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+
+    for (i, artist_entry) in artist_dirs.iter().enumerate() {
+        let artist_path = artist_entry.path();
+        let artist_name = artist_entry.file_name().to_string_lossy().to_string();
+        let _ = app.emit("scan-progress", &artist_name);
+
+        let sort_name = generate_sort_title(&artist_name, "en");
+        let rel_path = artist_path
+            .strip_prefix(base_path)
+            .unwrap_or(&artist_path)
+            .to_string_lossy()
+            .to_string();
+
+        let result = sqlx::query(
+            "INSERT INTO artists (name, folder_path, sort_order, sort_name) VALUES (?, ?, ?, ?)",
+        )
+        .bind(&artist_name)
+        .bind(&rel_path)
+        .bind(i as i32)
+        .bind(&sort_name)
+        .execute(pool)
+        .await?;
+
+        let artist_id = result.last_insert_rowid();
+
+        // Level 2: Albums
+        let mut album_dirs: Vec<_> = std::fs::read_dir(&artist_path)
+            .map_err(|e| sqlx::Error::Protocol(e.to_string()))?
+            .filter_map(|e| e.ok())
+            .filter(|e| is_scannable_dir(e))
+            .collect();
+        album_dirs.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+
+        for (j, album_entry) in album_dirs.iter().enumerate() {
+            let album_path = album_entry.path();
+            let album_name = album_entry.file_name().to_string_lossy().to_string();
+            let (album_title, album_year) = parse_folder_name(&album_name);
+            let album_sort_title = generate_sort_title(&album_title, "en");
+            let album_rel = album_path
+                .strip_prefix(base_path)
+                .unwrap_or(&album_path)
+                .to_string_lossy()
+                .to_string();
+
+            let result = sqlx::query(
+                "INSERT INTO albums (artist_id, title, year, folder_path, sort_order, sort_title) VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(artist_id)
+            .bind(&album_title)
+            .bind(&album_year)
+            .bind(&album_rel)
+            .bind(j as i32)
+            .bind(&album_sort_title)
+            .execute(pool)
+            .await?;
+
+            let album_id = result.last_insert_rowid();
+
+            // Level 3: Songs (files)
+            let mut song_files: Vec<_> = std::fs::read_dir(&album_path)
+                .map_err(|e| sqlx::Error::Protocol(e.to_string()))?
+                .filter_map(|e| e.ok())
+                .filter(|e| is_media_file(&e.path(), AUDIO_EXTENSIONS))
+                .collect();
+
+            song_files.sort_by(|a, b| {
+                let (_, a_num) = parse_song_filename(&a.file_name().to_string_lossy());
+                let (_, b_num) = parse_song_filename(&b.file_name().to_string_lossy());
+                match (a_num, b_num) {
+                    (Some(a), Some(b)) => a.cmp(&b),
+                    _ => a.file_name().cmp(&b.file_name()),
+                }
+            });
+
+            for (k, song_entry) in song_files.iter().enumerate() {
+                let song_name = song_entry.file_name().to_string_lossy().to_string();
+                let (song_title, track_number) = parse_song_filename(&song_name);
+                let song_rel = song_entry
+                    .path()
+                    .strip_prefix(base_path)
+                    .unwrap_or(&song_entry.path())
+                    .to_string_lossy()
+                    .to_string();
+
+                sqlx::query(
+                    "INSERT INTO songs (album_id, title, track_number, file_path, sort_order) VALUES (?, ?, ?, ?, ?)",
+                )
+                .bind(album_id)
+                .bind(&song_title)
+                .bind(track_number)
+                .bind(&song_rel)
+                .bind(k as i32)
+                .execute(pool)
+                .await?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 async fn scan_folder(
@@ -896,6 +1855,128 @@ async fn scan_dir(
     }
 
     Ok(())
+}
+
+const VIDEO_EXTENSIONS: &[&str] = &[
+    "mkv", "mp4", "avi", "m4v", "mov", "wmv", "flv", "webm", "ts", "mpg", "mpeg",
+];
+
+const AUDIO_EXTENSIONS: &[&str] = &[
+    "flac", "mp3", "m4a", "wav", "aac", "ogg", "opus", "wma", "aiff", "ape",
+];
+
+fn is_media_file(path: &std::path::Path, extensions: &[&str]) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| extensions.contains(&e.to_lowercase().as_str()))
+            .unwrap_or(false)
+}
+
+fn parse_season_folder_name(name: &str) -> (String, Option<i32>) {
+    let lower = name.to_lowercase();
+    if let Some(rest) = lower.strip_prefix("season ") {
+        if let Ok(n) = rest.trim().parse::<i32>() {
+            return (name.to_string(), Some(n));
+        }
+    }
+    if let Some(rest) = lower.strip_prefix('s') {
+        if rest.chars().all(|c| c.is_ascii_digit()) && !rest.is_empty() {
+            if let Ok(n) = rest.parse::<i32>() {
+                return (name.to_string(), Some(n));
+            }
+        }
+    }
+    (name.to_string(), None)
+}
+
+fn parse_episode_filename(name: &str) -> (String, Option<i32>) {
+    let stem = std::path::Path::new(name)
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+
+    let lower = stem.to_lowercase();
+
+    // Try S01E01 pattern
+    if let Some(pos) = lower.find('e') {
+        if pos > 0 && lower[..pos].starts_with('s') {
+            let after_e = &lower[pos + 1..];
+            let digits: String = after_e.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if !digits.is_empty() {
+                if let Ok(n) = digits.parse::<i32>() {
+                    let title_start = pos + 1 + digits.len();
+                    let title = stem[title_start..]
+                        .trim_start_matches(|c: char| c == ' ' || c == '-' || c == '.')
+                        .to_string();
+                    let title = if title.is_empty() { stem.clone() } else { title };
+                    return (title, Some(n));
+                }
+            }
+        }
+    }
+
+    // Try E01 pattern
+    if let Some(rest) = lower.strip_prefix('e') {
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty() {
+            if let Ok(n) = digits.parse::<i32>() {
+                let title_start = 1 + digits.len();
+                let title = stem[title_start..]
+                    .trim_start_matches(|c: char| c == ' ' || c == '-' || c == '.')
+                    .to_string();
+                let title = if title.is_empty() { stem.clone() } else { title };
+                return (title, Some(n));
+            }
+        }
+    }
+
+    // Try leading digits: "01 - Title"
+    let digits: String = lower.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if !digits.is_empty() {
+        if let Ok(n) = digits.parse::<i32>() {
+            let title = stem[digits.len()..]
+                .trim_start_matches(|c: char| c == ' ' || c == '-' || c == '.')
+                .to_string();
+            let title = if title.is_empty() { stem.clone() } else { title };
+            return (title, Some(n));
+        }
+    }
+
+    (stem, None)
+}
+
+fn parse_song_filename(name: &str) -> (String, Option<i32>) {
+    let stem = std::path::Path::new(name)
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+
+    // Try leading digits: "01 - Title", "01. Title"
+    let digits: String = stem.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if !digits.is_empty() {
+        if let Ok(n) = digits.parse::<i32>() {
+            let title = stem[digits.len()..]
+                .trim_start_matches(|c: char| c == ' ' || c == '-' || c == '.')
+                .to_string();
+            let title = if title.is_empty() { stem.clone() } else { title };
+            return (title, Some(n));
+        }
+    }
+
+    (stem, None)
+}
+
+fn is_scannable_dir(entry: &std::fs::DirEntry) -> bool {
+    let name = entry.file_name().to_string_lossy().to_string();
+    entry.path().is_dir()
+        && name != "covers"
+        && name != "backgrounds"
+        && name != "extras"
+        && !name.starts_with('.')
 }
 
 fn parse_folder_name(name: &str) -> (String, Option<String>) {

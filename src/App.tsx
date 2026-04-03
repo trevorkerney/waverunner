@@ -16,6 +16,7 @@ function App() {
   const [sortMode, setSortMode] = useState("alpha");
   const [coverSize, setCoverSize] = useState(200);
   const [search, setSearch] = useState("");
+  const [loading, setLoading] = useState(false);
 
   const loadLibraries = useCallback(async () => {
     try {
@@ -32,6 +33,7 @@ function App() {
 
   const loadEntries = useCallback(
     async (library: Library, parentId: number | null, breadcrumb: BreadcrumbItem[]) => {
+      setLoading(true);
       try {
         const res = await invoke<EntriesResponse>("get_entries", {
           libraryId: library.id,
@@ -42,6 +44,8 @@ function App() {
         setBreadcrumbs(breadcrumb);
       } catch (e) {
         console.error("Failed to load entries:", e);
+      } finally {
+        setLoading(false);
       }
     },
     []
@@ -216,6 +220,7 @@ function App() {
         />
         <MainContent
           entries={entries}
+          loading={loading}
           breadcrumbs={breadcrumbs}
           coverSize={coverSize}
           onCoverSizeChange={setCoverSize}
