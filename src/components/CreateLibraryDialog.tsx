@@ -24,7 +24,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { Spinner } from "@/components/ui/spinner";
-import { FolderOpen, Film, Tv, Music, CircleHelp, FolderSync, FolderSearch } from "lucide-react";
+import { FolderOpen, Film, Music, CircleHelp, FolderSync, FolderSearch, Plus, X } from "lucide-react";
 
 interface CreateLibraryDialogProps {
   open: boolean;
@@ -39,8 +39,8 @@ export function CreateLibraryDialog({
 }: CreateLibraryDialogProps) {
   const [managed, setManaged] = useState(true);
   const [name, setName] = useState("");
-  const [path, setPath] = useState("");
-  const [format, setFormat] = useState("movies");
+  const [paths, setPaths] = useState<string[]>([""]);
+  const [format, setFormat] = useState("video");
   const [portable, setPortable] = useState(false);
   const [creating, setCreating] = useState(false);
   const [scanProgress, setScanProgress] = useState("");
@@ -53,29 +53,43 @@ export function CreateLibraryDialog({
     return () => { unlisten.then((fn) => fn()); };
   }, [creating]);
 
-  async function browsePath() {
+  function updatePath(index: number, value: string) {
+    setPaths((prev) => prev.map((p, i) => (i === index ? value : p)));
+  }
+
+  function addPath() {
+    setPaths((prev) => [...prev, ""]);
+  }
+
+  function removePath(index: number) {
+    setPaths((prev) => prev.filter((_, i) => i !== index));
+  }
+
+  async function browsePath(index: number) {
     const selected = await open({ directory: true, multiple: false });
     if (selected) {
-      setPath(selected as string);
-      if (!name) {
+      updatePath(index, selected as string);
+      if (!name && index === 0) {
         const parts = (selected as string).replace(/\\/g, "/").split("/");
         setName(parts[parts.length - 1] || "");
       }
     }
   }
 
+  const validPaths = paths.filter((p) => p.trim() !== "");
+
   async function handleCreate() {
-    if (!name || !path) return;
+    if (!name || validPaths.length === 0) return;
     setCreating(true);
     setScanProgress("");
     try {
-      await invoke("create_library", { name, path, format, portable, managed });
+      await invoke("create_library", { name, paths: validPaths, format, portable, managed });
       onCreated();
       onOpenChange(false);
       setManaged(true);
       setName("");
-      setPath("");
-      setFormat("movies");
+      setPaths([""]);
+      setFormat("video");
       setPortable(false);
     } catch (e) {
       console.error("Failed to create library:", e);
@@ -121,21 +135,14 @@ export function CreateLibraryDialog({
               value={[format]}
               onValueChange={(v) => { if (v.length) setFormat(v[v.length - 1]); }}
               spacing={1}
-              className="grid w-full grid-cols-3 gap-3"
+              className="grid w-full grid-cols-2 gap-3"
             >
               <ToggleGroupItem
-                value="movies"
+                value="video"
                 className="flex h-auto flex-col items-center gap-2 rounded border border-border px-4 py-4 data-[state=on]:border-primary data-[state=on]:bg-accent"
               >
                 <Film size={28} />
-                <span className="text-sm font-medium">Movies</span>
-              </ToggleGroupItem>
-              <ToggleGroupItem
-                value="tv"
-                className="flex h-auto flex-col items-center gap-2 rounded border border-border px-4 py-4 data-[state=on]:border-primary data-[state=on]:bg-accent"
-              >
-                <Tv size={28} />
-                <span className="text-sm font-medium">TV</span>
+                <span className="text-sm font-medium">Video</span>
               </ToggleGroupItem>
               <ToggleGroupItem
                 value="music"
@@ -152,21 +159,33 @@ export function CreateLibraryDialog({
               id="name"
               value={name}
               onChange={(e) => setName(e.target.value)}
-              placeholder={format === "movies" ? "Movies" : format === "tv" ? "TV Shows" : "Music"}
+              placeholder={format === "video" ? "Videos" : "Music"}
             />
           </div>
           <div className="grid gap-3">
-            <Label htmlFor="path">Folder</Label>
-            <div className="flex gap-2">
-              <Input
-                id="path"
-                value={path}
-                onChange={(e) => setPath(e.target.value)}
-                placeholder="Select a folder..."
-                className="flex-1"
-              />
-              <Button variant="outline" onClick={browsePath} className="h-9 w-9 shrink-0 p-0">
-                <FolderOpen size={16} />
+            <Label>Folders</Label>
+            <div className="grid gap-2">
+              {paths.map((p, i) => (
+                <div key={i} className="flex gap-2">
+                  <Input
+                    value={p}
+                    onChange={(e) => updatePath(i, e.target.value)}
+                    placeholder="Select a folder..."
+                    className="flex-1"
+                  />
+                  <Button variant="outline" onClick={() => browsePath(i)} className="h-9 w-9 shrink-0 p-0">
+                    <FolderOpen size={16} />
+                  </Button>
+                  {paths.length > 1 && (
+                    <Button variant="outline" onClick={() => removePath(i)} className="h-9 w-9 shrink-0 p-0">
+                      <X size={16} />
+                    </Button>
+                  )}
+                </div>
+              ))}
+              <Button variant="ghost" size="sm" onClick={addPath} className="justify-start gap-1.5 text-muted-foreground">
+                <Plus size={14} />
+                Add folder
               </Button>
             </div>
           </div>
@@ -200,7 +219,7 @@ export function CreateLibraryDialog({
               <Button variant="outline" onClick={() => onOpenChange(false)}>
                 Cancel
               </Button>
-              <Button onClick={handleCreate} disabled={!name || !path}>
+              <Button onClick={handleCreate} disabled={!name || validPaths.length === 0}>
                 Create
               </Button>
             </>

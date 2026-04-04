@@ -1,7 +1,7 @@
 export interface Library {
   id: string;
   name: string;
-  path: string;
+  paths: string[];
   format: string;
   portable: boolean;
   db_filename: string;
@@ -19,9 +19,10 @@ export interface MediaEntry {
   id: number;
   title: string;
   year: string | null;
+  end_year: string | null;
   folder_path: string;
   parent_id: number | null;
-  is_collection: boolean;
+  entry_type: string;
   covers: string[];
   selected_cover: string | null;
 }

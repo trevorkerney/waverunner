@@ -62,7 +62,7 @@ function App() {
 
   const navigateTo = useCallback(
     (entry: MediaEntry) => {
-      if (!selectedLibrary || !entry.is_collection) return;
+      if (!selectedLibrary || entry.entry_type !== "collection") return;
       setForwardStack([]);
       const newBreadcrumbs = [...breadcrumbs, { id: entry.id, title: entry.title }];
       loadEntries(selectedLibrary, entry.id, newBreadcrumbs);

@@ -283,7 +283,6 @@ export function MainContent({
                 key={entry.id}
                 entry={entry}
                 size={coverSize}
-                format={selectedLibrary?.format ?? "movies"}
                 onNavigate={onNavigate}
                 onRename={onRenameEntry}
                 onChangeCover={() => setCoverDialogEntry(entry)}
@@ -314,14 +313,12 @@ export function MainContent({
 function CoverCard({
   entry,
   size,
-  format,
   onNavigate,
   onRename,
   onChangeCover,
 }: {
   entry: MediaEntry;
   size: number;
-  format: string;
   onNavigate: (entry: MediaEntry) => void;
   onRename: (entryId: number, newTitle: string) => Promise<string | null>;
   onChangeCover: () => void;
@@ -371,7 +368,7 @@ function CoverCard({
         render={
           <button
             onClick={() =>
-              !isRenaming && entry.is_collection && onNavigate(entry)
+              !isRenaming && entry.entry_type === "collection" && onNavigate(entry)
             }
           />
         }
@@ -393,7 +390,7 @@ function CoverCard({
               className="text-muted-foreground/30"
             />
           )}
-          {entry.is_collection && format === "movies" && (
+          {entry.entry_type === "collection" && (
             <div className="absolute bottom-1 right-1 rounded-sm bg-black/60 px-1.5 py-0.5 text-xs text-white">
               Collection
             </div>
