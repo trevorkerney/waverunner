@@ -7,6 +7,8 @@ import {
   useSensor,
   useSensors,
   type DragEndEvent,
+  type DragStartEvent,
+  DragOverlay,
 } from "@dnd-kit/core";
 import {
   SortableContext,
@@ -125,12 +127,19 @@ export function MainContent({
     [onSortModeChange]
   );
 
+  const [activeDragId, setActiveDragId] = useState<number | null>(null);
+
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } })
   );
 
+  const handleDragStart = useCallback((event: DragStartEvent) => {
+    setActiveDragId(event.active.id as number);
+  }, []);
+
   const handleDragEnd = useCallback(
     (event: DragEndEvent) => {
+      setActiveDragId(null);
       const { active, over } = event;
       if (!over || active.id === over.id) return;
       const oldIndex = filteredEntries.findIndex((e) => e.id === active.id);
@@ -143,6 +152,10 @@ export function MainContent({
     },
     [filteredEntries, onSortOrderChange]
   );
+
+  const activeDragEntry = activeDragId != null
+    ? filteredEntries.find((e) => e.id === activeDragId) ?? null
+    : null;
 
   return (
     <main className="flex flex-1 flex-col overflow-hidden bg-background">
@@ -249,7 +262,9 @@ export function MainContent({
             sensors={sensors}
             collisionDetection={closestCenter}
             modifiers={[restrictToParentElement]}
+            onDragStart={handleDragStart}
             onDragEnd={handleDragEnd}
+            onDragCancel={() => setActiveDragId(null)}
           >
             <SortableContext
               items={filteredEntries.map((e) => e.id)}
@@ -259,6 +274,8 @@ export function MainContent({
                 className="grid gap-4"
                 style={{
                   gridTemplateColumns: `repeat(auto-fill, minmax(${coverSize}px, 1fr))`,
+                  alignItems: "center",
+                  justifyItems: "center",
                 }}
               >
                 {filteredEntries.map((entry) => (
@@ -270,12 +287,19 @@ export function MainContent({
                 ))}
               </div>
             </SortableContext>
+            <DragOverlay>
+              {activeDragEntry && (
+                <DragOverlayCard entry={activeDragEntry} size={coverSize} />
+              )}
+            </DragOverlay>
           </DndContext>
         ) : (
           <div
             className="grid gap-4"
             style={{
               gridTemplateColumns: `repeat(auto-fill, minmax(${coverSize}px, 1fr))`,
+              alignItems: "center",
+              justifyItems: "center",
             }}
           >
             {filteredEntries.map((entry) => (
@@ -373,22 +397,28 @@ function CoverCard({
           />
         }
         className="group flex flex-col items-center gap-2 rounded-md p-2 text-left hover:bg-accent"
+        style={{ maxWidth: size }}
       >
         <div
-          className="relative flex items-center justify-center overflow-hidden rounded-md bg-muted"
-          style={{ width: size, height: size * 1.5 }}
+          className="relative overflow-hidden rounded-md bg-muted"
         >
           {coverSrc ? (
             <img
               src={coverSrc}
               alt={entry.title}
-              className="h-full w-full object-cover"
+              className="w-full"
+              style={{ maxHeight: size * 2 }}
             />
           ) : (
-            <Folder
-              size={size * 0.3}
-              className="text-muted-foreground/30"
-            />
+            <div
+              className="flex items-center justify-center"
+              style={{ height: size * 1.5 }}
+            >
+              <Folder
+                size={size * 0.3}
+                className="text-muted-foreground/30"
+              />
+            </div>
           )}
           {entry.entry_type === "collection" && (
             <div className="absolute bottom-1 right-1 rounded-sm bg-black/60 px-1.5 py-0.5 text-xs text-white">
@@ -396,7 +426,7 @@ function CoverCard({
             </div>
           )}
         </div>
-        <div className="w-full" style={{ maxWidth: size }}>
+        <div className="w-full">
           {renameLoading ? (
             <div className="flex items-center gap-1.5 px-1">
               <Spinner className="size-3" />
@@ -464,7 +494,7 @@ function SortableCoverCard({
   const style = {
     transform: CSS.Transform.toString(transform),
     transition,
-    opacity: isDragging ? 0.5 : 1,
+    opacity: isDragging ? 0 : 1,
   };
 
   const coverPath = getDisplayCover(entry);
@@ -473,27 +503,78 @@ function SortableCoverCard({
   return (
     <div
       ref={setNodeRef}
-      style={style}
+      style={{ ...style, maxWidth: size }}
       {...attributes}
       {...listeners}
       className="group flex cursor-grab flex-col items-center gap-2 rounded-md p-2 text-left hover:bg-accent active:cursor-grabbing"
     >
       <div
-        className="relative flex items-center justify-center overflow-hidden rounded-md bg-muted"
-        style={{ width: size, height: size * 1.5 }}
+        className="relative overflow-hidden rounded-md bg-muted"
       >
         {coverSrc ? (
           <img
             src={coverSrc}
             alt={entry.title}
-            className="pointer-events-none h-full w-full object-cover"
+            className="pointer-events-none w-full"
+            style={{ maxHeight: size * 2 }}
             draggable={false}
           />
         ) : (
-          <Folder
-            size={size * 0.3}
-            className="text-muted-foreground/30"
+          <div
+            className="flex items-center justify-center"
+            style={{ height: size * 1.5 }}
+          >
+            <Folder
+              size={size * 0.3}
+              className="text-muted-foreground/30"
+            />
+          </div>
+        )}
+        <div className="absolute top-1 left-1 rounded-sm bg-black/60 p-1 text-white">
+          <GripVertical size={14} />
+        </div>
+      </div>
+      <div className="w-full">
+        <p className="text-sm font-medium">{entry.title}</p>
+        {entry.year && (
+          <p className="text-xs text-muted-foreground">{entry.year}</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function DragOverlayCard({
+  entry,
+  size,
+}: {
+  entry: MediaEntry;
+  size: number;
+}) {
+  const coverPath = getDisplayCover(entry);
+  const coverSrc = coverPath ? convertFileSrc(coverPath) : null;
+
+  return (
+    <div className="flex cursor-grabbing flex-col items-center gap-2 rounded-md bg-accent p-2 text-left shadow-lg">
+      <div className="relative overflow-hidden rounded-md bg-muted">
+        {coverSrc ? (
+          <img
+            src={coverSrc}
+            alt={entry.title}
+            className="pointer-events-none w-full"
+            style={{ maxHeight: size * 2, width: size }}
+            draggable={false}
           />
+        ) : (
+          <div
+            className="flex items-center justify-center"
+            style={{ height: size * 1.5, width: size }}
+          >
+            <Folder
+              size={size * 0.3}
+              className="text-muted-foreground/30"
+            />
+          </div>
         )}
         <div className="absolute top-1 left-1 rounded-sm bg-black/60 p-1 text-white">
           <GripVertical size={14} />
