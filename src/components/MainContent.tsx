@@ -61,11 +61,12 @@ import {
   ArrowUpDown,
   GripVertical,
   Pencil,
+  Play,
   Image as ImageIcon,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
-import { Library, MediaEntry, BreadcrumbItem, MovieDetail, MovieDetailUpdate } from "@/types";
+import { Library, MediaEntry, BreadcrumbItem, MovieDetail, MovieDetailUpdate, SeasonInfo, EpisodeInfo } from "@/types";
 
 function getDisplayCover(entry: MediaEntry): string | null {
   if (entry.selected_cover && entry.covers.includes(entry.selected_cover)) {
@@ -801,6 +802,19 @@ function EntryDetailPage({
             )}
           </div>
           <div className="flex gap-2">
+            <Button
+              size="sm"
+              onClick={async () => {
+                try {
+                  await invoke("play_movie", { libraryId: selectedLibrary.id, entryId: entry.id });
+                } catch (e) {
+                  toast.error(String(e));
+                }
+              }}
+            >
+              <Play size={14} />
+              Play
+            </Button>
             {editing ? (
               <>
                 <Button size="sm" variant="outline" onClick={() => setEditing(false)} disabled={saving}>
@@ -865,13 +879,49 @@ function EntryDetailPage({
 
 function ShowDetailPage({
   entry,
-  selectedLibrary: _selectedLibrary,
+  selectedLibrary,
   getFullCoverUrl,
 }: {
   entry: MediaEntry;
   selectedLibrary: Library;
   getFullCoverUrl: (filePath: string) => string;
 }) {
+  const [seasons, setSeasons] = useState<SeasonInfo[]>([]);
+  const [selectedSeasonId, setSelectedSeasonId] = useState<number | null>(null);
+  const [episodes, setEpisodes] = useState<EpisodeInfo[]>([]);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const s = await invoke<SeasonInfo[]>("get_show_seasons", {
+          libraryId: selectedLibrary.id,
+          showId: entry.id,
+        });
+        setSeasons(s);
+        if (s.length > 0) {
+          setSelectedSeasonId(s[0].id);
+        }
+      } catch (e) {
+        console.error("Failed to load seasons:", e);
+      }
+    })();
+  }, [selectedLibrary.id, entry.id]);
+
+  useEffect(() => {
+    if (selectedSeasonId == null) return;
+    (async () => {
+      try {
+        const eps = await invoke<EpisodeInfo[]>("get_season_episodes", {
+          libraryId: selectedLibrary.id,
+          seasonId: selectedSeasonId,
+        });
+        setEpisodes(eps);
+      } catch (e) {
+        console.error("Failed to load episodes:", e);
+      }
+    })();
+  }, [selectedLibrary.id, selectedSeasonId]);
+
   const coverPath = getDisplayCover(entry);
   const coverSrc = coverPath ? getFullCoverUrl(coverPath) : null;
 
@@ -893,6 +943,63 @@ function ShowDetailPage({
             </p>
           )}
         </div>
+
+        {seasons.length > 0 && (
+          <div className="flex flex-col gap-3">
+            <div className="flex gap-2">
+              {seasons.map((s) => (
+                <button
+                  key={s.id}
+                  onClick={() => setSelectedSeasonId(s.id)}
+                  className={`rounded-md px-3 py-1.5 text-sm ${
+                    s.id === selectedSeasonId
+                      ? "bg-primary text-primary-foreground"
+                      : "bg-muted text-muted-foreground hover:bg-accent"
+                  }`}
+                >
+                  {s.season_number != null ? `Season ${s.season_number}` : s.title}
+                </button>
+              ))}
+            </div>
+
+            <div className="flex flex-col gap-1">
+              {episodes.map((ep) => (
+                <div
+                  key={ep.id}
+                  className="flex items-center gap-3 rounded-md px-3 py-2 hover:bg-accent"
+                >
+                  <span className="w-8 text-right text-sm text-muted-foreground">
+                    {ep.episode_number != null ? ep.episode_number : "–"}
+                  </span>
+                  <span className="flex-1 truncate text-sm">{ep.title}</span>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={async () => {
+                      try {
+                        await invoke("play_episode", {
+                          libraryId: selectedLibrary.id,
+                          episodeId: ep.id,
+                        });
+                      } catch (e) {
+                        toast.error(String(e));
+                      }
+                    }}
+                  >
+                    <Play size={14} />
+                  </Button>
+                </div>
+              ))}
+              {episodes.length === 0 && (
+                <p className="text-sm text-muted-foreground">No episodes</p>
+              )}
+            </div>
+          </div>
+        )}
+
+        {seasons.length === 0 && (
+          <p className="text-sm text-muted-foreground">No seasons</p>
+        )}
       </div>
     </div>
   );

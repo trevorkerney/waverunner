@@ -39,6 +39,8 @@ pub struct Library {
     pub db_filename: String,
     pub default_sort_mode: String,
     pub managed: bool,
+    pub player_path: Option<String>,
+    pub player_args: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -237,6 +239,8 @@ pub async fn create_library(
             db_filename: db_filename.clone(),
             default_sort_mode: "alpha".to_string(),
             managed,
+            player_path: None,
+            player_args: None,
         },
     );
 
@@ -291,6 +295,8 @@ pub async fn create_library(
         db_filename: db_filename.clone(),
         default_sort_mode: "alpha".to_string(),
         managed,
+        player_path: None,
+        player_args: None,
     };
 
     sqlx::query(
@@ -313,8 +319,8 @@ pub async fn create_library(
 
 #[tauri::command]
 pub async fn get_libraries(state: tauri::State<'_, AppState>) -> Result<Vec<Library>, String> {
-    let rows: Vec<(String, String, String, String, i32, String, String, i32)> = sqlx::query_as(
-        "SELECT id, name, paths, format, portable, db_filename, default_sort_mode, managed FROM libraries ORDER BY name",
+    let rows: Vec<(String, String, String, String, i32, String, String, i32, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT id, name, paths, format, portable, db_filename, default_sort_mode, managed, player_path, player_args FROM libraries ORDER BY name",
     )
     .fetch_all(&state.app_db)
     .await
@@ -322,7 +328,7 @@ pub async fn get_libraries(state: tauri::State<'_, AppState>) -> Result<Vec<Libr
 
     Ok(rows
         .into_iter()
-        .map(|(id, name, paths_json, format, portable, db_filename, default_sort_mode, managed)| Library {
+        .map(|(id, name, paths_json, format, portable, db_filename, default_sort_mode, managed, player_path, player_args)| Library {
             id,
             name,
             paths: serde_json::from_str(&paths_json).unwrap_or_default(),
@@ -331,6 +337,8 @@ pub async fn get_libraries(state: tauri::State<'_, AppState>) -> Result<Vec<Libr
             db_filename,
             default_sort_mode,
             managed: managed != 0,
+            player_path,
+            player_args,
         })
         .collect())
 }
@@ -1199,6 +1207,332 @@ pub async fn update_movie_detail(
     pool.close().await;
     Ok(())
 }
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DetectedPlayer {
+    pub name: String,
+    pub path: String,
+}
+
+#[tauri::command]
+pub async fn detect_players() -> Result<Vec<DetectedPlayer>, String> {
+    let candidates: Vec<(&str, Vec<&str>)> = vec![
+        ("VLC", vec![
+            r"C:\Program Files\VideoLAN\VLC\vlc.exe",
+            r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe",
+        ]),
+        ("mpv", vec![
+            r"C:\Program Files\mpv\mpv.exe",
+            r"C:\Program Files (x86)\mpv\mpv.exe",
+        ]),
+        ("MPC-HC", vec![
+            r"C:\Program Files\MPC-HC\mpc-hc64.exe",
+            r"C:\Program Files (x86)\MPC-HC\mpc-hc.exe",
+        ]),
+        ("PotPlayer", vec![
+            r"C:\Program Files\DAUM\PotPlayer\PotPlayerMini64.exe",
+            r"C:\Program Files (x86)\DAUM\PotPlayer\PotPlayerMini.exe",
+        ]),
+    ];
+
+    let mut found = Vec::new();
+    for (name, paths) in candidates {
+        for path in paths {
+            if PathBuf::from(path).exists() {
+                found.push(DetectedPlayer {
+                    name: name.to_string(),
+                    path: path.to_string(),
+                });
+                break;
+            }
+        }
+    }
+    Ok(found)
+}
+
+#[tauri::command]
+pub async fn set_library_player(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    player_path: Option<String>,
+    player_args: Option<String>,
+) -> Result<(), String> {
+    sqlx::query("UPDATE libraries SET player_path = ?, player_args = ? WHERE id = ?")
+        .bind(&player_path)
+        .bind(&player_args)
+        .bind(&library_id)
+        .execute(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn play_movie(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    entry_id: i64,
+) -> Result<(), String> {
+    // Get library info
+    let row: Option<(String, i32, String, Option<String>, Option<String>, String)> = sqlx::query_as(
+        "SELECT paths, portable, db_filename, player_path, player_args, format FROM libraries WHERE id = ?",
+    )
+    .bind(&library_id)
+    .fetch_optional(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let (paths_json, portable, db_filename, player_path, player_args, format) = row.ok_or("Library not found")?;
+    let lib_paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
+
+    let db_path = if portable != 0 {
+        PathBuf::from(&lib_paths[0]).join(".waverunner.db")
+    } else {
+        state.app_data_dir.join(&db_filename)
+    };
+
+    let pool = crate::db::connect_library_pool(&db_path).await.map_err(|e| e.to_string())?;
+
+    // Get entry folder_path
+    let folder_path: String = match format.as_str() {
+        "video" => {
+            let row: Option<(String,)> = sqlx::query_as(
+                "SELECT folder_path FROM media_entry WHERE id = ?",
+            )
+            .bind(entry_id)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            row.ok_or("Entry not found")?.0
+        }
+        _ => {
+            let row: Option<(String,)> = sqlx::query_as(
+                "SELECT folder_path FROM movie WHERE id = ?",
+            )
+            .bind(entry_id)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            row.ok_or("Entry not found")?.0
+        }
+    };
+
+    pool.close().await;
+
+    // Resolve full path
+    let root = resolve_entry_root(&lib_paths, &folder_path)
+        .ok_or("Could not find entry on disk")?;
+    let full_folder = PathBuf::from(root).join(&folder_path);
+
+    // Find video file
+    let video_file = std::fs::read_dir(&full_folder)
+        .map_err(|e| format!("Cannot read folder: {}", e))?
+        .filter_map(|e| e.ok())
+        .filter(|e| is_media_file(&e.path(), VIDEO_EXTENSIONS))
+        .map(|e| e.path())
+        .next()
+        .ok_or("No video file found in movie folder")?;
+
+    // Launch player
+    if let Some(ref exe) = player_path {
+        let mut cmd = std::process::Command::new(exe);
+        if let Some(ref args) = player_args {
+            for arg in args.split_whitespace() {
+                cmd.arg(arg);
+            }
+        }
+        cmd.arg(&video_file);
+        cmd.spawn().map_err(|e| format!("Failed to launch player: {}", e))?;
+    } else {
+        // OS default: use 'cmd /C start "" "path"' on Windows
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", &video_file.to_string_lossy()])
+            .spawn()
+            .map_err(|e| format!("Failed to open file: {}", e))?;
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SeasonInfo {
+    pub id: i64,
+    pub title: String,
+    pub season_number: Option<i64>,
+    pub sort_order: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EpisodeInfo {
+    pub id: i64,
+    pub title: String,
+    pub episode_number: Option<i64>,
+    pub file_path: String,
+    pub sort_order: i64,
+}
+
+#[tauri::command]
+pub async fn get_show_seasons(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    show_id: i64,
+) -> Result<Vec<SeasonInfo>, String> {
+    let row: Option<(String, i32, String)> = sqlx::query_as(
+        "SELECT paths, portable, db_filename FROM libraries WHERE id = ?",
+    )
+    .bind(&library_id)
+    .fetch_optional(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let (paths_json, portable, db_filename) = row.ok_or("Library not found")?;
+    let paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
+
+    let db_path = if portable != 0 {
+        PathBuf::from(&paths[0]).join(".waverunner.db")
+    } else {
+        state.app_data_dir.join(&db_filename)
+    };
+
+    let pool = crate::db::connect_library_pool(&db_path).await.map_err(|e| e.to_string())?;
+
+    let rows: Vec<(i64, String, Option<i64>, i64)> = sqlx::query_as(
+        "SELECT id, title, season_number, sort_order FROM season WHERE show_id = ? ORDER BY sort_order",
+    )
+    .bind(show_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    pool.close().await;
+
+    Ok(rows
+        .into_iter()
+        .map(|(id, title, season_number, sort_order)| SeasonInfo {
+            id,
+            title,
+            season_number,
+            sort_order,
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub async fn get_season_episodes(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    season_id: i64,
+) -> Result<Vec<EpisodeInfo>, String> {
+    let row: Option<(String, i32, String)> = sqlx::query_as(
+        "SELECT paths, portable, db_filename FROM libraries WHERE id = ?",
+    )
+    .bind(&library_id)
+    .fetch_optional(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let (paths_json, portable, db_filename) = row.ok_or("Library not found")?;
+    let paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
+
+    let db_path = if portable != 0 {
+        PathBuf::from(&paths[0]).join(".waverunner.db")
+    } else {
+        state.app_data_dir.join(&db_filename)
+    };
+
+    let pool = crate::db::connect_library_pool(&db_path).await.map_err(|e| e.to_string())?;
+
+    let rows: Vec<(i64, String, Option<i64>, String, i64)> = sqlx::query_as(
+        "SELECT id, title, episode_number, file_path, sort_order FROM episode WHERE season_id = ? ORDER BY sort_order",
+    )
+    .bind(season_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    pool.close().await;
+
+    Ok(rows
+        .into_iter()
+        .map(|(id, title, episode_number, file_path, sort_order)| EpisodeInfo {
+            id,
+            title,
+            episode_number,
+            file_path,
+            sort_order,
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub async fn play_episode(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    episode_id: i64,
+) -> Result<(), String> {
+    let row: Option<(String, i32, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT paths, portable, db_filename, player_path, player_args FROM libraries WHERE id = ?",
+    )
+    .bind(&library_id)
+    .fetch_optional(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let (paths_json, portable, db_filename, player_path, player_args) = row.ok_or("Library not found")?;
+    let lib_paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
+
+    let db_path = if portable != 0 {
+        PathBuf::from(&lib_paths[0]).join(".waverunner.db")
+    } else {
+        state.app_data_dir.join(&db_filename)
+    };
+
+    let pool = crate::db::connect_library_pool(&db_path).await.map_err(|e| e.to_string())?;
+
+    // Get the episode file_path (relative to library root)
+    let ep_row: Option<(String,)> = sqlx::query_as(
+        "SELECT file_path FROM episode WHERE id = ?",
+    )
+    .bind(episode_id)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    pool.close().await;
+
+    let file_path = ep_row.ok_or("Episode not found")?.0;
+
+    // Resolve full path against library roots
+    let mut full_path: Option<PathBuf> = None;
+    for p in &lib_paths {
+        let candidate = PathBuf::from(p).join(&file_path);
+        if candidate.exists() {
+            full_path = Some(candidate);
+            break;
+        }
+    }
+    let full_path = full_path.ok_or("Episode file not found on disk")?;
+
+    // Launch player (same logic as play_movie)
+    if let Some(ref exe) = player_path {
+        let mut cmd = std::process::Command::new(exe);
+        if let Some(ref args) = player_args {
+            for arg in args.split_whitespace() {
+                cmd.arg(arg);
+            }
+        }
+        cmd.arg(&full_path);
+        cmd.spawn().map_err(|e| format!("Failed to launch player: {}", e))?;
+    } else {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", &full_path.to_string_lossy()])
+            .spawn()
+            .map_err(|e| format!("Failed to open file: {}", e))?;
+    }
+
+    Ok(())
+}
+
 
 #[tauri::command]
 pub async fn set_sort_mode(
@@ -3852,48 +4186,19 @@ fn parse_episode_filename(name: &str) -> (String, Option<i32>) {
 
     let lower = stem.to_lowercase();
 
-    // Try S01E01 pattern
-    if let Some(pos) = lower.find('e') {
-        if pos > 0 && lower[..pos].starts_with('s') {
-            let after_e = &lower[pos + 1..];
-            let digits: String = after_e.chars().take_while(|c| c.is_ascii_digit()).collect();
-            if !digits.is_empty() {
-                if let Ok(n) = digits.parse::<i32>() {
-                    let title_start = pos + 1 + digits.len();
-                    let title = stem[title_start..]
-                        .trim_start_matches(|c: char| c == ' ' || c == '-' || c == '.')
-                        .to_string();
-                    let title = if title.is_empty() { stem.clone() } else { title };
-                    return (title, Some(n));
+    // Match SxxExx pattern anywhere in the filename
+    let bytes = lower.as_bytes();
+    for i in 0..bytes.len() {
+        if bytes[i] == b's' {
+            let s_digits: String = lower[i + 1..].chars().take_while(|c| c.is_ascii_digit()).collect();
+            if s_digits.is_empty() { continue; }
+            let e_pos = i + 1 + s_digits.len();
+            if e_pos < bytes.len() && bytes[e_pos] == b'e' {
+                let ep_digits: String = lower[e_pos + 1..].chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(n) = ep_digits.parse::<i32>() {
+                    return (stem, Some(n));
                 }
             }
-        }
-    }
-
-    // Try E01 pattern
-    if let Some(rest) = lower.strip_prefix('e') {
-        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-        if !digits.is_empty() {
-            if let Ok(n) = digits.parse::<i32>() {
-                let title_start = 1 + digits.len();
-                let title = stem[title_start..]
-                    .trim_start_matches(|c: char| c == ' ' || c == '-' || c == '.')
-                    .to_string();
-                let title = if title.is_empty() { stem.clone() } else { title };
-                return (title, Some(n));
-            }
-        }
-    }
-
-    // Try leading digits: "01 - Title"
-    let digits: String = lower.chars().take_while(|c| c.is_ascii_digit()).collect();
-    if !digits.is_empty() {
-        if let Ok(n) = digits.parse::<i32>() {
-            let title = stem[digits.len()..]
-                .trim_start_matches(|c: char| c == ' ' || c == '-' || c == '.')
-                .to_string();
-            let title = if title.is_empty() { stem.clone() } else { title };
-            return (title, Some(n));
         }
     }
 

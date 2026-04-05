@@ -37,6 +37,14 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
         .await?;
     }
 
+    // Migrate: add player_path and player_args columns
+    let _ = sqlx::query("ALTER TABLE libraries ADD COLUMN player_path TEXT")
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE libraries ADD COLUMN player_args TEXT")
+        .execute(&pool)
+        .await;
+
     Ok(pool)
 }
 

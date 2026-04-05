@@ -46,6 +46,12 @@ pub fn run() {
             commands::rename_entry,
             commands::set_cover,
             commands::rescan_library,
+            commands::detect_players,
+            commands::set_library_player,
+            commands::play_movie,
+            commands::get_show_seasons,
+            commands::get_season_episodes,
+            commands::play_episode,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

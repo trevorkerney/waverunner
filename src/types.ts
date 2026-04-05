@@ -7,6 +7,13 @@ export interface Library {
   db_filename: string;
   default_sort_mode: string;
   managed: boolean;
+  player_path: string | null;
+  player_args: string | null;
+}
+
+export interface DetectedPlayer {
+  name: string;
+  path: string;
 }
 
 export interface EntriesResponse {
@@ -72,6 +79,21 @@ export interface CastUpdateInfo {
 export interface CrewUpdateInfo {
   name: string;
   job: string | null;
+}
+
+export interface SeasonInfo {
+  id: number;
+  title: string;
+  season_number: number | null;
+  sort_order: number;
+}
+
+export interface EpisodeInfo {
+  id: number;
+  title: string;
+  episode_number: number | null;
+  file_path: string;
+  sort_order: number;
 }
 
 export interface MovieDetailUpdate {
