@@ -2391,6 +2391,7 @@ fn cache_images_for_entry(
 ) -> Vec<(String, String)> {
     let source_dir = library_base.join(entry_rel_path).join(image_type_dir);
     let cache_dir = cache_base.join(entry_rel_path).join(image_type_dir);
+    let thumb_dir = cache_base.join(entry_rel_path).join(format!("{}_thumb", image_type_dir));
     let mut results = Vec::new();
 
     if !source_dir.exists() {
@@ -2403,6 +2404,7 @@ fn cache_images_for_entry(
     };
 
     let _ = std::fs::create_dir_all(&cache_dir);
+    let _ = std::fs::create_dir_all(&thumb_dir);
 
     for entry in entries.flatten() {
         let path = entry.path();
@@ -2412,6 +2414,11 @@ fn cache_images_for_entry(
         let filename = entry.file_name().to_string_lossy().to_string();
         let cached_path = cache_dir.join(&filename);
         if std::fs::copy(&path, &cached_path).is_ok() {
+            // Generate thumbnail
+            if let Ok(img) = image::open(&cached_path) {
+                let thumb = img.thumbnail(600, 900);
+                let _ = thumb.save(thumb_dir.join(&filename));
+            }
             results.push((filename, cached_path.to_string_lossy().to_string()));
         }
     }

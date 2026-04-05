@@ -1,5 +1,4 @@
-import { useState, useCallback, useRef, useEffect } from "react";
-import { convertFileSrc } from "@tauri-apps/api/core";
+import { useState, useCallback, useRef, useEffect, type RefObject } from "react";
 import {
   DndContext,
   closestCenter,
@@ -90,6 +89,9 @@ interface MainContentProps {
   onSortOrderChange: (reordered: MediaEntry[]) => void;
   onRenameEntry: (entryId: number, newTitle: string) => Promise<string | null>;
   onSetCover: (entryId: number, coverPath: string | null) => void;
+  getCoverUrl: (filePath: string) => string;
+  getFullCoverUrl: (filePath: string) => string;
+  scrollContainerRef: RefObject<HTMLDivElement | null>;
 }
 
 export function MainContent({
@@ -108,6 +110,9 @@ export function MainContent({
   onSortOrderChange,
   onRenameEntry,
   onSetCover,
+  getCoverUrl,
+  getFullCoverUrl,
+  scrollContainerRef,
 }: MainContentProps) {
   const [reordering, setReordering] = useState(false);
   const [coverDialogEntry, setCoverDialogEntry] = useState<MediaEntry | null>(
@@ -246,7 +251,7 @@ export function MainContent({
       )}
 
       {/* Content Grid */}
-      <div className="flex-1 overflow-y-auto overflow-x-hidden p-4">
+      <div ref={scrollContainerRef} className="flex-1 overflow-y-auto overflow-x-hidden p-4">
         {!selectedLibrary ? (
           <div />
         ) : loading ? (
@@ -283,13 +288,14 @@ export function MainContent({
                     key={entry.id}
                     entry={entry}
                     size={coverSize}
+                    getCoverUrl={getCoverUrl}
                   />
                 ))}
               </div>
             </SortableContext>
             <DragOverlay>
               {activeDragEntry && (
-                <DragOverlayCard entry={activeDragEntry} size={coverSize} />
+                <DragOverlayCard entry={activeDragEntry} size={coverSize} getCoverUrl={getCoverUrl} />
               )}
             </DragOverlay>
           </DndContext>
@@ -310,6 +316,7 @@ export function MainContent({
                 onNavigate={onNavigate}
                 onRename={onRenameEntry}
                 onChangeCover={() => setCoverDialogEntry(entry)}
+                getCoverUrl={getCoverUrl}
               />
             ))}
           </div>
@@ -328,6 +335,7 @@ export function MainContent({
             onSetCover(coverDialogEntry.id, coverPath);
             setCoverDialogEntry(null);
           }}
+          getCoverUrl={getFullCoverUrl}
         />
       )}
     </main>
@@ -340,12 +348,14 @@ function CoverCard({
   onNavigate,
   onRename,
   onChangeCover,
+  getCoverUrl,
 }: {
   entry: MediaEntry;
   size: number;
   onNavigate: (entry: MediaEntry) => void;
   onRename: (entryId: number, newTitle: string) => Promise<string | null>;
   onChangeCover: () => void;
+  getCoverUrl: (filePath: string) => string;
 }) {
   const [isRenaming, setIsRenaming] = useState(false);
   const [renameLoading, setRenameLoading] = useState(false);
@@ -384,7 +394,7 @@ function CoverCard({
   };
 
   const coverPath = getDisplayCover(entry);
-  const coverSrc = coverPath ? convertFileSrc(coverPath) : null;
+  const coverSrc = coverPath ? getCoverUrl(coverPath) : null;
 
   return (
     <ContextMenu>
@@ -478,9 +488,11 @@ function CoverCard({
 function SortableCoverCard({
   entry,
   size,
+  getCoverUrl,
 }: {
   entry: MediaEntry;
   size: number;
+  getCoverUrl: (filePath: string) => string;
 }) {
   const {
     attributes,
@@ -498,7 +510,7 @@ function SortableCoverCard({
   };
 
   const coverPath = getDisplayCover(entry);
-  const coverSrc = coverPath ? convertFileSrc(coverPath) : null;
+  const coverSrc = coverPath ? getCoverUrl(coverPath) : null;
 
   return (
     <div
@@ -547,12 +559,14 @@ function SortableCoverCard({
 function DragOverlayCard({
   entry,
   size,
+  getCoverUrl,
 }: {
   entry: MediaEntry;
   size: number;
+  getCoverUrl: (filePath: string) => string;
 }) {
   const coverPath = getDisplayCover(entry);
-  const coverSrc = coverPath ? convertFileSrc(coverPath) : null;
+  const coverSrc = coverPath ? getCoverUrl(coverPath) : null;
 
   return (
     <div className="flex cursor-grabbing flex-col items-center gap-2 rounded-md bg-accent p-2 text-left shadow-lg">
@@ -595,11 +609,13 @@ function CoverCarouselDialog({
   open,
   onOpenChange,
   onSelect,
+  getCoverUrl,
 }: {
   entry: MediaEntry;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onSelect: (coverPath: string) => void;
+  getCoverUrl: (filePath: string) => string;
 }) {
   const currentCover = getDisplayCover(entry);
   const startIndex = currentCover
@@ -630,7 +646,7 @@ function CoverCarouselDialog({
                 <CarouselItem key={i}>
                   <div className="flex items-center justify-center">
                     <img
-                      src={convertFileSrc(cover)}
+                      src={getCoverUrl(cover)}
                       alt={`Cover ${i + 1}`}
                       className="max-h-[400px] rounded-md object-contain"
                     />
