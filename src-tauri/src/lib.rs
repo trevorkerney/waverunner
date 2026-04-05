@@ -39,6 +39,8 @@ pub fn run() {
             commands::get_libraries,
             commands::get_entries,
             commands::search_entries,
+            commands::get_movie_detail,
+            commands::update_movie_detail,
             commands::set_sort_mode,
             commands::update_sort_order,
             commands::rename_entry,

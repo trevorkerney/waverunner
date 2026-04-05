@@ -17,6 +17,7 @@ function App() {
   const [coverSize, setCoverSize] = useState(200);
   const [search, setSearch] = useState("");
   const [searchResults, setSearchResults] = useState<MediaEntry[] | null>(null);
+  const [selectedEntry, setSelectedEntry] = useState<MediaEntry | null>(null);
   const [loading, setLoading] = useState(false);
 
   // Cache: "libraryId:parentId" -> { entries, sortMode }
@@ -165,6 +166,7 @@ function App() {
     (library: Library) => {
       saveScrollPosition();
       setSelectedLibrary(library);
+      setSelectedEntry(null);
       setSearch("");
       loadEntries(library, null, [{ id: null, title: library.name }]);
     },
@@ -173,11 +175,17 @@ function App() {
 
   const navigateTo = useCallback(
     (entry: MediaEntry) => {
-      if (!selectedLibrary || entry.entry_type !== "collection") return;
+      if (!selectedLibrary) return;
       saveScrollPosition();
       setForwardStack([]);
       const newBreadcrumbs = [...breadcrumbs, { id: entry.id, title: entry.title }];
-      loadEntries(selectedLibrary, entry.id, newBreadcrumbs);
+      if (entry.entry_type === "movie") {
+        setSelectedEntry(entry);
+        setBreadcrumbs(newBreadcrumbs);
+      } else if (entry.entry_type === "collection") {
+        setSelectedEntry(null);
+        loadEntries(selectedLibrary, entry.id, newBreadcrumbs);
+      }
     },
     [selectedLibrary, breadcrumbs, loadEntries, saveScrollPosition]
   );
@@ -186,6 +194,7 @@ function App() {
     (index: number) => {
       if (!selectedLibrary) return;
       saveScrollPosition();
+      setSelectedEntry(null);
       setForwardStack([]);
       const newBreadcrumbs = breadcrumbs.slice(0, index + 1);
       const parentId = newBreadcrumbs[newBreadcrumbs.length - 1].id;
@@ -201,8 +210,13 @@ function App() {
     setForwardStack((prev) => [...prev, removed]);
     const newBreadcrumbs = breadcrumbs.slice(0, -1);
     const parentId = newBreadcrumbs[newBreadcrumbs.length - 1].id;
-    loadEntries(selectedLibrary, parentId, newBreadcrumbs);
-  }, [selectedLibrary, breadcrumbs, loadEntries, saveScrollPosition]);
+    if (selectedEntry) {
+      setSelectedEntry(null);
+      setBreadcrumbs(newBreadcrumbs);
+    } else {
+      loadEntries(selectedLibrary, parentId, newBreadcrumbs);
+    }
+  }, [selectedLibrary, breadcrumbs, selectedEntry, loadEntries, saveScrollPosition]);
 
   const goForward = useCallback(() => {
     if (!selectedLibrary || forwardStack.length === 0) return;
@@ -210,8 +224,16 @@ function App() {
     const next = forwardStack[forwardStack.length - 1];
     setForwardStack((prev) => prev.slice(0, -1));
     const newBreadcrumbs = [...breadcrumbs, next];
-    loadEntries(selectedLibrary, next.id, newBreadcrumbs);
-  }, [selectedLibrary, forwardStack, breadcrumbs, loadEntries, saveScrollPosition]);
+    // Check if the forward entry is a non-collection (movie/show detail page)
+    const forwardEntry = entries.find((e) => e.id === next.id);
+    if (forwardEntry && forwardEntry.entry_type !== "collection") {
+      setSelectedEntry(forwardEntry);
+      setBreadcrumbs(newBreadcrumbs);
+    } else {
+      setSelectedEntry(null);
+      loadEntries(selectedLibrary, next.id, newBreadcrumbs);
+    }
+  }, [selectedLibrary, forwardStack, breadcrumbs, entries, loadEntries, saveScrollPosition]);
 
   const invalidateCache = useCallback((libraryId?: string, parentId?: number | null) => {
     if (libraryId != null && parentId !== undefined) {
@@ -362,6 +384,7 @@ function App() {
         <MainContent
           entries={entries}
           searchResults={searchResults}
+          selectedEntry={selectedEntry}
           loading={loading}
           breadcrumbs={breadcrumbs}
           coverSize={coverSize}

@@ -31,3 +31,64 @@ export interface BreadcrumbItem {
   id: number | null;
   title: string;
 }
+
+export interface PersonInfo {
+  id: number;
+  name: string;
+  image_path: string | null;
+}
+
+export interface CastInfo extends PersonInfo {
+  role: string | null;
+}
+
+export interface CrewInfo extends PersonInfo {
+  job: string | null;
+}
+
+export interface MovieDetail {
+  id: number;
+  tmdb_id: string | null;
+  imdb_id: string | null;
+  rotten_tomatoes_id: string | null;
+  plot: string | null;
+  tagline: string | null;
+  runtime: number | null;
+  maturity_rating: string | null;
+  genres: string[];
+  directors: PersonInfo[];
+  cast: CastInfo[];
+  crew: CrewInfo[];
+  producers: PersonInfo[];
+  studios: string[];
+  keywords: string[];
+}
+
+export interface CastUpdateInfo {
+  name: string;
+  role: string | null;
+}
+
+export interface CrewUpdateInfo {
+  name: string;
+  job: string | null;
+}
+
+export interface MovieDetailUpdate {
+  tmdb_id?: string | null;
+  imdb_id?: string | null;
+  rotten_tomatoes_id?: string | null;
+  title?: string;
+  year?: string;
+  plot?: string | null;
+  tagline?: string | null;
+  runtime?: number | null;
+  maturity_rating?: string | null;
+  genres?: string[];
+  directors?: string[];
+  cast?: CastUpdateInfo[];
+  crew?: CrewUpdateInfo[];
+  producers?: string[];
+  studios?: string[];
+  keywords?: string[];
+}

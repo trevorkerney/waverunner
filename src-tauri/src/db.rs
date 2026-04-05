@@ -87,10 +87,154 @@ pub async fn create_library_pool(db_path: &Path, format: &str) -> Result<SqliteP
             .execute(&pool)
             .await?;
 
+            // Lookup tables
+            sqlx::query(
+                "CREATE TABLE IF NOT EXISTS genre (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE
+                )",
+            )
+            .execute(&pool)
+            .await?;
+
+            sqlx::query(
+                "CREATE TABLE IF NOT EXISTS maturity_rating (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE
+                )",
+            )
+            .execute(&pool)
+            .await?;
+
+            sqlx::query(
+                "CREATE TABLE IF NOT EXISTS person (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    image_path TEXT
+                )",
+            )
+            .execute(&pool)
+            .await?;
+
+            sqlx::query(
+                "CREATE TABLE IF NOT EXISTS studio (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE
+                )",
+            )
+            .execute(&pool)
+            .await?;
+
+            sqlx::query(
+                "CREATE TABLE IF NOT EXISTS keyword (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE
+                )",
+            )
+            .execute(&pool)
+            .await?;
+
+            // Movie table (1:1 with media_entry)
             sqlx::query(
                 "CREATE TABLE IF NOT EXISTS movie (
                     id INTEGER PRIMARY KEY,
-                    FOREIGN KEY (id) REFERENCES media_entry(id) ON DELETE CASCADE
+                    tmdb_id TEXT,
+                    imdb_id TEXT,
+                    rotten_tomatoes_id TEXT,
+                    plot TEXT,
+                    tagline TEXT,
+                    runtime INTEGER,
+                    maturity_rating_id INTEGER,
+                    FOREIGN KEY (id) REFERENCES media_entry(id) ON DELETE CASCADE,
+                    FOREIGN KEY (maturity_rating_id) REFERENCES maturity_rating(id)
+                )",
+            )
+            .execute(&pool)
+            .await?;
+
+            // M2M junction tables
+            sqlx::query(
+                "CREATE TABLE IF NOT EXISTS movie_genre (
+                    movie_id INTEGER NOT NULL,
+                    genre_id INTEGER NOT NULL,
+                    PRIMARY KEY (movie_id, genre_id),
+                    FOREIGN KEY (movie_id) REFERENCES movie(id) ON DELETE CASCADE,
+                    FOREIGN KEY (genre_id) REFERENCES genre(id) ON DELETE CASCADE
+                )",
+            )
+            .execute(&pool)
+            .await?;
+
+            sqlx::query(
+                "CREATE TABLE IF NOT EXISTS movie_director (
+                    movie_id INTEGER NOT NULL,
+                    person_id INTEGER NOT NULL,
+                    PRIMARY KEY (movie_id, person_id),
+                    FOREIGN KEY (movie_id) REFERENCES movie(id) ON DELETE CASCADE,
+                    FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
+                )",
+            )
+            .execute(&pool)
+            .await?;
+
+            sqlx::query(
+                "CREATE TABLE IF NOT EXISTS movie_cast (
+                    movie_id INTEGER NOT NULL,
+                    person_id INTEGER NOT NULL,
+                    role TEXT,
+                    sort_order INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (movie_id, person_id),
+                    FOREIGN KEY (movie_id) REFERENCES movie(id) ON DELETE CASCADE,
+                    FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
+                )",
+            )
+            .execute(&pool)
+            .await?;
+
+            sqlx::query(
+                "CREATE TABLE IF NOT EXISTS movie_crew (
+                    movie_id INTEGER NOT NULL,
+                    person_id INTEGER NOT NULL,
+                    job TEXT,
+                    PRIMARY KEY (movie_id, person_id, job),
+                    FOREIGN KEY (movie_id) REFERENCES movie(id) ON DELETE CASCADE,
+                    FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
+                )",
+            )
+            .execute(&pool)
+            .await?;
+
+            sqlx::query(
+                "CREATE TABLE IF NOT EXISTS movie_producer (
+                    movie_id INTEGER NOT NULL,
+                    person_id INTEGER NOT NULL,
+                    PRIMARY KEY (movie_id, person_id),
+                    FOREIGN KEY (movie_id) REFERENCES movie(id) ON DELETE CASCADE,
+                    FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
+                )",
+            )
+            .execute(&pool)
+            .await?;
+
+            sqlx::query(
+                "CREATE TABLE IF NOT EXISTS movie_studio (
+                    movie_id INTEGER NOT NULL,
+                    studio_id INTEGER NOT NULL,
+                    PRIMARY KEY (movie_id, studio_id),
+                    FOREIGN KEY (movie_id) REFERENCES movie(id) ON DELETE CASCADE,
+                    FOREIGN KEY (studio_id) REFERENCES studio(id) ON DELETE CASCADE
+                )",
+            )
+            .execute(&pool)
+            .await?;
+
+            sqlx::query(
+                "CREATE TABLE IF NOT EXISTS movie_keyword (
+                    movie_id INTEGER NOT NULL,
+                    keyword_id INTEGER NOT NULL,
+                    PRIMARY KEY (movie_id, keyword_id),
+                    FOREIGN KEY (movie_id) REFERENCES movie(id) ON DELETE CASCADE,
+                    FOREIGN KEY (keyword_id) REFERENCES keyword(id) ON DELETE CASCADE
                 )",
             )
             .execute(&pool)

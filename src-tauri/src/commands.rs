@@ -61,6 +61,80 @@ pub struct EntriesResponse {
     pub format: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PersonInfo {
+    pub id: i64,
+    pub name: String,
+    pub image_path: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CastInfo {
+    pub id: i64,
+    pub name: String,
+    pub image_path: Option<String>,
+    pub role: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CrewInfo {
+    pub id: i64,
+    pub name: String,
+    pub image_path: Option<String>,
+    pub job: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct MovieDetail {
+    pub id: i64,
+    pub tmdb_id: Option<String>,
+    pub imdb_id: Option<String>,
+    pub rotten_tomatoes_id: Option<String>,
+    pub plot: Option<String>,
+    pub tagline: Option<String>,
+    pub runtime: Option<i64>,
+    pub maturity_rating: Option<String>,
+    pub genres: Vec<String>,
+    pub directors: Vec<PersonInfo>,
+    pub cast: Vec<CastInfo>,
+    pub crew: Vec<CrewInfo>,
+    pub producers: Vec<PersonInfo>,
+    pub studios: Vec<String>,
+    pub keywords: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct MovieDetailUpdate {
+    pub tmdb_id: Option<String>,
+    pub imdb_id: Option<String>,
+    pub rotten_tomatoes_id: Option<String>,
+    pub title: Option<String>,
+    pub year: Option<String>,
+    pub plot: Option<String>,
+    pub tagline: Option<String>,
+    pub runtime: Option<i64>,
+    pub maturity_rating: Option<String>,
+    pub genres: Option<Vec<String>>,
+    pub directors: Option<Vec<String>>,
+    pub cast: Option<Vec<CastUpdateInfo>>,
+    pub crew: Option<Vec<CrewUpdateInfo>>,
+    pub producers: Option<Vec<String>>,
+    pub studios: Option<Vec<String>>,
+    pub keywords: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CastUpdateInfo {
+    pub name: String,
+    pub role: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CrewUpdateInfo {
+    pub name: String,
+    pub job: Option<String>,
+}
+
 fn sanitize_db_filename(name: &str) -> String {
     let sanitized: String = name
         .chars()
@@ -731,6 +805,399 @@ pub async fn search_entries(
 
     pool.close().await;
     Ok(entries)
+}
+
+#[tauri::command]
+pub async fn get_movie_detail(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    entry_id: i64,
+) -> Result<MovieDetail, String> {
+    let row: Option<(String, i32, String)> = sqlx::query_as(
+        "SELECT paths, portable, db_filename FROM libraries WHERE id = ?",
+    )
+    .bind(&library_id)
+    .fetch_optional(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let (paths_json, portable, db_filename) = row.ok_or("Library not found")?;
+    let _paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
+
+    let db_path = if portable != 0 {
+        PathBuf::from(&_paths[0]).join(".waverunner.db")
+    } else {
+        state.app_data_dir.join(&db_filename)
+    };
+
+    let pool = crate::db::connect_library_pool(&db_path)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Movie scalar fields
+    let movie_row: Option<(i64, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<i64>, Option<i64>)> =
+        sqlx::query_as(
+            "SELECT id, tmdb_id, imdb_id, rotten_tomatoes_id, plot, tagline, runtime, maturity_rating_id FROM movie WHERE id = ?",
+        )
+        .bind(entry_id)
+        .fetch_optional(&pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let (id, tmdb_id, imdb_id, rotten_tomatoes_id, plot, tagline, runtime, maturity_rating_id) =
+        movie_row.ok_or("Movie not found")?;
+
+    // Maturity rating name
+    let maturity_rating: Option<String> = if let Some(mr_id) = maturity_rating_id {
+        let mr_row: Option<(String,)> = sqlx::query_as("SELECT name FROM maturity_rating WHERE id = ?")
+            .bind(mr_id)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        mr_row.map(|(name,)| name)
+    } else {
+        None
+    };
+
+    // Genres
+    let genre_rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT g.name FROM movie_genre mg JOIN genre g ON mg.genre_id = g.id WHERE mg.movie_id = ? ORDER BY g.name",
+    )
+    .bind(entry_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let genres: Vec<String> = genre_rows.into_iter().map(|(n,)| n).collect();
+
+    // Directors
+    let director_rows: Vec<(i64, String, Option<String>)> = sqlx::query_as(
+        "SELECT p.id, p.name, p.image_path FROM movie_director md JOIN person p ON md.person_id = p.id WHERE md.movie_id = ? ORDER BY p.name",
+    )
+    .bind(entry_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let directors: Vec<PersonInfo> = director_rows.into_iter().map(|(id, name, image_path)| PersonInfo { id, name, image_path }).collect();
+
+    // Cast
+    let cast_rows: Vec<(i64, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT p.id, p.name, p.image_path, mc.role FROM movie_cast mc JOIN person p ON mc.person_id = p.id WHERE mc.movie_id = ? ORDER BY mc.sort_order",
+    )
+    .bind(entry_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let cast: Vec<CastInfo> = cast_rows.into_iter().map(|(id, name, image_path, role)| CastInfo { id, name, image_path, role }).collect();
+
+    // Crew
+    let crew_rows: Vec<(i64, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT p.id, p.name, p.image_path, mc.job FROM movie_crew mc JOIN person p ON mc.person_id = p.id WHERE mc.movie_id = ? ORDER BY p.name",
+    )
+    .bind(entry_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let crew: Vec<CrewInfo> = crew_rows.into_iter().map(|(id, name, image_path, job)| CrewInfo { id, name, image_path, job }).collect();
+
+    // Producers
+    let producer_rows: Vec<(i64, String, Option<String>)> = sqlx::query_as(
+        "SELECT p.id, p.name, p.image_path FROM movie_producer mp JOIN person p ON mp.person_id = p.id WHERE mp.movie_id = ? ORDER BY p.name",
+    )
+    .bind(entry_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let producers: Vec<PersonInfo> = producer_rows.into_iter().map(|(id, name, image_path)| PersonInfo { id, name, image_path }).collect();
+
+    // Studios
+    let studio_rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT s.name FROM movie_studio ms JOIN studio s ON ms.studio_id = s.id WHERE ms.movie_id = ? ORDER BY s.name",
+    )
+    .bind(entry_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let studios: Vec<String> = studio_rows.into_iter().map(|(n,)| n).collect();
+
+    // Keywords
+    let keyword_rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT k.name FROM movie_keyword mk JOIN keyword k ON mk.keyword_id = k.id WHERE mk.movie_id = ? ORDER BY k.name",
+    )
+    .bind(entry_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let keywords: Vec<String> = keyword_rows.into_iter().map(|(n,)| n).collect();
+
+    pool.close().await;
+
+    Ok(MovieDetail {
+        id,
+        tmdb_id,
+        imdb_id,
+        rotten_tomatoes_id,
+        plot,
+        tagline,
+        runtime,
+        maturity_rating,
+        genres,
+        directors,
+        cast,
+        crew,
+        producers,
+        studios,
+        keywords,
+    })
+}
+
+#[tauri::command]
+pub async fn update_movie_detail(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    entry_id: i64,
+    detail: MovieDetailUpdate,
+) -> Result<(), String> {
+    let row: Option<(String, i32, String)> = sqlx::query_as(
+        "SELECT paths, portable, db_filename FROM libraries WHERE id = ?",
+    )
+    .bind(&library_id)
+    .fetch_optional(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let (paths_json, portable, db_filename) = row.ok_or("Library not found")?;
+    let _paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
+
+    let db_path = if portable != 0 {
+        PathBuf::from(&_paths[0]).join(".waverunner.db")
+    } else {
+        state.app_data_dir.join(&db_filename)
+    };
+
+    let pool = crate::db::connect_library_pool(&db_path)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Update media_entry title/year if provided
+    if let Some(ref title) = detail.title {
+        let sort_title = generate_sort_title(title, "en");
+        sqlx::query("UPDATE media_entry SET title = ?, sort_title = ? WHERE id = ?")
+            .bind(title)
+            .bind(&sort_title)
+            .bind(entry_id)
+            .execute(&pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    if let Some(ref year) = detail.year {
+        let year_val = if year.is_empty() { None } else { Some(year.as_str()) };
+        sqlx::query("UPDATE media_entry SET year = ? WHERE id = ?")
+            .bind(year_val)
+            .bind(entry_id)
+            .execute(&pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    // Update movie scalar fields
+    sqlx::query(
+        "UPDATE movie SET tmdb_id = COALESCE(?, tmdb_id), imdb_id = COALESCE(?, imdb_id), \
+         rotten_tomatoes_id = COALESCE(?, rotten_tomatoes_id), plot = COALESCE(?, plot), \
+         tagline = COALESCE(?, tagline), runtime = COALESCE(?, runtime) WHERE id = ?",
+    )
+    .bind(&detail.tmdb_id)
+    .bind(&detail.imdb_id)
+    .bind(&detail.rotten_tomatoes_id)
+    .bind(&detail.plot)
+    .bind(&detail.tagline)
+    .bind(&detail.runtime)
+    .bind(entry_id)
+    .execute(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // Maturity rating
+    if let Some(ref mr_name) = detail.maturity_rating {
+        if mr_name.is_empty() {
+            sqlx::query("UPDATE movie SET maturity_rating_id = NULL WHERE id = ?")
+                .bind(entry_id)
+                .execute(&pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        } else {
+            sqlx::query("INSERT OR IGNORE INTO maturity_rating (name) VALUES (?)")
+                .bind(mr_name)
+                .execute(&pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            sqlx::query("UPDATE movie SET maturity_rating_id = (SELECT id FROM maturity_rating WHERE name = ?) WHERE id = ?")
+                .bind(mr_name)
+                .bind(entry_id)
+                .execute(&pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
+    // Genres (delete + re-insert)
+    if let Some(ref genres) = detail.genres {
+        sqlx::query("DELETE FROM movie_genre WHERE movie_id = ?")
+            .bind(entry_id)
+            .execute(&pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        for genre_name in genres {
+            sqlx::query("INSERT OR IGNORE INTO genre (name) VALUES (?)")
+                .bind(genre_name)
+                .execute(&pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            sqlx::query("INSERT INTO movie_genre (movie_id, genre_id) VALUES (?, (SELECT id FROM genre WHERE name = ?))")
+                .bind(entry_id)
+                .bind(genre_name)
+                .execute(&pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
+    // Directors
+    if let Some(ref directors) = detail.directors {
+        sqlx::query("DELETE FROM movie_director WHERE movie_id = ?")
+            .bind(entry_id)
+            .execute(&pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        for name in directors {
+            sqlx::query("INSERT OR IGNORE INTO person (name) VALUES (?)")
+                .bind(name)
+                .execute(&pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            sqlx::query("INSERT INTO movie_director (movie_id, person_id) VALUES (?, (SELECT id FROM person WHERE name = ?))")
+                .bind(entry_id)
+                .bind(name)
+                .execute(&pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
+    // Cast
+    if let Some(ref cast) = detail.cast {
+        sqlx::query("DELETE FROM movie_cast WHERE movie_id = ?")
+            .bind(entry_id)
+            .execute(&pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        for (i, c) in cast.iter().enumerate() {
+            sqlx::query("INSERT OR IGNORE INTO person (name) VALUES (?)")
+                .bind(&c.name)
+                .execute(&pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            sqlx::query("INSERT INTO movie_cast (movie_id, person_id, role, sort_order) VALUES (?, (SELECT id FROM person WHERE name = ?), ?, ?)")
+                .bind(entry_id)
+                .bind(&c.name)
+                .bind(&c.role)
+                .bind(i as i64)
+                .execute(&pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
+    // Crew
+    if let Some(ref crew) = detail.crew {
+        sqlx::query("DELETE FROM movie_crew WHERE movie_id = ?")
+            .bind(entry_id)
+            .execute(&pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        for c in crew {
+            sqlx::query("INSERT OR IGNORE INTO person (name) VALUES (?)")
+                .bind(&c.name)
+                .execute(&pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            sqlx::query("INSERT INTO movie_crew (movie_id, person_id, job) VALUES (?, (SELECT id FROM person WHERE name = ?), ?)")
+                .bind(entry_id)
+                .bind(&c.name)
+                .bind(&c.job)
+                .execute(&pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
+    // Producers
+    if let Some(ref producers) = detail.producers {
+        sqlx::query("DELETE FROM movie_producer WHERE movie_id = ?")
+            .bind(entry_id)
+            .execute(&pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        for name in producers {
+            sqlx::query("INSERT OR IGNORE INTO person (name) VALUES (?)")
+                .bind(name)
+                .execute(&pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            sqlx::query("INSERT INTO movie_producer (movie_id, person_id) VALUES (?, (SELECT id FROM person WHERE name = ?))")
+                .bind(entry_id)
+                .bind(name)
+                .execute(&pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
+    // Studios
+    if let Some(ref studios) = detail.studios {
+        sqlx::query("DELETE FROM movie_studio WHERE movie_id = ?")
+            .bind(entry_id)
+            .execute(&pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        for name in studios {
+            sqlx::query("INSERT OR IGNORE INTO studio (name) VALUES (?)")
+                .bind(name)
+                .execute(&pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            sqlx::query("INSERT INTO movie_studio (movie_id, studio_id) VALUES (?, (SELECT id FROM studio WHERE name = ?))")
+                .bind(entry_id)
+                .bind(name)
+                .execute(&pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
+    // Keywords
+    if let Some(ref keywords) = detail.keywords {
+        sqlx::query("DELETE FROM movie_keyword WHERE movie_id = ?")
+            .bind(entry_id)
+            .execute(&pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        for name in keywords {
+            sqlx::query("INSERT OR IGNORE INTO keyword (name) VALUES (?)")
+                .bind(name)
+                .execute(&pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            sqlx::query("INSERT INTO movie_keyword (movie_id, keyword_id) VALUES (?, (SELECT id FROM keyword WHERE name = ?))")
+                .bind(entry_id)
+                .bind(name)
+                .execute(&pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
+    pool.close().await;
+    Ok(())
 }
 
 #[tauri::command]

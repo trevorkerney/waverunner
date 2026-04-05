@@ -63,8 +63,9 @@ import {
   Pencil,
   Image as ImageIcon,
 } from "lucide-react";
+import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
-import { Library, MediaEntry, BreadcrumbItem } from "@/types";
+import { Library, MediaEntry, BreadcrumbItem, MovieDetail, MovieDetailUpdate } from "@/types";
 
 function getDisplayCover(entry: MediaEntry): string | null {
   if (entry.selected_cover && entry.covers.includes(entry.selected_cover)) {
@@ -76,6 +77,7 @@ function getDisplayCover(entry: MediaEntry): string | null {
 interface MainContentProps {
   entries: MediaEntry[];
   searchResults: MediaEntry[] | null;
+  selectedEntry: MediaEntry | null;
   loading: boolean;
   breadcrumbs: BreadcrumbItem[];
   coverSize: number;
@@ -98,6 +100,7 @@ interface MainContentProps {
 export function MainContent({
   entries,
   searchResults,
+  selectedEntry,
   loading,
   breadcrumbs,
   coverSize,
@@ -186,7 +189,7 @@ export function MainContent({
           </Breadcrumb>
 
           {/* Search + Sort + Size Slider */}
-          <div className="flex items-center gap-3 border-b border-border px-4 py-2">
+          {!selectedEntry && <div className="flex items-center gap-3 border-b border-border px-4 py-2">
             <div className="relative flex-1">
               <Search
                 size={14}
@@ -245,13 +248,15 @@ export function MainContent({
                 className="w-full"
               />
             </div>
-          </div>
+          </div>}
         </>
       )}
 
-      {/* Content Grid */}
+      {/* Content */}
       <div ref={scrollContainerRef} className="flex-1 overflow-y-auto overflow-x-hidden p-4">
-        {!selectedLibrary ? (
+        {selectedEntry ? (
+          <EntryDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getFullCoverUrl={getFullCoverUrl} />
+        ) : !selectedLibrary ? (
           <div />
         ) : loading ? (
           <div className="flex flex-1 items-center justify-center">
@@ -401,7 +406,7 @@ function CoverCard({
         render={
           <button
             onClick={() =>
-              !isRenaming && entry.entry_type === "collection" && onNavigate(entry)
+              !isRenaming && entry.entry_type !== "show" && onNavigate(entry)
             }
           />
         }
@@ -672,5 +677,218 @@ function CoverCarouselDialog({
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  );
+}
+
+function EntryDetailPage({
+  entry,
+  selectedLibrary,
+  getFullCoverUrl,
+}: {
+  entry: MediaEntry;
+  selectedLibrary: Library;
+  getFullCoverUrl: (filePath: string) => string;
+}) {
+  const [detail, setDetail] = useState<MovieDetail | null>(null);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState<MovieDetailUpdate>({});
+  const [saving, setSaving] = useState(false);
+
+  const loadDetail = useCallback(async () => {
+    try {
+      const d = await invoke<MovieDetail>("get_movie_detail", {
+        libraryId: selectedLibrary.id,
+        entryId: entry.id,
+      });
+      setDetail(d);
+    } catch (e) {
+      console.error("Failed to load movie detail:", e);
+    }
+  }, [selectedLibrary.id, entry.id]);
+
+  useEffect(() => {
+    loadDetail();
+  }, [loadDetail]);
+
+  const startEditing = () => {
+    setDraft({
+      title: entry.title,
+      year: entry.year ?? "",
+      tmdb_id: detail?.tmdb_id ?? null,
+      imdb_id: detail?.imdb_id ?? null,
+      rotten_tomatoes_id: detail?.rotten_tomatoes_id ?? null,
+      plot: detail?.plot ?? null,
+      tagline: detail?.tagline ?? null,
+      runtime: detail?.runtime ?? null,
+      maturity_rating: detail?.maturity_rating ?? null,
+      genres: detail?.genres ?? [],
+      directors: detail?.directors.map((d: { name: string }) => d.name) ?? [],
+      cast: detail?.cast.map((c: { name: string; role: string | null }) => ({ name: c.name, role: c.role })) ?? [],
+      crew: detail?.crew.map((c: { name: string; job: string | null }) => ({ name: c.name, job: c.job })) ?? [],
+      producers: detail?.producers.map((p: { name: string }) => p.name) ?? [],
+      studios: detail?.studios ?? [],
+      keywords: detail?.keywords ?? [],
+    });
+    setEditing(true);
+  };
+
+  const saveDetail = async () => {
+    setSaving(true);
+    try {
+      await invoke("update_movie_detail", {
+        libraryId: selectedLibrary.id,
+        entryId: entry.id,
+        detail: draft,
+      });
+      await loadDetail();
+      setEditing(false);
+    } catch (e) {
+      console.error("Failed to save movie detail:", e);
+      toast.error(String(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const coverPath = getDisplayCover(entry);
+  const coverSrc = coverPath ? getFullCoverUrl(coverPath) : null;
+
+  const updateDraft = (field: keyof MovieDetailUpdate, value: unknown) => {
+    setDraft((prev: MovieDetailUpdate) => ({ ...prev, [field]: value }));
+  };
+
+  const updateListField = (field: keyof MovieDetailUpdate, value: string) => {
+    updateDraft(field, value.split(",").map((s) => s.trim()).filter(Boolean));
+  };
+
+  return (
+    <div className="flex gap-8 p-4">
+      {coverSrc && (
+        <img
+          src={coverSrc}
+          alt={entry.title}
+          className="h-auto max-h-[500px] w-auto shrink-0 rounded-lg object-contain shadow-lg"
+        />
+      )}
+      <div className="flex min-w-0 flex-1 flex-col gap-4">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            {editing ? (
+              <div className="flex flex-col gap-2">
+                <input
+                  value={draft.title ?? ""}
+                  onChange={(e) => updateDraft("title", e.target.value)}
+                  className="rounded border border-input bg-transparent px-2 py-1 text-2xl font-bold outline-none"
+                />
+                <input
+                  value={draft.year ?? ""}
+                  onChange={(e) => updateDraft("year", e.target.value)}
+                  placeholder="Year"
+                  className="w-24 rounded border border-input bg-transparent px-2 py-1 text-sm outline-none"
+                />
+              </div>
+            ) : (
+              <>
+                <h1 className="text-3xl font-bold">{entry.title}</h1>
+                {entry.year && (
+                  <p className="text-lg text-muted-foreground">
+                    {entry.year}{entry.end_year ? `–${entry.end_year}` : ""}
+                  </p>
+                )}
+              </>
+            )}
+          </div>
+          <div className="flex gap-2">
+            {editing ? (
+              <>
+                <Button size="sm" variant="outline" onClick={() => setEditing(false)} disabled={saving}>
+                  Cancel
+                </Button>
+                <Button size="sm" onClick={saveDetail} disabled={saving}>
+                  {saving ? "Saving..." : "Save"}
+                </Button>
+              </>
+            ) : (
+              <Button size="sm" variant="outline" onClick={startEditing}>
+                <Pencil size={14} />
+                Edit
+              </Button>
+            )}
+          </div>
+        </div>
+
+        {detail && !editing && (
+          <div className="flex flex-col gap-3 text-sm">
+            {detail.tagline && <p className="italic text-muted-foreground">{detail.tagline}</p>}
+            {detail.plot && <p>{detail.plot}</p>}
+            {detail.runtime != null && <p><span className="font-medium">Runtime:</span> {detail.runtime} min</p>}
+            {detail.maturity_rating && <p><span className="font-medium">Rating:</span> {detail.maturity_rating}</p>}
+            {detail.genres.length > 0 && <p><span className="font-medium">Genres:</span> {detail.genres.join(", ")}</p>}
+            {detail.directors.length > 0 && <p><span className="font-medium">Director:</span> {detail.directors.map((d: { name: string }) => d.name).join(", ")}</p>}
+            {detail.cast.length > 0 && (
+              <p><span className="font-medium">Cast:</span> {detail.cast.map((c: { name: string; role: string | null }) => c.role ? `${c.name} (${c.role})` : c.name).join(", ")}</p>
+            )}
+            {detail.crew.length > 0 && (
+              <p><span className="font-medium">Crew:</span> {detail.crew.map((c: { name: string; job: string | null }) => c.job ? `${c.name} (${c.job})` : c.name).join(", ")}</p>
+            )}
+            {detail.producers.length > 0 && <p><span className="font-medium">Producers:</span> {detail.producers.map((p: { name: string }) => p.name).join(", ")}</p>}
+            {detail.studios.length > 0 && <p><span className="font-medium">Studios:</span> {detail.studios.join(", ")}</p>}
+            {detail.keywords.length > 0 && <p><span className="font-medium">Keywords:</span> {detail.keywords.join(", ")}</p>}
+            {detail.tmdb_id && <p><span className="font-medium">TMDB:</span> {detail.tmdb_id}</p>}
+            {detail.imdb_id && <p><span className="font-medium">IMDB:</span> {detail.imdb_id}</p>}
+            {detail.rotten_tomatoes_id && <p><span className="font-medium">Rotten Tomatoes:</span> {detail.rotten_tomatoes_id}</p>}
+          </div>
+        )}
+
+        {editing && (
+          <div className="flex flex-col gap-3 text-sm">
+            <EditField label="Tagline" value={draft.tagline ?? ""} onChange={(v) => updateDraft("tagline", v || null)} />
+            <EditField label="Plot" value={draft.plot ?? ""} onChange={(v) => updateDraft("plot", v || null)} multiline />
+            <EditField label="Runtime (min)" value={draft.runtime != null ? String(draft.runtime) : ""} onChange={(v) => updateDraft("runtime", v ? Number(v) : null)} />
+            <EditField label="Maturity Rating" value={draft.maturity_rating ?? ""} onChange={(v) => updateDraft("maturity_rating", v || null)} />
+            <EditField label="Genres (comma-separated)" value={(draft.genres ?? []).join(", ")} onChange={(v) => updateListField("genres", v)} />
+            <EditField label="Directors (comma-separated)" value={(draft.directors ?? []).join(", ")} onChange={(v) => updateListField("directors", v)} />
+            <EditField label="Producers (comma-separated)" value={(draft.producers ?? []).join(", ")} onChange={(v) => updateListField("producers", v)} />
+            <EditField label="Studios (comma-separated)" value={(draft.studios ?? []).join(", ")} onChange={(v) => updateListField("studios", v)} />
+            <EditField label="Keywords (comma-separated)" value={(draft.keywords ?? []).join(", ")} onChange={(v) => updateListField("keywords", v)} />
+            <EditField label="TMDB ID" value={draft.tmdb_id ?? ""} onChange={(v) => updateDraft("tmdb_id", v || null)} />
+            <EditField label="IMDB ID" value={draft.imdb_id ?? ""} onChange={(v) => updateDraft("imdb_id", v || null)} />
+            <EditField label="Rotten Tomatoes ID" value={draft.rotten_tomatoes_id ?? ""} onChange={(v) => updateDraft("rotten_tomatoes_id", v || null)} />
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function EditField({
+  label,
+  value,
+  onChange,
+  multiline,
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  multiline?: boolean;
+}) {
+  return (
+    <div className="flex flex-col gap-1">
+      <label className="text-xs font-medium text-muted-foreground">{label}</label>
+      {multiline ? (
+        <textarea
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          rows={3}
+          className="rounded border border-input bg-transparent px-2 py-1 text-sm outline-none"
+        />
+      ) : (
+        <input
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          className="rounded border border-input bg-transparent px-2 py-1 text-sm outline-none"
+        />
+      )}
+    </div>
   );
 }
