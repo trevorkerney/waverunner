@@ -255,7 +255,9 @@ export function MainContent({
       {/* Content */}
       <div ref={scrollContainerRef} className="flex-1 overflow-y-auto overflow-x-hidden p-4">
         {selectedEntry ? (
-          <EntryDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getFullCoverUrl={getFullCoverUrl} />
+          selectedEntry.entry_type === "show"
+            ? <ShowDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getFullCoverUrl={getFullCoverUrl} />
+            : <EntryDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getFullCoverUrl={getFullCoverUrl} />
         ) : !selectedLibrary ? (
           <div />
         ) : loading ? (
@@ -406,7 +408,7 @@ function CoverCard({
         render={
           <button
             onClick={() =>
-              !isRenaming && entry.entry_type !== "show" && onNavigate(entry)
+              !isRenaming && onNavigate(entry)
             }
           />
         }
@@ -856,6 +858,41 @@ function EntryDetailPage({
             <EditField label="Rotten Tomatoes ID" value={draft.rotten_tomatoes_id ?? ""} onChange={(v) => updateDraft("rotten_tomatoes_id", v || null)} />
           </div>
         )}
+      </div>
+    </div>
+  );
+}
+
+function ShowDetailPage({
+  entry,
+  selectedLibrary: _selectedLibrary,
+  getFullCoverUrl,
+}: {
+  entry: MediaEntry;
+  selectedLibrary: Library;
+  getFullCoverUrl: (filePath: string) => string;
+}) {
+  const coverPath = getDisplayCover(entry);
+  const coverSrc = coverPath ? getFullCoverUrl(coverPath) : null;
+
+  return (
+    <div className="flex gap-8 p-4">
+      {coverSrc && (
+        <img
+          src={coverSrc}
+          alt={entry.title}
+          className="h-auto max-h-[500px] w-auto shrink-0 rounded-lg object-contain shadow-lg"
+        />
+      )}
+      <div className="flex min-w-0 flex-1 flex-col gap-4">
+        <div>
+          <h1 className="text-3xl font-bold">{entry.title}</h1>
+          {entry.year && (
+            <p className="text-lg text-muted-foreground">
+              {entry.year}{entry.end_year ? `–${entry.end_year}` : ""}
+            </p>
+          )}
+        </div>
       </div>
     </div>
   );

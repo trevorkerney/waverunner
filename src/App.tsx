@@ -179,7 +179,7 @@ function App() {
       saveScrollPosition();
       setForwardStack([]);
       const newBreadcrumbs = [...breadcrumbs, { id: entry.id, title: entry.title }];
-      if (entry.entry_type === "movie") {
+      if (entry.entry_type === "movie" || entry.entry_type === "show") {
         setSelectedEntry(entry);
         setBreadcrumbs(newBreadcrumbs);
       } else if (entry.entry_type === "collection") {
