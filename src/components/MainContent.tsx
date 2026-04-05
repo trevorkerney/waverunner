@@ -75,6 +75,7 @@ function getDisplayCover(entry: MediaEntry): string | null {
 
 interface MainContentProps {
   entries: MediaEntry[];
+  searchResults: MediaEntry[] | null;
   loading: boolean;
   breadcrumbs: BreadcrumbItem[];
   coverSize: number;
@@ -96,6 +97,7 @@ interface MainContentProps {
 
 export function MainContent({
   entries,
+  searchResults,
   loading,
   breadcrumbs,
   coverSize,
@@ -118,11 +120,8 @@ export function MainContent({
   const [coverDialogEntry, setCoverDialogEntry] = useState<MediaEntry | null>(
     null
   );
-  const filteredEntries = search
-    ? entries.filter((e) =>
-        e.title.toLowerCase().includes(search.toLowerCase())
-      )
-    : entries;
+  const isSearching = searchResults != null;
+  const filteredEntries = isSearching ? searchResults : entries;
 
   const changeSortMode = useCallback(
     (mode: string) => {

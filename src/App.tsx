@@ -16,6 +16,7 @@ function App() {
   const [sortMode, setSortMode] = useState("alpha");
   const [coverSize, setCoverSize] = useState(200);
   const [search, setSearch] = useState("");
+  const [searchResults, setSearchResults] = useState<MediaEntry[] | null>(null);
   const [loading, setLoading] = useState(false);
 
   // Cache: "libraryId:parentId" -> { entries, sortMode }
@@ -81,6 +82,29 @@ function App() {
   useEffect(() => {
     loadLibraries();
   }, [loadLibraries]);
+
+  useEffect(() => {
+    if (!selectedLibrary || !search.trim()) {
+      setSearchResults(null);
+      return;
+    }
+    const timer = setTimeout(async () => {
+      try {
+        const parentId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
+        const results = await invoke<MediaEntry[]>("search_entries", {
+          libraryId: selectedLibrary.id,
+          parentId,
+          query: search.trim(),
+        });
+        await preloadCovers(results);
+        setSearchResults(results);
+      } catch (e) {
+        console.error("Search failed:", e);
+        setSearchResults(null);
+      }
+    }, 200);
+    return () => clearTimeout(timer);
+  }, [search, selectedLibrary, breadcrumbs, preloadCovers]);
 
   const saveScrollPosition = useCallback(() => {
     if (!selectedLibrary || !scrollContainerRef.current) return;
@@ -337,6 +361,7 @@ function App() {
         />
         <MainContent
           entries={entries}
+          searchResults={searchResults}
           loading={loading}
           breadcrumbs={breadcrumbs}
           coverSize={coverSize}

@@ -569,6 +569,171 @@ pub async fn get_entries(
 }
 
 #[tauri::command]
+pub async fn search_entries(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    parent_id: Option<i64>,
+    query: String,
+) -> Result<Vec<MediaEntry>, String> {
+    let row: Option<(String, i32, String, String, String)> = sqlx::query_as(
+        "SELECT paths, portable, db_filename, default_sort_mode, format FROM libraries WHERE id = ?",
+    )
+    .bind(&library_id)
+    .fetch_optional(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let (paths_json, portable, db_filename, _default_sort_mode, format) = row.ok_or("Library not found")?;
+    let _paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
+
+    let db_path = if portable != 0 {
+        PathBuf::from(&_paths[0]).join(".waverunner.db")
+    } else {
+        state.app_data_dir.join(&db_filename)
+    };
+
+    let pool = crate::db::connect_library_pool(&db_path)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut covers_map = get_all_cached_covers(&pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let like_pattern = format!("%{}%", query);
+
+    let entries = match format.as_str() {
+        "video" => {
+            let query_str = match parent_id {
+                Some(_) => "\
+                    WITH RECURSIVE descendants(id) AS ( \
+                        SELECT id FROM media_entry WHERE parent_id = ? \
+                        UNION ALL \
+                        SELECT me.id FROM media_entry me JOIN descendants d ON me.parent_id = d.id \
+                    ) \
+                    SELECT me.id, me.title, me.year, me.end_year, me.folder_path, me.parent_id, met.name as entry_type, me.selected_cover \
+                    FROM media_entry me \
+                    JOIN media_entry_type met ON me.entry_type_id = met.id \
+                    WHERE me.id IN (SELECT id FROM descendants) AND me.title LIKE ? \
+                    ORDER BY me.sort_title ASC",
+                None => "\
+                    SELECT me.id, me.title, me.year, me.end_year, me.folder_path, me.parent_id, met.name as entry_type, me.selected_cover \
+                    FROM media_entry me \
+                    JOIN media_entry_type met ON me.entry_type_id = met.id \
+                    WHERE me.title LIKE ? \
+                    ORDER BY me.sort_title ASC",
+            };
+
+            let rows: Vec<(i64, String, Option<String>, Option<String>, String, Option<i64>, String, Option<String>)> = match parent_id {
+                Some(pid) => {
+                    sqlx::query_as(query_str)
+                        .bind(pid)
+                        .bind(&like_pattern)
+                        .fetch_all(&pool)
+                        .await
+                }
+                None => {
+                    sqlx::query_as(query_str)
+                        .bind(&like_pattern)
+                        .fetch_all(&pool)
+                        .await
+                }
+            }
+            .map_err(|e| e.to_string())?;
+
+            rows.into_iter()
+                .map(|(id, title, year, end_year, folder_path, parent_id, entry_type, selected_cover)| {
+                    let covers = covers_map.remove(&folder_path).unwrap_or_default();
+                    MediaEntry { id, title, year, end_year, folder_path, parent_id, entry_type, covers, selected_cover }
+                })
+                .collect()
+        }
+        "tv" => {
+            let rows: Vec<(i64, String, Option<String>, String, Option<String>)> =
+                sqlx::query_as(
+                    "SELECT id, title, year, folder_path, selected_cover FROM shows WHERE title LIKE ? ORDER BY sort_title ASC",
+                )
+                .bind(&like_pattern)
+                .fetch_all(&pool)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            rows.into_iter()
+                .map(|(id, title, year, folder_path, selected_cover)| {
+                    let covers = covers_map.remove(&folder_path).unwrap_or_default();
+                    MediaEntry { id, title, year, end_year: None, folder_path, parent_id: None, entry_type: "show".to_string(), covers, selected_cover }
+                })
+                .collect()
+        }
+        "music" => {
+            let rows: Vec<(i64, String, String, Option<String>)> =
+                sqlx::query_as(
+                    "SELECT id, name, folder_path, selected_cover FROM artists WHERE name LIKE ? ORDER BY sort_name ASC",
+                )
+                .bind(&like_pattern)
+                .fetch_all(&pool)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            rows.into_iter()
+                .map(|(id, name, folder_path, selected_cover)| {
+                    let covers = covers_map.remove(&folder_path).unwrap_or_default();
+                    MediaEntry { id, title: name, year: None, end_year: None, folder_path, parent_id: None, entry_type: "artist".to_string(), covers, selected_cover }
+                })
+                .collect()
+        }
+        _ => {
+            // Legacy movies — recursive CTE scoped to parent
+            let query_str = match parent_id {
+                Some(_) => "\
+                    WITH RECURSIVE descendants(id) AS ( \
+                        SELECT id FROM movie WHERE parent_id = ? \
+                        UNION ALL \
+                        SELECT m.id FROM movie m JOIN descendants d ON m.parent_id = d.id \
+                    ) \
+                    SELECT id, title, year, folder_path, parent_id, is_collection, selected_cover \
+                    FROM movie WHERE id IN (SELECT id FROM descendants) AND title LIKE ? \
+                    ORDER BY sort_title ASC",
+                None => "\
+                    SELECT id, title, year, folder_path, parent_id, is_collection, selected_cover \
+                    FROM movie WHERE title LIKE ? ORDER BY sort_title ASC",
+            };
+
+            let rows: Vec<(i64, String, Option<String>, String, Option<i64>, i32, Option<String>)> = match parent_id {
+                Some(pid) => {
+                    sqlx::query_as(query_str)
+                        .bind(pid)
+                        .bind(&like_pattern)
+                        .fetch_all(&pool)
+                        .await
+                }
+                None => {
+                    sqlx::query_as(query_str)
+                        .bind(&like_pattern)
+                        .fetch_all(&pool)
+                        .await
+                }
+            }
+            .map_err(|e| e.to_string())?;
+
+            rows.into_iter()
+                .map(|(id, title, year, folder_path, parent_id, is_collection, selected_cover)| {
+                    let covers = covers_map.remove(&folder_path).unwrap_or_default();
+                    MediaEntry {
+                        id, title, year, end_year: None, folder_path, parent_id,
+                        entry_type: if is_collection != 0 { "collection".to_string() } else { "movie".to_string() },
+                        covers, selected_cover,
+                    }
+                })
+                .collect()
+        }
+    };
+
+    pool.close().await;
+    Ok(entries)
+}
+
+#[tauri::command]
 pub async fn set_sort_mode(
     state: tauri::State<'_, AppState>,
     library_id: String,

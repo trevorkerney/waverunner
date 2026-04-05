@@ -38,6 +38,7 @@ pub fn run() {
             commands::delete_library,
             commands::get_libraries,
             commands::get_entries,
+            commands::search_entries,
             commands::set_sort_mode,
             commands::update_sort_order,
             commands::rename_entry,
