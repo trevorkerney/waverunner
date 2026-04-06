@@ -11,6 +11,8 @@
     "core:window:allow-toggle-maximize",
     "core:window:allow-close",
     "core:webview:allow-set-webview-zoom",
-    "dialog:default"
+    "dialog:default",
+    "updater:default",
+    "process:allow-restart"
   ]
 }

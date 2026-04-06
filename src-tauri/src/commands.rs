@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tauri::Emitter;
+use tauri_plugin_updater::UpdaterExt;
 
 fn generate_sort_title(title: &str, language: &str) -> String {
     let articles: &[&str] = match language {
@@ -198,6 +199,97 @@ fn resolve_entry_root<'a>(paths: &'a [String], folder_path: &str) -> Option<&'a 
         }
     }
     None
+}
+
+#[tauri::command]
+pub async fn get_settings(
+    state: tauri::State<'_, AppState>,
+) -> Result<HashMap<String, String>, String> {
+    let rows: Vec<(String, String)> = sqlx::query_as("SELECT key, value FROM settings")
+        .fetch_all(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(rows.into_iter().collect())
+}
+
+#[tauri::command]
+pub async fn set_setting(
+    state: tauri::State<'_, AppState>,
+    key: String,
+    value: String,
+) -> Result<(), String> {
+    sqlx::query("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
+        .bind(&key)
+        .bind(&value)
+        .execute(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_app_version() -> Result<String, String> {
+    Ok(env!("CARGO_PKG_VERSION").to_string())
+}
+
+#[tauri::command]
+pub async fn check_for_update(
+    app: tauri::AppHandle,
+    endpoint: String,
+) -> Result<Option<serde_json::Value>, String> {
+    let url: url::Url = endpoint.parse().map_err(|e| format!("invalid endpoint: {e}"))?;
+    let updater = app
+        .updater_builder()
+        .endpoints(vec![url])
+        .map_err(|e| e.to_string())?
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    match updater.check().await {
+        Ok(Some(update)) => Ok(Some(serde_json::json!({
+            "version": update.version,
+            "body": update.body,
+        }))),
+        Ok(None) => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[tauri::command]
+pub async fn download_and_install_update(
+    app: tauri::AppHandle,
+    endpoint: String,
+) -> Result<(), String> {
+    let url: url::Url = endpoint.parse().map_err(|e| format!("invalid endpoint: {e}"))?;
+    let updater = app
+        .updater_builder()
+        .endpoints(vec![url])
+        .map_err(|e| e.to_string())?
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let update = updater
+        .check()
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "No update available".to_string())?;
+
+    let handle = app.clone();
+    let mut downloaded: usize = 0;
+
+    update
+        .download_and_install(
+            move |chunk_len, total| {
+                downloaded += chunk_len;
+                let _ = handle.emit(
+                    "update-progress",
+                    serde_json::json!({ "downloaded": downloaded, "total": total }),
+                );
+            },
+            || {},
+        )
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

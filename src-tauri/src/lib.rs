@@ -15,6 +15,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .setup(|app| {
             let app_data_dir = dirs::data_local_dir()
                 .expect("failed to get local app data dir")
@@ -34,6 +36,11 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::get_settings,
+            commands::set_setting,
+            commands::get_app_version,
+            commands::check_for_update,
+            commands::download_and_install_update,
             commands::create_library,
             commands::delete_library,
             commands::get_libraries,

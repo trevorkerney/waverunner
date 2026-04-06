@@ -2,12 +2,14 @@ import { useEffect, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Minus, Square, X, ZoomIn, ZoomOut, RotateCcw } from "lucide-react";
 import { ThemeToggle } from "@/components/ThemeToggle";
+import { SettingsDialog } from "@/components/SettingsDialog";
 import {
   Menubar,
   MenubarMenu,
   MenubarTrigger,
   MenubarContent,
   MenubarItem,
+  MenubarShortcut,
 } from "@/components/ui/menubar";
 
 const appWindow = getCurrentWindow();
@@ -64,6 +66,19 @@ export function Titlebar() {
     };
   }, []);
 
+  const [settingsOpen, setSettingsOpen] = useState(false);
+
+  useEffect(() => {
+    function handleKeyDown(e: KeyboardEvent) {
+      if (e.ctrlKey && e.key === ",") {
+        e.preventDefault();
+        setSettingsOpen(true);
+      }
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
+
   const btnClass = "inline-flex h-6 w-10 items-center justify-center text-muted-foreground hover:bg-accent";
 
   return (
@@ -76,7 +91,9 @@ export function Titlebar() {
         <MenubarMenu>
           <MenubarTrigger className="text-xs px-2 py-0">File</MenubarTrigger>
           <MenubarContent>
-            <MenubarItem disabled>Coming soon</MenubarItem>
+            <MenubarItem onClick={() => setSettingsOpen(true)}>
+              Settings <MenubarShortcut>Ctrl+,</MenubarShortcut>
+            </MenubarItem>
           </MenubarContent>
         </MenubarMenu>
         <MenubarMenu>
@@ -116,6 +133,7 @@ export function Titlebar() {
         <X size={12} strokeWidth={1.5} />
       </button>
       </div>
+      <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
     </div>
   );
 }

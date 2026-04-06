@@ -6,6 +6,7 @@ import { Sidebar } from "@/components/Sidebar";
 import { MainContent } from "@/components/MainContent";
 import { Toaster } from "@/components/ui/sonner";
 import { toast } from "sonner";
+import { relaunch } from "@tauri-apps/plugin-process";
 import { Library, MediaEntry, EntriesResponse, BreadcrumbItem } from "@/types";
 
 function App() {
@@ -84,6 +85,37 @@ function App() {
   useEffect(() => {
     loadLibraries();
   }, [loadLibraries]);
+
+  // Auto-update on launch
+  useEffect(() => {
+    const endpoint =
+      "https://github.com/trevorkerney/waverunner/releases/latest/download/latest.json";
+    (async () => {
+      try {
+        const settings = await invoke<Record<string, string>>("get_settings");
+        if (settings["auto_update"] === "false") return;
+        const result = await invoke<{ version: string } | null>(
+          "check_for_update",
+          { endpoint }
+        );
+        if (!result) return;
+        toast(`Update v${result.version} available`, {
+          description: "Downloading...",
+          duration: Infinity,
+          id: "auto-update",
+        });
+        await invoke("download_and_install_update", { endpoint });
+        toast("Update ready", {
+          description: "Restart to apply the update.",
+          duration: Infinity,
+          id: "auto-update",
+          action: { label: "Restart", onClick: () => relaunch() },
+        });
+      } catch {
+        // Silent fail — don't bother user if update check fails
+      }
+    })();
+  }, []);
 
   useEffect(() => {
     if (!selectedLibrary || !search.trim()) {

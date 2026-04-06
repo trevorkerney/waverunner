@@ -26,3 +26,6 @@ dist-ssr
 .claude
 .vscode
 old
+
+# Updater signing key (private)
+src-tauri/keys/updater.key

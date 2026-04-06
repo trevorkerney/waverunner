@@ -16,12 +16,7 @@ TMDB metadata integration (toggle per library, title resolution: file metadata >
 
 confirmation modal for delete library
 
-individual title pages!
-
 consider how streamed media should be dealt with as opposed to local media (like from a plex server)
-
-context menus
-- move reorder mode button to context menus
 
 settings: sorting language selection (determines which articles like "The", "A", "An" are ignored for alphabetical sort — currently hardcoded to English)
 

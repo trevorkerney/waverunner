@@ -23,6 +23,15 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .execute(&pool)
     .await?;
 
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     // Migrate: rename 'path' column to 'paths' and convert values to JSON arrays
     if sqlx::query("ALTER TABLE libraries RENAME COLUMN path TO paths")
         .execute(&pool)
