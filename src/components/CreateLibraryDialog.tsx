@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
+import { toast } from "sonner";
 import {
   Dialog,
   DialogContent,
@@ -92,7 +93,7 @@ export function CreateLibraryDialog({
       setFormat("video");
       setPortable(false);
     } catch (e) {
-      console.error("Failed to create library:", e);
+      toast.error(String(e));
     } finally {
       setCreating(false);
     }

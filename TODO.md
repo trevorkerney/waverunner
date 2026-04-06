@@ -29,6 +29,6 @@ settings: sorting language selection (determines which articles like "The", "A",
 
 # BIG STUFF NOW
 
-search isnt working for movies inside categories anymore
-
 Okay now what about functionality for creating categories, bringing movies into them, and also bringing them out?
+
+currently when using an external player, the player is forked from waverunner and is a child of it, therefore when you close waverunner, the player closes. This should not be the case.

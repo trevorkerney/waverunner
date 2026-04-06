@@ -44,6 +44,7 @@ pub fn run() {
             commands::set_sort_mode,
             commands::update_sort_order,
             commands::rename_entry,
+            commands::move_entry,
             commands::set_cover,
             commands::rescan_library,
             commands::detect_players,

@@ -210,6 +210,9 @@ pub async fn create_library(
     portable: bool,
     managed: bool,
 ) -> Result<Library, String> {
+    if !matches!(format.as_str(), "video" | "music") {
+        return Err(format!("Unsupported library format: {}", format));
+    }
     if paths.is_empty() {
         return Err("At least one path is required".to_string());
     }
@@ -1809,22 +1812,25 @@ pub async fn rename_entry(
                     if old_cache.exists() {
                         let _ = std::fs::rename(&old_cache, &new_cache);
                     }
+                    let old_cache_abs = old_cache.to_string_lossy().to_string().replace('/', "\\");
+                    let new_cache_abs = new_cache.to_string_lossy().to_string().replace('/', "\\");
+                    let old_cache_abs_prefix = format!("{}\\", old_cache_abs);
+                    let new_cache_abs_prefix = format!("{}\\", new_cache_abs);
                     sqlx::query("UPDATE cached_images SET entry_folder_path = ?, cached_path = REPLACE(cached_path, ?, ?) WHERE entry_folder_path = ?")
                         .bind(&new_rel_path)
-                        .bind(folder_path.replace('/', "\\"))
-                        .bind(new_rel_path.replace('/', "\\"))
+                        .bind(&old_cache_abs)
+                        .bind(&new_cache_abs)
                         .bind(&folder_path)
                         .execute(&pool)
                         .await
                         .map_err(|e| e.to_string())?;
-                    let old_prefix_ci = format!("{}\\", folder_path);
-                    let new_prefix_ci = format!("{}\\", new_rel_path);
+                    let old_rel_prefix_ci = format!("{}\\", folder_path);
                     sqlx::query("UPDATE cached_images SET entry_folder_path = ? || SUBSTR(entry_folder_path, ?), cached_path = REPLACE(cached_path, ?, ?) WHERE entry_folder_path LIKE ?")
-                        .bind(&new_prefix_ci)
-                        .bind((old_prefix_ci.len() + 1) as i32)
-                        .bind(&old_prefix_ci)
-                        .bind(&new_prefix_ci)
-                        .bind(format!("{}%", old_prefix_ci))
+                        .bind(&format!("{}\\", new_rel_path))
+                        .bind((old_rel_prefix_ci.len() + 1) as i32)
+                        .bind(&old_cache_abs_prefix)
+                        .bind(&new_cache_abs_prefix)
+                        .bind(format!("{}%", old_rel_prefix_ci))
                         .execute(&pool)
                         .await
                         .map_err(|e| e.to_string())?;
@@ -1894,24 +1900,27 @@ pub async fn rename_entry(
                     if old_cache.exists() {
                         let _ = std::fs::rename(&old_cache, &new_cache);
                     }
+                    let old_cache_abs = old_cache.to_string_lossy().to_string().replace('/', "\\");
+                    let new_cache_abs = new_cache.to_string_lossy().to_string().replace('/', "\\");
+                    let old_cache_abs_prefix = format!("{}\\", old_cache_abs);
+                    let new_cache_abs_prefix = format!("{}\\", new_cache_abs);
                     // Update this entry's cached_images
                     sqlx::query("UPDATE cached_images SET entry_folder_path = ?, cached_path = REPLACE(cached_path, ?, ?) WHERE entry_folder_path = ?")
                         .bind(&new_rel_path)
-                        .bind(folder_path.replace('/', "\\"))
-                        .bind(new_rel_path.replace('/', "\\"))
+                        .bind(&old_cache_abs)
+                        .bind(&new_cache_abs)
                         .bind(&folder_path)
                         .execute(&pool)
                         .await
                         .map_err(|e| e.to_string())?;
                     // Update child entries' cached_images (movies can nest)
-                    let old_prefix_ci = format!("{}\\", folder_path);
-                    let new_prefix_ci = format!("{}\\", new_rel_path);
+                    let old_rel_prefix_ci = format!("{}\\", folder_path);
                     sqlx::query("UPDATE cached_images SET entry_folder_path = ? || SUBSTR(entry_folder_path, ?), cached_path = REPLACE(cached_path, ?, ?) WHERE entry_folder_path LIKE ?")
-                        .bind(&new_prefix_ci)
-                        .bind((old_prefix_ci.len() + 1) as i32)
-                        .bind(&old_prefix_ci)
-                        .bind(&new_prefix_ci)
-                        .bind(format!("{}%", old_prefix_ci))
+                        .bind(&format!("{}\\", new_rel_path))
+                        .bind((old_rel_prefix_ci.len() + 1) as i32)
+                        .bind(&old_cache_abs_prefix)
+                        .bind(&new_cache_abs_prefix)
+                        .bind(format!("{}%", old_rel_prefix_ci))
                         .execute(&pool)
                         .await
                         .map_err(|e| e.to_string())?;
@@ -1992,10 +2001,12 @@ pub async fn rename_entry(
                     if old_cache.exists() {
                         let _ = std::fs::rename(&old_cache, &new_cache);
                     }
+                    let old_cache_abs = old_cache.to_string_lossy().to_string().replace('/', "\\");
+                    let new_cache_abs = new_cache.to_string_lossy().to_string().replace('/', "\\");
                     sqlx::query("UPDATE cached_images SET entry_folder_path = ?, cached_path = REPLACE(cached_path, ?, ?) WHERE entry_folder_path = ?")
                         .bind(&new_rel_path)
-                        .bind(&folder_path)
-                        .bind(&new_rel_path)
+                        .bind(&old_cache_abs)
+                        .bind(&new_cache_abs)
                         .bind(&folder_path)
                         .execute(&pool)
                         .await
@@ -2073,23 +2084,26 @@ pub async fn rename_entry(
                     if old_cache.exists() {
                         let _ = std::fs::rename(&old_cache, &new_cache);
                     }
+                    let old_cache_abs = old_cache.to_string_lossy().to_string().replace('/', "\\");
+                    let new_cache_abs = new_cache.to_string_lossy().to_string().replace('/', "\\");
+                    let old_cache_abs_prefix = format!("{}\\", old_cache_abs);
+                    let new_cache_abs_prefix = format!("{}\\", new_cache_abs);
                     // Update this entry + child album entries
-                    let old_prefix_ci = format!("{}\\", folder_path);
-                    let new_prefix_ci = format!("{}\\", new_rel_path);
                     sqlx::query("UPDATE cached_images SET entry_folder_path = ?, cached_path = REPLACE(cached_path, ?, ?) WHERE entry_folder_path = ?")
                         .bind(&new_rel_path)
-                        .bind(&folder_path)
-                        .bind(&new_rel_path)
+                        .bind(&old_cache_abs)
+                        .bind(&new_cache_abs)
                         .bind(&folder_path)
                         .execute(&pool)
                         .await
                         .map_err(|e| e.to_string())?;
+                    let old_rel_prefix_ci = format!("{}\\", folder_path);
                     sqlx::query("UPDATE cached_images SET entry_folder_path = ? || SUBSTR(entry_folder_path, ?), cached_path = REPLACE(cached_path, ?, ?) WHERE entry_folder_path LIKE ?")
-                        .bind(&new_prefix_ci)
-                        .bind((old_prefix_ci.len() + 1) as i32)
-                        .bind(&old_prefix_ci)
-                        .bind(&new_prefix_ci)
-                        .bind(format!("{}%", old_prefix_ci))
+                        .bind(&format!("{}\\", new_rel_path))
+                        .bind((old_rel_prefix_ci.len() + 1) as i32)
+                        .bind(&old_cache_abs_prefix)
+                        .bind(&new_cache_abs_prefix)
+                        .bind(format!("{}%", old_rel_prefix_ci))
                         .execute(&pool)
                         .await
                         .map_err(|e| e.to_string())?;
@@ -2137,6 +2151,346 @@ pub async fn rename_entry(
                 .execute(&pool)
                 .await
                 .map_err(|e| e.to_string())?;
+        }
+    }
+
+    pool.close().await;
+    Ok(())
+}
+
+/// Recursively copy a directory and all its contents.
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let dest_path = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursive(&entry.path(), &dest_path)?;
+        } else {
+            std::fs::copy(&entry.path(), &dest_path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Move a directory: try rename first (instant, same-drive only), fall back to copy + delete.
+fn move_dir(src: &Path, dst: &Path) -> Result<(), String> {
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create destination directory: {}", e))?;
+    }
+    match std::fs::rename(src, dst) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            copy_dir_recursive(src, dst)
+                .map_err(|e| format!("Failed to copy folder: {}", e))?;
+            std::fs::remove_dir_all(src)
+                .map_err(|e| format!("Copied but failed to remove original: {}", e))?;
+            Ok(())
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn move_entry(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    entry_id: i64,
+    new_parent_id: Option<i64>,
+    insert_before_id: Option<i64>,
+) -> Result<(), String> {
+    let row: Option<(String, i32, String, i32, String)> = sqlx::query_as(
+        "SELECT paths, portable, db_filename, managed, format FROM libraries WHERE id = ?",
+    )
+    .bind(&library_id)
+    .fetch_optional(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let (paths_json, portable, db_filename, managed, format) = row.ok_or("Library not found")?;
+    let lib_paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
+
+    let db_path = if portable != 0 {
+        PathBuf::from(&lib_paths[0]).join(".waverunner.db")
+    } else {
+        state.app_data_dir.join(&db_filename)
+    };
+
+    let pool = crate::db::connect_library_pool(&db_path)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match format.as_str() {
+        "video" => {
+            // Get the entry being moved
+            let entry_row: (String, Option<i64>) = sqlx::query_as(
+                "SELECT folder_path, parent_id FROM media_entry WHERE id = ?",
+            )
+            .bind(entry_id)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or("Entry not found")?;
+
+            let (old_folder_path, old_parent_id) = entry_row;
+
+            // No-op if already in the target parent
+            if old_parent_id == new_parent_id {
+                pool.close().await;
+                return Ok(());
+            }
+
+            // Prevent moving into self or a descendant
+            if let Some(target_id) = new_parent_id {
+                if target_id == entry_id {
+                    pool.close().await;
+                    return Err("Cannot move entry into itself".to_string());
+                }
+                // Walk up from target to root, ensure we don't hit entry_id
+                let mut check_id = Some(target_id);
+                while let Some(cid) = check_id {
+                    let parent: Option<(Option<i64>,)> = sqlx::query_as(
+                        "SELECT parent_id FROM media_entry WHERE id = ?",
+                    )
+                    .bind(cid)
+                    .fetch_optional(&pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                    match parent {
+                        Some((Some(pid),)) => {
+                            if pid == entry_id {
+                                pool.close().await;
+                                return Err("Cannot move entry into its own descendant".to_string());
+                            }
+                            check_id = Some(pid);
+                        }
+                        _ => { check_id = None; }
+                    }
+                }
+            }
+
+            // Determine the new folder_path
+            let folder_name = PathBuf::from(&old_folder_path)
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+
+            let new_folder_path = if let Some(target_id) = new_parent_id {
+                let (parent_folder,): (String,) = sqlx::query_as(
+                    "SELECT folder_path FROM media_entry WHERE id = ?",
+                )
+                .bind(target_id)
+                .fetch_optional(&pool)
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or("Target collection not found")?;
+                format!("{}\\{}", parent_folder, folder_name)
+            } else {
+                // Moving to root level — folder_name only
+                folder_name.clone()
+            };
+
+            // --- Phase 1: Disk moves (reversible) ---
+            let mut source_moved = false;
+            let mut cache_moved = false;
+            let mut old_full_path = PathBuf::new();
+            let mut new_full_path = PathBuf::new();
+            let cache_base = state.app_data_dir.join("cache").join(&library_id);
+            let old_cache = cache_base.join(&old_folder_path);
+            let new_cache = cache_base.join(&new_folder_path);
+
+            // Move source folder on disk if managed
+            if managed != 0 {
+                let lib_base = PathBuf::from(
+                    resolve_entry_root(&lib_paths, &old_folder_path)
+                        .ok_or("Could not find entry on disk")?,
+                );
+                old_full_path = lib_base.join(&old_folder_path);
+                new_full_path = lib_base.join(&new_folder_path);
+
+                if old_full_path != new_full_path {
+                    if new_full_path.exists() {
+                        pool.close().await;
+                        return Err(format!(
+                            "A folder named '{}' already exists at the destination",
+                            folder_name
+                        ));
+                    }
+                    move_dir(&old_full_path, &new_full_path)?;
+                    source_moved = true;
+                }
+            }
+
+            // Move cache directory on disk
+            if old_cache.exists() {
+                if move_dir(&old_cache, &new_cache).is_ok() {
+                    cache_moved = true;
+                }
+            }
+
+            // --- Phase 2: DB updates in a transaction ---
+            // Use full absolute cache prefixes for REPLACE to avoid matching
+            // folder names that appear elsewhere in the absolute path
+            let old_cache_abs = old_cache.to_string_lossy().to_string().replace('/', "\\");
+            let new_cache_abs = new_cache.to_string_lossy().to_string().replace('/', "\\");
+            let old_cache_abs_prefix = format!("{}\\", old_cache_abs);
+            let new_cache_abs_prefix = format!("{}\\", new_cache_abs);
+
+            let db_result: Result<(), String> = async {
+                let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+
+                let old_rel_prefix = format!("{}\\", old_folder_path);
+                let new_rel_prefix = format!("{}\\", new_folder_path);
+
+                // This entry's cached_images
+                sqlx::query("UPDATE cached_images SET entry_folder_path = ?, cached_path = REPLACE(cached_path, ?, ?) WHERE entry_folder_path = ?")
+                    .bind(&new_folder_path)
+                    .bind(&old_cache_abs)
+                    .bind(&new_cache_abs)
+                    .bind(&old_folder_path)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                // Child entries' cached_images
+                sqlx::query("UPDATE cached_images SET entry_folder_path = ? || SUBSTR(entry_folder_path, ?), cached_path = REPLACE(cached_path, ?, ?) WHERE entry_folder_path LIKE ?")
+                    .bind(&new_rel_prefix)
+                    .bind((old_rel_prefix.len() + 1) as i32)
+                    .bind(&old_cache_abs_prefix)
+                    .bind(&new_cache_abs_prefix)
+                    .bind(format!("{}%", old_rel_prefix))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                // Update selected_cover for this entry
+                sqlx::query("UPDATE media_entry SET selected_cover = REPLACE(selected_cover, ?, ?) WHERE selected_cover LIKE ? AND id = ?")
+                    .bind(&old_cache_abs)
+                    .bind(&new_cache_abs)
+                    .bind(format!("{}%", old_cache_abs))
+                    .bind(entry_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                // Update selected_cover for child entries
+                sqlx::query("UPDATE media_entry SET selected_cover = REPLACE(selected_cover, ?, ?) WHERE selected_cover LIKE ? AND id != ?")
+                    .bind(&old_cache_abs_prefix)
+                    .bind(&new_cache_abs_prefix)
+                    .bind(format!("{}%", old_cache_abs_prefix))
+                    .bind(entry_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                // Determine sort_order for the moved entry
+                let new_sort_order: i64 = if let Some(before_id) = insert_before_id {
+                    let (before_order,): (i64,) = sqlx::query_as(
+                        "SELECT sort_order FROM media_entry WHERE id = ?",
+                    )
+                    .bind(before_id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .ok_or("insert_before entry not found")?;
+
+                    sqlx::query(
+                        "UPDATE media_entry SET sort_order = sort_order + 1 WHERE parent_id IS ? AND sort_order >= ? AND id != ?",
+                    )
+                    .bind(new_parent_id)
+                    .bind(before_order)
+                    .bind(entry_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                    before_order
+                } else {
+                    let max_row: Option<(i64,)> = sqlx::query_as(
+                        "SELECT MAX(sort_order) FROM media_entry WHERE parent_id IS ?",
+                    )
+                    .bind(new_parent_id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                    max_row.and_then(|r| Some(r.0 + 1)).unwrap_or(0)
+                };
+
+                // Update parent_id, folder_path, and sort_order
+                sqlx::query("UPDATE media_entry SET parent_id = ?, folder_path = ?, sort_order = ? WHERE id = ?")
+                    .bind(new_parent_id)
+                    .bind(&new_folder_path)
+                    .bind(new_sort_order)
+                    .bind(entry_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                // Update child folder_paths
+                sqlx::query(
+                    "UPDATE media_entry SET folder_path = ? || SUBSTR(folder_path, ?) WHERE folder_path LIKE ? AND id != ?",
+                )
+                .bind(&new_rel_prefix)
+                .bind((old_rel_prefix.len() + 1) as i32)
+                .bind(format!("{}%", old_rel_prefix))
+                .bind(entry_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+
+                // Update season/episode paths if entry is a show
+                let (entry_type_name,): (String,) = sqlx::query_as(
+                    "SELECT met.name FROM media_entry me JOIN media_entry_type met ON me.entry_type_id = met.id WHERE me.id = ?",
+                )
+                .bind(entry_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or("Entry not found")?;
+
+                if entry_type_name == "show" {
+                    sqlx::query(
+                        "UPDATE season SET folder_path = ? || SUBSTR(folder_path, ?) WHERE show_id = ?",
+                    )
+                    .bind(&new_rel_prefix)
+                    .bind((old_rel_prefix.len() + 1) as i32)
+                    .bind(entry_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                    sqlx::query(
+                        "UPDATE episode SET file_path = ? || SUBSTR(file_path, ?) WHERE season_id IN (SELECT id FROM season WHERE show_id = ?)",
+                    )
+                    .bind(&new_rel_prefix)
+                    .bind((old_rel_prefix.len() + 1) as i32)
+                    .bind(entry_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                }
+
+                tx.commit().await.map_err(|e| e.to_string())?;
+                Ok(())
+            }
+            .await;
+
+            // --- Phase 3: Roll back disk moves if DB failed ---
+            if let Err(e) = db_result {
+                if source_moved {
+                    let _ = move_dir(&new_full_path, &old_full_path);
+                }
+                if cache_moved {
+                    let _ = move_dir(&new_cache, &old_cache);
+                }
+                pool.close().await;
+                return Err(e);
+            }
+        }
+        _ => {
+            pool.close().await;
+            return Err("Move is only supported for video format libraries".to_string());
         }
     }
 

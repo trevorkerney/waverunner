@@ -391,24 +391,9 @@ pub async fn create_library_pool(db_path: &Path, format: &str) -> Result<SqliteP
             .await?;
         }
         _ => {
-            // movies
-            sqlx::query(
-                "CREATE TABLE IF NOT EXISTS movie (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    title TEXT NOT NULL,
-                    year TEXT,
-                    folder_path TEXT NOT NULL,
-                    parent_id INTEGER,
-                    is_collection INTEGER NOT NULL DEFAULT 0,
-                    sort_order INTEGER NOT NULL DEFAULT 0,
-                    sort_mode TEXT NOT NULL DEFAULT 'alpha',
-                    selected_cover TEXT,
-                    sort_title TEXT NOT NULL DEFAULT '',
-                    FOREIGN KEY (parent_id) REFERENCES movie(id) ON DELETE CASCADE
-                )",
-            )
-            .execute(&pool)
-            .await?;
+            return Err(sqlx::Error::Configuration(
+                format!("Unsupported library format: {}", format).into(),
+            ));
         }
     }
 

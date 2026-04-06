@@ -5,6 +5,7 @@ import { Titlebar } from "@/components/Titlebar";
 import { Sidebar } from "@/components/Sidebar";
 import { MainContent } from "@/components/MainContent";
 import { Toaster } from "@/components/ui/sonner";
+import { toast } from "sonner";
 import { Library, MediaEntry, EntriesResponse, BreadcrumbItem } from "@/types";
 
 function App() {
@@ -312,6 +313,45 @@ function App() {
     [selectedLibrary, breadcrumbs, loadEntries, invalidateCache]
   );
 
+  const moveEntry = useCallback(
+    async (entryId: number, newParentId: number | null, insertBeforeId: number | null) => {
+      if (!selectedLibrary) return;
+      try {
+        await invoke("move_entry", {
+          libraryId: selectedLibrary.id,
+          entryId,
+          newParentId,
+          insertBeforeId,
+        });
+        // Save scroll before reload
+        const scrollTop = scrollContainerRef.current?.scrollTop ?? 0;
+        invalidateCache(selectedLibrary.id);
+        const parentId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
+        // Reload entries inline without showing spinner
+        const res = await invoke<EntriesResponse>("get_entries", {
+          libraryId: selectedLibrary.id,
+          parentId,
+        });
+        await preloadCovers(res.entries);
+        entryCacheRef.current.set(`${selectedLibrary.id}:${parentId}`, { entries: res.entries, sort_mode: res.sort_mode });
+        setEntries(res.entries);
+        setSortMode(res.sort_mode);
+        // Restore scroll after React paints
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            if (scrollContainerRef.current) {
+              scrollContainerRef.current.scrollTop = scrollTop;
+            }
+          });
+        });
+      } catch (e) {
+        console.error("Failed to move entry:", e);
+        toast.error(String(e));
+      }
+    },
+    [selectedLibrary, breadcrumbs, invalidateCache, preloadCovers]
+  );
+
   const setCover = useCallback(
     async (entryId: number, coverPath: string | null) => {
       if (!selectedLibrary) return;
@@ -399,6 +439,7 @@ function App() {
           onSortOrderChange={updateSortOrder}
           onRenameEntry={renameEntry}
           onSetCover={setCover}
+          onMoveEntry={moveEntry}
           getCoverUrl={getCoverUrl}
           getFullCoverUrl={getFullCoverUrl}
           scrollContainerRef={scrollContainerRef}

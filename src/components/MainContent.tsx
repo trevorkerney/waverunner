@@ -8,6 +8,9 @@ import {
   type DragEndEvent,
   type DragStartEvent,
   DragOverlay,
+  useDroppable,
+  pointerWithin,
+  type CollisionDetection,
 } from "@dnd-kit/core";
 import {
   SortableContext,
@@ -15,7 +18,6 @@ import {
   useSortable,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { restrictToParentElement } from "@dnd-kit/modifiers";
 import { Input } from "@/components/ui/input";
 import { Slider } from "@/components/ui/slider";
 import {
@@ -59,7 +61,7 @@ import {
   Search,
   Folder,
   ArrowUpDown,
-  GripVertical,
+  ArrowUp,
   Pencil,
   Play,
   Image as ImageIcon,
@@ -93,6 +95,7 @@ interface MainContentProps {
   onSortOrderChange: (reordered: MediaEntry[]) => void;
   onRenameEntry: (entryId: number, newTitle: string) => Promise<string | null>;
   onSetCover: (entryId: number, coverPath: string | null) => void;
+  onMoveEntry: (entryId: number, newParentId: number | null, insertBeforeId: number | null) => Promise<void>;
   getCoverUrl: (filePath: string) => string;
   getFullCoverUrl: (filePath: string) => string;
   scrollContainerRef: RefObject<HTMLDivElement | null>;
@@ -116,54 +119,77 @@ export function MainContent({
   onSortOrderChange,
   onRenameEntry,
   onSetCover,
+  onMoveEntry,
   getCoverUrl,
   getFullCoverUrl,
   scrollContainerRef,
 }: MainContentProps) {
-  const [reordering, setReordering] = useState(false);
   const [coverDialogEntry, setCoverDialogEntry] = useState<MediaEntry | null>(
     null
   );
   const isSearching = searchResults != null;
   const filteredEntries = isSearching ? searchResults : entries;
 
-  const changeSortMode = useCallback(
-    (mode: string) => {
-      setReordering(false);
-      onSortModeChange(mode);
-    },
-    [onSortModeChange]
-  );
-
-  const [activeDragId, setActiveDragId] = useState<number | null>(null);
+  const [dragId, setDragId] = useState<number | null>(null);
 
   const sensors = useSensors(
-    useSensor(PointerSensor, { activationConstraint: { distance: 5 } })
+    useSensor(PointerSensor, { activationConstraint: { delay: 500, tolerance: 5 } })
   );
 
   const handleDragStart = useCallback((event: DragStartEvent) => {
-    setActiveDragId(event.active.id as number);
+    setDragId(event.active.id as number);
   }, []);
 
   const handleDragEnd = useCallback(
-    (event: DragEndEvent) => {
-      setActiveDragId(null);
+    async (event: DragEndEvent) => {
+      setDragId(null);
       const { active, over } = event;
       if (!over || active.id === over.id) return;
-      const oldIndex = filteredEntries.findIndex((e) => e.id === active.id);
-      const newIndex = filteredEntries.findIndex((e) => e.id === over.id);
-      if (oldIndex === -1 || newIndex === -1) return;
-      const reordered = [...filteredEntries];
-      const [moved] = reordered.splice(oldIndex, 1);
-      reordered.splice(newIndex, 0, moved);
-      onSortOrderChange(reordered);
+      const entryId = active.id as number;
+      const overId = String(over.id);
+
+      if (overId === "move-up-zone") {
+        const currentParentId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
+        const grandparentId = breadcrumbs.length >= 3 ? breadcrumbs[breadcrumbs.length - 2].id : null;
+        await onMoveEntry(entryId, grandparentId, currentParentId);
+      } else if (overId.startsWith("collection-")) {
+        const targetId = Number(overId.replace("collection-", ""));
+        if (targetId !== entryId) {
+          await onMoveEntry(entryId, targetId, null);
+        }
+      } else {
+        // Sortable reorder (over.id is the numeric entry id from useSortable)
+        if (sortMode !== "custom") return;
+        const targetId = over.id as number;
+        const oldIndex = filteredEntries.findIndex((e) => e.id === entryId);
+        const newIndex = filteredEntries.findIndex((e) => e.id === targetId);
+        if (oldIndex === -1 || newIndex === -1) return;
+        const reordered = [...filteredEntries];
+        const [moved] = reordered.splice(oldIndex, 1);
+        reordered.splice(newIndex, 0, moved);
+        onSortOrderChange(reordered);
+      }
     },
-    [filteredEntries, onSortOrderChange]
+    [breadcrumbs, onMoveEntry, sortMode, filteredEntries, onSortOrderChange]
   );
 
-  const activeDragEntry = activeDragId != null
-    ? filteredEntries.find((e) => e.id === activeDragId) ?? null
+  const dragEntry = dragId != null
+    ? filteredEntries.find((e) => e.id === dragId) ?? null
     : null;
+
+  // Prefer collection/move-up droppables (pointerWithin), fall back to closestCenter for sort
+  const collisionDetection: CollisionDetection = useCallback((args) => {
+    const pointerCollisions = pointerWithin(args);
+    // Filter for our special droppables (collection-* and move-up-zone)
+    const specialCollisions = pointerCollisions.filter((c) => {
+      const id = String(c.id);
+      return id === "move-up-zone" || id.startsWith("collection-");
+    });
+    if (specialCollisions.length > 0) return specialCollisions;
+    return closestCenter(args);
+  }, []);
+
+  const isInsideCollection = breadcrumbs.length > 1;
 
   return (
     <main className="flex flex-1 flex-col overflow-hidden bg-background">
@@ -213,30 +239,17 @@ export function MainContent({
                     : "Custom"}
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
-                <DropdownMenuItem onClick={() => changeSortMode("alpha")}>
+                <DropdownMenuItem onClick={() => onSortModeChange("alpha")}>
                   Alphabetical
                 </DropdownMenuItem>
-                <DropdownMenuItem onClick={() => changeSortMode("year")}>
+                <DropdownMenuItem onClick={() => onSortModeChange("year")}>
                   Year
                 </DropdownMenuItem>
-                <DropdownMenuItem onClick={() => changeSortMode("custom")}>
+                <DropdownMenuItem onClick={() => onSortModeChange("custom")}>
                   Custom
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
-            {sortMode === "custom" && (
-              <button
-                onClick={() => setReordering((r) => !r)}
-                className={`flex h-8 items-center gap-1.5 rounded-md border px-2.5 text-xs ${
-                  reordering
-                    ? "border-primary bg-primary text-primary-foreground"
-                    : "border-input bg-background text-muted-foreground hover:bg-accent hover:text-accent-foreground"
-                }`}
-              >
-                <GripVertical size={12} />
-                {reordering ? "Done" : "Reorder"}
-              </button>
-            )}
             <div className="flex w-32 items-center gap-2">
               <Slider
                 value={[coverSize]}
@@ -269,15 +282,15 @@ export function MainContent({
           <p className="text-sm text-muted-foreground">
             {search ? "No results" : "Empty"}
           </p>
-        ) : reordering ? (
+        ) : (
           <DndContext
             sensors={sensors}
-            collisionDetection={closestCenter}
-            modifiers={[restrictToParentElement]}
+            collisionDetection={collisionDetection}
             onDragStart={handleDragStart}
             onDragEnd={handleDragEnd}
-            onDragCancel={() => setActiveDragId(null)}
+            onDragCancel={() => setDragId(null)}
           >
+            {isInsideCollection && <MoveUpDropZone isActive={dragId != null} />}
             <SortableContext
               items={filteredEntries.map((e) => e.id)}
               strategy={rectSortingStrategy}
@@ -295,38 +308,22 @@ export function MainContent({
                     key={entry.id}
                     entry={entry}
                     size={coverSize}
+                    onNavigate={onNavigate}
+                    onRename={onRenameEntry}
+                    onChangeCover={() => setCoverDialogEntry(entry)}
                     getCoverUrl={getCoverUrl}
+                    isDragActive={dragId != null}
+                    sortMode={sortMode}
                   />
                 ))}
               </div>
             </SortableContext>
             <DragOverlay>
-              {activeDragEntry && (
-                <DragOverlayCard entry={activeDragEntry} size={coverSize} getCoverUrl={getCoverUrl} />
+              {dragEntry && (
+                <DragOverlayCard entry={dragEntry} size={coverSize} getCoverUrl={getCoverUrl} />
               )}
             </DragOverlay>
           </DndContext>
-        ) : (
-          <div
-            className="grid gap-4"
-            style={{
-              gridTemplateColumns: `repeat(auto-fill, minmax(${coverSize}px, 1fr))`,
-              alignItems: "center",
-              justifyItems: "center",
-            }}
-          >
-            {filteredEntries.map((entry) => (
-              <CoverCard
-                key={entry.id}
-                entry={entry}
-                size={coverSize}
-                onNavigate={onNavigate}
-                onRename={onRenameEntry}
-                onChangeCover={() => setCoverDialogEntry(entry)}
-                getCoverUrl={getCoverUrl}
-              />
-            ))}
-          </div>
         )}
       </div>
 
@@ -349,13 +346,15 @@ export function MainContent({
   );
 }
 
-function CoverCard({
+function SortableCoverCard({
   entry,
   size,
   onNavigate,
   onRename,
   onChangeCover,
   getCoverUrl,
+  isDragActive,
+  sortMode,
 }: {
   entry: MediaEntry;
   size: number;
@@ -363,7 +362,39 @@ function CoverCard({
   onRename: (entryId: number, newTitle: string) => Promise<string | null>;
   onChangeCover: () => void;
   getCoverUrl: (filePath: string) => string;
+  isDragActive: boolean;
+  sortMode: string;
 }) {
+  const {
+    attributes,
+    listeners,
+    setNodeRef: setSortRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({ id: entry.id });
+
+  const isCollection = entry.entry_type === "collection";
+  // Collections get an extra droppable so we can detect "move into" vs "reorder"
+  const { setNodeRef: setCollectionDropRef, isOver } = useDroppable({
+    id: `collection-${entry.id}`,
+    disabled: !isCollection || isDragging,
+  });
+
+  const setRef = useCallback(
+    (node: HTMLElement | null) => {
+      setSortRef(node);
+      if (isCollection) setCollectionDropRef(node);
+    },
+    [setSortRef, setCollectionDropRef, isCollection]
+  );
+
+  // Only show sort shift animation in custom sort mode
+  const style = {
+    transform: sortMode === "custom" ? CSS.Transform.toString(transform) : undefined,
+    transition: sortMode === "custom" ? transition : undefined,
+  };
+
   const [isRenaming, setIsRenaming] = useState(false);
   const [renameLoading, setRenameLoading] = useState(false);
   const [renameValue, setRenameValue] = useState("");
@@ -407,24 +438,26 @@ function CoverCard({
     <ContextMenu>
       <ContextMenuTrigger
         render={
-          <button
-            onClick={() =>
-              !isRenaming && onNavigate(entry)
-            }
+          <div
+            ref={setRef}
+            {...attributes}
+            {...listeners}
+            onClick={() => !isRenaming && !isDragging && onNavigate(entry)}
           />
         }
-        className="group flex flex-col items-center gap-2 rounded-md p-2 text-left hover:bg-accent"
-        style={{ maxWidth: size }}
+        className={`group flex flex-col items-center gap-2 rounded-md p-2 text-left hover:bg-accent ${
+          isDragging ? "opacity-0" : ""
+        } ${isOver && isDragActive ? "ring-2 ring-primary ring-offset-2" : ""}`}
+        style={{ ...style, maxWidth: size }}
       >
-        <div
-          className="relative overflow-hidden rounded-md bg-muted"
-        >
+        <div className="relative overflow-hidden rounded-md bg-muted">
           {coverSrc ? (
             <img
               src={coverSrc}
               alt={entry.title}
-              className="w-full"
+              className="pointer-events-none w-full"
               style={{ maxHeight: size * 2 }}
+              draggable={false}
             />
           ) : (
             <div
@@ -437,7 +470,7 @@ function CoverCard({
               />
             </div>
           )}
-          {entry.entry_type === "collection" && (
+          {isCollection && (
             <div className="absolute bottom-1 right-1 rounded-sm bg-black/60 px-1.5 py-0.5 text-xs text-white">
               Collection
             </div>
@@ -492,73 +525,24 @@ function CoverCard({
   );
 }
 
-function SortableCoverCard({
-  entry,
-  size,
-  getCoverUrl,
-}: {
-  entry: MediaEntry;
-  size: number;
-  getCoverUrl: (filePath: string) => string;
-}) {
-  const {
-    attributes,
-    listeners,
-    setNodeRef,
-    transform,
-    transition,
-    isDragging,
-  } = useSortable({ id: entry.id });
+function MoveUpDropZone({ isActive }: { isActive: boolean }) {
+  const { setNodeRef, isOver } = useDroppable({
+    id: "move-up-zone",
+  });
 
-  const style = {
-    transform: CSS.Transform.toString(transform),
-    transition,
-    opacity: isDragging ? 0 : 1,
-  };
-
-  const coverPath = getDisplayCover(entry);
-  const coverSrc = coverPath ? getCoverUrl(coverPath) : null;
+  if (!isActive) return null;
 
   return (
     <div
       ref={setNodeRef}
-      style={{ ...style, maxWidth: size }}
-      {...attributes}
-      {...listeners}
-      className="group flex cursor-grab flex-col items-center gap-2 rounded-md p-2 text-left hover:bg-accent active:cursor-grabbing"
+      className={`mb-4 flex items-center justify-center gap-2 rounded-lg border-2 border-dashed px-4 py-3 text-sm transition-colors ${
+        isOver
+          ? "border-primary bg-primary/10 text-primary"
+          : "border-muted-foreground/30 text-muted-foreground"
+      }`}
     >
-      <div
-        className="relative overflow-hidden rounded-md bg-muted"
-      >
-        {coverSrc ? (
-          <img
-            src={coverSrc}
-            alt={entry.title}
-            className="pointer-events-none w-full"
-            style={{ maxHeight: size * 2 }}
-            draggable={false}
-          />
-        ) : (
-          <div
-            className="flex items-center justify-center"
-            style={{ height: size * 1.5 }}
-          >
-            <Folder
-              size={size * 0.3}
-              className="text-muted-foreground/30"
-            />
-          </div>
-        )}
-        <div className="absolute top-1 left-1 rounded-sm bg-black/60 p-1 text-white">
-          <GripVertical size={14} />
-        </div>
-      </div>
-      <div className="w-full">
-        <p className="text-sm font-medium">{entry.title}</p>
-        {entry.year && (
-          <p className="text-xs text-muted-foreground">{entry.year}</p>
-        )}
-      </div>
+      <ArrowUp size={16} />
+      Move up a level
     </div>
   );
 }
@@ -597,9 +581,6 @@ function DragOverlayCard({
             />
           </div>
         )}
-        <div className="absolute top-1 left-1 rounded-sm bg-black/60 p-1 text-white">
-          <GripVertical size={14} />
-        </div>
       </div>
       <div className="w-full" style={{ maxWidth: size }}>
         <p className="text-sm font-medium">{entry.title}</p>
