@@ -156,7 +156,7 @@ export function CreateLibraryDialog({
   return (
     <Dialog open={isOpen} onOpenChange={handleDialogClose}>
       <DialogContent className="sm:max-w-md overflow-hidden flex flex-col px-0 gap-0">
-        <DialogHeader className="px-4">
+        <DialogHeader className="px-4 pb-2">
           <DialogTitle>Create Library</DialogTitle>
         </DialogHeader>
         <div className="grid gap-6 py-4 px-4 overflow-y-auto min-h-0">
