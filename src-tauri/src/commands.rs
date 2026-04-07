@@ -2675,6 +2675,123 @@ pub async fn move_entry(
 }
 
 #[tauri::command]
+pub async fn create_collection(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    name: String,
+    parent_id: Option<i64>,
+) -> Result<(), String> {
+    let row: Option<(String, i32, String, i32, String)> = sqlx::query_as(
+        "SELECT paths, portable, db_filename, managed, format FROM libraries WHERE id = ?",
+    )
+    .bind(&library_id)
+    .fetch_optional(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let (paths_json, portable, db_filename, managed, format) = row.ok_or("Library not found")?;
+    if format != "video" {
+        return Err("Collections are only supported for video libraries".to_string());
+    }
+
+    let lib_paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
+
+    let db_path = if portable != 0 {
+        PathBuf::from(&lib_paths[0]).join(".waverunner.db")
+    } else {
+        state.app_data_dir.join(&db_filename)
+    };
+
+    let pool = crate::db::connect_library_pool(&db_path)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let safe_name = sanitize_filename(&name);
+    if safe_name.is_empty() {
+        pool.close().await;
+        return Err("Invalid collection name".to_string());
+    }
+
+    // Determine the parent folder path on disk
+    let parent_folder = if let Some(pid) = parent_id {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT folder_path FROM media_entry WHERE id = ?",
+        )
+        .bind(pid)
+        .fetch_optional(&pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        row.ok_or("Parent entry not found")?.0
+    } else {
+        String::new()
+    };
+
+    let rel_path = if parent_folder.is_empty() {
+        safe_name.clone()
+    } else {
+        format!("{}\\{}", parent_folder, safe_name)
+    };
+
+    // For managed libraries, create the folder on disk
+    if managed != 0 {
+        let lib_base = PathBuf::from(&lib_paths[0]);
+        let full_path = lib_base.join(&rel_path);
+        if full_path.exists() {
+            pool.close().await;
+            return Err(format!("A folder named '{}' already exists", safe_name));
+        }
+        std::fs::create_dir_all(&full_path)
+            .map_err(|e| format!("Failed to create folder: {}", e))?;
+    }
+
+    // Get the collection entry type id
+    let collection_type_id: (i64,) =
+        sqlx::query_as("SELECT id FROM media_entry_type WHERE name = 'collection'")
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| e.to_string())?;
+
+    // Determine sort_order (append at end)
+    let max_order: (i64,) = if parent_id.is_some() {
+        sqlx::query_as("SELECT COALESCE(MAX(sort_order), -1) FROM media_entry WHERE parent_id = ?")
+            .bind(parent_id)
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| e.to_string())?
+    } else {
+        sqlx::query_as("SELECT COALESCE(MAX(sort_order), -1) FROM media_entry WHERE parent_id IS NULL")
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| e.to_string())?
+    };
+
+    let sort_title = generate_sort_title(&name, "en");
+
+    let result = sqlx::query(
+        "INSERT INTO media_entry (parent_id, entry_type_id, title, folder_path, sort_title, sort_order) VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(parent_id)
+    .bind(collection_type_id.0)
+    .bind(&name)
+    .bind(&rel_path)
+    .bind(&sort_title)
+    .bind(max_order.0 + 1)
+    .execute(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let entry_id = result.last_insert_rowid();
+    sqlx::query("INSERT INTO collection (id) VALUES (?)")
+        .bind(entry_id)
+        .execute(&pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    pool.close().await;
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn set_cover(
     state: tauri::State<'_, AppState>,
     library_id: String,
@@ -2962,31 +3079,63 @@ async fn rescan_video_library(
                 .await
                 .map_err(|e| e.to_string())?;
         } else {
-            // Movie (leaf)
-            let result = sqlx::query(
-                "INSERT INTO media_entry (parent_id, entry_type_id, title, folder_path, sort_title, sort_order, year) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(parent_id)
-            .bind(movie_type_id.0)
-            .bind(&title)
-            .bind(rel_path)
-            .bind(&sort_title)
-            .bind(sort_order)
-            .bind(&year)
-            .execute(pool)
-            .await
-            .map_err(|e| e.to_string())?;
+            let has_video = std::fs::read_dir(&full_path)
+                .map(|rd| rd.filter_map(|e| e.ok()).any(|e| is_media_file(&e.path(), VIDEO_EXTENSIONS)))
+                .unwrap_or(false);
 
-            let entry_id = result.last_insert_rowid();
-            sqlx::query("INSERT INTO movie (id) VALUES (?)")
-                .bind(entry_id)
+            if has_video {
+                // Movie (leaf with video files)
+                let result = sqlx::query(
+                    "INSERT INTO media_entry (parent_id, entry_type_id, title, folder_path, sort_title, sort_order, year) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(parent_id)
+                .bind(movie_type_id.0)
+                .bind(&title)
+                .bind(rel_path)
+                .bind(&sort_title)
+                .bind(sort_order)
+                .bind(&year)
                 .execute(pool)
                 .await
                 .map_err(|e| e.to_string())?;
 
-            cache_entry_images(pool, cache_base, base_path, rel_path)
+                let entry_id = result.last_insert_rowid();
+                sqlx::query("INSERT INTO movie (id) VALUES (?)")
+                    .bind(entry_id)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                cache_entry_images(pool, cache_base, base_path, rel_path)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            } else {
+                // Empty folder → collection
+                let result = sqlx::query(
+                    "INSERT INTO media_entry (parent_id, entry_type_id, title, folder_path, sort_title, sort_order, year) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(parent_id)
+                .bind(collection_type_id.0)
+                .bind(&title)
+                .bind(rel_path)
+                .bind(&sort_title)
+                .bind(sort_order)
+                .bind(&year)
+                .execute(pool)
                 .await
                 .map_err(|e| e.to_string())?;
+
+                let entry_id = result.last_insert_rowid();
+                sqlx::query("INSERT INTO collection (id) VALUES (?)")
+                    .bind(entry_id)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                cache_entry_images(pool, cache_base, base_path, rel_path)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
         }
     }
 
@@ -4542,8 +4691,12 @@ async fn scan_video_dir(
         .to_string_lossy()
         .to_string();
 
-    if subdirs.is_empty() {
-        // Movie (leaf node)
+    let has_video_files = subdirs.is_empty() && std::fs::read_dir(dir)
+        .map(|rd| rd.filter_map(|e| e.ok()).any(|e| is_media_file(&e.path(), VIDEO_EXTENSIONS)))
+        .unwrap_or(false);
+
+    if has_video_files {
+        // Movie (leaf node with video files)
         let result = sqlx::query(
             "INSERT INTO media_entry (parent_id, entry_type_id, title, folder_path, sort_title, sort_order, year) VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
@@ -4565,7 +4718,7 @@ async fn scan_video_dir(
 
         cache_entry_images(pool, cache_base, base_path, &rel_path).await?;
     } else {
-        // Collection
+        // Collection (has subdirs, or empty folder)
         let result = sqlx::query(
             "INSERT INTO media_entry (parent_id, entry_type_id, title, folder_path, sort_title, sort_order, year) VALUES (?, ?, ?, ?, ?, ?, ?)",
         )

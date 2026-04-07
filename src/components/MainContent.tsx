@@ -79,6 +79,9 @@ import {
   Play,
   Image as ImageIcon,
   LibraryBig,
+  FolderPlus,
+  Film,
+  Tv,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
@@ -111,6 +114,7 @@ interface MainContentProps {
   onRenameEntry: (entryId: number, newTitle: string) => Promise<string | null>;
   onSetCover: (entryId: number, coverPath: string | null) => void;
   onMoveEntry: (entryId: number, newParentId: number | null, insertBeforeId: number | null) => Promise<void>;
+  onCreateCollection: (name: string) => Promise<void>;
   getCoverUrl: (filePath: string) => string;
   getFullCoverUrl: (filePath: string) => string;
   scrollContainerRef: RefObject<HTMLDivElement | null>;
@@ -136,6 +140,7 @@ export function MainContent({
   onRenameEntry,
   onSetCover,
   onMoveEntry,
+  onCreateCollection,
   getCoverUrl,
   getFullCoverUrl,
   scrollContainerRef,
@@ -147,6 +152,8 @@ export function MainContent({
   const filteredEntries = isSearching ? searchResults : entries;
 
   const [dragId, setDragId] = useState<number | null>(null);
+  const [newCollectionOpen, setNewCollectionOpen] = useState(false);
+  const [newCollectionName, setNewCollectionName] = useState("");
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { delay: 500, tolerance: 5 } })
@@ -283,7 +290,8 @@ export function MainContent({
       )}
 
       {/* Content */}
-      <div ref={scrollContainerRef} className="flex-1 overflow-y-auto overflow-x-hidden p-4">
+      <ContextMenu>
+        <ContextMenuTrigger render={<div ref={scrollContainerRef} className="flex-1 overflow-y-auto overflow-x-hidden p-4" />}>
         {selectedEntry ? (
           selectedEntry.entry_type === "show"
             ? <ShowDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getFullCoverUrl={getFullCoverUrl} />
@@ -358,7 +366,53 @@ export function MainContent({
             </DragOverlay>
           </DndContext>
         )}
-      </div>
+        </ContextMenuTrigger>
+        {selectedLibrary?.format === "video" && !selectedEntry && (
+          <ContextMenuContent>
+            <ContextMenuItem onClick={() => { setNewCollectionName(""); setNewCollectionOpen(true); }}>
+              <FolderPlus size={14} />
+              New Collection
+            </ContextMenuItem>
+          </ContextMenuContent>
+        )}
+      </ContextMenu>
+
+      {/* New Collection Dialog */}
+      <Dialog open={newCollectionOpen} onOpenChange={setNewCollectionOpen}>
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle>New Collection</DialogTitle>
+          </DialogHeader>
+          <div className="py-2">
+            <Input
+              value={newCollectionName}
+              onChange={(e) => setNewCollectionName(e.target.value)}
+              placeholder="Collection name"
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && newCollectionName.trim()) {
+                  onCreateCollection(newCollectionName.trim());
+                  setNewCollectionOpen(false);
+                }
+              }}
+              autoFocus
+            />
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setNewCollectionOpen(false)}>
+              Cancel
+            </Button>
+            <Button
+              disabled={!newCollectionName.trim()}
+              onClick={() => {
+                onCreateCollection(newCollectionName.trim());
+                setNewCollectionOpen(false);
+              }}
+            >
+              Create
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* Cover Carousel Dialog */}
       {coverDialogEntry && (
@@ -495,12 +549,15 @@ function SortableCoverCard({
           ) : (
             <div
               className="flex items-center justify-center"
-              style={{ height: size * 1.5 }}
+              style={{ height: size * 1.5, width: size - 16 }}
             >
-              <Folder
-                size={size * 0.3}
-                className="text-muted-foreground/30"
-              />
+              {entry.entry_type === "movie" ? (
+                <Film size={size * 0.3} className="text-muted-foreground" />
+              ) : entry.entry_type === "show" ? (
+                <Tv size={size * 0.3} className="text-muted-foreground" />
+              ) : (
+                <Folder size={size * 0.3} className="text-muted-foreground" />
+              )}
             </div>
           )}
           {isCollection && (
@@ -608,10 +665,13 @@ function DragOverlayCard({
             className="flex items-center justify-center"
             style={{ height: size * 1.5, width: size }}
           >
-            <Folder
-              size={size * 0.3}
-              className="text-muted-foreground/30"
-            />
+            {entry.entry_type === "movie" ? (
+              <Film size={size * 0.3} className="text-muted-foreground" />
+            ) : entry.entry_type === "show" ? (
+              <Tv size={size * 0.3} className="text-muted-foreground" />
+            ) : (
+              <Folder size={size * 0.3} className="text-muted-foreground" />
+            )}
           </div>
         )}
       </div>

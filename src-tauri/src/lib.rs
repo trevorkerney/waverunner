@@ -68,6 +68,7 @@ pub fn run() {
             commands::update_sort_order,
             commands::rename_entry,
             commands::move_entry,
+            commands::create_collection,
             commands::set_cover,
             commands::rescan_library,
             commands::detect_players,

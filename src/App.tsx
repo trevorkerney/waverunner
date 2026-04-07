@@ -386,6 +386,25 @@ function App() {
     [selectedLibrary, breadcrumbs, invalidateCache, preloadCovers]
   );
 
+  const createCollection = useCallback(
+    async (name: string) => {
+      if (!selectedLibrary) return;
+      try {
+        const parentId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
+        await invoke("create_collection", {
+          libraryId: selectedLibrary.id,
+          name,
+          parentId,
+        });
+        invalidateCache(selectedLibrary.id, parentId);
+        await loadEntries(selectedLibrary, parentId, breadcrumbs);
+      } catch (e) {
+        toast.error(String(e));
+      }
+    },
+    [selectedLibrary, breadcrumbs, invalidateCache, loadEntries]
+  );
+
   const setCover = useCallback(
     async (entryId: number, coverPath: string | null) => {
       if (!selectedLibrary) return;
@@ -475,6 +494,7 @@ function App() {
           onRenameEntry={renameEntry}
           onSetCover={setCover}
           onMoveEntry={moveEntry}
+          onCreateCollection={createCollection}
           getCoverUrl={getCoverUrl}
           getFullCoverUrl={getFullCoverUrl}
           scrollContainerRef={scrollContainerRef}

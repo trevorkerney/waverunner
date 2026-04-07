@@ -18,8 +18,17 @@ on the first time someone sets sort mode to custom OR creates a collection, show
 
 go through everything ensuring compatibility with MacOS and Linux
 
+custom collections / playlists / whatever you want to call it - user should be able to create custom collections 
+
 
 
 # BIG STUFF NOW
+
+fix blank cover width
+
+ability to import media not currently on media drive. however this is done can potentially provide another method of making collections as well
+
+ability to delete media and collections, needs confirmation modal unless empty collection
+- for media on managed libraries, give user option to actually delete media or not and remind them that if they choose no, a rescan will make it return
 
 TMDB metadata integration (toggle per library, title resolution: file metadata > folder name > TMDB search)

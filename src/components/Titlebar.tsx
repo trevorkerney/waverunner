@@ -87,7 +87,7 @@ export function Titlebar() {
   return (
     <div
       data-tauri-drag-region
-      className="flex h-6 select-none items-center bg-background"
+      className="flex h-6 select-none items-center border-b bg-background"
     >
       <img src="/logo256.png" alt="Waverunner" className="ml-2 h-4 w-4" draggable={false} />
       <Menubar className="border-none rounded-none h-6 px-1 ml-1">
