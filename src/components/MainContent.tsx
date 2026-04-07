@@ -483,7 +483,7 @@ function SortableCoverCard({
         } ${isOver && isDragActive ? "ring-2 ring-primary ring-offset-2" : ""}`}
         style={{ ...style, maxWidth: size }}
       >
-        <div className="relative overflow-hidden rounded-md bg-muted">
+        <div className="relative overflow-hidden rounded-sm bg-muted">
           {coverSrc ? (
             <img
               src={coverSrc}
@@ -594,7 +594,7 @@ function DragOverlayCard({
 
   return (
     <div className="flex cursor-grabbing flex-col items-center gap-2 rounded-md bg-accent p-2 text-left shadow-lg">
-      <div className="relative overflow-hidden rounded-md bg-muted">
+      <div className="relative overflow-hidden rounded-sm bg-muted">
         {coverSrc ? (
           <img
             src={coverSrc}

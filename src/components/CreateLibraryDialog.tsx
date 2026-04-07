@@ -118,7 +118,7 @@ export function CreateLibraryDialog({
     try {
       await invoke("create_library", { name, paths: validPaths, format, portable, managed });
       if (toastIdRef.current != null) {
-        toast.success(`Library "${name}" created`, { id: toastIdRef.current, duration: 4000 });
+        toast.success(`Library "${name}" created`, { id: toastIdRef.current, duration: 4000, action: undefined });
         toastIdRef.current = null;
       }
       onCreated();
@@ -132,7 +132,7 @@ export function CreateLibraryDialog({
       const msg = String(e);
       if (msg.includes("cancelled")) {
         if (toastIdRef.current != null) {
-          toast.info("Library creation cancelled", { id: toastIdRef.current, duration: 3000 });
+          toast.info("Library creation cancelled", { id: toastIdRef.current, duration: 3000, action: undefined });
           toastIdRef.current = null;
         }
         onOpenChange(false);
@@ -142,7 +142,7 @@ export function CreateLibraryDialog({
         setFormat("video");
         setPortable(false);
       } else if (toastIdRef.current != null) {
-        toast.error(msg, { id: toastIdRef.current, duration: 4000 });
+        toast.error(msg, { id: toastIdRef.current, duration: 4000, action: undefined });
         toastIdRef.current = null;
       } else {
         toast.error(msg);

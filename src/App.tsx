@@ -334,15 +334,17 @@ function App() {
           entryId,
           newTitle,
         });
+        setEntries((prev) =>
+          prev.map((e) => (e.id === entryId ? { ...e, title: newTitle } : e))
+        );
         const parentId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
         invalidateCache(selectedLibrary.id, parentId);
-        await loadEntries(selectedLibrary, parentId, breadcrumbs);
         return null;
       } catch (e) {
         return String(e);
       }
     },
-    [selectedLibrary, breadcrumbs, loadEntries, invalidateCache]
+    [selectedLibrary, breadcrumbs, invalidateCache]
   );
 
   const moveEntry = useCallback(
