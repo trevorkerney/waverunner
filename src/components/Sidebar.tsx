@@ -9,6 +9,15 @@ import {
   ContextMenuContent,
   ContextMenuItem,
 } from "@/components/ui/context-menu";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+} from "@/components/ui/dialog";
+import { Button } from "@/components/ui/button";
 import { CreateLibraryDialog } from "@/components/CreateLibraryDialog";
 import { Library } from "@/types";
 
@@ -37,6 +46,7 @@ export function Sidebar({
   const [collapsed, setCollapsed] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [dialogOpen, setDialogOpen] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<Library | null>(null);
   const widthBeforeCollapse = useRef(DEFAULT_WIDTH);
   const didDrag = useRef(false);
   const isResizing = useRef(false);
@@ -141,14 +151,7 @@ export function Sidebar({
                     Rescan
                   </ContextMenuItem>
                   <ContextMenuItem
-                    onClick={async () => {
-                      try {
-                        await invoke("delete_library", { libraryId: lib.id });
-                        onLibraryDeleted();
-                      } catch (err) {
-                        toast.error(String(err));
-                      }
-                    }}
+                    onClick={() => setDeleteTarget(lib)}
                     className="text-destructive focus:text-destructive"
                   >
                     <Trash2 size={14} />
@@ -172,6 +175,36 @@ export function Sidebar({
         onOpenChange={setDialogOpen}
         onCreated={onLibraryCreated}
       />
+      <Dialog open={deleteTarget !== null} onOpenChange={(open) => { if (!open) setDeleteTarget(null); }}>
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle>Delete library?</DialogTitle>
+            <DialogDescription>
+              Are you sure you want to delete "{deleteTarget?.name}"? This cannot be undone.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setDeleteTarget(null)}>
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={async () => {
+                if (!deleteTarget) return;
+                try {
+                  await invoke("delete_library", { libraryId: deleteTarget.id });
+                  setDeleteTarget(null);
+                  onLibraryDeleted();
+                } catch (err) {
+                  toast.error(String(err));
+                }
+              }}
+            >
+              Delete
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
