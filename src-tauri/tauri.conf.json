@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "waverunner",
-  "version": "0.1.0",
+  "version": "1.0.0-alpha.1",
   "identifier": "com.trevorkerney.waverunner",
   "build": {
     "beforeDevCommand": "pnpm dev",
@@ -13,8 +13,10 @@
     "windows": [
       {
         "title": "waverunner",
-        "width": 800,
-        "height": 600,
+        "width": 1280,
+        "height": 720,
+        "minWidth": 1280,
+        "minHeight": 720,
         "decorations": false
       }
     ],
@@ -30,8 +32,8 @@
   },
   "bundle": {
     "active": true,
-    "createUpdaterArtifacts": "v1Compatible",
-    "targets": "all",
+    "createUpdaterArtifacts": true,
+    "targets": ["nsis"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

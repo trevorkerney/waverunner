@@ -58,6 +58,12 @@ import {
 } from "@/components/ui/carousel";
 import { Spinner } from "@/components/ui/spinner";
 import {
+  Select,
+  SelectTrigger,
+  SelectContent,
+  SelectItem,
+} from "@/components/ui/select";
+import {
   Search,
   Folder,
   ArrowUpDown,
@@ -870,6 +876,10 @@ function ShowDetailPage({
   const [seasons, setSeasons] = useState<SeasonInfo[]>([]);
   const [selectedSeasonId, setSelectedSeasonId] = useState<number | null>(null);
   const [episodes, setEpisodes] = useState<EpisodeInfo[]>([]);
+  const selectedSeason = seasons.find((s) => s.id === selectedSeasonId);
+  const selectedSeasonLabel = selectedSeason
+    ? (selectedSeason.season_number != null ? `Season ${selectedSeason.season_number}` : selectedSeason.title)
+    : "Select season";
 
   useEffect(() => {
     (async () => {
@@ -927,21 +937,21 @@ function ShowDetailPage({
 
         {seasons.length > 0 && (
           <div className="flex flex-col gap-3">
-            <div className="flex gap-2">
-              {seasons.map((s) => (
-                <button
-                  key={s.id}
-                  onClick={() => setSelectedSeasonId(s.id)}
-                  className={`rounded-md px-3 py-1.5 text-sm ${
-                    s.id === selectedSeasonId
-                      ? "bg-primary text-primary-foreground"
-                      : "bg-muted text-muted-foreground hover:bg-accent"
-                  }`}
-                >
-                  {s.season_number != null ? `Season ${s.season_number}` : s.title}
-                </button>
-              ))}
-            </div>
+            <Select
+              value={String(selectedSeasonId)}
+              onValueChange={(val) => setSelectedSeasonId(Number(val))}
+            >
+              <SelectTrigger>
+                {selectedSeasonLabel}
+              </SelectTrigger>
+              <SelectContent>
+                {seasons.map((s) => (
+                  <SelectItem key={s.id} value={String(s.id)}>
+                    {s.season_number != null ? `Season ${s.season_number}` : s.title}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
 
             <div className="flex flex-col gap-1">
               {episodes.map((ep) => (

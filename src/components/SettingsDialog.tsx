@@ -77,7 +77,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="flex h-[480px] max-w-2xl gap-0 overflow-hidden p-0">
+      <DialogContent className="flex h-[576px] w-[1024px] gap-0 overflow-hidden p-0">
         {/* Sidebar */}
         <div className="flex w-44 shrink-0 flex-col border-r bg-muted/30 p-2">
           <p className="mb-2 px-2 pt-1 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
@@ -99,7 +99,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
           ))}
           {appVersion && (
             <p className="mt-auto px-2 pb-1 text-xs text-muted-foreground">
-              v{appVersion}-alpha
+              v{appVersion}
             </p>
           )}
         </div>

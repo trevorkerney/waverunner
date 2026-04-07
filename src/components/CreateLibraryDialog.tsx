@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -33,6 +33,8 @@ interface CreateLibraryDialogProps {
   onCreated: () => void;
 }
 
+let creatingGlobal = false;
+
 export function CreateLibraryDialog({
   open: isOpen,
   onOpenChange,
@@ -43,13 +45,17 @@ export function CreateLibraryDialog({
   const [paths, setPaths] = useState<string[]>([""]);
   const [format, setFormat] = useState("video");
   const [portable, setPortable] = useState(false);
-  const [creating, setCreating] = useState(false);
+  const [creating, setCreating] = useState(creatingGlobal);
   const [scanProgress, setScanProgress] = useState("");
+  const toastIdRef = useRef<string | number | null>(null);
 
   useEffect(() => {
     if (!creating) return;
     const unlisten = listen<string>("scan-progress", (event) => {
       setScanProgress(event.payload);
+      if (toastIdRef.current != null) {
+        toast.loading(event.payload, { id: toastIdRef.current, duration: Infinity });
+      }
     });
     return () => { unlisten.then((fn) => fn()); };
   }, [creating]);
@@ -79,12 +85,26 @@ export function CreateLibraryDialog({
 
   const validPaths = paths.filter((p) => p.trim() !== "");
 
+  function handleDialogClose(open: boolean) {
+    if (!open && creating && toastIdRef.current == null) {
+      toastIdRef.current = toast.loading(scanProgress || "Creating library...", {
+        duration: Infinity,
+      });
+    }
+    onOpenChange(open);
+  }
+
   async function handleCreate() {
-    if (!name || validPaths.length === 0) return;
+    if (!name || validPaths.length === 0 || creatingGlobal) return;
     setCreating(true);
+    creatingGlobal = true;
     setScanProgress("");
     try {
       await invoke("create_library", { name, paths: validPaths, format, portable, managed });
+      if (toastIdRef.current != null) {
+        toast.success(`Library "${name}" created`, { id: toastIdRef.current, duration: 4000 });
+        toastIdRef.current = null;
+      }
       onCreated();
       onOpenChange(false);
       setManaged(true);
@@ -93,14 +113,20 @@ export function CreateLibraryDialog({
       setFormat("video");
       setPortable(false);
     } catch (e) {
-      toast.error(String(e));
+      if (toastIdRef.current != null) {
+        toast.error(String(e), { id: toastIdRef.current, duration: 4000 });
+        toastIdRef.current = null;
+      } else {
+        toast.error(String(e));
+      }
     } finally {
       setCreating(false);
+      creatingGlobal = false;
     }
   }
 
   return (
-    <Dialog open={isOpen} onOpenChange={onOpenChange}>
+    <Dialog open={isOpen} onOpenChange={handleDialogClose}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>Create Library</DialogTitle>

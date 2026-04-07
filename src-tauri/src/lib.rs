@@ -18,9 +18,10 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
+            let folder = if cfg!(debug_assertions) { "waverunner_dev" } else { "waverunner" };
             let app_data_dir = dirs::data_local_dir()
                 .expect("failed to get local app data dir")
-                .join("waverunner");
+                .join(folder);
             std::fs::create_dir_all(&app_data_dir)
                 .expect("failed to create app data dir");
 
@@ -32,6 +33,12 @@ pub fn run() {
                 app_data_dir,
                 app_db,
             });
+
+            if cfg!(debug_assertions) {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.set_title("waverunner_dev");
+                }
+            }
 
             Ok(())
         })

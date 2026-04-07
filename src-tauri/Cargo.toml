@@ -1,7 +1,7 @@
 [package]
 name = "waverunner"
-version = "0.1.0"
-description = "A Tauri App"
+version = "1.0.0-alpha.1"
+description = "Media library"
 authors = ["you"]
 edition = "2021"
 
