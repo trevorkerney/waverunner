@@ -17,10 +17,10 @@ fn generate_sort_title(title: &str, language: &str) -> String {
     let lower = title.to_lowercase();
     for article in articles {
         if lower.starts_with(article) {
-            return title[article.len()..].to_string();
+            return lower[article.len()..].to_string();
         }
     }
-    title.to_string()
+    lower
 }
 
 fn sanitize_filename(name: &str) -> String {
@@ -604,9 +604,9 @@ pub async fn get_entries(
             };
 
             let order_clause = match sort_mode.as_str() {
-                "year" => "ORDER BY me.year ASC, me.sort_title ASC",
-                "custom" => "ORDER BY me.sort_order ASC, me.sort_title ASC",
-                _ => "ORDER BY me.sort_title ASC",
+                "year" => "ORDER BY me.year ASC, me.sort_title COLLATE NOCASE ASC",
+                "custom" => "ORDER BY me.sort_order ASC, me.sort_title COLLATE NOCASE ASC",
+                _ => "ORDER BY me.sort_title COLLATE NOCASE ASC",
             };
 
             let query_str = match parent_id {
@@ -662,9 +662,9 @@ pub async fn get_entries(
         }
         "tv" => {
             let order_clause = match default_sort_mode.as_str() {
-                "year" => "ORDER BY year ASC, sort_title ASC",
-                "custom" => "ORDER BY sort_order ASC, sort_title ASC",
-                _ => "ORDER BY sort_title ASC",
+                "year" => "ORDER BY year ASC, sort_title COLLATE NOCASE ASC",
+                "custom" => "ORDER BY sort_order ASC, sort_title COLLATE NOCASE ASC",
+                _ => "ORDER BY sort_title COLLATE NOCASE ASC",
             };
 
             let query_str = format!(
@@ -705,8 +705,8 @@ pub async fn get_entries(
         }
         "music" => {
             let order_clause = match default_sort_mode.as_str() {
-                "custom" => "ORDER BY sort_order ASC, sort_name ASC",
-                _ => "ORDER BY sort_name ASC",
+                "custom" => "ORDER BY sort_order ASC, sort_name COLLATE NOCASE ASC",
+                _ => "ORDER BY sort_name COLLATE NOCASE ASC",
             };
 
             let query_str = format!(
@@ -762,9 +762,9 @@ pub async fn get_entries(
             };
 
             let order_clause = match sort_mode.as_str() {
-                "year" => "ORDER BY year ASC, sort_title ASC",
-                "custom" => "ORDER BY sort_order ASC, sort_title ASC",
-                _ => "ORDER BY sort_title ASC",
+                "year" => "ORDER BY year ASC, sort_title COLLATE NOCASE ASC",
+                "custom" => "ORDER BY sort_order ASC, sort_title COLLATE NOCASE ASC",
+                _ => "ORDER BY sort_title COLLATE NOCASE ASC",
             };
 
             let query_str = match parent_id {
@@ -871,13 +871,13 @@ pub async fn search_entries(
                     FROM media_entry me \
                     JOIN media_entry_type met ON me.entry_type_id = met.id \
                     WHERE me.id IN (SELECT id FROM descendants) AND me.title LIKE ? \
-                    ORDER BY me.sort_title ASC",
+                    ORDER BY me.sort_title COLLATE NOCASE ASC",
                 None => "\
                     SELECT me.id, me.title, me.year, me.end_year, me.folder_path, me.parent_id, met.name as entry_type, me.selected_cover \
                     FROM media_entry me \
                     JOIN media_entry_type met ON me.entry_type_id = met.id \
                     WHERE me.title LIKE ? \
-                    ORDER BY me.sort_title ASC",
+                    ORDER BY me.sort_title COLLATE NOCASE ASC",
             };
 
             let rows: Vec<(i64, String, Option<String>, Option<String>, String, Option<i64>, String, Option<String>)> = match parent_id {
@@ -907,7 +907,7 @@ pub async fn search_entries(
         "tv" => {
             let rows: Vec<(i64, String, Option<String>, String, Option<String>)> =
                 sqlx::query_as(
-                    "SELECT id, title, year, folder_path, selected_cover FROM shows WHERE title LIKE ? ORDER BY sort_title ASC",
+                    "SELECT id, title, year, folder_path, selected_cover FROM shows WHERE title LIKE ? ORDER BY sort_title COLLATE NOCASE ASC",
                 )
                 .bind(&like_pattern)
                 .fetch_all(&pool)
@@ -924,7 +924,7 @@ pub async fn search_entries(
         "music" => {
             let rows: Vec<(i64, String, String, Option<String>)> =
                 sqlx::query_as(
-                    "SELECT id, name, folder_path, selected_cover FROM artists WHERE name LIKE ? ORDER BY sort_name ASC",
+                    "SELECT id, name, folder_path, selected_cover FROM artists WHERE name LIKE ? ORDER BY sort_name COLLATE NOCASE ASC",
                 )
                 .bind(&like_pattern)
                 .fetch_all(&pool)
@@ -949,10 +949,10 @@ pub async fn search_entries(
                     ) \
                     SELECT id, title, year, folder_path, parent_id, is_collection, selected_cover \
                     FROM movie WHERE id IN (SELECT id FROM descendants) AND title LIKE ? \
-                    ORDER BY sort_title ASC",
+                    ORDER BY sort_title COLLATE NOCASE ASC",
                 None => "\
                     SELECT id, title, year, folder_path, parent_id, is_collection, selected_cover \
-                    FROM movie WHERE title LIKE ? ORDER BY sort_title ASC",
+                    FROM movie WHERE title LIKE ? ORDER BY sort_title COLLATE NOCASE ASC",
             };
 
             let rows: Vec<(i64, String, Option<String>, String, Option<i64>, i32, Option<String>)> = match parent_id {
@@ -2890,8 +2890,33 @@ pub async fn delete_entry(
         if let Some(root) = resolve_entry_root(&lib_paths, &folder_path) {
             let full_path = PathBuf::from(root).join(&folder_path);
             if full_path.exists() {
-                std::fs::remove_dir_all(&full_path)
-                    .map_err(|e| format!("Failed to delete folder: {}", e))?;
+                // Read recycle bin threshold setting
+                let threshold_gb: i64 = sqlx::query_as::<_, (String,)>(
+                    "SELECT value FROM settings WHERE key = 'recycle_bin_max_gb'",
+                )
+                .fetch_optional(&state.app_db)
+                .await
+                .map_err(|e| e.to_string())?
+                .and_then(|(v,)| v.parse().ok())
+                .unwrap_or(50); // default 50 GB
+
+                let use_trash = if threshold_gb < 0 {
+                    true // always recycle
+                } else if threshold_gb == 0 {
+                    false // always permanent
+                } else {
+                    let size_bytes = dir_size(&full_path);
+                    let threshold_bytes = threshold_gb as u64 * 1_073_741_824;
+                    size_bytes <= threshold_bytes
+                };
+
+                if use_trash {
+                    trash::delete(&full_path)
+                        .map_err(|e| format!("Failed to send to Recycle Bin: {}", e))?;
+                } else {
+                    std::fs::remove_dir_all(&full_path)
+                        .map_err(|e| format!("Failed to delete folder: {}", e))?;
+                }
             }
         }
     }
@@ -4242,6 +4267,21 @@ async fn get_all_cached_covers(pool: &sqlx::SqlitePool) -> Result<HashMap<String
         map.entry(folder_path).or_default().push(cached_path);
     }
     Ok(map)
+}
+
+fn dir_size(path: &Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let p = entry.path();
+            if p.is_dir() {
+                total += dir_size(&p);
+            } else if let Ok(meta) = p.metadata() {
+                total += meta.len();
+            }
+        }
+    }
+    total
 }
 
 fn delete_cache_for_library(app_data_dir: &Path, library_id: &str) {

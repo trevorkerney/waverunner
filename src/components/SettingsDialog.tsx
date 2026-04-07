@@ -7,9 +7,27 @@ import {
   DialogContent,
 } from "@/components/ui/dialog";
 import { Switch } from "@/components/ui/switch";
+import { Slider } from "@/components/ui/slider";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { Settings, Download } from "lucide-react";
+
+const RECYCLE_STEPS = [0, 1, 2, 5, 10, 25, 50, 100, 250, -1];
+const RECYCLE_DEFAULT_STEP = 6; // 50 GB
+
+function recycleValueToStep(value: string | undefined): number {
+  if (!value) return RECYCLE_DEFAULT_STEP;
+  const num = parseInt(value, 10);
+  const idx = RECYCLE_STEPS.indexOf(num);
+  return idx >= 0 ? idx : RECYCLE_DEFAULT_STEP;
+}
+
+function recycleStepLabel(step: number): string {
+  const val = RECYCLE_STEPS[step];
+  if (val === 0) return "Always permanently delete";
+  if (val === -1) return "Always send to Recycle Bin";
+  return `Send to Recycle Bin if under ${val} GB, otherwise permanently delete`;
+}
 
 const UPDATE_ENDPOINT =
   "https://github.com/trevorkerney/waverunner/releases/latest/download/latest.json";
@@ -162,6 +180,30 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                       </Button>
                     )}
                   </div>
+                </div>
+              </div>
+              <div>
+                <h3 className="mb-4 text-sm font-semibold">Deletion</h3>
+                <div className="flex flex-col gap-3">
+                  <div>
+                    <p className="text-sm">Recycle Bin Threshold</p>
+                    <p className="text-xs text-muted-foreground">
+                      When deleting media from managed libraries, folders under this size are sent to the Recycle Bin instead of being permanently deleted.
+                    </p>
+                  </div>
+                  <Slider
+                    value={[recycleValueToStep(settings["recycle_bin_max_gb"])]}
+                    onValueChange={(v) => {
+                      const step = Array.isArray(v) ? v[0] : v;
+                      setSetting("recycle_bin_max_gb", String(RECYCLE_STEPS[step]));
+                    }}
+                    min={0}
+                    max={RECYCLE_STEPS.length - 1}
+                    step={1}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    {recycleStepLabel(recycleValueToStep(settings["recycle_bin_max_gb"]))}
+                  </p>
                 </div>
               </div>
             </div>

@@ -28,4 +28,4 @@ ability to import media not currently on media drive. however this is done can p
 
 TMDB metadata integration (toggle per library, title resolution: file metadata > folder name > TMDB search)
 
-when deleting things in managed mode that deletes files/folders, send to recycle bin under a given threshold
+consider some sort of movie/show separation for the sidebar

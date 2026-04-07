@@ -19,6 +19,7 @@ import {
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
 import { Slider } from "@/components/ui/slider";
 import {
   Breadcrumb,
@@ -159,7 +160,19 @@ export function MainContent({
   const [newCollectionName, setNewCollectionName] = useState("");
   const [newCollectionPath, setNewCollectionPath] = useState("");
   const [deleteTarget, setDeleteTarget] = useState<MediaEntry | null>(null);
+  const [deleteFromDisk, setDeleteFromDisk] = useState(false);
+  const [deleteConfirmText, setDeleteConfirmText] = useState("");
   const [deleteFilesWarning, setDeleteFilesWarning] = useState<MediaEntry | null>(null);
+  const [deletingId, setDeletingId] = useState<number | null>(null);
+
+  const handleDelete = useCallback(async (entryId: number, deleteFromDisk: boolean) => {
+    setDeletingId(entryId);
+    try {
+      await onDeleteEntry(entryId, deleteFromDisk);
+    } finally {
+      setDeletingId(null);
+    }
+  }, [onDeleteEntry]);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { delay: 500, tolerance: 5 } })
@@ -369,14 +382,15 @@ export function MainContent({
                             setDeleteFilesWarning(entry);
                             return;
                           }
-                          onDeleteEntry(entry.id, true);
+                          handleDelete(entry.id, true);
                         } else {
-                          onDeleteEntry(entry.id, false);
+                          handleDelete(entry.id, false);
                         }
                       } else {
                         setDeleteTarget(entry);
                       }
                     }}
+                    deletingId={deletingId}
                     getCoverUrl={getCoverUrl}
                     isDragActive={dragId != null}
                     sortMode={sortMode}
@@ -452,7 +466,7 @@ export function MainContent({
       </Dialog>
 
       {/* Delete Confirmation Dialog */}
-      <Dialog open={deleteTarget != null} onOpenChange={(open) => { if (!open) setDeleteTarget(null); }}>
+      <Dialog open={deleteTarget != null} onOpenChange={(open) => { if (!open) { setDeleteTarget(null); setDeleteFromDisk(false); setDeleteConfirmText(""); } }}>
         <DialogContent className="sm:max-w-sm">
           <DialogHeader>
             <DialogTitle>Delete {deleteTarget?.entry_type === "movie" ? "Movie" : deleteTarget?.entry_type === "show" ? "Show" : "Entry"}</DialogTitle>
@@ -460,46 +474,55 @@ export function MainContent({
           <p className="text-sm text-muted-foreground">
             Are you sure you want to delete &ldquo;{deleteTarget?.title}&rdquo;?
           </p>
-          {selectedLibrary?.managed ? (
-            <DialogFooter className="flex-col gap-2 sm:flex-col">
-              <Button
-                variant="outline"
-                onClick={() => {
-                  if (deleteTarget) onDeleteEntry(deleteTarget.id, false);
-                  setDeleteTarget(null);
-                }}
-              >
-                Remove from library
-              </Button>
-              <p className="text-xs text-muted-foreground text-center">
-                The folder will remain on disk. A rescan will bring it back.
-              </p>
-              <Button
-                variant="destructive"
-                onClick={() => {
-                  if (deleteTarget) onDeleteEntry(deleteTarget.id, true);
-                  setDeleteTarget(null);
-                }}
-              >
-                Delete from disk
-              </Button>
-            </DialogFooter>
-          ) : (
-            <DialogFooter>
-              <Button variant="outline" onClick={() => setDeleteTarget(null)}>
-                Cancel
-              </Button>
-              <Button
-                variant="destructive"
-                onClick={() => {
-                  if (deleteTarget) onDeleteEntry(deleteTarget.id, false);
-                  setDeleteTarget(null);
-                }}
-              >
-                Delete
-              </Button>
-            </DialogFooter>
+          {selectedLibrary?.managed && (
+            <div className="flex flex-col">
+              <div className="flex items-center justify-between">
+                <label className="text-sm">Delete from disk</label>
+                <Switch
+                  checked={deleteFromDisk}
+                  onCheckedChange={(checked) => { setDeleteFromDisk(checked); setDeleteConfirmText(""); }}
+                />
+              </div>
+              <div className="grid transition-[grid-template-rows] duration-200 ease-out" style={{ gridTemplateRows: deleteFromDisk ? "0fr" : "1fr" }}>
+                <div className="overflow-hidden">
+                  <p className="pt-2 text-xs text-muted-foreground">
+                    The folder will remain on disk. A rescan will bring it back.
+                  </p>
+                </div>
+              </div>
+              <div className="grid transition-[grid-template-rows] duration-200 ease-out" style={{ gridTemplateRows: deleteFromDisk ? "1fr" : "0fr" }}>
+                <div className="overflow-hidden">
+                  <div className="flex flex-col gap-2 px-1 pb-1 pt-2">
+                    <p className="text-xs text-muted-foreground">
+                      Type &ldquo;{deleteTarget?.title}&rdquo; to confirm.
+                    </p>
+                    <Input
+                      value={deleteConfirmText}
+                      onChange={(e) => setDeleteConfirmText(e.target.value)}
+                      placeholder={deleteTarget?.title ?? ""}
+                    />
+                  </div>
+                </div>
+              </div>
+            </div>
           )}
+          <DialogFooter>
+            <Button variant="outline" onClick={() => { setDeleteTarget(null); setDeleteFromDisk(false); setDeleteConfirmText(""); }}>
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              disabled={selectedLibrary?.managed && deleteFromDisk && deleteConfirmText !== deleteTarget?.title}
+              onClick={() => {
+                if (deleteTarget) handleDelete(deleteTarget.id, deleteFromDisk);
+                setDeleteTarget(null);
+                setDeleteFromDisk(false);
+                setDeleteConfirmText("");
+              }}
+            >
+              Delete
+            </Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
 
@@ -519,7 +542,7 @@ export function MainContent({
             <Button
               variant="destructive"
               onClick={() => {
-                if (deleteFilesWarning) onDeleteEntry(deleteFilesWarning.id, true);
+                if (deleteFilesWarning) handleDelete(deleteFilesWarning.id, true);
                 setDeleteFilesWarning(null);
               }}
             >
@@ -558,16 +581,18 @@ function SortableCoverCard({
   getCoverUrl,
   isDragActive,
   sortMode,
+  deletingId,
 }: {
   entry: MediaEntry;
   size: number;
   onNavigate: (entry: MediaEntry) => void;
   onRename: (entryId: number, newTitle: string) => Promise<string | null>;
   onChangeCover: () => void;
-  onDelete: (entry: MediaEntry) => void;
+  onDelete: (entry: MediaEntry) => Promise<void>;
   getCoverUrl: (filePath: string) => string;
   isDragActive: boolean;
   sortMode: string;
+  deletingId: number | null;
 }) {
   const {
     attributes,
@@ -602,6 +627,7 @@ function SortableCoverCard({
   const [isRenaming, setIsRenaming] = useState(false);
   const [renameLoading, setRenameLoading] = useState(false);
   const [renameValue, setRenameValue] = useState("");
+  const isDeleting = deletingId === entry.id;
   const renameInputRef = useRef<HTMLInputElement>(null);
   const submittedRef = useRef(false);
 
@@ -684,7 +710,12 @@ function SortableCoverCard({
           )}
         </div>
         <div className="w-full">
-          {renameLoading ? (
+          {isDeleting ? (
+            <div className="flex items-center gap-1.5 px-1">
+              <Spinner className="size-3" />
+              <span className="truncate text-sm text-muted-foreground">{entry.title}</span>
+            </div>
+          ) : renameLoading ? (
             <div className="flex items-center gap-1.5 px-1">
               <Spinner className="size-3" />
               <span className="truncate text-sm text-muted-foreground">{renameValue}</span>

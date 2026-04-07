@@ -1,6 +1,6 @@
 [package]
 name = "waverunner"
-version = "1.0.0-alpha.2"
+version = "1.0.0-alpha.3"
 description = "Media library"
 authors = ["you"]
 edition = "2021"
@@ -31,3 +31,4 @@ image = "0.25"
 tauri-plugin-updater = "2.10.1"
 tauri-plugin-process = "2.3.1"
 url = "2.5.8"
+trash = "5.2.5"
