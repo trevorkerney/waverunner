@@ -1502,7 +1502,7 @@ pub async fn play_movie(
         .next()
         .ok_or("No video file found in movie folder")?;
 
-    // Launch player
+    // Launch player (detached so closing waverunner doesn't kill it)
     if let Some(ref exe) = player_path {
         let mut cmd = std::process::Command::new(exe);
         if let Some(ref args) = player_args {
@@ -1511,6 +1511,11 @@ pub async fn play_movie(
             }
         }
         cmd.arg(&video_file);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x00000008 | 0x00000010); // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        }
         cmd.spawn().map_err(|e| format!("Failed to launch player: {}", e))?;
     } else {
         // OS default: use 'cmd /C start "" "path"' on Windows
@@ -1682,7 +1687,7 @@ pub async fn play_episode(
     }
     let full_path = full_path.ok_or("Episode file not found on disk")?;
 
-    // Launch player (same logic as play_movie)
+    // Launch player (detached so closing waverunner doesn't kill it)
     if let Some(ref exe) = player_path {
         let mut cmd = std::process::Command::new(exe);
         if let Some(ref args) = player_args {
@@ -1691,6 +1696,11 @@ pub async fn play_episode(
             }
         }
         cmd.arg(&full_path);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x00000008 | 0x00000010); // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        }
         cmd.spawn().map_err(|e| format!("Failed to launch player: {}", e))?;
     } else {
         std::process::Command::new("cmd")
