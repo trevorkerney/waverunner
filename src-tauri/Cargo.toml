@@ -1,6 +1,6 @@
 [package]
 name = "waverunner"
-version = "1.0.0-alpha.1"
+version = "1.0.0-alpha.2"
 description = "Media library"
 authors = ["you"]
 edition = "2021"
