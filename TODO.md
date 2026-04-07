@@ -1,3 +1,5 @@
+# TODO
+
 add hover tooltips to format options explaining them
 
 when there are options between local library and externally managed library, have hover tooltips for that too
@@ -18,11 +20,21 @@ on the first time someone sets sort mode to custom OR creates a collection, show
 
 go through everything ensuring compatibility with MacOS and Linux
 
-custom collections / playlists / whatever you want to call it - user should be able to create custom collections 
+custom collections / playlists / whatever you want to call it - user should be able to create custom collections
 
+save cover sets. users should be able to save a set of media covers so that they can easily switch all media covers in a library to the saved set. 
 
+save custom sort sets. users should be able to create and name custom sorting sets and easily switch to them (i.e. named sorting sets based on things not in metadata like 'chronological')
 
-# BIG STUFF NOW
+sidebar complications (complications like a watch)
+- movies/tv
+  - just movies
+  - just tv
+  - actors
+  - directors/producers
+  - custom collections/playlists
+
+## BIG STUFF NOW
 
 ability to import media not currently on media drive. however this is done can potentially provide another method of making collections as well
 

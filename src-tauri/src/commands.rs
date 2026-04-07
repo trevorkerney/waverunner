@@ -234,11 +234,68 @@ pub async fn get_app_version() -> Result<String, String> {
     Ok(env!("CARGO_PKG_VERSION").to_string())
 }
 
+const GITHUB_RELEASES_API: &str =
+    "https://api.github.com/repos/trevorkerney/waverunner/releases";
+
+async fn resolve_update_endpoint(channel: &str) -> Result<String, String> {
+    let client = reqwest::Client::new();
+
+    if channel == "stable" {
+        // /releases/latest only returns non-prerelease
+        let release: serde_json::Value = client
+            .get(format!("{GITHUB_RELEASES_API}/latest"))
+            .header("User-Agent", "waverunner-updater")
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        extract_latest_json_url(&release)
+    } else {
+        // First release in the list is the most recent (including prereleases)
+        let releases: Vec<serde_json::Value> = client
+            .get(GITHUB_RELEASES_API)
+            .header("User-Agent", "waverunner-updater")
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let release = releases.first().ok_or("No releases found")?;
+        extract_latest_json_url(release)
+    }
+}
+
+fn extract_latest_json_url(release: &serde_json::Value) -> Result<String, String> {
+    let assets = release["assets"]
+        .as_array()
+        .ok_or("No assets in release")?;
+    assets
+        .iter()
+        .find(|a| a["name"].as_str() == Some("latest.json"))
+        .and_then(|a| a["browser_download_url"].as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| "latest.json not found in release assets".to_string())
+}
+
 #[tauri::command]
 pub async fn check_for_update(
     app: tauri::AppHandle,
-    endpoint: String,
+    state: tauri::State<'_, AppState>,
 ) -> Result<Option<serde_json::Value>, String> {
+    let channel = sqlx::query_scalar::<_, String>(
+        "SELECT value FROM settings WHERE key = 'release_channel'"
+    )
+    .fetch_optional(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?
+    .unwrap_or_else(|| "stable".to_string());
+
+    let endpoint = resolve_update_endpoint(&channel).await?;
     let url: url::Url = endpoint.parse().map_err(|e| format!("invalid endpoint: {e}"))?;
     let updater = app
         .updater_builder()
@@ -260,8 +317,17 @@ pub async fn check_for_update(
 #[tauri::command]
 pub async fn download_and_install_update(
     app: tauri::AppHandle,
-    endpoint: String,
+    state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
+    let channel = sqlx::query_scalar::<_, String>(
+        "SELECT value FROM settings WHERE key = 'release_channel'"
+    )
+    .fetch_optional(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?
+    .unwrap_or_else(|| "stable".to_string());
+
+    let endpoint = resolve_update_endpoint(&channel).await?;
     let url: url::Url = endpoint.parse().map_err(|e| format!("invalid endpoint: {e}"))?;
     let updater = app
         .updater_builder()

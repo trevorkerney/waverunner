@@ -10,6 +10,7 @@ import { Switch } from "@/components/ui/switch";
 import { Slider } from "@/components/ui/slider";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
+import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from "@/components/ui/select";
 import { Settings, Download } from "lucide-react";
 
 const RECYCLE_STEPS = [0, 1, 2, 5, 10, 25, 50, 100, 250, -1];
@@ -28,9 +29,6 @@ function recycleStepLabel(step: number): string {
   if (val === -1) return "Always send to Recycle Bin";
   return `Send to Recycle Bin if under ${val} GB, otherwise permanently delete`;
 }
-
-const UPDATE_ENDPOINT =
-  "https://github.com/trevorkerney/waverunner/releases/latest/download/latest.json";
 
 interface SettingsDialogProps {
   open: boolean;
@@ -74,15 +72,13 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
   const checkForUpdates = useCallback(async () => {
     setUpdateStatus("checking");
     try {
-      const endpoint = UPDATE_ENDPOINT;
       const result = await invoke<{ version: string; body?: string } | null>(
-        "check_for_update",
-        { endpoint }
+        "check_for_update"
       );
       if (result) {
         setUpdateVersion(result.version);
         setUpdateStatus("downloading");
-        await invoke("download_and_install_update", { endpoint });
+        await invoke("download_and_install_update");
         setUpdateStatus("ready");
       } else {
         setUpdateStatus("none");
@@ -142,6 +138,26 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                         setSetting("auto_update", checked ? "true" : "false")
                       }
                     />
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <p className="text-sm">Release channel</p>
+                      <p className="text-xs text-muted-foreground">
+                        Choose which releases to receive updates from
+                      </p>
+                    </div>
+                    <Select
+                      value={settings["release_channel"] || "stable"}
+                      onValueChange={(v) => setSetting("release_channel", v ?? "prerelease")}
+                    >
+                      <SelectTrigger className="w-36">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="stable">stable</SelectItem>
+                        <SelectItem value="prerelease">prerelease</SelectItem>
+                      </SelectContent>
+                    </Select>
                   </div>
                   <div className="flex items-center justify-between">
                     <div>
