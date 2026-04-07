@@ -1,8 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { confirm } from "@tauri-apps/plugin-dialog";
+import { invoke } from "@tauri-apps/api/core";
 import { Minus, Square, X, ZoomIn, ZoomOut, RotateCcw } from "lucide-react";
 import { ThemeToggle } from "@/components/ThemeToggle";
 import { SettingsDialog } from "@/components/SettingsDialog";
+import { isCreatingLibrary } from "@/components/CreateLibraryDialog";
 import {
   Menubar,
   MenubarMenu,
@@ -129,7 +132,22 @@ export function Titlebar() {
       <button onClick={() => appWindow.toggleMaximize()} className={btnClass}>
         <Square size={10} strokeWidth={1.5} />
       </button>
-      <button onClick={() => appWindow.close()} className="inline-flex h-6 w-10 items-center justify-center text-muted-foreground hover:bg-red-500 hover:text-white">
+      <button
+        onClick={async () => {
+          if (isCreatingLibrary()) {
+            const confirmed = await confirm(
+              "A library is being created. Closing will cancel the creation. Are you sure?",
+              { title: "Cancel library creation?", kind: "warning" }
+            );
+            if (!confirmed) return;
+            await invoke("cancel_library_creation");
+            setTimeout(() => appWindow.close(), 500);
+          } else {
+            appWindow.close();
+          }
+        }}
+        className="inline-flex h-6 w-10 items-center justify-center text-muted-foreground hover:bg-red-500 hover:text-white"
+      >
         <X size={12} strokeWidth={1.5} />
       </button>
       </div>

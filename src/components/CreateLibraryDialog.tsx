@@ -35,6 +35,10 @@ interface CreateLibraryDialogProps {
 
 let creatingGlobal = false;
 
+export function isCreatingLibrary(): boolean {
+  return creatingGlobal;
+}
+
 export function CreateLibraryDialog({
   open: isOpen,
   onOpenChange,
@@ -85,10 +89,22 @@ export function CreateLibraryDialog({
 
   const validPaths = paths.filter((p) => p.trim() !== "");
 
+  async function handleCancel() {
+    try {
+      await invoke("cancel_library_creation");
+    } catch (e) {
+      console.error("Failed to cancel:", e);
+    }
+  }
+
   function handleDialogClose(open: boolean) {
     if (!open && creating && toastIdRef.current == null) {
       toastIdRef.current = toast.loading(scanProgress || "Creating library...", {
         duration: Infinity,
+        action: {
+          label: "Cancel",
+          onClick: handleCancel,
+        },
       });
     }
     onOpenChange(open);
@@ -113,11 +129,23 @@ export function CreateLibraryDialog({
       setFormat("video");
       setPortable(false);
     } catch (e) {
-      if (toastIdRef.current != null) {
-        toast.error(String(e), { id: toastIdRef.current, duration: 4000 });
+      const msg = String(e);
+      if (msg.includes("cancelled")) {
+        if (toastIdRef.current != null) {
+          toast.info("Library creation cancelled", { id: toastIdRef.current, duration: 3000 });
+          toastIdRef.current = null;
+        }
+        onOpenChange(false);
+        setManaged(true);
+        setName("");
+        setPaths([""]);
+        setFormat("video");
+        setPortable(false);
+      } else if (toastIdRef.current != null) {
+        toast.error(msg, { id: toastIdRef.current, duration: 4000 });
         toastIdRef.current = null;
       } else {
-        toast.error(String(e));
+        toast.error(msg);
       }
     } finally {
       setCreating(false);
@@ -237,9 +265,12 @@ export function CreateLibraryDialog({
           {creating ? (
             <div className="flex w-full items-center gap-2">
               <Spinner className="size-3.5" />
-              <span className="truncate text-xs text-muted-foreground">
+              <span className="flex-1 truncate text-xs text-muted-foreground">
                 {scanProgress || "Scanning..."}
               </span>
+              <Button variant="outline" size="sm" onClick={handleCancel}>
+                Cancel
+              </Button>
             </div>
           ) : (
             <>

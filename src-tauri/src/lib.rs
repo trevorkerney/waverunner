@@ -2,12 +2,14 @@ mod commands;
 mod db;
 
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use sqlx::SqlitePool;
 use tauri::Manager;
 
 pub struct AppState {
     pub app_data_dir: PathBuf,
     pub app_db: SqlitePool,
+    pub cancel_creation: AtomicBool,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -29,9 +31,15 @@ pub fn run() {
             let app_db = tauri::async_runtime::block_on(db::create_app_pool(&db_path))
                 .expect("failed to create app database");
 
+            // Clean up any incomplete libraries from a previous force-close
+            tauri::async_runtime::block_on(
+                commands::cleanup_incomplete_libraries(&app_data_dir, &app_db)
+            ).unwrap_or_else(|e| eprintln!("cleanup failed: {e}"));
+
             app.manage(AppState {
                 app_data_dir,
                 app_db,
+                cancel_creation: AtomicBool::new(false),
             });
 
             if cfg!(debug_assertions) {
@@ -49,6 +57,7 @@ pub fn run() {
             commands::check_for_update,
             commands::download_and_install_update,
             commands::create_library,
+            commands::cancel_library_creation,
             commands::delete_library,
             commands::get_libraries,
             commands::get_entries,

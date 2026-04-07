@@ -54,6 +54,11 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
         .execute(&pool)
         .await;
 
+    // Migrate: add creating column for tracking in-progress library creation
+    let _ = sqlx::query("ALTER TABLE libraries ADD COLUMN creating INTEGER NOT NULL DEFAULT 0")
+        .execute(&pool)
+        .await;
+
     Ok(pool)
 }
 

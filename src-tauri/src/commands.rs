@@ -2,6 +2,7 @@ use crate::AppState;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::Emitter;
 use tauri_plugin_updater::UpdaterExt;
 
@@ -346,39 +347,6 @@ pub async fn create_library(
     let cache_base = state.app_data_dir.join("cache").join(&id);
     std::fs::create_dir_all(&cache_base).map_err(|e| e.to_string())?;
 
-    match format.as_str() {
-        "video" => {
-            sqlx::query("DELETE FROM media_entry").execute(&pool).await.map_err(|e| e.to_string())?;
-            for p in &paths {
-                let lib_path = PathBuf::from(p);
-                scan_video_library(&app, &pool, &lib_path, &cache_base).await.map_err(|e| e.to_string())?;
-            }
-        }
-        "tv" => {
-            sqlx::query("DELETE FROM shows").execute(&pool).await.map_err(|e| e.to_string())?;
-            for p in &paths {
-                let lib_path = PathBuf::from(p);
-                scan_tv_library(&app, &pool, &lib_path, &cache_base).await.map_err(|e| e.to_string())?;
-            }
-        }
-        "music" => {
-            sqlx::query("DELETE FROM artists").execute(&pool).await.map_err(|e| e.to_string())?;
-            for p in &paths {
-                let lib_path = PathBuf::from(p);
-                scan_music_library(&app, &pool, &lib_path, &cache_base).await.map_err(|e| e.to_string())?;
-            }
-        }
-        _ => {
-            sqlx::query("DELETE FROM movie").execute(&pool).await.map_err(|e| e.to_string())?;
-            for p in &paths {
-                let lib_path = PathBuf::from(p);
-                scan_folder(&app, &pool, &lib_path, None, &cache_base).await.map_err(|e| e.to_string())?;
-            }
-        }
-    }
-
-    pool.close().await;
-
     let paths_json = serde_json::to_string(&paths).map_err(|e| e.to_string())?;
 
     let library = Library {
@@ -394,8 +362,9 @@ pub async fn create_library(
         player_args: None,
     };
 
+    // Insert with creating=1 before scanning so startup cleanup can find it
     sqlx::query(
-        "INSERT INTO libraries (id, name, paths, format, portable, db_filename, default_sort_mode, managed) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO libraries (id, name, paths, format, portable, db_filename, default_sort_mode, managed, creating) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)",
     )
     .bind(&library.id)
     .bind(&library.name)
@@ -409,13 +378,112 @@ pub async fn create_library(
     .await
     .map_err(|e| e.to_string())?;
 
-    Ok(library)
+    // Reset cancellation flag
+    state.cancel_creation.store(false, Ordering::SeqCst);
+    let cancel = &state.cancel_creation;
+
+    let scan_result: Result<(), String> = async {
+        match format.as_str() {
+            "video" => {
+                sqlx::query("DELETE FROM media_entry").execute(&pool).await.map_err(|e| e.to_string())?;
+                for p in &paths {
+                    let lib_path = PathBuf::from(p);
+                    scan_video_library(&app, &pool, &lib_path, &cache_base, cancel).await.map_err(|e| e.to_string())?;
+                }
+            }
+            "tv" => {
+                sqlx::query("DELETE FROM shows").execute(&pool).await.map_err(|e| e.to_string())?;
+                for p in &paths {
+                    let lib_path = PathBuf::from(p);
+                    scan_tv_library(&app, &pool, &lib_path, &cache_base, cancel).await.map_err(|e| e.to_string())?;
+                }
+            }
+            "music" => {
+                sqlx::query("DELETE FROM artists").execute(&pool).await.map_err(|e| e.to_string())?;
+                for p in &paths {
+                    let lib_path = PathBuf::from(p);
+                    scan_music_library(&app, &pool, &lib_path, &cache_base, cancel).await.map_err(|e| e.to_string())?;
+                }
+            }
+            _ => {
+                sqlx::query("DELETE FROM movie").execute(&pool).await.map_err(|e| e.to_string())?;
+                for p in &paths {
+                    let lib_path = PathBuf::from(p);
+                    scan_folder(&app, &pool, &lib_path, None, &cache_base, cancel).await.map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        Ok(())
+    }.await;
+
+    pool.close().await;
+
+    match scan_result {
+        Ok(()) => {
+            sqlx::query("UPDATE libraries SET creating = 0 WHERE id = ?")
+                .bind(&id)
+                .execute(&state.app_db)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(library)
+        }
+        Err(e) => {
+            // Cleanup: remove DB file, cache, and libraries row
+            let _ = std::fs::remove_file(&db_path);
+            delete_cache_for_library(&state.app_data_dir, &id);
+            let _ = sqlx::query("DELETE FROM libraries WHERE id = ?")
+                .bind(&id)
+                .execute(&state.app_db)
+                .await;
+            if e.contains("cancelled") {
+                Err("Library creation cancelled".to_string())
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn cancel_library_creation(
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    state.cancel_creation.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+pub async fn cleanup_incomplete_libraries(
+    app_data_dir: &Path,
+    app_db: &sqlx::SqlitePool,
+) -> Result<(), String> {
+    let rows: Vec<(String, String, i32, String)> = sqlx::query_as(
+        "SELECT id, paths, portable, db_filename FROM libraries WHERE creating = 1",
+    )
+    .fetch_all(app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    for (id, paths_json, portable, db_filename) in rows {
+        let paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
+        let db_path = if portable != 0 && !paths.is_empty() {
+            PathBuf::from(&paths[0]).join(".waverunner.db")
+        } else {
+            app_data_dir.join(&db_filename)
+        };
+        let _ = std::fs::remove_file(&db_path);
+        delete_cache_for_library(app_data_dir, &id);
+        let _ = sqlx::query("DELETE FROM libraries WHERE id = ?")
+            .bind(&id)
+            .execute(app_db)
+            .await;
+    }
+    Ok(())
 }
 
 #[tauri::command]
 pub async fn get_libraries(state: tauri::State<'_, AppState>) -> Result<Vec<Library>, String> {
     let rows: Vec<(String, String, String, String, i32, String, String, i32, Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT id, name, paths, format, portable, db_filename, default_sort_mode, managed, player_path, player_args FROM libraries ORDER BY name",
+        "SELECT id, name, paths, format, portable, db_filename, default_sort_mode, managed, player_path, player_args FROM libraries WHERE creating = 0 ORDER BY name",
     )
     .fetch_all(&state.app_db)
     .await
@@ -460,6 +528,14 @@ pub async fn delete_library(
         state.app_data_dir.join(&db_filename)
     };
 
+    // Delete cache first — if it fails (e.g. files locked), abort the whole delete
+    let cache_dir = state.app_data_dir.join("cache").join(&library_id);
+    if cache_dir.exists() {
+        std::fs::remove_dir_all(&cache_dir).map_err(|e| {
+            format!("Could not delete library cache: {}", e)
+        })?;
+    }
+
     if db_path.exists() {
         std::fs::remove_file(&db_path).map_err(|e| {
             format!(
@@ -475,8 +551,6 @@ pub async fn delete_library(
         .execute(&state.app_db)
         .await
         .map_err(|e| e.to_string())?;
-
-    delete_cache_for_library(&state.app_data_dir, &library_id);
 
     Ok(())
 }
@@ -4004,6 +4078,7 @@ async fn scan_tv_library(
     pool: &sqlx::SqlitePool,
     base_path: &PathBuf,
     cache_base: &Path,
+    cancel: &AtomicBool,
 ) -> Result<(), sqlx::Error> {
     // Level 1: Shows
     let mut show_dirs: Vec<_> = std::fs::read_dir(base_path)
@@ -4014,6 +4089,9 @@ async fn scan_tv_library(
     show_dirs.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
 
     for (i, show_entry) in show_dirs.iter().enumerate() {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(sqlx::Error::Protocol("Library creation cancelled".to_string()));
+        }
         let show_path = show_entry.path();
         let show_name = show_entry.file_name().to_string_lossy().to_string();
         let _ = app.emit("scan-progress", &show_name);
@@ -4129,6 +4207,7 @@ async fn scan_music_library(
     pool: &sqlx::SqlitePool,
     base_path: &PathBuf,
     cache_base: &Path,
+    cancel: &AtomicBool,
 ) -> Result<(), sqlx::Error> {
     // Level 1: Artists
     let mut artist_dirs: Vec<_> = std::fs::read_dir(base_path)
@@ -4139,6 +4218,9 @@ async fn scan_music_library(
     artist_dirs.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
 
     for (i, artist_entry) in artist_dirs.iter().enumerate() {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(sqlx::Error::Protocol("Library creation cancelled".to_string()));
+        }
         let artist_path = artist_entry.path();
         let artist_name = artist_entry.file_name().to_string_lossy().to_string();
         let _ = app.emit("scan-progress", &artist_name);
@@ -4247,6 +4329,7 @@ async fn scan_video_library(
     pool: &sqlx::SqlitePool,
     base_path: &PathBuf,
     cache_base: &Path,
+    cancel: &AtomicBool,
 ) -> Result<(), sqlx::Error> {
     // Get entry_type_id mappings
     let movie_type_id: (i64,) =
@@ -4270,6 +4353,9 @@ async fn scan_video_library(
     top_dirs.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
 
     for (i, dir_entry) in top_dirs.iter().enumerate() {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(sqlx::Error::Protocol("Library creation cancelled".to_string()));
+        }
         let path = dir_entry.path();
         let name = dir_entry.file_name().to_string_lossy().to_string();
         let _ = app.emit("scan-progress", &name);
@@ -4399,6 +4485,7 @@ async fn scan_video_library(
                 i as i32,
                 movie_type_id.0,
                 collection_type_id.0,
+                cancel,
             )
             .await?;
         }
@@ -4418,7 +4505,11 @@ async fn scan_video_dir(
     sort_order: i32,
     movie_type_id: i64,
     collection_type_id: i64,
+    cancel: &AtomicBool,
 ) -> Result<(), sqlx::Error> {
+    if cancel.load(Ordering::SeqCst) {
+        return Err(sqlx::Error::Protocol("Library creation cancelled".to_string()));
+    }
     let name = dir
         .file_name()
         .unwrap_or_default()
@@ -4501,6 +4592,7 @@ async fn scan_video_dir(
                 j as i32,
                 movie_type_id,
                 collection_type_id,
+                cancel,
             )
             .await?;
         }
@@ -4515,8 +4607,9 @@ async fn scan_folder(
     base_path: &PathBuf,
     parent_id: Option<i64>,
     cache_base: &Path,
+    cancel: &AtomicBool,
 ) -> Result<(), sqlx::Error> {
-    scan_dir(app, pool, base_path, base_path, parent_id, cache_base).await
+    scan_dir(app, pool, base_path, base_path, parent_id, cache_base, cancel).await
 }
 
 #[async_recursion::async_recursion]
@@ -4527,6 +4620,7 @@ async fn scan_dir(
     dir: &PathBuf,
     parent_id: Option<i64>,
     cache_base: &Path,
+    cancel: &AtomicBool,
 ) -> Result<(), sqlx::Error> {
     let mut entries: Vec<_> = std::fs::read_dir(dir)
         .map_err(|e| sqlx::Error::Protocol(e.to_string()))?
@@ -4540,6 +4634,9 @@ async fn scan_dir(
     entries.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
 
     for (i, entry) in entries.iter().enumerate() {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(sqlx::Error::Protocol("Library creation cancelled".to_string()));
+        }
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
 
@@ -4582,7 +4679,7 @@ async fn scan_dir(
         cache_entry_images(pool, cache_base, base_path, &rel_path).await?;
 
         if has_subdirs {
-            scan_dir(app, pool, base_path, &path, Some(new_id), cache_base).await?;
+            scan_dir(app, pool, base_path, &path, Some(new_id), cache_base, cancel).await?;
         }
     }
 
