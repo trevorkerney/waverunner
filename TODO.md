@@ -27,12 +27,12 @@ save cover sets. users should be able to save a set of media covers so that they
 save custom sort sets. users should be able to create and name custom sorting sets and easily switch to them (i.e. named sorting sets based on things not in metadata like 'chronological')
 
 sidebar complications (complications like a watch)
-- movies/tv
-  - just movies
-  - just tv
-  - actors
-  - directors/producers
-  - custom collections/playlists
+  - movies/tv
+    - just movies
+    - just tv
+    - actors
+    - directors/producers
+    - custom collections/playlists
 
 ## BIG STUFF NOW
 

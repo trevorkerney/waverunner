@@ -416,8 +416,7 @@ function App() {
           deleteFromDisk,
         });
         setEntries((prev) => prev.filter((e) => e.id !== entryId));
-        const parentId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
-        invalidateCache(selectedLibrary.id, parentId);
+        invalidateCache(selectedLibrary.id);
       } catch (e) {
         toast.error(String(e));
       }
@@ -516,6 +515,13 @@ function App() {
           onMoveEntry={moveEntry}
           onCreateCollection={createCollection}
           onDeleteEntry={deleteEntry}
+          onRescan={() => {
+            if (selectedLibrary) {
+              invalidateCache(selectedLibrary.id);
+              const parentId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
+              loadEntries(selectedLibrary, parentId, breadcrumbs);
+            }
+          }}
           getCoverUrl={getCoverUrl}
           getFullCoverUrl={getFullCoverUrl}
           scrollContainerRef={scrollContainerRef}

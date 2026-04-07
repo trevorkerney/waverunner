@@ -84,8 +84,10 @@ import {
   Film,
   Tv,
   Trash2,
+  RefreshCw,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
 import { Library, MediaEntry, BreadcrumbItem, MovieDetail, MovieDetailUpdate, SeasonInfo, EpisodeInfo } from "@/types";
 
@@ -118,6 +120,7 @@ interface MainContentProps {
   onMoveEntry: (entryId: number, newParentId: number | null, insertBeforeId: number | null) => Promise<void>;
   onCreateCollection: (name: string, basePath?: string) => Promise<void>;
   onDeleteEntry: (entryId: number, deleteFromDisk: boolean) => Promise<void>;
+  onRescan: () => void;
   getCoverUrl: (filePath: string) => string;
   getFullCoverUrl: (filePath: string) => string;
   scrollContainerRef: RefObject<HTMLDivElement | null>;
@@ -145,6 +148,7 @@ export function MainContent({
   onMoveEntry,
   onCreateCollection,
   onDeleteEntry,
+  onRescan,
   getCoverUrl,
   getFullCoverUrl,
   scrollContainerRef,
@@ -238,10 +242,10 @@ export function MainContent({
       {selectedLibrary && (
         <>
           {/* Breadcrumbs */}
-          <Breadcrumb className="border-b border-border px-4 py-2">
-            <BreadcrumbList>
+          <Breadcrumb className="border-b border-border">
+            <BreadcrumbList className="!flex-nowrap overflow-x-auto px-4 py-2 pr-8">
               {breadcrumbs.map((crumb, i) => (
-                <BreadcrumbUIItem key={i}>
+                <BreadcrumbUIItem key={i} className="whitespace-nowrap">
                   {i > 0 && <BreadcrumbSeparator />}
                   {i === breadcrumbs.length - 1 ? (
                     <BreadcrumbPage>{crumb.title}</BreadcrumbPage>
@@ -309,13 +313,15 @@ export function MainContent({
       )}
 
       {/* Content */}
+      <div ref={scrollContainerRef} className="flex-1 overflow-y-auto overflow-x-hidden p-4">
+      {selectedEntry ? (
+        selectedEntry.entry_type === "show"
+          ? <ShowDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getFullCoverUrl={getFullCoverUrl} />
+          : <EntryDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getFullCoverUrl={getFullCoverUrl} />
+      ) : (
       <ContextMenu>
-        <ContextMenuTrigger render={<div ref={scrollContainerRef} className="flex-1 overflow-y-auto overflow-x-hidden p-4" />}>
-        {selectedEntry ? (
-          selectedEntry.entry_type === "show"
-            ? <ShowDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getFullCoverUrl={getFullCoverUrl} />
-            : <EntryDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getFullCoverUrl={getFullCoverUrl} />
-        ) : !selectedLibrary ? (
+        <ContextMenuTrigger render={<div className="flex min-h-full flex-col" />}>
+        {!selectedLibrary ? (
           <Empty className="border-none min-h-full">
             <EmptyHeader>
               <EmptyMedia>
@@ -406,15 +412,36 @@ export function MainContent({
           </DndContext>
         )}
         </ContextMenuTrigger>
-        {selectedLibrary?.format === "video" && !selectedEntry && (
           <ContextMenuContent>
-            <ContextMenuItem onClick={() => { setNewCollectionName(""); setNewCollectionPath(selectedLibrary?.paths[0] ?? ""); setNewCollectionOpen(true); }}>
-              <FolderPlus size={14} />
-              New Collection
+            {selectedLibrary?.format === "video" && (
+              <ContextMenuItem onClick={() => { setNewCollectionName(""); setNewCollectionPath(selectedLibrary?.paths[0] ?? ""); setNewCollectionOpen(true); }}>
+                <FolderPlus size={14} />
+                New Collection
+              </ContextMenuItem>
+            )}
+            <ContextMenuItem onClick={async () => {
+              if (!selectedLibrary) return;
+              const toastId = toast.loading("Rescanning...");
+              const unlisten = await listen<string>("scan-progress", (event) => {
+                toast.loading(event.payload, { id: toastId });
+              });
+              try {
+                await invoke("rescan_library", { libraryId: selectedLibrary.id });
+                toast.success("Rescan complete", { id: toastId });
+                onRescan();
+              } catch (err) {
+                toast.error(String(err), { id: toastId });
+              } finally {
+                unlisten();
+              }
+            }}>
+              <RefreshCw size={14} />
+              Rescan
             </ContextMenuItem>
           </ContextMenuContent>
-        )}
       </ContextMenu>
+      )}
+      </div>
 
       {/* New Collection Dialog */}
       <Dialog open={newCollectionOpen} onOpenChange={setNewCollectionOpen}>
@@ -493,14 +520,21 @@ export function MainContent({
               <div className="grid transition-[grid-template-rows] duration-200 ease-out" style={{ gridTemplateRows: deleteFromDisk ? "1fr" : "0fr" }}>
                 <div className="overflow-hidden">
                   <div className="flex flex-col gap-2 px-1 pb-1 pt-2">
-                    <p className="text-xs text-muted-foreground">
-                      Type &ldquo;{deleteTarget?.title}&rdquo; to confirm.
-                    </p>
-                    <Input
-                      value={deleteConfirmText}
-                      onChange={(e) => setDeleteConfirmText(e.target.value)}
-                      placeholder={deleteTarget?.title ?? ""}
-                    />
+                    <p className="text-xs text-muted-foreground">Type &ldquo;<ContextMenu><ContextMenuTrigger render={<span />} className="!inline !select-text cursor-text font-semibold text-foreground">{deleteTarget?.title}</ContextMenuTrigger><ContextMenuContent><ContextMenuItem onClick={() => { if (deleteTarget) navigator.clipboard.writeText(deleteTarget.title); }}>Copy title</ContextMenuItem></ContextMenuContent></ContextMenu>&rdquo; to confirm.</p>
+                    <ContextMenu>
+                      <ContextMenuTrigger className="w-full">
+                        <Input
+                          value={deleteConfirmText}
+                          onChange={(e) => setDeleteConfirmText(e.target.value)}
+                          placeholder={deleteTarget?.title ?? ""}
+                        />
+                      </ContextMenuTrigger>
+                      <ContextMenuContent>
+                        <ContextMenuItem onClick={async () => { const text = await navigator.clipboard.readText(); setDeleteConfirmText(text); }}>
+                          Paste
+                        </ContextMenuItem>
+                      </ContextMenuContent>
+                    </ContextMenu>
                   </div>
                 </div>
               </div>
