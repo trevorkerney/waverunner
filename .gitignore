@@ -29,3 +29,5 @@ old
 
 # Updater signing key (private)
 src-tauri/keys/updater.key
+
+RELEASE.md
