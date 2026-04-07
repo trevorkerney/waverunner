@@ -77,6 +77,8 @@ pub fn run() {
             commands::get_show_seasons,
             commands::get_season_episodes,
             commands::play_episode,
+            commands::delete_entry,
+            commands::check_entry_has_files,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -24,11 +24,8 @@ custom collections / playlists / whatever you want to call it - user should be a
 
 # BIG STUFF NOW
 
-fix blank cover width
-
 ability to import media not currently on media drive. however this is done can potentially provide another method of making collections as well
 
-ability to delete media and collections, needs confirmation modal unless empty collection
-- for media on managed libraries, give user option to actually delete media or not and remind them that if they choose no, a rescan will make it return
-
 TMDB metadata integration (toggle per library, title resolution: file metadata > folder name > TMDB search)
+
+when deleting things in managed mode that deletes files/folders, send to recycle bin under a given threshold

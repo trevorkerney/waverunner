@@ -32,6 +32,7 @@ export interface MediaEntry {
   entry_type: string;
   covers: string[];
   selected_cover: string | null;
+  child_count: number;
 }
 
 export interface BreadcrumbItem {

@@ -387,7 +387,7 @@ function App() {
   );
 
   const createCollection = useCallback(
-    async (name: string) => {
+    async (name: string, basePath?: string) => {
       if (!selectedLibrary) return;
       try {
         const parentId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
@@ -395,6 +395,7 @@ function App() {
           libraryId: selectedLibrary.id,
           name,
           parentId,
+          basePath: basePath ?? null,
         });
         invalidateCache(selectedLibrary.id, parentId);
         await loadEntries(selectedLibrary, parentId, breadcrumbs);
@@ -403,6 +404,25 @@ function App() {
       }
     },
     [selectedLibrary, breadcrumbs, invalidateCache, loadEntries]
+  );
+
+  const deleteEntry = useCallback(
+    async (entryId: number, deleteFromDisk: boolean) => {
+      if (!selectedLibrary) return;
+      try {
+        await invoke("delete_entry", {
+          libraryId: selectedLibrary.id,
+          entryId,
+          deleteFromDisk,
+        });
+        setEntries((prev) => prev.filter((e) => e.id !== entryId));
+        const parentId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
+        invalidateCache(selectedLibrary.id, parentId);
+      } catch (e) {
+        toast.error(String(e));
+      }
+    },
+    [selectedLibrary, breadcrumbs, invalidateCache]
   );
 
   const setCover = useCallback(
@@ -495,6 +515,7 @@ function App() {
           onSetCover={setCover}
           onMoveEntry={moveEntry}
           onCreateCollection={createCollection}
+          onDeleteEntry={deleteEntry}
           getCoverUrl={getCoverUrl}
           getFullCoverUrl={getFullCoverUrl}
           scrollContainerRef={scrollContainerRef}

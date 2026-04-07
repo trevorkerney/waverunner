@@ -56,6 +56,7 @@ pub struct MediaEntry {
     pub entry_type: String,
     pub covers: Vec<String>,
     pub selected_cover: Option<String>,
+    pub child_count: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -610,16 +611,16 @@ pub async fn get_entries(
 
             let query_str = match parent_id {
                 Some(_) => format!(
-                    "SELECT me.id, me.title, me.year, me.end_year, me.folder_path, me.parent_id, met.name as entry_type, me.selected_cover FROM media_entry me JOIN media_entry_type met ON me.entry_type_id = met.id WHERE me.parent_id = ? {}",
+                    "SELECT me.id, me.title, me.year, me.end_year, me.folder_path, me.parent_id, met.name as entry_type, me.selected_cover, (SELECT COUNT(*) FROM media_entry c WHERE c.parent_id = me.id) as child_count FROM media_entry me JOIN media_entry_type met ON me.entry_type_id = met.id WHERE me.parent_id = ? {}",
                     order_clause
                 ),
                 None => format!(
-                    "SELECT me.id, me.title, me.year, me.end_year, me.folder_path, me.parent_id, met.name as entry_type, me.selected_cover FROM media_entry me JOIN media_entry_type met ON me.entry_type_id = met.id WHERE me.parent_id IS NULL {}",
+                    "SELECT me.id, me.title, me.year, me.end_year, me.folder_path, me.parent_id, met.name as entry_type, me.selected_cover, (SELECT COUNT(*) FROM media_entry c WHERE c.parent_id = me.id) as child_count FROM media_entry me JOIN media_entry_type met ON me.entry_type_id = met.id WHERE me.parent_id IS NULL {}",
                     order_clause
                 ),
             };
 
-            let rows: Vec<(i64, String, Option<String>, Option<String>, String, Option<i64>, String, Option<String>)> = match parent_id {
+            let rows: Vec<(i64, String, Option<String>, Option<String>, String, Option<i64>, String, Option<String>, i64)> = match parent_id {
                 Some(pid) => {
                     sqlx::query_as(&query_str)
                         .bind(pid)
@@ -636,7 +637,7 @@ pub async fn get_entries(
 
             let entries: Vec<MediaEntry> = rows
                 .into_iter()
-                .map(|(id, title, year, end_year, folder_path, parent_id, entry_type, selected_cover)| {
+                .map(|(id, title, year, end_year, folder_path, parent_id, entry_type, selected_cover, child_count)| {
                     let covers = covers_map.remove(&folder_path).unwrap_or_default();
                     MediaEntry {
                         id,
@@ -648,6 +649,7 @@ pub async fn get_entries(
                         entry_type,
                         covers,
                         selected_cover,
+                        child_count,
                     }
                 })
                 .collect();
@@ -690,6 +692,7 @@ pub async fn get_entries(
                         entry_type: "show".to_string(),
                         covers,
                         selected_cover,
+                        child_count: 0,
                     }
                 })
                 .collect();
@@ -731,6 +734,7 @@ pub async fn get_entries(
                         entry_type: "artist".to_string(),
                         covers,
                         selected_cover,
+                        child_count: 0,
                     }
                 })
                 .collect();
@@ -803,6 +807,7 @@ pub async fn get_entries(
                         entry_type: if is_collection != 0 { "collection".to_string() } else { "movie".to_string() },
                         covers,
                         selected_cover,
+                        child_count: 0,
                     }
                 })
                 .collect();
@@ -895,7 +900,7 @@ pub async fn search_entries(
             rows.into_iter()
                 .map(|(id, title, year, end_year, folder_path, parent_id, entry_type, selected_cover)| {
                     let covers = covers_map.remove(&folder_path).unwrap_or_default();
-                    MediaEntry { id, title, year, end_year, folder_path, parent_id, entry_type, covers, selected_cover }
+                    MediaEntry { id, title, year, end_year, folder_path, parent_id, entry_type, covers, selected_cover, child_count: 0 }
                 })
                 .collect()
         }
@@ -912,7 +917,7 @@ pub async fn search_entries(
             rows.into_iter()
                 .map(|(id, title, year, folder_path, selected_cover)| {
                     let covers = covers_map.remove(&folder_path).unwrap_or_default();
-                    MediaEntry { id, title, year, end_year: None, folder_path, parent_id: None, entry_type: "show".to_string(), covers, selected_cover }
+                    MediaEntry { id, title, year, end_year: None, folder_path, parent_id: None, entry_type: "show".to_string(), covers, selected_cover, child_count: 0 }
                 })
                 .collect()
         }
@@ -929,7 +934,7 @@ pub async fn search_entries(
             rows.into_iter()
                 .map(|(id, name, folder_path, selected_cover)| {
                     let covers = covers_map.remove(&folder_path).unwrap_or_default();
-                    MediaEntry { id, title: name, year: None, end_year: None, folder_path, parent_id: None, entry_type: "artist".to_string(), covers, selected_cover }
+                    MediaEntry { id, title: name, year: None, end_year: None, folder_path, parent_id: None, entry_type: "artist".to_string(), covers, selected_cover, child_count: 0 }
                 })
                 .collect()
         }
@@ -973,7 +978,7 @@ pub async fn search_entries(
                     MediaEntry {
                         id, title, year, end_year: None, folder_path, parent_id,
                         entry_type: if is_collection != 0 { "collection".to_string() } else { "movie".to_string() },
-                        covers, selected_cover,
+                        covers, selected_cover, child_count: 0,
                     }
                 })
                 .collect()
@@ -2680,6 +2685,7 @@ pub async fn create_collection(
     library_id: String,
     name: String,
     parent_id: Option<i64>,
+    base_path: Option<String>,
 ) -> Result<(), String> {
     let row: Option<(String, i32, String, i32, String)> = sqlx::query_as(
         "SELECT paths, portable, db_filename, managed, format FROM libraries WHERE id = ?",
@@ -2734,7 +2740,9 @@ pub async fn create_collection(
 
     // For managed libraries, create the folder on disk
     if managed != 0 {
-        let lib_base = PathBuf::from(&lib_paths[0]);
+        let lib_base = PathBuf::from(
+            base_path.as_deref().unwrap_or(&lib_paths[0])
+        );
         let full_path = lib_base.join(&rel_path);
         if full_path.exists() {
             pool.close().await;
@@ -2836,6 +2844,137 @@ pub async fn set_cover(
 
     pool.close().await;
     Ok(())
+}
+
+#[tauri::command]
+pub async fn delete_entry(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    entry_id: i64,
+    delete_from_disk: bool,
+) -> Result<(), String> {
+    let row: Option<(String, i32, String, i32)> = sqlx::query_as(
+        "SELECT paths, portable, db_filename, managed FROM libraries WHERE id = ?",
+    )
+    .bind(&library_id)
+    .fetch_optional(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let (paths_json, portable, db_filename, managed) = row.ok_or("Library not found")?;
+    let lib_paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
+
+    let db_path = if portable != 0 {
+        PathBuf::from(&lib_paths[0]).join(".waverunner.db")
+    } else {
+        state.app_data_dir.join(&db_filename)
+    };
+
+    let pool = crate::db::connect_library_pool(&db_path)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Get the entry's folder_path
+    let entry_row: Option<(String,)> = sqlx::query_as(
+        "SELECT folder_path FROM media_entry WHERE id = ?",
+    )
+    .bind(entry_id)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let (folder_path,) = entry_row.ok_or("Entry not found")?;
+
+    // Delete from disk if requested and library is managed
+    if delete_from_disk && managed != 0 {
+        if let Some(root) = resolve_entry_root(&lib_paths, &folder_path) {
+            let full_path = PathBuf::from(root).join(&folder_path);
+            if full_path.exists() {
+                std::fs::remove_dir_all(&full_path)
+                    .map_err(|e| format!("Failed to delete folder: {}", e))?;
+            }
+        }
+    }
+
+    // Clean up cached images on disk for this entry and descendants
+    let cache_base = state.app_data_dir.join("cache").join(&library_id);
+    if cache_base.exists() {
+        let cache_entry_dir = cache_base.join(&folder_path);
+        if cache_entry_dir.exists() {
+            let _ = std::fs::remove_dir_all(&cache_entry_dir);
+        }
+    }
+
+    // Remove cached_images DB rows for this entry and descendants
+    sqlx::query("DELETE FROM cached_images WHERE entry_folder_path = ? OR entry_folder_path LIKE ?")
+        .bind(&folder_path)
+        .bind(format!("{}\\%", folder_path))
+        .execute(&pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Delete from DB (CASCADE handles children, movie, collection, show tables)
+    sqlx::query("DELETE FROM media_entry WHERE id = ?")
+        .bind(entry_id)
+        .execute(&pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    pool.close().await;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn check_entry_has_files(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    entry_id: i64,
+) -> Result<bool, String> {
+    let row: Option<(String, i32, String)> = sqlx::query_as(
+        "SELECT paths, portable, db_filename FROM libraries WHERE id = ?",
+    )
+    .bind(&library_id)
+    .fetch_optional(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let (paths_json, portable, db_filename) = row.ok_or("Library not found")?;
+    let lib_paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
+
+    let db_path = if portable != 0 {
+        PathBuf::from(&lib_paths[0]).join(".waverunner.db")
+    } else {
+        state.app_data_dir.join(&db_filename)
+    };
+
+    let pool = crate::db::connect_library_pool(&db_path)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let entry_row: Option<(String,)> = sqlx::query_as(
+        "SELECT folder_path FROM media_entry WHERE id = ?",
+    )
+    .bind(entry_id)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let (folder_path,) = entry_row.ok_or("Entry not found")?;
+    pool.close().await;
+
+    if let Some(root) = resolve_entry_root(&lib_paths, &folder_path) {
+        let full_path = PathBuf::from(root).join(&folder_path);
+        if full_path.exists() {
+            let has_files = std::fs::read_dir(&full_path)
+                .map(|rd| rd.filter_map(|e| e.ok()).any(|e| {
+                    e.file_type().map(|ft| ft.is_file()).unwrap_or(false)
+                }))
+                .unwrap_or(false);
+            return Ok(has_files);
+        }
+    }
+
+    Ok(false)
 }
 
 #[tauri::command]

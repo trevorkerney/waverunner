@@ -82,6 +82,7 @@ import {
   FolderPlus,
   Film,
   Tv,
+  Trash2,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
@@ -114,7 +115,8 @@ interface MainContentProps {
   onRenameEntry: (entryId: number, newTitle: string) => Promise<string | null>;
   onSetCover: (entryId: number, coverPath: string | null) => void;
   onMoveEntry: (entryId: number, newParentId: number | null, insertBeforeId: number | null) => Promise<void>;
-  onCreateCollection: (name: string) => Promise<void>;
+  onCreateCollection: (name: string, basePath?: string) => Promise<void>;
+  onDeleteEntry: (entryId: number, deleteFromDisk: boolean) => Promise<void>;
   getCoverUrl: (filePath: string) => string;
   getFullCoverUrl: (filePath: string) => string;
   scrollContainerRef: RefObject<HTMLDivElement | null>;
@@ -141,6 +143,7 @@ export function MainContent({
   onSetCover,
   onMoveEntry,
   onCreateCollection,
+  onDeleteEntry,
   getCoverUrl,
   getFullCoverUrl,
   scrollContainerRef,
@@ -154,6 +157,9 @@ export function MainContent({
   const [dragId, setDragId] = useState<number | null>(null);
   const [newCollectionOpen, setNewCollectionOpen] = useState(false);
   const [newCollectionName, setNewCollectionName] = useState("");
+  const [newCollectionPath, setNewCollectionPath] = useState("");
+  const [deleteTarget, setDeleteTarget] = useState<MediaEntry | null>(null);
+  const [deleteFilesWarning, setDeleteFilesWarning] = useState<MediaEntry | null>(null);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { delay: 500, tolerance: 5 } })
@@ -352,6 +358,25 @@ export function MainContent({
                     onNavigate={onNavigate}
                     onRename={onRenameEntry}
                     onChangeCover={() => setCoverDialogEntry(entry)}
+                    onDelete={async (entry) => {
+                      if (entry.entry_type === "collection" && entry.child_count === 0) {
+                        if (selectedLibrary?.managed) {
+                          const hasFiles = await invoke<boolean>("check_entry_has_files", {
+                            libraryId: selectedLibrary.id,
+                            entryId: entry.id,
+                          });
+                          if (hasFiles) {
+                            setDeleteFilesWarning(entry);
+                            return;
+                          }
+                          onDeleteEntry(entry.id, true);
+                        } else {
+                          onDeleteEntry(entry.id, false);
+                        }
+                      } else {
+                        setDeleteTarget(entry);
+                      }
+                    }}
                     getCoverUrl={getCoverUrl}
                     isDragActive={dragId != null}
                     sortMode={sortMode}
@@ -369,7 +394,7 @@ export function MainContent({
         </ContextMenuTrigger>
         {selectedLibrary?.format === "video" && !selectedEntry && (
           <ContextMenuContent>
-            <ContextMenuItem onClick={() => { setNewCollectionName(""); setNewCollectionOpen(true); }}>
+            <ContextMenuItem onClick={() => { setNewCollectionName(""); setNewCollectionPath(selectedLibrary?.paths[0] ?? ""); setNewCollectionOpen(true); }}>
               <FolderPlus size={14} />
               New Collection
             </ContextMenuItem>
@@ -383,19 +408,31 @@ export function MainContent({
           <DialogHeader>
             <DialogTitle>New Collection</DialogTitle>
           </DialogHeader>
-          <div className="py-2">
+          <div className="grid gap-3 py-2">
             <Input
               value={newCollectionName}
               onChange={(e) => setNewCollectionName(e.target.value)}
               placeholder="Collection name"
               onKeyDown={(e) => {
                 if (e.key === "Enter" && newCollectionName.trim()) {
-                  onCreateCollection(newCollectionName.trim());
+                  onCreateCollection(newCollectionName.trim(), newCollectionPath || undefined);
                   setNewCollectionOpen(false);
                 }
               }}
               autoFocus
             />
+            {selectedLibrary?.managed && (selectedLibrary.paths.length > 1) && breadcrumbs.length <= 1 && (
+              <Select value={newCollectionPath} onValueChange={(v) => setNewCollectionPath(v ?? "")}>
+                <SelectTrigger className="text-xs">
+                  {newCollectionPath || "Select location"}
+                </SelectTrigger>
+                <SelectContent>
+                  {selectedLibrary.paths.map((p) => (
+                    <SelectItem key={p} value={p} className="text-xs">{p}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            )}
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setNewCollectionOpen(false)}>
@@ -404,11 +441,89 @@ export function MainContent({
             <Button
               disabled={!newCollectionName.trim()}
               onClick={() => {
-                onCreateCollection(newCollectionName.trim());
+                onCreateCollection(newCollectionName.trim(), newCollectionPath || undefined);
                 setNewCollectionOpen(false);
               }}
             >
               Create
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Delete Confirmation Dialog */}
+      <Dialog open={deleteTarget != null} onOpenChange={(open) => { if (!open) setDeleteTarget(null); }}>
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle>Delete {deleteTarget?.entry_type === "movie" ? "Movie" : deleteTarget?.entry_type === "show" ? "Show" : "Entry"}</DialogTitle>
+          </DialogHeader>
+          <p className="text-sm text-muted-foreground">
+            Are you sure you want to delete &ldquo;{deleteTarget?.title}&rdquo;?
+          </p>
+          {selectedLibrary?.managed ? (
+            <DialogFooter className="flex-col gap-2 sm:flex-col">
+              <Button
+                variant="outline"
+                onClick={() => {
+                  if (deleteTarget) onDeleteEntry(deleteTarget.id, false);
+                  setDeleteTarget(null);
+                }}
+              >
+                Remove from library
+              </Button>
+              <p className="text-xs text-muted-foreground text-center">
+                The folder will remain on disk. A rescan will bring it back.
+              </p>
+              <Button
+                variant="destructive"
+                onClick={() => {
+                  if (deleteTarget) onDeleteEntry(deleteTarget.id, true);
+                  setDeleteTarget(null);
+                }}
+              >
+                Delete from disk
+              </Button>
+            </DialogFooter>
+          ) : (
+            <DialogFooter>
+              <Button variant="outline" onClick={() => setDeleteTarget(null)}>
+                Cancel
+              </Button>
+              <Button
+                variant="destructive"
+                onClick={() => {
+                  if (deleteTarget) onDeleteEntry(deleteTarget.id, false);
+                  setDeleteTarget(null);
+                }}
+              >
+                Delete
+              </Button>
+            </DialogFooter>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      {/* Delete Empty Collection With Files Warning */}
+      <Dialog open={deleteFilesWarning != null} onOpenChange={(open) => { if (!open) setDeleteFilesWarning(null); }}>
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle>Delete Collection</DialogTitle>
+          </DialogHeader>
+          <p className="text-sm text-muted-foreground">
+            &ldquo;{deleteFilesWarning?.title}&rdquo; contains files on disk. Are you sure you want to delete it?
+          </p>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setDeleteFilesWarning(null)}>
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={() => {
+                if (deleteFilesWarning) onDeleteEntry(deleteFilesWarning.id, true);
+                setDeleteFilesWarning(null);
+              }}
+            >
+              Delete
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -439,6 +554,7 @@ function SortableCoverCard({
   onNavigate,
   onRename,
   onChangeCover,
+  onDelete,
   getCoverUrl,
   isDragActive,
   sortMode,
@@ -448,6 +564,7 @@ function SortableCoverCard({
   onNavigate: (entry: MediaEntry) => void;
   onRename: (entryId: number, newTitle: string) => Promise<string | null>;
   onChangeCover: () => void;
+  onDelete: (entry: MediaEntry) => void;
   getCoverUrl: (filePath: string) => string;
   isDragActive: boolean;
   sortMode: string;
@@ -608,6 +725,12 @@ function SortableCoverCard({
           <ContextMenuItem onClick={onChangeCover}>
             <ImageIcon size={14} />
             Change Cover
+          </ContextMenuItem>
+        )}
+        {!(entry.entry_type === "collection" && entry.child_count > 0) && (
+          <ContextMenuItem onClick={() => onDelete(entry)} className="text-destructive focus:text-destructive">
+            <Trash2 size={14} />
+            Delete
           </ContextMenuItem>
         )}
       </ContextMenuContent>
