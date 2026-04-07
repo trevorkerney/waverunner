@@ -58,6 +58,13 @@ import {
 } from "@/components/ui/carousel";
 import { Spinner } from "@/components/ui/spinner";
 import {
+  Empty,
+  EmptyHeader,
+  EmptyMedia,
+  EmptyTitle,
+  EmptyDescription,
+} from "@/components/ui/empty";
+import {
   Select,
   SelectTrigger,
   SelectContent,
@@ -71,6 +78,7 @@ import {
   Pencil,
   Play,
   Image as ImageIcon,
+  LibraryBig,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
@@ -96,6 +104,7 @@ interface MainContentProps {
   onNavigate: (entry: MediaEntry) => void;
   onBreadcrumbClick: (index: number) => void;
   selectedLibrary: Library | null;
+  hasLibraries: boolean;
   sortMode: string;
   onSortModeChange: (mode: string) => void;
   onSortOrderChange: (reordered: MediaEntry[]) => void;
@@ -120,6 +129,7 @@ export function MainContent({
   onNavigate,
   onBreadcrumbClick,
   selectedLibrary,
+  hasLibraries,
   sortMode,
   onSortModeChange,
   onSortOrderChange,
@@ -279,7 +289,24 @@ export function MainContent({
             ? <ShowDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getFullCoverUrl={getFullCoverUrl} />
             : <EntryDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getFullCoverUrl={getFullCoverUrl} />
         ) : !selectedLibrary ? (
-          <div />
+          <Empty className="border-none min-h-full">
+            <EmptyHeader>
+              <EmptyMedia>
+                <LibraryBig size={48} className="text-muted-foreground" />
+              </EmptyMedia>
+              {hasLibraries ? (
+                <>
+                  <EmptyTitle>No library selected</EmptyTitle>
+                  <EmptyDescription>Select a library from the sidebar to get started.</EmptyDescription>
+                </>
+              ) : (
+                <>
+                  <EmptyTitle>No libraries yet</EmptyTitle>
+                  <EmptyDescription>Create a library from the sidebar to start organizing your media.</EmptyDescription>
+                </>
+              )}
+            </EmptyHeader>
+          </Empty>
         ) : loading ? (
           <div className="flex flex-1 items-center justify-center">
             <Spinner className="size-6" />

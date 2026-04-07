@@ -466,6 +466,7 @@ function App() {
           onNavigate={navigateTo}
           onBreadcrumbClick={navigateBreadcrumb}
           selectedLibrary={selectedLibrary}
+          hasLibraries={libraries.length > 0}
           sortMode={sortMode}
           onSortModeChange={changeSortMode}
           onSortOrderChange={updateSortOrder}

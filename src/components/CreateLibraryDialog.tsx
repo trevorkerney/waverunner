@@ -155,7 +155,7 @@ export function CreateLibraryDialog({
 
   return (
     <Dialog open={isOpen} onOpenChange={handleDialogClose}>
-      <DialogContent className="sm:max-w-md overflow-hidden flex flex-col px-0">
+      <DialogContent className="sm:max-w-md overflow-hidden flex flex-col px-0 gap-0">
         <DialogHeader className="px-4">
           <DialogTitle>Create Library</DialogTitle>
         </DialogHeader>
@@ -261,7 +261,7 @@ export function CreateLibraryDialog({
             </TooltipProvider>
           </div>
         </div>
-        <DialogFooter className="px-4">
+        <DialogFooter className="px-4 mx-0 -mb-4">
           {creating ? (
             <div className="flex w-full items-center gap-2">
               <Spinner className="size-3.5" />
