@@ -1,5 +1,6 @@
 use crate::AppState;
 use serde::{Deserialize, Serialize};
+use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -132,12 +133,85 @@ pub struct MovieDetailUpdate {
 pub struct CastUpdateInfo {
     pub name: String,
     pub role: Option<String>,
+    pub tmdb_id: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CrewUpdateInfo {
     pub name: String,
     pub job: Option<String>,
+    pub tmdb_id: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PersonUpdateInfo {
+    pub name: String,
+    pub tmdb_id: Option<i64>,
+}
+
+/// Insert or find a person, using tmdb_id for matching when available.
+/// Returns the person's database id.
+async fn ensure_person(pool: &SqlitePool, name: &str, tmdb_id: Option<i64>) -> Result<i64, String> {
+    if let Some(tid) = tmdb_id {
+        // Check if person with this tmdb_id already exists
+        let existing: Option<(i64,)> = sqlx::query_as("SELECT id FROM person WHERE tmdb_id = ?")
+            .bind(tid)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if let Some((id,)) = existing {
+            // Update name in case it changed on TMDB
+            sqlx::query("UPDATE person SET name = ? WHERE id = ?")
+                .bind(name)
+                .bind(id)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            return Ok(id);
+        }
+
+        // Check if person exists by name without tmdb_id (was manually added)
+        let by_name: Option<(i64,)> =
+            sqlx::query_as("SELECT id FROM person WHERE name = ? AND tmdb_id IS NULL")
+                .bind(name)
+                .fetch_optional(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+
+        if let Some((id,)) = by_name {
+            // Attach tmdb_id to existing person
+            sqlx::query("UPDATE person SET tmdb_id = ? WHERE id = ?")
+                .bind(tid)
+                .bind(id)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            return Ok(id);
+        }
+
+        // Insert new person with tmdb_id
+        let result = sqlx::query("INSERT INTO person (name, tmdb_id) VALUES (?, ?)")
+            .bind(name)
+            .bind(tid)
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(result.last_insert_rowid())
+    } else {
+        // No tmdb_id — use name-based matching
+        sqlx::query("INSERT OR IGNORE INTO person (name) VALUES (?)")
+            .bind(name)
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        let (id,): (i64,) = sqlx::query_as("SELECT id FROM person WHERE name = ? LIMIT 1")
+            .bind(name)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(id)
+    }
 }
 
 fn sanitize_db_filename(name: &str) -> String {
@@ -668,15 +742,21 @@ pub async fn get_entries(
                 _ => "ORDER BY me.sort_title COLLATE NOCASE ASC",
             };
 
+            let base_query = format!(
+                "SELECT me.id, me.title, \
+                 CASE WHEN met.name IN ('collection','show') THEN \
+                   COALESCE((SELECT MIN(c.year) FROM media_entry c WHERE c.parent_id = me.id AND c.year IS NOT NULL), me.year) \
+                 ELSE me.year END as year, \
+                 CASE WHEN met.name IN ('collection','show') THEN \
+                   (SELECT NULLIF(MAX(c.year), MIN(c.year)) FROM media_entry c WHERE c.parent_id = me.id AND c.year IS NOT NULL) \
+                 ELSE me.end_year END as end_year, \
+                 me.folder_path, me.parent_id, met.name as entry_type, me.selected_cover, \
+                 (SELECT COUNT(*) FROM media_entry c WHERE c.parent_id = me.id) as child_count \
+                 FROM media_entry me JOIN media_entry_type met ON me.entry_type_id = met.id"
+            );
             let query_str = match parent_id {
-                Some(_) => format!(
-                    "SELECT me.id, me.title, me.year, me.end_year, me.folder_path, me.parent_id, met.name as entry_type, me.selected_cover, (SELECT COUNT(*) FROM media_entry c WHERE c.parent_id = me.id) as child_count FROM media_entry me JOIN media_entry_type met ON me.entry_type_id = met.id WHERE me.parent_id = ? {}",
-                    order_clause
-                ),
-                None => format!(
-                    "SELECT me.id, me.title, me.year, me.end_year, me.folder_path, me.parent_id, met.name as entry_type, me.selected_cover, (SELECT COUNT(*) FROM media_entry c WHERE c.parent_id = me.id) as child_count FROM media_entry me JOIN media_entry_type met ON me.entry_type_id = met.id WHERE me.parent_id IS NULL {}",
-                    order_clause
-                ),
+                Some(_) => format!("{base_query} WHERE me.parent_id = ? {order_clause}"),
+                None => format!("{base_query} WHERE me.parent_id IS NULL {order_clause}"),
             };
 
             let rows: Vec<(i64, String, Option<String>, Option<String>, String, Option<i64>, String, Option<String>, i64)> = match parent_id {
@@ -876,36 +956,44 @@ pub async fn search_entries(
 
     let entries = match format.as_str() {
         "video" => {
+            let year_expr = "\
+                CASE WHEN met.name IN ('collection','show') THEN \
+                  COALESCE((SELECT MIN(c.year) FROM media_entry c WHERE c.parent_id = me.id AND c.year IS NOT NULL), me.year) \
+                ELSE me.year END";
+            let end_year_expr = "\
+                CASE WHEN met.name IN ('collection','show') THEN \
+                  (SELECT NULLIF(MAX(c.year), MIN(c.year)) FROM media_entry c WHERE c.parent_id = me.id AND c.year IS NOT NULL) \
+                ELSE me.end_year END";
             let query_str = match parent_id {
-                Some(_) => "\
+                Some(_) => format!("\
                     WITH RECURSIVE descendants(id) AS ( \
                         SELECT id FROM media_entry WHERE parent_id = ? \
                         UNION ALL \
                         SELECT me.id FROM media_entry me JOIN descendants d ON me.parent_id = d.id \
                     ) \
-                    SELECT me.id, me.title, me.year, me.end_year, me.folder_path, me.parent_id, met.name as entry_type, me.selected_cover \
+                    SELECT me.id, me.title, {year_expr} as year, {end_year_expr} as end_year, me.folder_path, me.parent_id, met.name as entry_type, me.selected_cover \
                     FROM media_entry me \
                     JOIN media_entry_type met ON me.entry_type_id = met.id \
                     WHERE me.id IN (SELECT id FROM descendants) AND me.title LIKE ? \
-                    ORDER BY me.sort_title COLLATE NOCASE ASC",
-                None => "\
-                    SELECT me.id, me.title, me.year, me.end_year, me.folder_path, me.parent_id, met.name as entry_type, me.selected_cover \
+                    ORDER BY me.sort_title COLLATE NOCASE ASC"),
+                None => format!("\
+                    SELECT me.id, me.title, {year_expr} as year, {end_year_expr} as end_year, me.folder_path, me.parent_id, met.name as entry_type, me.selected_cover \
                     FROM media_entry me \
                     JOIN media_entry_type met ON me.entry_type_id = met.id \
                     WHERE me.title LIKE ? \
-                    ORDER BY me.sort_title COLLATE NOCASE ASC",
+                    ORDER BY me.sort_title COLLATE NOCASE ASC"),
             };
 
             let rows: Vec<(i64, String, Option<String>, Option<String>, String, Option<i64>, String, Option<String>)> = match parent_id {
                 Some(pid) => {
-                    sqlx::query_as(query_str)
+                    sqlx::query_as(&query_str)
                         .bind(pid)
                         .bind(&like_pattern)
                         .fetch_all(&pool)
                         .await
                 }
                 None => {
-                    sqlx::query_as(query_str)
+                    sqlx::query_as(&query_str)
                         .bind(&like_pattern)
                         .fetch_all(&pool)
                         .await
@@ -1436,10 +1524,10 @@ pub struct TmdbFieldSelection {
     pub year: Option<String>,
     pub maturity_rating: Option<String>,
     pub genres: Option<Vec<String>>,
-    pub directors: Option<Vec<String>>,
+    pub directors: Option<Vec<PersonUpdateInfo>>,
     pub cast: Option<Vec<CastUpdateInfo>>,
     pub crew: Option<Vec<CrewUpdateInfo>>,
-    pub producers: Option<Vec<String>>,
+    pub producers: Option<Vec<PersonUpdateInfo>>,
     pub studios: Option<Vec<String>>,
     pub keywords: Option<Vec<String>>,
 }
@@ -1576,15 +1664,11 @@ pub async fn apply_tmdb_metadata(
             .execute(&pool)
             .await
             .map_err(|e| e.to_string())?;
-        for name in directors {
-            sqlx::query("INSERT OR IGNORE INTO person (name) VALUES (?)")
-                .bind(name)
-                .execute(&pool)
-                .await
-                .map_err(|e| e.to_string())?;
-            sqlx::query("INSERT INTO movie_director (movie_id, person_id) VALUES (?, (SELECT id FROM person WHERE name = ?))")
+        for d in directors {
+            let person_id = ensure_person(&pool, &d.name, d.tmdb_id).await?;
+            sqlx::query("INSERT INTO movie_director (movie_id, person_id) VALUES (?, ?)")
                 .bind(entry_id)
-                .bind(name)
+                .bind(person_id)
                 .execute(&pool)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -1598,14 +1682,10 @@ pub async fn apply_tmdb_metadata(
             .await
             .map_err(|e| e.to_string())?;
         for (i, c) in cast.iter().enumerate() {
-            sqlx::query("INSERT OR IGNORE INTO person (name) VALUES (?)")
-                .bind(&c.name)
-                .execute(&pool)
-                .await
-                .map_err(|e| e.to_string())?;
-            sqlx::query("INSERT INTO movie_cast (movie_id, person_id, role, sort_order) VALUES (?, (SELECT id FROM person WHERE name = ?), ?, ?)")
+            let person_id = ensure_person(&pool, &c.name, c.tmdb_id).await?;
+            sqlx::query("INSERT INTO movie_cast (movie_id, person_id, role, sort_order) VALUES (?, ?, ?, ?)")
                 .bind(entry_id)
-                .bind(&c.name)
+                .bind(person_id)
                 .bind(&c.role)
                 .bind(i as i64)
                 .execute(&pool)
@@ -1621,14 +1701,10 @@ pub async fn apply_tmdb_metadata(
             .await
             .map_err(|e| e.to_string())?;
         for c in crew {
-            sqlx::query("INSERT OR IGNORE INTO person (name) VALUES (?)")
-                .bind(&c.name)
-                .execute(&pool)
-                .await
-                .map_err(|e| e.to_string())?;
-            sqlx::query("INSERT INTO movie_crew (movie_id, person_id, job) VALUES (?, (SELECT id FROM person WHERE name = ?), ?)")
+            let person_id = ensure_person(&pool, &c.name, c.tmdb_id).await?;
+            sqlx::query("INSERT INTO movie_crew (movie_id, person_id, job) VALUES (?, ?, ?)")
                 .bind(entry_id)
-                .bind(&c.name)
+                .bind(person_id)
                 .bind(&c.job)
                 .execute(&pool)
                 .await
@@ -1642,15 +1718,11 @@ pub async fn apply_tmdb_metadata(
             .execute(&pool)
             .await
             .map_err(|e| e.to_string())?;
-        for name in producers {
-            sqlx::query("INSERT OR IGNORE INTO person (name) VALUES (?)")
-                .bind(name)
-                .execute(&pool)
-                .await
-                .map_err(|e| e.to_string())?;
-            sqlx::query("INSERT INTO movie_producer (movie_id, person_id) VALUES (?, (SELECT id FROM person WHERE name = ?))")
+        for p in producers {
+            let person_id = ensure_person(&pool, &p.name, p.tmdb_id).await?;
+            sqlx::query("INSERT INTO movie_producer (movie_id, person_id) VALUES (?, ?)")
                 .bind(entry_id)
-                .bind(name)
+                .bind(person_id)
                 .execute(&pool)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -5095,4 +5167,712 @@ fn parse_folder_name(name: &str) -> (String, Option<String>) {
         }
     }
     (name.to_string(), None)
+}
+
+// ---------- Show Detail ----------
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ShowDetail {
+    pub id: i64,
+    pub tmdb_id: Option<String>,
+    pub imdb_id: Option<String>,
+    pub plot: Option<String>,
+    pub tagline: Option<String>,
+    pub maturity_rating: Option<String>,
+    pub genres: Vec<String>,
+    pub directors: Vec<PersonInfo>,
+    pub cast: Vec<CastInfo>,
+    pub crew: Vec<CrewInfo>,
+    pub producers: Vec<PersonInfo>,
+    pub studios: Vec<String>,
+    pub keywords: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SeasonDetailLocal {
+    pub id: i64,
+    pub title: String,
+    pub season_number: Option<i64>,
+    pub plot: Option<String>,
+    pub cast: Vec<CastInfo>,
+    pub crew: Vec<CrewInfo>,
+    pub directors: Vec<PersonInfo>,
+    pub producers: Vec<PersonInfo>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EpisodeDetailLocal {
+    pub id: i64,
+    pub title: String,
+    pub episode_number: Option<i64>,
+    pub plot: Option<String>,
+    pub runtime: Option<i64>,
+    pub cast: Vec<CastInfo>,
+    pub crew: Vec<CrewInfo>,
+}
+
+/// Helper: open library pool from library_id
+async fn open_library_pool(
+    state: &AppState,
+    library_id: &str,
+) -> Result<(SqlitePool, Vec<String>), String> {
+    let row: Option<(String, i32, String)> = sqlx::query_as(
+        "SELECT paths, portable, db_filename FROM libraries WHERE id = ?",
+    )
+    .bind(library_id)
+    .fetch_optional(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let (paths_json, portable, db_filename) = row.ok_or("Library not found")?;
+    let paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
+
+    let db_path = if portable != 0 {
+        PathBuf::from(&paths[0]).join(".waverunner.db")
+    } else {
+        state.app_data_dir.join(&db_filename)
+    };
+
+    let pool = crate::db::connect_library_pool(&db_path)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok((pool, paths))
+}
+
+#[tauri::command]
+pub async fn get_show_detail(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    show_id: i64,
+) -> Result<ShowDetail, String> {
+    let (pool, _) = open_library_pool(&state, &library_id).await?;
+
+    let show_row: Option<(Option<String>, Option<String>, Option<String>, Option<String>, Option<i64>)> =
+        sqlx::query_as(
+            "SELECT tmdb_id, imdb_id, plot, tagline, maturity_rating_id FROM show WHERE id = ?",
+        )
+        .bind(show_id)
+        .fetch_optional(&pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let (tmdb_id, imdb_id, plot, tagline, mr_id) = show_row.ok_or("Show not found")?;
+
+    let maturity_rating: Option<String> = if let Some(mid) = mr_id {
+        sqlx::query_scalar("SELECT name FROM maturity_rating WHERE id = ?")
+            .bind(mid)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|e| e.to_string())?
+    } else {
+        None
+    };
+
+    // Genres
+    let genre_rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT g.name FROM show_genre sg JOIN genre g ON sg.genre_id = g.id WHERE sg.show_id = ? ORDER BY g.name",
+    )
+    .bind(show_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let genres: Vec<String> = genre_rows.into_iter().map(|(n,)| n).collect();
+
+    // Directors
+    let director_rows: Vec<(i64, String, Option<String>)> = sqlx::query_as(
+        "SELECT p.id, p.name, p.image_path FROM show_director sd JOIN person p ON sd.person_id = p.id WHERE sd.show_id = ? ORDER BY p.name",
+    )
+    .bind(show_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let directors: Vec<PersonInfo> = director_rows.into_iter().map(|(id, name, image_path)| PersonInfo { id, name, image_path }).collect();
+
+    // Cast
+    let cast_rows: Vec<(i64, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT p.id, p.name, p.image_path, sc.role FROM show_cast sc JOIN person p ON sc.person_id = p.id WHERE sc.show_id = ? ORDER BY sc.sort_order",
+    )
+    .bind(show_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let cast: Vec<CastInfo> = cast_rows.into_iter().map(|(id, name, image_path, role)| CastInfo { id, name, image_path, role }).collect();
+
+    // Crew
+    let crew_rows: Vec<(i64, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT p.id, p.name, p.image_path, sc.job FROM show_crew sc JOIN person p ON sc.person_id = p.id WHERE sc.show_id = ? ORDER BY p.name",
+    )
+    .bind(show_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let crew: Vec<CrewInfo> = crew_rows.into_iter().map(|(id, name, image_path, job)| CrewInfo { id, name, image_path, job }).collect();
+
+    // Producers
+    let producer_rows: Vec<(i64, String, Option<String>)> = sqlx::query_as(
+        "SELECT p.id, p.name, p.image_path FROM show_producer sp JOIN person p ON sp.person_id = p.id WHERE sp.show_id = ? ORDER BY p.name",
+    )
+    .bind(show_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let producers: Vec<PersonInfo> = producer_rows.into_iter().map(|(id, name, image_path)| PersonInfo { id, name, image_path }).collect();
+
+    // Studios
+    let studio_rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT s.name FROM show_studio ss JOIN studio s ON ss.studio_id = s.id WHERE ss.show_id = ? ORDER BY s.name",
+    )
+    .bind(show_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let studios: Vec<String> = studio_rows.into_iter().map(|(n,)| n).collect();
+
+    // Keywords
+    let keyword_rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT k.name FROM show_keyword sk JOIN keyword k ON sk.keyword_id = k.id WHERE sk.show_id = ? ORDER BY k.name",
+    )
+    .bind(show_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let keywords: Vec<String> = keyword_rows.into_iter().map(|(n,)| n).collect();
+
+    pool.close().await;
+
+    Ok(ShowDetail {
+        id: show_id,
+        tmdb_id,
+        imdb_id,
+        plot,
+        tagline,
+        maturity_rating,
+        genres,
+        directors,
+        cast,
+        crew,
+        producers,
+        studios,
+        keywords,
+    })
+}
+
+#[tauri::command]
+pub async fn get_season_detail_local(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    season_id: i64,
+) -> Result<SeasonDetailLocal, String> {
+    let (pool, _) = open_library_pool(&state, &library_id).await?;
+
+    let row: Option<(String, Option<i64>, Option<String>)> = sqlx::query_as(
+        "SELECT title, season_number, plot FROM season WHERE id = ?",
+    )
+    .bind(season_id)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let (title, season_number, plot) = row.ok_or("Season not found")?;
+
+    let cast_rows: Vec<(i64, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT p.id, p.name, p.image_path, sc.role FROM season_cast sc JOIN person p ON sc.person_id = p.id WHERE sc.season_id = ? ORDER BY sc.sort_order",
+    )
+    .bind(season_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let cast: Vec<CastInfo> = cast_rows.into_iter().map(|(id, name, image_path, role)| CastInfo { id, name, image_path, role }).collect();
+
+    let crew_rows: Vec<(i64, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT p.id, p.name, p.image_path, sc.job FROM season_crew sc JOIN person p ON sc.person_id = p.id WHERE sc.season_id = ? ORDER BY p.name",
+    )
+    .bind(season_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let crew: Vec<CrewInfo> = crew_rows.into_iter().map(|(id, name, image_path, job)| CrewInfo { id, name, image_path, job }).collect();
+
+    let director_rows: Vec<(i64, String, Option<String>)> = sqlx::query_as(
+        "SELECT p.id, p.name, p.image_path FROM season_director sd JOIN person p ON sd.person_id = p.id WHERE sd.season_id = ? ORDER BY p.name",
+    )
+    .bind(season_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let directors: Vec<PersonInfo> = director_rows.into_iter().map(|(id, name, image_path)| PersonInfo { id, name, image_path }).collect();
+
+    let producer_rows: Vec<(i64, String, Option<String>)> = sqlx::query_as(
+        "SELECT p.id, p.name, p.image_path FROM season_producer sp JOIN person p ON sp.person_id = p.id WHERE sp.season_id = ? ORDER BY p.name",
+    )
+    .bind(season_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let producers: Vec<PersonInfo> = producer_rows.into_iter().map(|(id, name, image_path)| PersonInfo { id, name, image_path }).collect();
+
+    pool.close().await;
+
+    Ok(SeasonDetailLocal {
+        id: season_id,
+        title,
+        season_number,
+        plot,
+        cast,
+        crew,
+        directors,
+        producers,
+    })
+}
+
+#[tauri::command]
+pub async fn get_episode_detail_local(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    episode_id: i64,
+) -> Result<EpisodeDetailLocal, String> {
+    let (pool, _) = open_library_pool(&state, &library_id).await?;
+
+    let row: Option<(String, Option<i64>, Option<String>, Option<i64>)> = sqlx::query_as(
+        "SELECT title, episode_number, plot, runtime FROM episode WHERE id = ?",
+    )
+    .bind(episode_id)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let (title, episode_number, plot, runtime) = row.ok_or("Episode not found")?;
+
+    let cast_rows: Vec<(i64, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT p.id, p.name, p.image_path, ec.role FROM episode_cast ec JOIN person p ON ec.person_id = p.id WHERE ec.episode_id = ? ORDER BY ec.sort_order",
+    )
+    .bind(episode_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let cast: Vec<CastInfo> = cast_rows.into_iter().map(|(id, name, image_path, role)| CastInfo { id, name, image_path, role }).collect();
+
+    let crew_rows: Vec<(i64, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT p.id, p.name, p.image_path, ec.job FROM episode_crew ec JOIN person p ON ec.person_id = p.id WHERE ec.episode_id = ? ORDER BY p.name",
+    )
+    .bind(episode_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let crew: Vec<CrewInfo> = crew_rows.into_iter().map(|(id, name, image_path, job)| CrewInfo { id, name, image_path, job }).collect();
+
+    pool.close().await;
+
+    Ok(EpisodeDetailLocal {
+        id: episode_id,
+        title,
+        episode_number,
+        plot,
+        runtime,
+        cast,
+        crew,
+    })
+}
+
+// ---------- Show TMDB Commands ----------
+
+#[tauri::command]
+pub async fn search_tmdb_show(
+    state: tauri::State<'_, AppState>,
+    query: String,
+    year: Option<String>,
+) -> Result<Vec<crate::tmdb::TmdbTvSearchResult>, String> {
+    let token: String = sqlx::query_scalar("SELECT value FROM settings WHERE key = 'tmdb_api_token'")
+        .fetch_optional(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "No TMDB API token configured. Add one in Settings.".to_string())?;
+
+    let client = reqwest::Client::new();
+    let resp = crate::tmdb::search_tv(&client, &token, &query, year.as_deref()).await?;
+    Ok(resp.results)
+}
+
+#[tauri::command]
+pub async fn get_tmdb_show_detail(
+    state: tauri::State<'_, AppState>,
+    tmdb_id: i64,
+) -> Result<crate::tmdb::TmdbTvDetail, String> {
+    let token: String = sqlx::query_scalar("SELECT value FROM settings WHERE key = 'tmdb_api_token'")
+        .fetch_optional(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "No TMDB API token configured.".to_string())?;
+
+    let client = reqwest::Client::new();
+    crate::tmdb::get_tv_detail(&client, &token, tmdb_id).await
+}
+
+#[tauri::command]
+pub async fn get_tmdb_season_detail(
+    state: tauri::State<'_, AppState>,
+    tmdb_id: i64,
+    season_number: i64,
+) -> Result<crate::tmdb::TmdbSeasonDetail, String> {
+    let token: String = sqlx::query_scalar("SELECT value FROM settings WHERE key = 'tmdb_api_token'")
+        .fetch_optional(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "No TMDB API token configured.".to_string())?;
+
+    let client = reqwest::Client::new();
+    crate::tmdb::get_season_detail(&client, &token, tmdb_id, season_number).await
+}
+
+#[tauri::command]
+pub async fn get_tmdb_episode_detail(
+    state: tauri::State<'_, AppState>,
+    tmdb_id: i64,
+    season_number: i64,
+    episode_number: i64,
+) -> Result<crate::tmdb::TmdbEpisodeDetail, String> {
+    let token: String = sqlx::query_scalar("SELECT value FROM settings WHERE key = 'tmdb_api_token'")
+        .fetch_optional(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "No TMDB API token configured.".to_string())?;
+
+    let client = reqwest::Client::new();
+    crate::tmdb::get_episode_detail(&client, &token, tmdb_id, season_number, episode_number).await
+}
+
+// ---------- Apply TMDB Show Metadata ----------
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TmdbShowFieldSelection {
+    pub tmdb_id: Option<String>,
+    pub imdb_id: Option<String>,
+    pub plot: Option<String>,
+    pub tagline: Option<String>,
+    pub maturity_rating: Option<String>,
+    pub genres: Option<Vec<String>>,
+    pub directors: Option<Vec<PersonUpdateInfo>>,
+    pub cast: Option<Vec<CastUpdateInfo>>,
+    pub crew: Option<Vec<CrewUpdateInfo>>,
+    pub producers: Option<Vec<PersonUpdateInfo>>,
+    pub studios: Option<Vec<String>>,
+    pub keywords: Option<Vec<String>>,
+}
+
+#[tauri::command]
+pub async fn apply_tmdb_show_metadata(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    show_id: i64,
+    fields: TmdbShowFieldSelection,
+) -> Result<(), String> {
+    let (pool, _) = open_library_pool(&state, &library_id).await?;
+
+    // Scalar fields on show table
+    if let Some(ref tmdb_id) = fields.tmdb_id {
+        sqlx::query("UPDATE show SET tmdb_id = ? WHERE id = ?")
+            .bind(tmdb_id).bind(show_id).execute(&pool).await.map_err(|e| e.to_string())?;
+    }
+    if let Some(ref imdb_id) = fields.imdb_id {
+        sqlx::query("UPDATE show SET imdb_id = ? WHERE id = ?")
+            .bind(imdb_id).bind(show_id).execute(&pool).await.map_err(|e| e.to_string())?;
+    }
+    if let Some(ref plot) = fields.plot {
+        sqlx::query("UPDATE show SET plot = ? WHERE id = ?")
+            .bind(plot).bind(show_id).execute(&pool).await.map_err(|e| e.to_string())?;
+    }
+    if let Some(ref tagline) = fields.tagline {
+        sqlx::query("UPDATE show SET tagline = ? WHERE id = ?")
+            .bind(tagline).bind(show_id).execute(&pool).await.map_err(|e| e.to_string())?;
+    }
+
+    // Maturity rating
+    if let Some(ref mr_name) = fields.maturity_rating {
+        if mr_name.is_empty() {
+            sqlx::query("UPDATE show SET maturity_rating_id = NULL WHERE id = ?")
+                .bind(show_id).execute(&pool).await.map_err(|e| e.to_string())?;
+        } else {
+            sqlx::query("INSERT OR IGNORE INTO maturity_rating (name) VALUES (?)")
+                .bind(mr_name).execute(&pool).await.map_err(|e| e.to_string())?;
+            sqlx::query("UPDATE show SET maturity_rating_id = (SELECT id FROM maturity_rating WHERE name = ?) WHERE id = ?")
+                .bind(mr_name).bind(show_id).execute(&pool).await.map_err(|e| e.to_string())?;
+        }
+    }
+
+    // Junction tables
+    if let Some(ref genres) = fields.genres {
+        sqlx::query("DELETE FROM show_genre WHERE show_id = ?").bind(show_id).execute(&pool).await.map_err(|e| e.to_string())?;
+        for name in genres {
+            sqlx::query("INSERT OR IGNORE INTO genre (name) VALUES (?)").bind(name).execute(&pool).await.map_err(|e| e.to_string())?;
+            sqlx::query("INSERT INTO show_genre (show_id, genre_id) VALUES (?, (SELECT id FROM genre WHERE name = ?))")
+                .bind(show_id).bind(name).execute(&pool).await.map_err(|e| e.to_string())?;
+        }
+    }
+
+    if let Some(ref directors) = fields.directors {
+        sqlx::query("DELETE FROM show_director WHERE show_id = ?").bind(show_id).execute(&pool).await.map_err(|e| e.to_string())?;
+        for d in directors {
+            let person_id = ensure_person(&pool, &d.name, d.tmdb_id).await?;
+            sqlx::query("INSERT INTO show_director (show_id, person_id) VALUES (?, ?)")
+                .bind(show_id).bind(person_id).execute(&pool).await.map_err(|e| e.to_string())?;
+        }
+    }
+
+    if let Some(ref cast) = fields.cast {
+        sqlx::query("DELETE FROM show_cast WHERE show_id = ?").bind(show_id).execute(&pool).await.map_err(|e| e.to_string())?;
+        for (i, c) in cast.iter().enumerate() {
+            let person_id = ensure_person(&pool, &c.name, c.tmdb_id).await?;
+            sqlx::query("INSERT INTO show_cast (show_id, person_id, role, sort_order) VALUES (?, ?, ?, ?)")
+                .bind(show_id).bind(person_id).bind(&c.role).bind(i as i64).execute(&pool).await.map_err(|e| e.to_string())?;
+        }
+    }
+
+    if let Some(ref crew) = fields.crew {
+        sqlx::query("DELETE FROM show_crew WHERE show_id = ?").bind(show_id).execute(&pool).await.map_err(|e| e.to_string())?;
+        for c in crew {
+            let person_id = ensure_person(&pool, &c.name, c.tmdb_id).await?;
+            sqlx::query("INSERT INTO show_crew (show_id, person_id, job) VALUES (?, ?, ?)")
+                .bind(show_id).bind(person_id).bind(&c.job).execute(&pool).await.map_err(|e| e.to_string())?;
+        }
+    }
+
+    if let Some(ref producers) = fields.producers {
+        sqlx::query("DELETE FROM show_producer WHERE show_id = ?").bind(show_id).execute(&pool).await.map_err(|e| e.to_string())?;
+        for p in producers {
+            let person_id = ensure_person(&pool, &p.name, p.tmdb_id).await?;
+            sqlx::query("INSERT INTO show_producer (show_id, person_id) VALUES (?, ?)")
+                .bind(show_id).bind(person_id).execute(&pool).await.map_err(|e| e.to_string())?;
+        }
+    }
+
+    if let Some(ref studios) = fields.studios {
+        sqlx::query("DELETE FROM show_studio WHERE show_id = ?").bind(show_id).execute(&pool).await.map_err(|e| e.to_string())?;
+        for name in studios {
+            sqlx::query("INSERT OR IGNORE INTO studio (name) VALUES (?)").bind(name).execute(&pool).await.map_err(|e| e.to_string())?;
+            sqlx::query("INSERT INTO show_studio (show_id, studio_id) VALUES (?, (SELECT id FROM studio WHERE name = ?))")
+                .bind(show_id).bind(name).execute(&pool).await.map_err(|e| e.to_string())?;
+        }
+    }
+
+    if let Some(ref keywords) = fields.keywords {
+        sqlx::query("DELETE FROM show_keyword WHERE show_id = ?").bind(show_id).execute(&pool).await.map_err(|e| e.to_string())?;
+        for name in keywords {
+            sqlx::query("INSERT OR IGNORE INTO keyword (name) VALUES (?)").bind(name).execute(&pool).await.map_err(|e| e.to_string())?;
+            sqlx::query("INSERT INTO show_keyword (show_id, keyword_id) VALUES (?, (SELECT id FROM keyword WHERE name = ?))")
+                .bind(show_id).bind(name).execute(&pool).await.map_err(|e| e.to_string())?;
+        }
+    }
+
+    pool.close().await;
+    Ok(())
+}
+
+// ---------- Apply TMDB Season Metadata ----------
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TmdbSeasonFieldSelection {
+    pub plot: Option<String>,
+    pub cast: Option<Vec<CastUpdateInfo>>,
+    pub crew: Option<Vec<CrewUpdateInfo>>,
+    pub directors: Option<Vec<PersonUpdateInfo>>,
+    pub producers: Option<Vec<PersonUpdateInfo>>,
+}
+
+#[tauri::command]
+pub async fn apply_tmdb_season_metadata(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    season_id: i64,
+    fields: TmdbSeasonFieldSelection,
+) -> Result<(), String> {
+    let (pool, _) = open_library_pool(&state, &library_id).await?;
+
+    if let Some(ref plot) = fields.plot {
+        sqlx::query("UPDATE season SET plot = ? WHERE id = ?")
+            .bind(plot).bind(season_id).execute(&pool).await.map_err(|e| e.to_string())?;
+    }
+
+    if let Some(ref cast) = fields.cast {
+        sqlx::query("DELETE FROM season_cast WHERE season_id = ?").bind(season_id).execute(&pool).await.map_err(|e| e.to_string())?;
+        for (i, c) in cast.iter().enumerate() {
+            let person_id = ensure_person(&pool, &c.name, c.tmdb_id).await?;
+            sqlx::query("INSERT INTO season_cast (season_id, person_id, role, sort_order) VALUES (?, ?, ?, ?)")
+                .bind(season_id).bind(person_id).bind(&c.role).bind(i as i64).execute(&pool).await.map_err(|e| e.to_string())?;
+        }
+    }
+
+    if let Some(ref crew) = fields.crew {
+        sqlx::query("DELETE FROM season_crew WHERE season_id = ?").bind(season_id).execute(&pool).await.map_err(|e| e.to_string())?;
+        for c in crew {
+            let person_id = ensure_person(&pool, &c.name, c.tmdb_id).await?;
+            sqlx::query("INSERT INTO season_crew (season_id, person_id, job) VALUES (?, ?, ?)")
+                .bind(season_id).bind(person_id).bind(&c.job).execute(&pool).await.map_err(|e| e.to_string())?;
+        }
+    }
+
+    if let Some(ref directors) = fields.directors {
+        sqlx::query("DELETE FROM season_director WHERE season_id = ?").bind(season_id).execute(&pool).await.map_err(|e| e.to_string())?;
+        for d in directors {
+            let person_id = ensure_person(&pool, &d.name, d.tmdb_id).await?;
+            sqlx::query("INSERT INTO season_director (season_id, person_id) VALUES (?, ?)")
+                .bind(season_id).bind(person_id).execute(&pool).await.map_err(|e| e.to_string())?;
+        }
+    }
+
+    if let Some(ref producers) = fields.producers {
+        sqlx::query("DELETE FROM season_producer WHERE season_id = ?").bind(season_id).execute(&pool).await.map_err(|e| e.to_string())?;
+        for p in producers {
+            let person_id = ensure_person(&pool, &p.name, p.tmdb_id).await?;
+            sqlx::query("INSERT INTO season_producer (season_id, person_id) VALUES (?, ?)")
+                .bind(season_id).bind(person_id).execute(&pool).await.map_err(|e| e.to_string())?;
+        }
+    }
+
+    pool.close().await;
+    Ok(())
+}
+
+// ---------- Apply TMDB Episode Metadata ----------
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TmdbEpisodeFieldSelection {
+    pub plot: Option<String>,
+    pub runtime: Option<i64>,
+    pub cast: Option<Vec<CastUpdateInfo>>,
+    pub crew: Option<Vec<CrewUpdateInfo>>,
+}
+
+#[tauri::command]
+pub async fn apply_tmdb_episode_metadata(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    episode_id: i64,
+    fields: TmdbEpisodeFieldSelection,
+) -> Result<(), String> {
+    let (pool, _) = open_library_pool(&state, &library_id).await?;
+
+    if let Some(ref plot) = fields.plot {
+        sqlx::query("UPDATE episode SET plot = ? WHERE id = ?")
+            .bind(plot).bind(episode_id).execute(&pool).await.map_err(|e| e.to_string())?;
+    }
+    if let Some(runtime) = fields.runtime {
+        sqlx::query("UPDATE episode SET runtime = ? WHERE id = ?")
+            .bind(runtime).bind(episode_id).execute(&pool).await.map_err(|e| e.to_string())?;
+    }
+
+    if let Some(ref cast) = fields.cast {
+        sqlx::query("DELETE FROM episode_cast WHERE episode_id = ?").bind(episode_id).execute(&pool).await.map_err(|e| e.to_string())?;
+        for (i, c) in cast.iter().enumerate() {
+            let person_id = ensure_person(&pool, &c.name, c.tmdb_id).await?;
+            sqlx::query("INSERT INTO episode_cast (episode_id, person_id, role, sort_order) VALUES (?, ?, ?, ?)")
+                .bind(episode_id).bind(person_id).bind(&c.role).bind(i as i64).execute(&pool).await.map_err(|e| e.to_string())?;
+        }
+    }
+
+    if let Some(ref crew) = fields.crew {
+        sqlx::query("DELETE FROM episode_crew WHERE episode_id = ?").bind(episode_id).execute(&pool).await.map_err(|e| e.to_string())?;
+        for c in crew {
+            let person_id = ensure_person(&pool, &c.name, c.tmdb_id).await?;
+            sqlx::query("INSERT INTO episode_crew (episode_id, person_id, job) VALUES (?, ?, ?)")
+                .bind(episode_id).bind(person_id).bind(&c.job).execute(&pool).await.map_err(|e| e.to_string())?;
+        }
+    }
+
+    pool.close().await;
+    Ok(())
+}
+
+// ---------- Bulk Apply TMDB Episode Details for a Season ----------
+
+#[tauri::command]
+pub async fn apply_tmdb_season_episodes(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    season_id: i64,
+    tmdb_id: i64,
+    season_number: i64,
+) -> Result<i64, String> {
+    let token: String = sqlx::query_scalar("SELECT value FROM settings WHERE key = 'tmdb_api_token'")
+        .fetch_optional(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "No TMDB API token configured.".to_string())?;
+
+    let (pool, _) = open_library_pool(&state, &library_id).await?;
+
+    // Get local episodes for this season
+    let local_episodes: Vec<(i64, Option<i64>)> = sqlx::query_as(
+        "SELECT id, episode_number FROM episode WHERE season_id = ? ORDER BY episode_number",
+    )
+    .bind(season_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // Fetch TMDB season detail (includes episode summaries with guest_stars and crew)
+    let client = reqwest::Client::new();
+    let season_detail = crate::tmdb::get_season_detail(&client, &token, tmdb_id, season_number).await?;
+
+    let mut applied_count: i64 = 0;
+
+    // Match by episode number
+    for (local_id, local_ep_num) in &local_episodes {
+        let local_num = match local_ep_num {
+            Some(n) => *n,
+            None => continue,
+        };
+
+        let tmdb_ep = season_detail.episodes.iter().find(|e| e.episode_number == local_num);
+        let tmdb_ep = match tmdb_ep {
+            Some(e) => e,
+            None => continue,
+        };
+
+        // Apply plot + runtime
+        if let Some(ref overview) = tmdb_ep.overview {
+            if !overview.is_empty() {
+                sqlx::query("UPDATE episode SET plot = COALESCE(plot, ?) WHERE id = ? AND plot IS NULL")
+                    .bind(overview).bind(local_id).execute(&pool).await.map_err(|e| e.to_string())?;
+            }
+        }
+        if let Some(runtime) = tmdb_ep.runtime {
+            sqlx::query("UPDATE episode SET runtime = COALESCE(runtime, ?) WHERE id = ? AND runtime IS NULL")
+                .bind(runtime).bind(local_id).execute(&pool).await.map_err(|e| e.to_string())?;
+        }
+
+        // Guest stars
+        if !tmdb_ep.guest_stars.is_empty() {
+            // Only populate if episode has no cast yet
+            let existing: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM episode_cast WHERE episode_id = ?")
+                .bind(local_id).fetch_one(&pool).await.map_err(|e| e.to_string())?;
+            if existing.0 == 0 {
+                for (i, gs) in tmdb_ep.guest_stars.iter().enumerate() {
+                    let person_id = ensure_person(&pool, &gs.name, Some(gs.id)).await?;
+                    sqlx::query("INSERT INTO episode_cast (episode_id, person_id, role, sort_order) VALUES (?, ?, ?, ?)")
+                        .bind(local_id).bind(person_id).bind(&gs.character).bind(i as i64)
+                        .execute(&pool).await.map_err(|e| e.to_string())?;
+                }
+            }
+        }
+
+        // Episode crew
+        if !tmdb_ep.crew.is_empty() {
+            let existing: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM episode_crew WHERE episode_id = ?")
+                .bind(local_id).fetch_one(&pool).await.map_err(|e| e.to_string())?;
+            if existing.0 == 0 {
+                for c in &tmdb_ep.crew {
+                    let person_id = ensure_person(&pool, &c.name, Some(c.id)).await?;
+                    sqlx::query("INSERT INTO episode_crew (episode_id, person_id, job) VALUES (?, ?, ?)")
+                        .bind(local_id).bind(person_id).bind(&c.job)
+                        .execute(&pool).await.map_err(|e| e.to_string())?;
+                }
+            }
+        }
+
+        applied_count += 1;
+    }
+
+    pool.close().await;
+    Ok(applied_count)
 }

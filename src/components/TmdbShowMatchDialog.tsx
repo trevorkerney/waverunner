@@ -14,16 +14,15 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Spinner } from "@/components/ui/spinner";
 import { Search, ArrowLeft } from "lucide-react";
 import type {
-  MovieDetail,
-  TmdbSearchResult,
-  TmdbMovieDetail,
-  TmdbFieldSelection,
+  ShowDetail,
+  TmdbTvSearchResult,
+  TmdbTvDetail,
+  TmdbShowFieldSelection,
   CastUpdateInfo,
   CrewUpdateInfo,
   PersonUpdateInfo,
 } from "@/types";
 
-// Notable crew jobs to pull from TMDB credits
 const NOTABLE_CREW_JOBS = [
   "Writer",
   "Screenplay",
@@ -35,14 +34,14 @@ const NOTABLE_CREW_JOBS = [
   "Editor",
 ];
 
-interface TmdbMatchDialogProps {
+interface TmdbShowMatchDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   libraryId: string;
   entryId: number;
   entryTitle: string;
   entryYear: string | null;
-  currentDetail: MovieDetail | null;
+  currentDetail: ShowDetail | null;
   onApplied: () => void;
 }
 
@@ -50,28 +49,28 @@ type Step = "search" | "review";
 
 interface FieldCheck {
   checked: boolean;
-  isEmpty: boolean; // whether local field is empty
+  isEmpty: boolean;
 }
 
-function extractYear(releaseDate: string | null | undefined): string {
-  if (!releaseDate) return "";
-  return releaseDate.substring(0, 4);
+function extractYear(date: string | null | undefined): string {
+  if (!date) return "";
+  return date.substring(0, 4);
 }
 
-function getUSCertification(tmdb: TmdbMovieDetail): string {
-  if (!tmdb.releases?.countries) return "";
-  const us = tmdb.releases.countries.find((c) => c.iso_3166_1 === "US");
-  return us?.certification ?? "";
+function getUSRating(tmdb: TmdbTvDetail): string {
+  if (!tmdb.content_ratings?.results) return "";
+  const us = tmdb.content_ratings.results.find((c) => c.iso_3166_1 === "US");
+  return us?.rating ?? "";
 }
 
-function extractDirectors(tmdb: TmdbMovieDetail): PersonUpdateInfo[] {
+function extractDirectors(tmdb: TmdbTvDetail): PersonUpdateInfo[] {
   if (!tmdb.credits?.crew) return [];
   return tmdb.credits.crew
     .filter((c) => c.job === "Director")
     .map((c) => ({ name: c.name, tmdb_id: c.id }));
 }
 
-function extractCast(tmdb: TmdbMovieDetail, limit = 20): CastUpdateInfo[] {
+function extractCast(tmdb: TmdbTvDetail, limit = 20): CastUpdateInfo[] {
   if (!tmdb.credits?.cast) return [];
   return tmdb.credits.cast.slice(0, limit).map((c) => ({
     name: c.name,
@@ -80,14 +79,14 @@ function extractCast(tmdb: TmdbMovieDetail, limit = 20): CastUpdateInfo[] {
   }));
 }
 
-function extractCrew(tmdb: TmdbMovieDetail): CrewUpdateInfo[] {
+function extractCrew(tmdb: TmdbTvDetail): CrewUpdateInfo[] {
   if (!tmdb.credits?.crew) return [];
   return tmdb.credits.crew
     .filter((c) => c.job && NOTABLE_CREW_JOBS.includes(c.job) && c.job !== "Director")
     .map((c) => ({ name: c.name, job: c.job ?? null, tmdb_id: c.id }));
 }
 
-function extractProducers(tmdb: TmdbMovieDetail): PersonUpdateInfo[] {
+function extractProducers(tmdb: TmdbTvDetail): PersonUpdateInfo[] {
   if (!tmdb.credits?.crew) return [];
   const seen = new Set<number>();
   return tmdb.credits.crew
@@ -105,12 +104,15 @@ function extractProducers(tmdb: TmdbMovieDetail): PersonUpdateInfo[] {
     .map((c) => ({ name: c.name, tmdb_id: c.id }));
 }
 
-function extractStudios(tmdb: TmdbMovieDetail): string[] {
-  return tmdb.production_companies.map((c) => c.name);
+function extractStudios(tmdb: TmdbTvDetail): string[] {
+  return [
+    ...tmdb.production_companies.map((c) => c.name),
+    ...tmdb.networks.map((n) => n.name),
+  ].filter((v, i, a) => a.indexOf(v) === i);
 }
 
-function extractKeywords(tmdb: TmdbMovieDetail): string[] {
-  return tmdb.keywords?.keywords.map((k) => k.name) ?? [];
+function extractKeywords(tmdb: TmdbTvDetail): string[] {
+  return tmdb.keywords?.results.map((k) => k.name) ?? [];
 }
 
 function formatList(items: string[]): string {
@@ -131,7 +133,6 @@ function formatCrew(items: CrewUpdateInfo[]): string {
     .join(", ");
 }
 
-// Per-field data for the review step
 interface ReviewField {
   key: string;
   label: string;
@@ -141,9 +142,8 @@ interface ReviewField {
 }
 
 function buildReviewFields(
-  current: MovieDetail,
-  tmdb: TmdbMovieDetail,
-  entryYear: string | null
+  current: ShowDetail,
+  tmdb: TmdbTvDetail,
 ): ReviewField[] {
   const fields: ReviewField[] = [];
 
@@ -166,26 +166,13 @@ function buildReviewFields(
   add("plot", "Plot", current.plot, tmdb.overview ?? "");
   add("tagline", "Tagline", current.tagline, tmdb.tagline ?? "");
   add(
-    "runtime",
-    "Runtime",
-    current.runtime != null ? `${current.runtime} min` : null,
-    tmdb.runtime != null ? `${tmdb.runtime} min` : ""
-  );
-  add(
-    "year",
-    "Year",
-    entryYear,
-    extractYear(tmdb.release_date)
-  );
-  add(
     "maturity_rating",
     "Maturity Rating",
     current.maturity_rating,
-    getUSCertification(tmdb)
+    getUSRating(tmdb)
   );
   add("imdb_id", "IMDB ID", current.imdb_id, tmdb.external_ids?.imdb_id ?? "");
 
-  // List fields
   fields.push({
     key: "genres",
     label: "Genres",
@@ -227,7 +214,7 @@ function buildReviewFields(
   });
   fields.push({
     key: "studios",
-    label: "Studios",
+    label: "Studios / Networks",
     currentDisplay: formatList(current.studios),
     tmdbDisplay: formatList(extractStudios(tmdb)),
     isEmpty: current.studios.length === 0,
@@ -243,7 +230,7 @@ function buildReviewFields(
   return fields;
 }
 
-export function TmdbMatchDialog({
+export function TmdbShowMatchDialog({
   open,
   onOpenChange,
   libraryId,
@@ -252,18 +239,17 @@ export function TmdbMatchDialog({
   entryYear,
   currentDetail,
   onApplied,
-}: TmdbMatchDialogProps) {
+}: TmdbShowMatchDialogProps) {
   const [step, setStep] = useState<Step>("search");
   const [query, setQuery] = useState("");
   const [yearFilter, setYearFilter] = useState("");
   const [searching, setSearching] = useState(false);
-  const [results, setResults] = useState<TmdbSearchResult[]>([]);
-  const [selectedTmdb, setSelectedTmdb] = useState<TmdbMovieDetail | null>(null);
+  const [results, setResults] = useState<TmdbTvSearchResult[]>([]);
+  const [selectedTmdb, setSelectedTmdb] = useState<TmdbTvDetail | null>(null);
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [fieldChecks, setFieldChecks] = useState<Record<string, FieldCheck>>({});
   const [applying, setApplying] = useState(false);
 
-  // Reset when dialog opens
   useEffect(() => {
     if (open) {
       setStep("search");
@@ -278,7 +264,7 @@ export function TmdbMatchDialog({
   const doSearch = useCallback(async () => {
     setSearching(true);
     try {
-      const res = await invoke<TmdbSearchResult[]>("search_tmdb_movie", {
+      const res = await invoke<TmdbTvSearchResult[]>("search_tmdb_show", {
         query,
         year: yearFilter || null,
       });
@@ -291,20 +277,18 @@ export function TmdbMatchDialog({
   }, [query, yearFilter]);
 
   const selectResult = useCallback(
-    async (result: TmdbSearchResult) => {
+    async (result: TmdbTvSearchResult) => {
       setLoadingDetail(true);
       try {
-        const detail = await invoke<TmdbMovieDetail>("get_tmdb_movie_detail", {
+        const detail = await invoke<TmdbTvDetail>("get_tmdb_show_detail", {
           tmdbId: result.id,
         });
         setSelectedTmdb(detail);
 
-        // Build initial check state — pre-check empty fields
         if (currentDetail) {
-          const fields = buildReviewFields(currentDetail, detail, entryYear);
+          const fields = buildReviewFields(currentDetail, detail);
           const checks: Record<string, FieldCheck> = {};
           for (const f of fields) {
-            // Only pre-check if TMDB actually has data for this field
             const tmdbHasData = f.tmdbDisplay !== "(empty)";
             checks[f.key] = {
               checked: f.isEmpty && tmdbHasData,
@@ -329,9 +313,8 @@ export function TmdbMatchDialog({
     setApplying(true);
 
     try {
-      const sel: TmdbFieldSelection = {};
+      const sel: TmdbShowFieldSelection = {};
 
-      // Always set tmdb_id when applying
       sel.tmdb_id = String(selectedTmdb.id);
 
       const isChecked = (key: string) => fieldChecks[key]?.checked;
@@ -342,16 +325,9 @@ export function TmdbMatchDialog({
       if (isChecked("tagline") && selectedTmdb.tagline) {
         sel.tagline = selectedTmdb.tagline;
       }
-      if (isChecked("runtime") && selectedTmdb.runtime != null) {
-        sel.runtime = selectedTmdb.runtime;
-      }
-      if (isChecked("year")) {
-        const y = extractYear(selectedTmdb.release_date);
-        if (y) sel.year = y;
-      }
       if (isChecked("maturity_rating")) {
-        const cert = getUSCertification(selectedTmdb);
-        if (cert) sel.maturity_rating = cert;
+        const rating = getUSRating(selectedTmdb);
+        if (rating) sel.maturity_rating = rating;
       }
       if (isChecked("imdb_id") && selectedTmdb.external_ids?.imdb_id) {
         sel.imdb_id = selectedTmdb.external_ids.imdb_id;
@@ -378,9 +354,9 @@ export function TmdbMatchDialog({
         sel.keywords = extractKeywords(selectedTmdb);
       }
 
-      await invoke("apply_tmdb_metadata", {
+      await invoke("apply_tmdb_show_metadata", {
         libraryId,
-        entryId,
+        showId: entryId,
         fields: sel,
       });
 
@@ -404,7 +380,7 @@ export function TmdbMatchDialog({
 
   const reviewFields =
     currentDetail && selectedTmdb
-      ? buildReviewFields(currentDetail, selectedTmdb, entryYear)
+      ? buildReviewFields(currentDetail, selectedTmdb)
       : [];
 
   const anyChecked = Object.values(fieldChecks).some((f) => f.checked);
@@ -420,12 +396,11 @@ export function TmdbMatchDialog({
 
         {step === "search" && (
           <div className="flex flex-1 flex-col overflow-hidden">
-            {/* Search bar */}
             <div className="flex gap-2 border-b px-6 py-3">
               <Input
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
-                placeholder="Movie title..."
+                placeholder="TV show title..."
                 className="flex-1"
                 onKeyDown={(e) => {
                   if (e.key === "Enter") doSearch();
@@ -450,7 +425,6 @@ export function TmdbMatchDialog({
               </Button>
             </div>
 
-            {/* Results */}
             <div className="flex-1 overflow-y-auto">
               {loadingDetail && (
                 <div className="flex items-center justify-center py-12">
@@ -459,7 +433,7 @@ export function TmdbMatchDialog({
               )}
               {!loadingDetail && results.length === 0 && !searching && (
                 <p className="px-6 py-8 text-center text-sm text-muted-foreground">
-                  Search for a movie to match
+                  Search for a TV show to match
                 </p>
               )}
               {!loadingDetail &&
@@ -482,10 +456,10 @@ export function TmdbMatchDialog({
                     )}
                     <div className="min-w-0 flex-1">
                       <p className="text-sm font-medium">
-                        {r.title}
-                        {r.release_date && (
+                        {r.name}
+                        {r.first_air_date && (
                           <span className="ml-1.5 font-normal text-muted-foreground">
-                            ({extractYear(r.release_date)})
+                            ({extractYear(r.first_air_date)})
                           </span>
                         )}
                       </p>
@@ -518,9 +492,9 @@ export function TmdbMatchDialog({
                 Back
               </Button>
               <p className="text-sm text-muted-foreground">
-                {selectedTmdb?.title}
-                {selectedTmdb?.release_date &&
-                  ` (${extractYear(selectedTmdb.release_date)})`}
+                {selectedTmdb?.name}
+                {selectedTmdb?.first_air_date &&
+                  ` (${extractYear(selectedTmdb.first_air_date)})`}
               </p>
             </div>
 
@@ -529,7 +503,6 @@ export function TmdbMatchDialog({
                 {reviewFields.map((field) => {
                   const check = fieldChecks[field.key];
                   if (!check) return null;
-                  // Skip if TMDB has no data for this field
                   if (field.tmdbDisplay === "(empty)") return null;
 
                   return (

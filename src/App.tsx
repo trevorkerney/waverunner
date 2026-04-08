@@ -515,6 +515,13 @@ function App() {
           onMoveEntry={moveEntry}
           onCreateCollection={createCollection}
           onDeleteEntry={deleteEntry}
+          onEntryChanged={() => {
+            if (selectedLibrary) {
+              // Invalidate the parent grid so going back shows fresh data (e.g. updated year)
+              const parentId = breadcrumbs.length >= 2 ? breadcrumbs[breadcrumbs.length - 2]?.id ?? null : null;
+              invalidateCache(selectedLibrary.id, parentId);
+            }
+          }}
           onRescan={() => {
             if (selectedLibrary) {
               invalidateCache(selectedLibrary.id);

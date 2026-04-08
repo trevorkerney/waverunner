@@ -84,6 +84,17 @@ pub fn run() {
             commands::get_tmdb_movie_detail,
             commands::apply_tmdb_metadata,
             commands::download_tmdb_images,
+            commands::get_show_detail,
+            commands::get_season_detail_local,
+            commands::get_episode_detail_local,
+            commands::search_tmdb_show,
+            commands::get_tmdb_show_detail,
+            commands::get_tmdb_season_detail,
+            commands::get_tmdb_episode_detail,
+            commands::apply_tmdb_show_metadata,
+            commands::apply_tmdb_season_metadata,
+            commands::apply_tmdb_episode_metadata,
+            commands::apply_tmdb_season_episodes,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

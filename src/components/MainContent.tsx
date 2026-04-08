@@ -89,8 +89,9 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
-import { Library, MediaEntry, BreadcrumbItem, MovieDetail, MovieDetailUpdate, SeasonInfo, EpisodeInfo } from "@/types";
+import { Library, MediaEntry, BreadcrumbItem, MovieDetail, MovieDetailUpdate, SeasonInfo, EpisodeInfo, ShowDetail } from "@/types";
 import { TmdbMatchDialog } from "@/components/TmdbMatchDialog";
+import { TmdbShowMatchDialog } from "@/components/TmdbShowMatchDialog";
 import { TmdbImageBrowserDialog } from "@/components/TmdbImageBrowserDialog";
 
 function getDisplayCover(entry: MediaEntry): string | null {
@@ -123,6 +124,7 @@ interface MainContentProps {
   onCreateCollection: (name: string, basePath?: string) => Promise<void>;
   onDeleteEntry: (entryId: number, deleteFromDisk: boolean) => Promise<void>;
   onRescan: () => void;
+  onEntryChanged: () => void;
   getCoverUrl: (filePath: string) => string;
   getFullCoverUrl: (filePath: string) => string;
   scrollContainerRef: RefObject<HTMLDivElement | null>;
@@ -151,6 +153,7 @@ export function MainContent({
   onCreateCollection,
   onDeleteEntry,
   onRescan,
+  onEntryChanged,
   getCoverUrl,
   getFullCoverUrl,
   scrollContainerRef,
@@ -318,8 +321,8 @@ export function MainContent({
       <div ref={scrollContainerRef} className="flex-1 overflow-y-auto overflow-x-hidden p-4">
       {selectedEntry ? (
         selectedEntry.entry_type === "show"
-          ? <ShowDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getFullCoverUrl={getFullCoverUrl} />
-          : <EntryDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getFullCoverUrl={getFullCoverUrl} />
+          ? <ShowDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getFullCoverUrl={getFullCoverUrl} onEntryChanged={onEntryChanged} />
+          : <EntryDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getFullCoverUrl={getFullCoverUrl} onEntryChanged={onEntryChanged} />
       ) : (
       <ContextMenu>
         <ContextMenuTrigger render={<div className="flex min-h-full flex-col" />}>
@@ -777,7 +780,7 @@ function SortableCoverCard({
             <>
               <p className="text-sm font-medium">{entry.title}</p>
               {entry.year && (
-                <p className="text-xs text-muted-foreground">{entry.year}</p>
+                <p className="text-xs text-muted-foreground">{entry.year}{entry.end_year ? `–${entry.end_year}` : ""}</p>
               )}
             </>
           )}
@@ -868,7 +871,7 @@ function DragOverlayCard({
       <div className="w-full" style={{ maxWidth: size }}>
         <p className="text-sm font-medium">{entry.title}</p>
         {entry.year && (
-          <p className="text-xs text-muted-foreground">{entry.year}</p>
+          <p className="text-xs text-muted-foreground">{entry.year}{entry.end_year ? `–${entry.end_year}` : ""}</p>
         )}
       </div>
     </div>
@@ -951,10 +954,12 @@ function EntryDetailPage({
   entry,
   selectedLibrary,
   getFullCoverUrl,
+  onEntryChanged,
 }: {
   entry: MediaEntry;
   selectedLibrary: Library;
   getFullCoverUrl: (filePath: string) => string;
+  onEntryChanged: () => void;
 }) {
   const [detail, setDetail] = useState<MovieDetail | null>(null);
   const [editing, setEditing] = useState(false);
@@ -992,8 +997,8 @@ function EntryDetailPage({
       maturity_rating: detail?.maturity_rating ?? null,
       genres: detail?.genres ?? [],
       directors: detail?.directors.map((d: { name: string }) => d.name) ?? [],
-      cast: detail?.cast.map((c: { name: string; role: string | null }) => ({ name: c.name, role: c.role })) ?? [],
-      crew: detail?.crew.map((c: { name: string; job: string | null }) => ({ name: c.name, job: c.job })) ?? [],
+      cast: detail?.cast.map((c: { name: string; role: string | null }) => ({ name: c.name, role: c.role, tmdb_id: null })) ?? [],
+      crew: detail?.crew.map((c: { name: string; job: string | null }) => ({ name: c.name, job: c.job, tmdb_id: null })) ?? [],
       producers: detail?.producers.map((p: { name: string }) => p.name) ?? [],
       studios: detail?.studios ?? [],
       keywords: detail?.keywords ?? [],
@@ -1010,6 +1015,7 @@ function EntryDetailPage({
         detail: draft,
       });
       await loadDetail();
+      onEntryChanged();
       setEditing(false);
     } catch (e) {
       console.error("Failed to save movie detail:", e);
@@ -1159,7 +1165,7 @@ function EntryDetailPage({
         entryTitle={entry.title}
         entryYear={entry.year}
         currentDetail={detail}
-        onApplied={loadDetail}
+        onApplied={() => { loadDetail(); onEntryChanged(); }}
       />
       {detail?.tmdb_id && (
         <TmdbImageBrowserDialog
@@ -1168,7 +1174,7 @@ function EntryDetailPage({
           libraryId={selectedLibrary.id}
           entryId={entry.id}
           tmdbId={detail.tmdb_id}
-          onDownloaded={loadDetail}
+          onDownloaded={() => { loadDetail(); onEntryChanged(); }}
         />
       )}
     </div>
@@ -1179,20 +1185,38 @@ function ShowDetailPage({
   entry,
   selectedLibrary,
   getFullCoverUrl,
+  onEntryChanged,
 }: {
   entry: MediaEntry;
   selectedLibrary: Library;
   getFullCoverUrl: (filePath: string) => string;
+  onEntryChanged: () => void;
 }) {
+  const [detail, setDetail] = useState<ShowDetail | null>(null);
   const [seasons, setSeasons] = useState<SeasonInfo[]>([]);
   const [selectedSeasonId, setSelectedSeasonId] = useState<number | null>(null);
   const [episodes, setEpisodes] = useState<EpisodeInfo[]>([]);
+  const [tmdbDialogOpen, setTmdbDialogOpen] = useState(false);
+  const [tmdbImagesOpen, setTmdbImagesOpen] = useState(false);
   const selectedSeason = seasons.find((s) => s.id === selectedSeasonId);
   const selectedSeasonLabel = selectedSeason
     ? (selectedSeason.season_number != null ? `Season ${selectedSeason.season_number}` : selectedSeason.title)
     : "Select season";
 
+  const loadDetail = useCallback(async () => {
+    try {
+      const d = await invoke<ShowDetail>("get_show_detail", {
+        libraryId: selectedLibrary.id,
+        showId: entry.id,
+      });
+      setDetail(d);
+    } catch (e) {
+      console.error("Failed to load show detail:", e);
+    }
+  }, [selectedLibrary.id, entry.id]);
+
   useEffect(() => {
+    loadDetail();
     (async () => {
       try {
         const s = await invoke<SeasonInfo[]>("get_show_seasons", {
@@ -1207,7 +1231,7 @@ function ShowDetailPage({
         console.error("Failed to load seasons:", e);
       }
     })();
-  }, [selectedLibrary.id, entry.id]);
+  }, [selectedLibrary.id, entry.id, loadDetail]);
 
   useEffect(() => {
     if (selectedSeasonId == null) return;
@@ -1237,15 +1261,96 @@ function ShowDetailPage({
         />
       )}
       <div className="flex min-w-0 flex-1 flex-col gap-4">
-        <div>
-          <h1 className="text-3xl font-bold">{entry.title}</h1>
-          {entry.year && (
-            <p className="text-lg text-muted-foreground">
-              {entry.year}{entry.end_year ? `–${entry.end_year}` : ""}
-            </p>
-          )}
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h1 className="text-3xl font-bold">{entry.title}</h1>
+            {entry.year && (
+              <p className="text-lg text-muted-foreground">
+                {entry.year}{entry.end_year ? `–${entry.end_year}` : ""}
+              </p>
+            )}
+          </div>
+          <div className="flex gap-2">
+            <Button size="sm" variant="outline" onClick={() => setTmdbDialogOpen(true)}>
+              <Film size={14} />
+              {detail?.tmdb_id ? "Re-match TMDB" : "Match TMDB"}
+            </Button>
+            {detail?.tmdb_id && (
+              <Button size="sm" variant="outline" onClick={() => setTmdbImagesOpen(true)}>
+                <ImageIcon size={14} />
+                TMDB Images
+              </Button>
+            )}
+          </div>
         </div>
 
+        {/* Show metadata */}
+        {detail && (
+          <div className="flex flex-col gap-3">
+            {detail.tagline && (
+              <p className="text-sm italic text-muted-foreground">{detail.tagline}</p>
+            )}
+            {detail.plot && (
+              <p className="text-sm">{detail.plot}</p>
+            )}
+            <div className="flex flex-wrap gap-x-6 gap-y-2 text-sm">
+              {detail.maturity_rating && (
+                <div>
+                  <span className="text-muted-foreground">Rating: </span>
+                  {detail.maturity_rating}
+                </div>
+              )}
+              {detail.genres.length > 0 && (
+                <div>
+                  <span className="text-muted-foreground">Genres: </span>
+                  {detail.genres.join(", ")}
+                </div>
+              )}
+              {detail.studios.length > 0 && (
+                <div>
+                  <span className="text-muted-foreground">Studios: </span>
+                  {detail.studios.join(", ")}
+                </div>
+              )}
+            </div>
+            {detail.cast.length > 0 && (
+              <div className="text-sm">
+                <span className="text-muted-foreground">Cast: </span>
+                {detail.cast.map((c) => c.role ? `${c.name} (${c.role})` : c.name).join(", ")}
+              </div>
+            )}
+            {detail.directors.length > 0 && (
+              <div className="text-sm">
+                <span className="text-muted-foreground">Directors: </span>
+                {detail.directors.map((d) => d.name).join(", ")}
+              </div>
+            )}
+            {detail.crew.length > 0 && (
+              <div className="text-sm">
+                <span className="text-muted-foreground">Crew: </span>
+                {detail.crew.map((c) => c.job ? `${c.name} (${c.job})` : c.name).join(", ")}
+              </div>
+            )}
+            {detail.producers.length > 0 && (
+              <div className="text-sm">
+                <span className="text-muted-foreground">Producers: </span>
+                {detail.producers.map((p) => p.name).join(", ")}
+              </div>
+            )}
+            {detail.keywords.length > 0 && (
+              <div className="text-sm">
+                <span className="text-muted-foreground">Keywords: </span>
+                {detail.keywords.join(", ")}
+              </div>
+            )}
+            <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+              {detail.tmdb_id && <span>TMDB: {detail.tmdb_id}</span>}
+              {detail.imdb_id && <span>IMDB: {detail.imdb_id}</span>}
+            </div>
+          </div>
+        )}
+
+        {/* Seasons + episodes */}
         {seasons.length > 0 && (
           <div className="flex flex-col gap-3">
             <Select
@@ -1303,6 +1408,28 @@ function ShowDetailPage({
           <p className="text-sm text-muted-foreground">No seasons</p>
         )}
       </div>
+
+      <TmdbShowMatchDialog
+        open={tmdbDialogOpen}
+        onOpenChange={setTmdbDialogOpen}
+        libraryId={selectedLibrary.id}
+        entryId={entry.id}
+        entryTitle={entry.title}
+        entryYear={entry.year}
+        currentDetail={detail}
+        onApplied={() => { loadDetail(); onEntryChanged(); }}
+      />
+
+      {detail?.tmdb_id && (
+        <TmdbImageBrowserDialog
+          open={tmdbImagesOpen}
+          onOpenChange={setTmdbImagesOpen}
+          libraryId={selectedLibrary.id}
+          entryId={entry.id}
+          tmdbId={detail.tmdb_id}
+          onDownloaded={() => { loadDetail(); onEntryChanged(); }}
+        />
+      )}
     </div>
   );
 }

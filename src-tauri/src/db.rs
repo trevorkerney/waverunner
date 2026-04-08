@@ -144,7 +144,8 @@ async fn create_video_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         "CREATE TABLE IF NOT EXISTS person (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
-            image_path TEXT
+            image_path TEXT,
+            tmdb_id INTEGER
         )",
     )
     .execute(pool)
@@ -278,7 +279,101 @@ async fn create_video_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS show (
             id INTEGER PRIMARY KEY,
-            FOREIGN KEY (id) REFERENCES media_entry(id) ON DELETE CASCADE
+            tmdb_id TEXT,
+            imdb_id TEXT,
+            plot TEXT,
+            tagline TEXT,
+            maturity_rating_id INTEGER,
+            FOREIGN KEY (id) REFERENCES media_entry(id) ON DELETE CASCADE,
+            FOREIGN KEY (maturity_rating_id) REFERENCES maturity_rating(id)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    // Show junction tables
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS show_genre (
+            show_id INTEGER NOT NULL,
+            genre_id INTEGER NOT NULL,
+            PRIMARY KEY (show_id, genre_id),
+            FOREIGN KEY (show_id) REFERENCES show(id) ON DELETE CASCADE,
+            FOREIGN KEY (genre_id) REFERENCES genre(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS show_director (
+            show_id INTEGER NOT NULL,
+            person_id INTEGER NOT NULL,
+            PRIMARY KEY (show_id, person_id),
+            FOREIGN KEY (show_id) REFERENCES show(id) ON DELETE CASCADE,
+            FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS show_cast (
+            show_id INTEGER NOT NULL,
+            person_id INTEGER NOT NULL,
+            role TEXT,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (show_id, person_id),
+            FOREIGN KEY (show_id) REFERENCES show(id) ON DELETE CASCADE,
+            FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS show_crew (
+            show_id INTEGER NOT NULL,
+            person_id INTEGER NOT NULL,
+            job TEXT,
+            PRIMARY KEY (show_id, person_id, job),
+            FOREIGN KEY (show_id) REFERENCES show(id) ON DELETE CASCADE,
+            FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS show_producer (
+            show_id INTEGER NOT NULL,
+            person_id INTEGER NOT NULL,
+            PRIMARY KEY (show_id, person_id),
+            FOREIGN KEY (show_id) REFERENCES show(id) ON DELETE CASCADE,
+            FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS show_studio (
+            show_id INTEGER NOT NULL,
+            studio_id INTEGER NOT NULL,
+            PRIMARY KEY (show_id, studio_id),
+            FOREIGN KEY (show_id) REFERENCES show(id) ON DELETE CASCADE,
+            FOREIGN KEY (studio_id) REFERENCES studio(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS show_keyword (
+            show_id INTEGER NOT NULL,
+            keyword_id INTEGER NOT NULL,
+            PRIMARY KEY (show_id, keyword_id),
+            FOREIGN KEY (show_id) REFERENCES show(id) ON DELETE CASCADE,
+            FOREIGN KEY (keyword_id) REFERENCES keyword(id) ON DELETE CASCADE
         )",
     )
     .execute(pool)
@@ -294,6 +389,7 @@ async fn create_video_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             folder_path TEXT NOT NULL,
             year TEXT,
             end_year TEXT,
+            plot TEXT,
             sort_order INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY (show_id) REFERENCES show(id) ON DELETE CASCADE,
             UNIQUE(show_id, season_number)
@@ -311,9 +407,91 @@ async fn create_video_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             episode_number INTEGER,
             file_path TEXT NOT NULL,
             year TEXT,
+            plot TEXT,
+            runtime INTEGER,
             sort_order INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY (season_id) REFERENCES season(id) ON DELETE CASCADE,
             UNIQUE(season_id, episode_number)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    // Season junction tables
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS season_cast (
+            season_id INTEGER NOT NULL,
+            person_id INTEGER NOT NULL,
+            role TEXT,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (season_id, person_id),
+            FOREIGN KEY (season_id) REFERENCES season(id) ON DELETE CASCADE,
+            FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS season_crew (
+            season_id INTEGER NOT NULL,
+            person_id INTEGER NOT NULL,
+            job TEXT,
+            PRIMARY KEY (season_id, person_id, job),
+            FOREIGN KEY (season_id) REFERENCES season(id) ON DELETE CASCADE,
+            FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS season_director (
+            season_id INTEGER NOT NULL,
+            person_id INTEGER NOT NULL,
+            PRIMARY KEY (season_id, person_id),
+            FOREIGN KEY (season_id) REFERENCES season(id) ON DELETE CASCADE,
+            FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS season_producer (
+            season_id INTEGER NOT NULL,
+            person_id INTEGER NOT NULL,
+            PRIMARY KEY (season_id, person_id),
+            FOREIGN KEY (season_id) REFERENCES season(id) ON DELETE CASCADE,
+            FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    // Episode junction tables
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS episode_cast (
+            episode_id INTEGER NOT NULL,
+            person_id INTEGER NOT NULL,
+            role TEXT,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (episode_id, person_id),
+            FOREIGN KEY (episode_id) REFERENCES episode(id) ON DELETE CASCADE,
+            FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS episode_crew (
+            episode_id INTEGER NOT NULL,
+            person_id INTEGER NOT NULL,
+            job TEXT,
+            PRIMARY KEY (episode_id, person_id, job),
+            FOREIGN KEY (episode_id) REFERENCES episode(id) ON DELETE CASCADE,
+            FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
         )",
     )
     .execute(pool)

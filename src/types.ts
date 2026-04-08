@@ -75,11 +75,18 @@ export interface MovieDetail {
 export interface CastUpdateInfo {
   name: string;
   role: string | null;
+  tmdb_id: number | null;
 }
 
 export interface CrewUpdateInfo {
   name: string;
   job: string | null;
+  tmdb_id: number | null;
+}
+
+export interface PersonUpdateInfo {
+  name: string;
+  tmdb_id: number | null;
 }
 
 export interface SeasonInfo {
@@ -176,10 +183,10 @@ export interface TmdbFieldSelection {
   year?: string;
   maturity_rating?: string;
   genres?: string[];
-  directors?: string[];
+  directors?: PersonUpdateInfo[];
   cast?: CastUpdateInfo[];
   crew?: CrewUpdateInfo[];
-  producers?: string[];
+  producers?: PersonUpdateInfo[];
   studios?: string[];
   keywords?: string[];
 }
@@ -201,4 +208,138 @@ export interface MovieDetailUpdate {
   producers?: string[];
   studios?: string[];
   keywords?: string[];
+}
+
+// ---------- Show types ----------
+
+export interface ShowDetail {
+  id: number;
+  tmdb_id: string | null;
+  imdb_id: string | null;
+  plot: string | null;
+  tagline: string | null;
+  maturity_rating: string | null;
+  genres: string[];
+  directors: PersonInfo[];
+  cast: CastInfo[];
+  crew: CrewInfo[];
+  producers: PersonInfo[];
+  studios: string[];
+  keywords: string[];
+}
+
+export interface SeasonDetailLocal {
+  id: number;
+  title: string;
+  season_number: number | null;
+  plot: string | null;
+  cast: CastInfo[];
+  crew: CrewInfo[];
+  directors: PersonInfo[];
+  producers: PersonInfo[];
+}
+
+export interface EpisodeDetailLocal {
+  id: number;
+  title: string;
+  episode_number: number | null;
+  plot: string | null;
+  runtime: number | null;
+  cast: CastInfo[];
+  crew: CrewInfo[];
+}
+
+// ---------- TMDB TV types ----------
+
+export interface TmdbTvSearchResult {
+  id: number;
+  name: string;
+  first_air_date: string | null;
+  overview: string | null;
+  poster_path: string | null;
+  vote_average: number | null;
+}
+
+export interface TmdbTvDetail {
+  id: number;
+  name: string;
+  overview: string | null;
+  tagline: string | null;
+  first_air_date: string | null;
+  number_of_seasons: number | null;
+  number_of_episodes: number | null;
+  genres: TmdbGenre[];
+  production_companies: TmdbCompany[];
+  networks: { id: number; name: string }[];
+  credits: {
+    cast: TmdbCastMember[];
+    crew: TmdbCrewMember[];
+  } | null;
+  keywords: { results: { id: number; name: string }[] } | null;
+  content_ratings: { results: { iso_3166_1: string; rating: string }[] } | null;
+  external_ids: { imdb_id: string | null } | null;
+  images: { posters: TmdbImage[]; backdrops: TmdbImage[] } | null;
+}
+
+export interface TmdbSeasonDetail {
+  id: number;
+  name: string;
+  overview: string | null;
+  season_number: number;
+  episodes: TmdbEpisodeSummary[];
+  credits: {
+    cast: TmdbCastMember[];
+    crew: TmdbCrewMember[];
+  } | null;
+}
+
+export interface TmdbEpisodeSummary {
+  id: number;
+  name: string;
+  overview: string | null;
+  episode_number: number;
+  runtime: number | null;
+  guest_stars: TmdbCastMember[];
+  crew: TmdbCrewMember[];
+}
+
+export interface TmdbEpisodeDetail {
+  id: number;
+  name: string;
+  overview: string | null;
+  episode_number: number;
+  runtime: number | null;
+  guest_stars: TmdbCastMember[];
+  crew: TmdbCrewMember[];
+  still_path: string | null;
+}
+
+export interface TmdbShowFieldSelection {
+  tmdb_id?: string;
+  imdb_id?: string;
+  plot?: string;
+  tagline?: string;
+  maturity_rating?: string;
+  genres?: string[];
+  directors?: PersonUpdateInfo[];
+  cast?: CastUpdateInfo[];
+  crew?: CrewUpdateInfo[];
+  producers?: PersonUpdateInfo[];
+  studios?: string[];
+  keywords?: string[];
+}
+
+export interface TmdbSeasonFieldSelection {
+  plot?: string;
+  cast?: CastUpdateInfo[];
+  crew?: CrewUpdateInfo[];
+  directors?: PersonUpdateInfo[];
+  producers?: PersonUpdateInfo[];
+}
+
+export interface TmdbEpisodeFieldSelection {
+  plot?: string;
+  runtime?: number;
+  cast?: CastUpdateInfo[];
+  crew?: CrewUpdateInfo[];
 }
