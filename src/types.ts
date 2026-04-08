@@ -97,6 +97,93 @@ export interface EpisodeInfo {
   sort_order: number;
 }
 
+// TMDB types
+
+export interface TmdbSearchResult {
+  id: number;
+  title: string;
+  release_date: string | null;
+  overview: string | null;
+  poster_path: string | null;
+  vote_average: number | null;
+}
+
+export interface TmdbGenre {
+  id: number;
+  name: string;
+}
+
+export interface TmdbCompany {
+  id: number;
+  name: string;
+}
+
+export interface TmdbCastMember {
+  id: number;
+  name: string;
+  character: string | null;
+  order: number | null;
+  profile_path: string | null;
+}
+
+export interface TmdbCrewMember {
+  id: number;
+  name: string;
+  job: string | null;
+  department: string | null;
+  profile_path: string | null;
+}
+
+export interface TmdbImage {
+  file_path: string;
+  width: number;
+  height: number;
+  vote_average: number | null;
+  iso_639_1: string | null;
+}
+
+export interface TmdbMovieDetail {
+  id: number;
+  title: string;
+  overview: string | null;
+  tagline: string | null;
+  runtime: number | null;
+  release_date: string | null;
+  genres: TmdbGenre[];
+  production_companies: TmdbCompany[];
+  credits: {
+    cast: TmdbCastMember[];
+    crew: TmdbCrewMember[];
+  } | null;
+  keywords: { keywords: { id: number; name: string }[] } | null;
+  releases: { countries: { iso_3166_1: string; certification: string }[] } | null;
+  external_ids: { imdb_id: string | null } | null;
+  images: { posters: TmdbImage[]; backdrops: TmdbImage[] } | null;
+}
+
+export interface TmdbImageDownload {
+  file_path: string;
+  size: string;
+  image_type: "cover" | "background";
+}
+
+export interface TmdbFieldSelection {
+  tmdb_id?: string;
+  imdb_id?: string;
+  plot?: string;
+  tagline?: string;
+  runtime?: number;
+  year?: string;
+  maturity_rating?: string;
+  genres?: string[];
+  directors?: string[];
+  cast?: CastUpdateInfo[];
+  crew?: CrewUpdateInfo[];
+  producers?: string[];
+  studios?: string[];
+  keywords?: string[];
+}
+
 export interface MovieDetailUpdate {
   tmdb_id?: string | null;
   imdb_id?: string | null;

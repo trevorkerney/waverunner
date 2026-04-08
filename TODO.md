@@ -34,10 +34,16 @@ sidebar complications (complications like a watch)
     - directors/producers
     - custom collections/playlists
 
+settings system where changes are all set at once on save button click, instead of on settings exit
+
 ## BIG STUFF NOW
 
-ability to import media not currently on media drive. however this is done can potentially provide another method of making collections as well
+Lets plan it. Shows are going to be the same mostly I think. Episodes need a year, and seasons and shows need a year range. What I'm debating really is which the cast will sit with. Would it be easy from a querying standpoint to, say, get a list of all the cast of a show, assuming the cast is stored with a m2m table 
+
+reduce zoom in out freedom. make it so that, from 100%, the user can go up twice max and down twice min
+
+show resolution and file size of each cover in carousel cover selection
 
 TMDB metadata integration (toggle per library, title resolution: file metadata > folder name > TMDB search)
 
-consider some sort of movie/show separation for the sidebar
+ability to import media not currently on media drive. however this is done can potentially provide another method of making collections as well

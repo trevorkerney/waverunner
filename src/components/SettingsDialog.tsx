@@ -11,7 +11,8 @@ import { Slider } from "@/components/ui/slider";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from "@/components/ui/select";
-import { Settings, Download } from "lucide-react";
+import { Input } from "@/components/ui/input";
+import { Settings, Download, Eye, EyeOff } from "lucide-react";
 
 const RECYCLE_STEPS = [0, 1, 2, 5, 10, 25, 50, 100, 250, -1];
 const RECYCLE_DEFAULT_STEP = 6; // 50 GB
@@ -49,6 +50,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
     "idle" | "checking" | "downloading" | "ready" | "none" | "error"
   >("idle");
   const [updateVersion, setUpdateVersion] = useState("");
+  const [showToken, setShowToken] = useState(false);
 
   useEffect(() => {
     if (!open) return;
@@ -220,6 +222,38 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                   <p className="text-xs text-muted-foreground">
                     {recycleStepLabel(recycleValueToStep(settings["recycle_bin_max_gb"]))}
                   </p>
+                </div>
+              </div>
+              <div>
+                <h3 className="mb-4 text-sm font-semibold">TMDB</h3>
+                <div className="flex flex-col gap-4">
+                  <div>
+                    <p className="text-sm">API Read Access Token</p>
+                    <p className="mb-2 text-xs text-muted-foreground">
+                      Required for fetching movie metadata from TMDB. Get one
+                      from your TMDB account settings.
+                    </p>
+                    <div className="flex gap-2">
+                      <div className="relative flex-1">
+                        <Input
+                          type={showToken ? "text" : "password"}
+                          value={settings["tmdb_api_token"] || ""}
+                          onChange={(e) =>
+                            setSetting("tmdb_api_token", e.target.value)
+                          }
+                          placeholder="Enter your TMDB API read access token"
+                          className="pr-9"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => setShowToken((v) => !v)}
+                          className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                        >
+                          {showToken ? <EyeOff size={14} /> : <Eye size={14} />}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
                 </div>
               </div>
             </div>

@@ -90,6 +90,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
 import { Library, MediaEntry, BreadcrumbItem, MovieDetail, MovieDetailUpdate, SeasonInfo, EpisodeInfo } from "@/types";
+import { TmdbMatchDialog } from "@/components/TmdbMatchDialog";
+import { TmdbImageBrowserDialog } from "@/components/TmdbImageBrowserDialog";
 
 function getDisplayCover(entry: MediaEntry): string | null {
   if (entry.selected_cover && entry.covers.includes(entry.selected_cover)) {
@@ -958,6 +960,8 @@ function EntryDetailPage({
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState<MovieDetailUpdate>({});
   const [saving, setSaving] = useState(false);
+  const [tmdbDialogOpen, setTmdbDialogOpen] = useState(false);
+  const [tmdbImagesOpen, setTmdbImagesOpen] = useState(false);
 
   const loadDetail = useCallback(async () => {
     try {
@@ -1087,10 +1091,22 @@ function EntryDetailPage({
                 </Button>
               </>
             ) : (
-              <Button size="sm" variant="outline" onClick={startEditing}>
-                <Pencil size={14} />
-                Edit
-              </Button>
+              <>
+                <Button size="sm" variant="outline" onClick={() => setTmdbDialogOpen(true)}>
+                  <Film size={14} />
+                  {detail?.tmdb_id ? "Re-match TMDB" : "Match TMDB"}
+                </Button>
+                {detail?.tmdb_id && (
+                  <Button size="sm" variant="outline" onClick={() => setTmdbImagesOpen(true)}>
+                    <ImageIcon size={14} />
+                    TMDB Images
+                  </Button>
+                )}
+                <Button size="sm" variant="outline" onClick={startEditing}>
+                  <Pencil size={14} />
+                  Edit
+                </Button>
+              </>
             )}
           </div>
         </div>
@@ -1135,6 +1151,26 @@ function EntryDetailPage({
           </div>
         )}
       </div>
+      <TmdbMatchDialog
+        open={tmdbDialogOpen}
+        onOpenChange={setTmdbDialogOpen}
+        libraryId={selectedLibrary.id}
+        entryId={entry.id}
+        entryTitle={entry.title}
+        entryYear={entry.year}
+        currentDetail={detail}
+        onApplied={loadDetail}
+      />
+      {detail?.tmdb_id && (
+        <TmdbImageBrowserDialog
+          open={tmdbImagesOpen}
+          onOpenChange={setTmdbImagesOpen}
+          libraryId={selectedLibrary.id}
+          entryId={entry.id}
+          tmdbId={detail.tmdb_id}
+          onDownloaded={loadDetail}
+        />
+      )}
     </div>
   );
 }

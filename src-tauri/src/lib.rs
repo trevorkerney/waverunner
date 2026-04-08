@@ -1,5 +1,6 @@
 mod commands;
 mod db;
+mod tmdb;
 
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -79,6 +80,10 @@ pub fn run() {
             commands::play_episode,
             commands::delete_entry,
             commands::check_entry_has_files,
+            commands::search_tmdb_movie,
+            commands::get_tmdb_movie_detail,
+            commands::apply_tmdb_metadata,
+            commands::download_tmdb_images,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

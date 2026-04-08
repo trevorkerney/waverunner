@@ -284,17 +284,6 @@ async fn create_video_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
-    // Collection (1:1 with media_entry)
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS collection (
-            id INTEGER PRIMARY KEY,
-            sort_mode TEXT NOT NULL DEFAULT 'alpha',
-            FOREIGN KEY (id) REFERENCES media_entry(id) ON DELETE CASCADE
-        )",
-    )
-    .execute(pool)
-    .await?;
-
     // Seasons
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS season (
@@ -325,6 +314,17 @@ async fn create_video_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             sort_order INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY (season_id) REFERENCES season(id) ON DELETE CASCADE,
             UNIQUE(season_id, episode_number)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    // Collection (1:1 with media_entry)
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS collection (
+            id INTEGER PRIMARY KEY,
+            sort_mode TEXT NOT NULL DEFAULT 'alpha',
+            FOREIGN KEY (id) REFERENCES media_entry(id) ON DELETE CASCADE
         )",
     )
     .execute(pool)
