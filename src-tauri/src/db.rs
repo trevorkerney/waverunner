@@ -305,7 +305,7 @@ async fn create_video_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     .await?;
 
     sqlx::query(
-        "CREATE TABLE IF NOT EXISTS show_director (
+        "CREATE TABLE IF NOT EXISTS show_creator (
             show_id INTEGER NOT NULL,
             person_id INTEGER NOT NULL,
             PRIMARY KEY (show_id, person_id),
@@ -476,7 +476,7 @@ async fn create_video_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             person_id INTEGER NOT NULL,
             role TEXT,
             sort_order INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (episode_id, person_id),
+            PRIMARY KEY (episode_id, person_id, role),
             FOREIGN KEY (episode_id) REFERENCES episode(id) ON DELETE CASCADE,
             FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
         )",

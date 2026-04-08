@@ -30,7 +30,10 @@ sidebar complications (complications like a watch)
   - movies/tv
     - just movies
     - just tv
-    - actors
+    - people
+      - actors
+      - directors/producers
+      - composers
     - directors/producers
     - custom collections/playlists
 
@@ -42,6 +45,8 @@ reduce zoom in out freedom. make it so that, from 100%, the user can go up twice
 
 show resolution and file size of each cover in carousel cover selection
 
-TMDB metadata integration (toggle per library, title resolution: file metadata > folder name > TMDB search)
+button or ability to import media not currently on media drive. this can potentially provide another method of making collections as well
 
-ability to import media not currently on media drive. however this is done can potentially provide another method of making collections as well
+highlight composers. tmdb has them as crew with job "Composer" or "Original Music Composer"
+
+tv shows have directors per episode, not season or show as a whole. tmdb has them in crew with 

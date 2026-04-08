@@ -63,11 +63,8 @@ function getUSRating(tmdb: TmdbTvDetail): string {
   return us?.rating ?? "";
 }
 
-function extractDirectors(tmdb: TmdbTvDetail): PersonUpdateInfo[] {
-  if (!tmdb.credits?.crew) return [];
-  return tmdb.credits.crew
-    .filter((c) => c.job === "Director")
-    .map((c) => ({ name: c.name, tmdb_id: c.id }));
+function extractCreators(tmdb: TmdbTvDetail): PersonUpdateInfo[] {
+  return tmdb.created_by.map((c) => ({ name: c.name, tmdb_id: c.id }));
 }
 
 function extractCast(tmdb: TmdbTvDetail, limit = 20): CastUpdateInfo[] {
@@ -181,11 +178,11 @@ function buildReviewFields(
     isEmpty: current.genres.length === 0,
   });
   fields.push({
-    key: "directors",
-    label: "Directors",
-    currentDisplay: formatList(current.directors.map((d) => d.name)),
-    tmdbDisplay: formatList(extractDirectors(tmdb).map((d) => d.name)),
-    isEmpty: current.directors.length === 0,
+    key: "creators",
+    label: "Created By",
+    currentDisplay: formatList(current.creators.map((c) => c.name)),
+    tmdbDisplay: formatList(extractCreators(tmdb).map((c) => c.name)),
+    isEmpty: current.creators.length === 0,
   });
   fields.push({
     key: "cast",
@@ -335,8 +332,8 @@ export function TmdbShowMatchDialog({
       if (isChecked("genres")) {
         sel.genres = selectedTmdb.genres.map((g) => g.name);
       }
-      if (isChecked("directors")) {
-        sel.directors = extractDirectors(selectedTmdb);
+      if (isChecked("creators")) {
+        sel.creators = extractCreators(selectedTmdb);
       }
       if (isChecked("cast")) {
         sel.cast = extractCast(selectedTmdb);

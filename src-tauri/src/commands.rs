@@ -5180,7 +5180,7 @@ pub struct ShowDetail {
     pub tagline: Option<String>,
     pub maturity_rating: Option<String>,
     pub genres: Vec<String>,
-    pub directors: Vec<PersonInfo>,
+    pub creators: Vec<PersonInfo>,
     pub cast: Vec<CastInfo>,
     pub crew: Vec<CrewInfo>,
     pub producers: Vec<PersonInfo>,
@@ -5279,15 +5279,15 @@ pub async fn get_show_detail(
     .map_err(|e| e.to_string())?;
     let genres: Vec<String> = genre_rows.into_iter().map(|(n,)| n).collect();
 
-    // Directors
-    let director_rows: Vec<(i64, String, Option<String>)> = sqlx::query_as(
-        "SELECT p.id, p.name, p.image_path FROM show_director sd JOIN person p ON sd.person_id = p.id WHERE sd.show_id = ? ORDER BY p.name",
+    // Creators
+    let creator_rows: Vec<(i64, String, Option<String>)> = sqlx::query_as(
+        "SELECT p.id, p.name, p.image_path FROM show_creator sc JOIN person p ON sc.person_id = p.id WHERE sc.show_id = ? ORDER BY p.name",
     )
     .bind(show_id)
     .fetch_all(&pool)
     .await
     .map_err(|e| e.to_string())?;
-    let directors: Vec<PersonInfo> = director_rows.into_iter().map(|(id, name, image_path)| PersonInfo { id, name, image_path }).collect();
+    let creators: Vec<PersonInfo> = creator_rows.into_iter().map(|(id, name, image_path)| PersonInfo { id, name, image_path }).collect();
 
     // Cast
     let cast_rows: Vec<(i64, String, Option<String>, Option<String>)> = sqlx::query_as(
@@ -5349,7 +5349,7 @@ pub async fn get_show_detail(
         tagline,
         maturity_rating,
         genres,
-        directors,
+        creators,
         cast,
         crew,
         producers,
@@ -5552,7 +5552,7 @@ pub struct TmdbShowFieldSelection {
     pub tagline: Option<String>,
     pub maturity_rating: Option<String>,
     pub genres: Option<Vec<String>>,
-    pub directors: Option<Vec<PersonUpdateInfo>>,
+    pub creators: Option<Vec<PersonUpdateInfo>>,
     pub cast: Option<Vec<CastUpdateInfo>>,
     pub crew: Option<Vec<CrewUpdateInfo>>,
     pub producers: Option<Vec<PersonUpdateInfo>>,
@@ -5610,11 +5610,11 @@ pub async fn apply_tmdb_show_metadata(
         }
     }
 
-    if let Some(ref directors) = fields.directors {
-        sqlx::query("DELETE FROM show_director WHERE show_id = ?").bind(show_id).execute(&pool).await.map_err(|e| e.to_string())?;
-        for d in directors {
-            let person_id = ensure_person(&pool, &d.name, d.tmdb_id).await?;
-            sqlx::query("INSERT INTO show_director (show_id, person_id) VALUES (?, ?)")
+    if let Some(ref creators) = fields.creators {
+        sqlx::query("DELETE FROM show_creator WHERE show_id = ?").bind(show_id).execute(&pool).await.map_err(|e| e.to_string())?;
+        for c in creators {
+            let person_id = ensure_person(&pool, &c.name, c.tmdb_id).await?;
+            sqlx::query("INSERT INTO show_creator (show_id, person_id) VALUES (?, ?)")
                 .bind(show_id).bind(person_id).execute(&pool).await.map_err(|e| e.to_string())?;
         }
     }

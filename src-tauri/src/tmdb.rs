@@ -239,6 +239,7 @@ pub struct TmdbTvDetail {
     pub first_air_date: Option<String>,
     pub number_of_seasons: Option<i64>,
     pub number_of_episodes: Option<i64>,
+    pub created_by: Vec<TmdbCreator>,
     pub genres: Vec<TmdbGenre>,
     pub production_companies: Vec<TmdbCompany>,
     pub networks: Vec<TmdbNetwork>,
@@ -247,6 +248,13 @@ pub struct TmdbTvDetail {
     pub content_ratings: Option<TmdbContentRatings>,
     pub external_ids: Option<TmdbExternalIds>,
     pub images: Option<TmdbImages>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TmdbCreator {
+    pub id: i64,
+    pub name: String,
+    pub profile_path: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

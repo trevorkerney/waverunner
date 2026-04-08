@@ -220,7 +220,7 @@ export interface ShowDetail {
   tagline: string | null;
   maturity_rating: string | null;
   genres: string[];
-  directors: PersonInfo[];
+  creators: PersonInfo[];
   cast: CastInfo[];
   crew: CrewInfo[];
   producers: PersonInfo[];
@@ -268,6 +268,7 @@ export interface TmdbTvDetail {
   first_air_date: string | null;
   number_of_seasons: number | null;
   number_of_episodes: number | null;
+  created_by: { id: number; name: string; profile_path: string | null }[];
   genres: TmdbGenre[];
   production_companies: TmdbCompany[];
   networks: { id: number; name: string }[];
@@ -321,7 +322,7 @@ export interface TmdbShowFieldSelection {
   tagline?: string;
   maturity_rating?: string;
   genres?: string[];
-  directors?: PersonUpdateInfo[];
+  creators?: PersonUpdateInfo[];
   cast?: CastUpdateInfo[];
   crew?: CrewUpdateInfo[];
   producers?: PersonUpdateInfo[];

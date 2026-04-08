@@ -85,11 +85,13 @@ import {
   Tv,
   Trash2,
   RefreshCw,
+  ChevronDown,
+  ChevronRight,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
-import { Library, MediaEntry, BreadcrumbItem, MovieDetail, MovieDetailUpdate, SeasonInfo, EpisodeInfo, ShowDetail } from "@/types";
+import { Library, MediaEntry, BreadcrumbItem, MovieDetail, MovieDetailUpdate, SeasonInfo, EpisodeInfo, ShowDetail, SeasonDetailLocal, EpisodeDetailLocal, TmdbSeasonDetail, TmdbEpisodeDetail, TmdbSeasonFieldSelection, TmdbEpisodeFieldSelection } from "@/types";
 import { TmdbMatchDialog } from "@/components/TmdbMatchDialog";
 import { TmdbShowMatchDialog } from "@/components/TmdbShowMatchDialog";
 import { TmdbImageBrowserDialog } from "@/components/TmdbImageBrowserDialog";
@@ -1181,6 +1183,27 @@ function EntryDetailPage({
   );
 }
 
+function TruncatedList({ label, items, limit = 5 }: { label: string; items: string[]; limit?: number }) {
+  const [expanded, setExpanded] = useState(false);
+  if (items.length === 0) return null;
+  const visible = expanded ? items : items.slice(0, limit);
+  const hasMore = items.length > limit;
+  return (
+    <div className="text-sm">
+      <span className="text-muted-foreground">{label}: </span>
+      {visible.join(", ")}
+      {hasMore && (
+        <button
+          className="ml-1 text-muted-foreground underline hover:text-foreground"
+          onClick={() => setExpanded(!expanded)}
+        >
+          {expanded ? "show less" : `+${items.length - limit} more`}
+        </button>
+      )}
+    </div>
+  );
+}
+
 function ShowDetailPage({
   entry,
   selectedLibrary,
@@ -1198,6 +1221,13 @@ function ShowDetailPage({
   const [episodes, setEpisodes] = useState<EpisodeInfo[]>([]);
   const [tmdbDialogOpen, setTmdbDialogOpen] = useState(false);
   const [tmdbImagesOpen, setTmdbImagesOpen] = useState(false);
+  const [seasonDetail, setSeasonDetail] = useState<SeasonDetailLocal | null>(null);
+  const [episodeDetails, setEpisodeDetails] = useState<Map<number, EpisodeDetailLocal>>(new Map());
+  const [expandedEpisodeId, setExpandedEpisodeId] = useState<number | null>(null);
+  const [seasonTmdbLoading, setSeasonTmdbLoading] = useState(false);
+  const [bulkEpisodesLoading, setBulkEpisodesLoading] = useState(false);
+  const [episodeTmdbLoading, setEpisodeTmdbLoading] = useState<number | null>(null);
+  const [bulkConfirmOpen, setBulkConfirmOpen] = useState(false);
   const selectedSeason = seasons.find((s) => s.id === selectedSeasonId);
   const selectedSeasonLabel = selectedSeason
     ? (selectedSeason.season_number != null ? `Season ${selectedSeason.season_number}` : selectedSeason.title)
@@ -1214,6 +1244,30 @@ function ShowDetailPage({
       console.error("Failed to load show detail:", e);
     }
   }, [selectedLibrary.id, entry.id]);
+
+  const loadSeasonDetail = useCallback(async (seasonId: number) => {
+    try {
+      const d = await invoke<SeasonDetailLocal>("get_season_detail_local", {
+        libraryId: selectedLibrary.id,
+        seasonId,
+      });
+      setSeasonDetail(d);
+    } catch (e) {
+      console.error("Failed to load season detail:", e);
+    }
+  }, [selectedLibrary.id]);
+
+  const loadEpisodeDetail = useCallback(async (episodeId: number) => {
+    try {
+      const d = await invoke<EpisodeDetailLocal>("get_episode_detail_local", {
+        libraryId: selectedLibrary.id,
+        episodeId,
+      });
+      setEpisodeDetails((prev) => new Map(prev).set(episodeId, d));
+    } catch (e) {
+      console.error("Failed to load episode detail:", e);
+    }
+  }, [selectedLibrary.id]);
 
   useEffect(() => {
     loadDetail();
@@ -1235,6 +1289,10 @@ function ShowDetailPage({
 
   useEffect(() => {
     if (selectedSeasonId == null) return;
+    setSeasonDetail(null);
+    setEpisodeDetails(new Map());
+    setExpandedEpisodeId(null);
+    loadSeasonDetail(selectedSeasonId);
     (async () => {
       try {
         const eps = await invoke<EpisodeInfo[]>("get_season_episodes", {
@@ -1246,10 +1304,129 @@ function ShowDetailPage({
         console.error("Failed to load episodes:", e);
       }
     })();
-  }, [selectedLibrary.id, selectedSeasonId]);
+  }, [selectedLibrary.id, selectedSeasonId, loadSeasonDetail]);
+
+  const handleSeasonTmdb = useCallback(async () => {
+    if (!detail?.tmdb_id || !selectedSeason || selectedSeason.season_number == null) return;
+    setSeasonTmdbLoading(true);
+    try {
+      const tmdbSeason = await invoke<TmdbSeasonDetail>("get_tmdb_season_detail", {
+        tmdbId: Number(detail.tmdb_id),
+        seasonNumber: selectedSeason.season_number,
+      });
+      const fields: TmdbSeasonFieldSelection = {};
+      if (tmdbSeason.overview) fields.plot = tmdbSeason.overview;
+      if (tmdbSeason.credits?.cast && tmdbSeason.credits.cast.length > 0) {
+        fields.cast = tmdbSeason.credits.cast.slice(0, 20).map((c) => ({
+          name: c.name,
+          role: c.character ?? null,
+          tmdb_id: c.id,
+        }));
+      }
+      if (tmdbSeason.credits?.crew) {
+        const crew = tmdbSeason.credits.crew;
+        fields.directors = crew
+          .filter((c) => c.job === "Director")
+          .map((c) => ({ name: c.name, tmdb_id: c.id }));
+        fields.producers = crew
+          .filter((c) => c.department === "Production")
+          .map((c) => ({ name: c.name, tmdb_id: c.id }));
+        fields.crew = crew
+          .filter((c) => c.job !== "Director" && c.department !== "Production")
+          .filter((c) => ["Writer", "Screenplay", "Story", "Composer", "Original Music Composer", "Director of Photography", "Cinematographer", "Editor"].includes(c.job ?? ""))
+          .map((c) => ({ name: c.name, job: c.job ?? null, tmdb_id: c.id }));
+      }
+      await invoke("apply_tmdb_season_metadata", {
+        libraryId: selectedLibrary.id,
+        seasonId: selectedSeason.id,
+        fields,
+      });
+      toast.success("Season metadata populated from TMDB");
+      loadSeasonDetail(selectedSeason.id);
+    } catch (e) {
+      toast.error(String(e));
+    } finally {
+      setSeasonTmdbLoading(false);
+    }
+  }, [detail, selectedSeason, selectedLibrary.id, loadSeasonDetail]);
+
+  const handleBulkEpisodes = useCallback(async () => {
+    if (!detail?.tmdb_id || !selectedSeason || selectedSeason.season_number == null) return;
+    setBulkConfirmOpen(false);
+    setBulkEpisodesLoading(true);
+    try {
+      const count = await invoke<number>("apply_tmdb_season_episodes", {
+        libraryId: selectedLibrary.id,
+        seasonId: selectedSeason.id,
+        tmdbId: Number(detail.tmdb_id),
+        seasonNumber: selectedSeason.season_number,
+      });
+      toast.success(`Populated ${count} episode(s) from TMDB`);
+      // Reload episode details
+      setEpisodeDetails(new Map());
+      setExpandedEpisodeId(null);
+    } catch (e) {
+      toast.error(String(e));
+    } finally {
+      setBulkEpisodesLoading(false);
+    }
+  }, [detail, selectedSeason, selectedLibrary.id]);
+
+  const handleEpisodeTmdb = useCallback(async (ep: EpisodeInfo) => {
+    if (!detail?.tmdb_id || !selectedSeason || selectedSeason.season_number == null || ep.episode_number == null) return;
+    setEpisodeTmdbLoading(ep.id);
+    try {
+      const tmdbEp = await invoke<TmdbEpisodeDetail>("get_tmdb_episode_detail", {
+        tmdbId: Number(detail.tmdb_id),
+        seasonNumber: selectedSeason.season_number,
+        episodeNumber: ep.episode_number,
+      });
+      const fields: TmdbEpisodeFieldSelection = {};
+      if (tmdbEp.overview) fields.plot = tmdbEp.overview;
+      if (tmdbEp.runtime) fields.runtime = tmdbEp.runtime;
+      if (tmdbEp.guest_stars && tmdbEp.guest_stars.length > 0) {
+        fields.cast = tmdbEp.guest_stars.map((c) => ({
+          name: c.name,
+          role: c.character ?? null,
+          tmdb_id: c.id,
+        }));
+      }
+      if (tmdbEp.crew && tmdbEp.crew.length > 0) {
+        fields.crew = tmdbEp.crew.map((c) => ({
+          name: c.name,
+          job: c.job ?? null,
+          tmdb_id: c.id,
+        }));
+      }
+      await invoke("apply_tmdb_episode_metadata", {
+        libraryId: selectedLibrary.id,
+        episodeId: ep.id,
+        fields,
+      });
+      toast.success(`Episode ${ep.episode_number} metadata populated`);
+      loadEpisodeDetail(ep.id);
+    } catch (e) {
+      toast.error(String(e));
+    } finally {
+      setEpisodeTmdbLoading(null);
+    }
+  }, [detail, selectedSeason, selectedLibrary.id, loadEpisodeDetail]);
+
+  const toggleEpisode = useCallback((epId: number) => {
+    if (expandedEpisodeId === epId) {
+      setExpandedEpisodeId(null);
+    } else {
+      setExpandedEpisodeId(epId);
+      if (!episodeDetails.has(epId)) {
+        loadEpisodeDetail(epId);
+      }
+    }
+  }, [expandedEpisodeId, episodeDetails, loadEpisodeDetail]);
 
   const coverPath = getDisplayCover(entry);
   const coverSrc = coverPath ? getFullCoverUrl(coverPath) : null;
+  const hasTmdb = !!detail?.tmdb_id;
+  const canSeasonTmdb = hasTmdb && selectedSeason?.season_number != null;
 
   return (
     <div className="flex gap-8 p-4">
@@ -1313,30 +1490,10 @@ function ShowDetailPage({
                 </div>
               )}
             </div>
-            {detail.cast.length > 0 && (
-              <div className="text-sm">
-                <span className="text-muted-foreground">Cast: </span>
-                {detail.cast.map((c) => c.role ? `${c.name} (${c.role})` : c.name).join(", ")}
-              </div>
-            )}
-            {detail.directors.length > 0 && (
-              <div className="text-sm">
-                <span className="text-muted-foreground">Directors: </span>
-                {detail.directors.map((d) => d.name).join(", ")}
-              </div>
-            )}
-            {detail.crew.length > 0 && (
-              <div className="text-sm">
-                <span className="text-muted-foreground">Crew: </span>
-                {detail.crew.map((c) => c.job ? `${c.name} (${c.job})` : c.name).join(", ")}
-              </div>
-            )}
-            {detail.producers.length > 0 && (
-              <div className="text-sm">
-                <span className="text-muted-foreground">Producers: </span>
-                {detail.producers.map((p) => p.name).join(", ")}
-              </div>
-            )}
+            <TruncatedList label="Cast" items={detail.cast.map((c) => c.role ? `${c.name} (${c.role})` : c.name)} />
+            <TruncatedList label="Created By" items={detail.creators.map((c) => c.name)} />
+            <TruncatedList label="Crew" items={detail.crew.map((c) => c.job ? `${c.name} (${c.job})` : c.name)} />
+            <TruncatedList label="Producers" items={detail.producers.map((p) => p.name)} />
             {detail.keywords.length > 0 && (
               <div className="text-sm">
                 <span className="text-muted-foreground">Keywords: </span>
@@ -1353,50 +1510,133 @@ function ShowDetailPage({
         {/* Seasons + episodes */}
         {seasons.length > 0 && (
           <div className="flex flex-col gap-3">
-            <Select
-              value={String(selectedSeasonId)}
-              onValueChange={(val) => setSelectedSeasonId(Number(val))}
-            >
-              <SelectTrigger>
-                {selectedSeasonLabel}
-              </SelectTrigger>
-              <SelectContent>
-                {seasons.map((s) => (
-                  <SelectItem key={s.id} value={String(s.id)}>
-                    {s.season_number != null ? `Season ${s.season_number}` : s.title}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-
-            <div className="flex flex-col gap-1">
-              {episodes.map((ep) => (
-                <div
-                  key={ep.id}
-                  className="flex items-center gap-3 rounded-md px-3 py-2 hover:bg-accent"
-                >
-                  <span className="w-8 text-right text-sm text-muted-foreground">
-                    {ep.episode_number != null ? ep.episode_number : "–"}
-                  </span>
-                  <span className="flex-1 truncate text-sm">{ep.title}</span>
+            <div className="flex items-center gap-2">
+              <Select
+                value={String(selectedSeasonId)}
+                onValueChange={(val) => setSelectedSeasonId(Number(val))}
+              >
+                <SelectTrigger className="w-48">
+                  {selectedSeasonLabel}
+                </SelectTrigger>
+                <SelectContent>
+                  {seasons.map((s) => (
+                    <SelectItem key={s.id} value={String(s.id)}>
+                      {s.season_number != null ? `Season ${s.season_number}` : s.title}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              {canSeasonTmdb && (
+                <>
                   <Button
                     size="sm"
-                    variant="ghost"
-                    onClick={async () => {
-                      try {
-                        await invoke("play_episode", {
-                          libraryId: selectedLibrary.id,
-                          episodeId: ep.id,
-                        });
-                      } catch (e) {
-                        toast.error(String(e));
-                      }
-                    }}
+                    variant="outline"
+                    disabled={seasonTmdbLoading}
+                    onClick={handleSeasonTmdb}
                   >
-                    <Play size={14} />
+                    <Tv size={14} />
+                    {seasonTmdbLoading ? "Loading..." : "Populate Season from TMDB"}
                   </Button>
-                </div>
-              ))}
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={bulkEpisodesLoading}
+                    onClick={() => setBulkConfirmOpen(true)}
+                  >
+                    <Film size={14} />
+                    {bulkEpisodesLoading ? "Loading..." : "Fetch Episode Details"}
+                  </Button>
+                </>
+              )}
+            </div>
+
+            {/* Season metadata */}
+            {seasonDetail && (seasonDetail.plot || seasonDetail.cast.length > 0 || seasonDetail.directors.length > 0 || seasonDetail.crew.length > 0 || seasonDetail.producers.length > 0) && (
+              <div className="flex flex-col gap-2 rounded-md border p-3">
+                {seasonDetail.plot && (
+                  <p className="text-sm">{seasonDetail.plot}</p>
+                )}
+                <TruncatedList label="Cast" items={seasonDetail.cast.map((c) => c.role ? `${c.name} (${c.role})` : c.name)} />
+                <TruncatedList label="Directors" items={seasonDetail.directors.map((d) => d.name)} />
+                <TruncatedList label="Crew" items={seasonDetail.crew.map((c) => c.job ? `${c.name} (${c.job})` : c.name)} />
+                <TruncatedList label="Producers" items={seasonDetail.producers.map((p) => p.name)} />
+              </div>
+            )}
+
+            {/* Episodes */}
+            <div className="flex flex-col gap-1">
+              {episodes.map((ep) => {
+                const isExpanded = expandedEpisodeId === ep.id;
+                const epDetail = episodeDetails.get(ep.id);
+                const hasDetail = epDetail && (epDetail.plot || epDetail.runtime || epDetail.cast.length > 0 || epDetail.crew.length > 0);
+                return (
+                  <div key={ep.id} className="flex flex-col">
+                    <div
+                      className="flex cursor-pointer items-center gap-3 rounded-md px-3 py-2 hover:bg-accent"
+                      onClick={() => toggleEpisode(ep.id)}
+                    >
+                      {isExpanded ? <ChevronDown size={14} className="shrink-0 text-muted-foreground" /> : <ChevronRight size={14} className="shrink-0 text-muted-foreground" />}
+                      <span className="w-8 text-right text-sm text-muted-foreground">
+                        {ep.episode_number != null ? ep.episode_number : "–"}
+                      </span>
+                      <span className="flex-1 truncate text-sm">{ep.title}</span>
+                      {canSeasonTmdb && ep.episode_number != null && (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          disabled={episodeTmdbLoading === ep.id}
+                          onClick={(e) => { e.stopPropagation(); handleEpisodeTmdb(ep); }}
+                          title="Fetch from TMDB"
+                        >
+                          {episodeTmdbLoading === ep.id ? <Spinner className="h-3.5 w-3.5" /> : <Tv size={14} />}
+                        </Button>
+                      )}
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          (async () => {
+                            try {
+                              await invoke("play_episode", {
+                                libraryId: selectedLibrary.id,
+                                episodeId: ep.id,
+                              });
+                            } catch (err) {
+                              toast.error(String(err));
+                            }
+                          })();
+                        }}
+                      >
+                        <Play size={14} />
+                      </Button>
+                    </div>
+                    {isExpanded && (
+                      <div className="ml-14 mb-1 flex flex-col gap-1 rounded-md border p-3 text-sm">
+                        {!epDetail && <Spinner className="h-4 w-4" />}
+                        {epDetail && !hasDetail && (
+                          <p className="text-muted-foreground">No metadata</p>
+                        )}
+                        {epDetail && hasDetail && (
+                          <>
+                            {epDetail.runtime && (
+                              <div>
+                                <span className="text-muted-foreground">Runtime: </span>
+                                {epDetail.runtime} min
+                              </div>
+                            )}
+                            {epDetail.plot && (
+                              <p>{epDetail.plot}</p>
+                            )}
+                            <TruncatedList label="Guest Stars" items={epDetail.cast.map((c) => c.role ? `${c.name} (${c.role})` : c.name)} />
+                            <TruncatedList label="Crew" items={epDetail.crew.map((c) => c.job ? `${c.name} (${c.job})` : c.name)} />
+                          </>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
               {episodes.length === 0 && (
                 <p className="text-sm text-muted-foreground">No episodes</p>
               )}
@@ -1430,6 +1670,23 @@ function ShowDetailPage({
           onDownloaded={() => { loadDetail(); onEntryChanged(); }}
         />
       )}
+
+      {/* Bulk episode fetch confirmation */}
+      <Dialog open={bulkConfirmOpen} onOpenChange={setBulkConfirmOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Fetch Episode Details</DialogTitle>
+          </DialogHeader>
+          <p className="text-sm">
+            This will fetch metadata (plot, runtime, guest stars, crew) for all episodes in this season from TMDB.
+            Only empty fields will be populated. Doing this multiple times in quick succession may cause you to hit TMDB's rate limit.
+          </p>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setBulkConfirmOpen(false)}>Cancel</Button>
+            <Button onClick={handleBulkEpisodes}>Fetch All Episodes</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
