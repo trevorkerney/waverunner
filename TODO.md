@@ -38,9 +38,9 @@ sidebar complications (complications like a watch)
 
 settings system where changes are all set at once on save button click, instead of on settings exit
 
-## BIG STUFF NOW
+add warning when playing entire seasons without episode numbers (they will likely play out of order)
 
-year everywhere except media_entry needs to become a full date. also add title to movie, show and collection. let there be duplication. i dont like it
+## BIG STUFF NOW
 
 reduce zoom in out freedom. make it so that, from 100%, the user can go up twice max and down twice min
 
