@@ -96,6 +96,7 @@ pub struct MovieDetail {
     pub tmdb_id: Option<String>,
     pub imdb_id: Option<String>,
     pub rotten_tomatoes_id: Option<String>,
+    pub release_date: Option<String>,
     pub plot: Option<String>,
     pub tagline: Option<String>,
     pub runtime: Option<i64>,
@@ -115,7 +116,7 @@ pub struct MovieDetailUpdate {
     pub imdb_id: Option<String>,
     pub rotten_tomatoes_id: Option<String>,
     pub title: Option<String>,
-    pub year: Option<String>,
+    pub release_date: Option<String>,
     pub plot: Option<String>,
     pub tagline: Option<String>,
     pub runtime: Option<i64>,
@@ -737,26 +738,48 @@ pub async fn get_entries(
             };
 
             let order_clause = match sort_mode.as_str() {
-                "year" => "ORDER BY me.year ASC, me.sort_title COLLATE NOCASE ASC",
-                "custom" => "ORDER BY me.sort_order ASC, me.sort_title COLLATE NOCASE ASC",
-                _ => "ORDER BY me.sort_title COLLATE NOCASE ASC",
+                "year" => "ORDER BY year ASC, mef.sort_title COLLATE NOCASE ASC",
+                "custom" => "ORDER BY mef.sort_order ASC, mef.sort_title COLLATE NOCASE ASC",
+                _ => "ORDER BY mef.sort_title COLLATE NOCASE ASC",
             };
 
+            // Subquery: all years from a collection's children (movies + shows' episodes)
+            let collection_child_years = "\
+                SELECT SUBSTR(m2.release_date, 1, 4) as yr FROM movie m2 \
+                  JOIN media_entry me2 ON m2.id = me2.id \
+                  WHERE me2.parent_id = mef.id AND m2.release_date IS NOT NULL \
+                UNION ALL \
+                SELECT SUBSTR(e.release_date, 1, 4) as yr FROM episode e \
+                  JOIN season s ON e.season_id = s.id \
+                  JOIN media_entry me2 ON s.show_id = me2.id \
+                  WHERE me2.parent_id = mef.id AND e.release_date IS NOT NULL";
+
+            // Subquery: all years from a show's episodes
+            let show_episode_years = "\
+                SELECT SUBSTR(e.release_date, 1, 4) as yr FROM episode e \
+                  JOIN season s ON e.season_id = s.id \
+                  WHERE s.show_id = mef.id AND e.release_date IS NOT NULL";
+
             let base_query = format!(
-                "SELECT me.id, me.title, \
-                 CASE WHEN met.name IN ('collection','show') THEN \
-                   COALESCE((SELECT MIN(c.year) FROM media_entry c WHERE c.parent_id = me.id AND c.year IS NOT NULL), me.year) \
-                 ELSE me.year END as year, \
-                 CASE WHEN met.name IN ('collection','show') THEN \
-                   (SELECT NULLIF(MAX(c.year), MIN(c.year)) FROM media_entry c WHERE c.parent_id = me.id AND c.year IS NOT NULL) \
-                 ELSE me.end_year END as end_year, \
-                 me.folder_path, me.parent_id, met.name as entry_type, me.selected_cover, \
-                 (SELECT COUNT(*) FROM media_entry c WHERE c.parent_id = me.id) as child_count \
-                 FROM media_entry me JOIN media_entry_type met ON me.entry_type_id = met.id"
+                "SELECT mef.id, mef.title, \
+                 CASE \
+                   WHEN mef.entry_type = 'movie' THEN SUBSTR(mef.release_date, 1, 4) \
+                   WHEN mef.entry_type = 'show' THEN (SELECT MIN(yr) FROM ({show_episode_years})) \
+                   WHEN mef.entry_type = 'collection' THEN (SELECT MIN(yr) FROM ({collection_child_years})) \
+                 END as year, \
+                 CASE \
+                   WHEN mef.entry_type = 'show' THEN \
+                     NULLIF((SELECT MAX(yr) FROM ({show_episode_years})), (SELECT MIN(yr) FROM ({show_episode_years}))) \
+                   WHEN mef.entry_type = 'collection' THEN \
+                     NULLIF((SELECT MAX(yr) FROM ({collection_child_years})), (SELECT MIN(yr) FROM ({collection_child_years}))) \
+                 END as end_year, \
+                 mef.folder_path, mef.parent_id, mef.entry_type, mef.selected_cover, \
+                 (SELECT COUNT(*) FROM media_entry c WHERE c.parent_id = mef.id) as child_count \
+                 FROM media_entry_full mef"
             );
             let query_str = match parent_id {
-                Some(_) => format!("{base_query} WHERE me.parent_id = ? {order_clause}"),
-                None => format!("{base_query} WHERE me.parent_id IS NULL {order_clause}"),
+                Some(_) => format!("{base_query} WHERE mef.parent_id = ? {order_clause}"),
+                None => format!("{base_query} WHERE mef.parent_id IS NULL {order_clause}"),
             };
 
             let rows: Vec<(i64, String, Option<String>, Option<String>, String, Option<i64>, String, Option<String>, i64)> = match parent_id {
@@ -865,11 +888,11 @@ pub async fn get_entries(
 
             let query_str = match parent_id {
                 Some(_) => format!(
-                    "SELECT id, title, year, folder_path, parent_id, is_collection, selected_cover FROM movie WHERE parent_id = ? {}",
+                    "SELECT id, title, SUBSTR(release_date, 1, 4) as year, folder_path, parent_id, is_collection, selected_cover FROM movie WHERE parent_id = ? {}",
                     order_clause
                 ),
                 None => format!(
-                    "SELECT id, title, year, folder_path, parent_id, is_collection, selected_cover FROM movie WHERE parent_id IS NULL {}",
+                    "SELECT id, title, SUBSTR(release_date, 1, 4) as year, folder_path, parent_id, is_collection, selected_cover FROM movie WHERE parent_id IS NULL {}",
                     order_clause
                 ),
             };
@@ -956,14 +979,32 @@ pub async fn search_entries(
 
     let entries = match format.as_str() {
         "video" => {
-            let year_expr = "\
-                CASE WHEN met.name IN ('collection','show') THEN \
-                  COALESCE((SELECT MIN(c.year) FROM media_entry c WHERE c.parent_id = me.id AND c.year IS NOT NULL), me.year) \
-                ELSE me.year END";
-            let end_year_expr = "\
-                CASE WHEN met.name IN ('collection','show') THEN \
-                  (SELECT NULLIF(MAX(c.year), MIN(c.year)) FROM media_entry c WHERE c.parent_id = me.id AND c.year IS NOT NULL) \
-                ELSE me.end_year END";
+            let collection_child_years = "\
+                SELECT SUBSTR(m2.release_date, 1, 4) as yr FROM movie m2 \
+                  JOIN media_entry me2 ON m2.id = me2.id \
+                  WHERE me2.parent_id = mef.id AND m2.release_date IS NOT NULL \
+                UNION ALL \
+                SELECT SUBSTR(e.release_date, 1, 4) as yr FROM episode e \
+                  JOIN season s ON e.season_id = s.id \
+                  JOIN media_entry me2 ON s.show_id = me2.id \
+                  WHERE me2.parent_id = mef.id AND e.release_date IS NOT NULL";
+            let show_episode_years = "\
+                SELECT SUBSTR(e.release_date, 1, 4) as yr FROM episode e \
+                  JOIN season s ON e.season_id = s.id \
+                  WHERE s.show_id = mef.id AND e.release_date IS NOT NULL";
+            let year_expr = format!("\
+                CASE \
+                  WHEN mef.entry_type = 'movie' THEN SUBSTR(mef.release_date, 1, 4) \
+                  WHEN mef.entry_type = 'show' THEN (SELECT MIN(yr) FROM ({show_episode_years})) \
+                  WHEN mef.entry_type = 'collection' THEN (SELECT MIN(yr) FROM ({collection_child_years})) \
+                END");
+            let end_year_expr = format!("\
+                CASE \
+                  WHEN mef.entry_type = 'show' THEN \
+                    NULLIF((SELECT MAX(yr) FROM ({show_episode_years})), (SELECT MIN(yr) FROM ({show_episode_years}))) \
+                  WHEN mef.entry_type = 'collection' THEN \
+                    NULLIF((SELECT MAX(yr) FROM ({collection_child_years})), (SELECT MIN(yr) FROM ({collection_child_years}))) \
+                END");
             let query_str = match parent_id {
                 Some(_) => format!("\
                     WITH RECURSIVE descendants(id) AS ( \
@@ -971,17 +1012,15 @@ pub async fn search_entries(
                         UNION ALL \
                         SELECT me.id FROM media_entry me JOIN descendants d ON me.parent_id = d.id \
                     ) \
-                    SELECT me.id, me.title, {year_expr} as year, {end_year_expr} as end_year, me.folder_path, me.parent_id, met.name as entry_type, me.selected_cover \
-                    FROM media_entry me \
-                    JOIN media_entry_type met ON me.entry_type_id = met.id \
-                    WHERE me.id IN (SELECT id FROM descendants) AND me.title LIKE ? \
-                    ORDER BY me.sort_title COLLATE NOCASE ASC"),
+                    SELECT mef.id, mef.title, {year_expr} as year, {end_year_expr} as end_year, mef.folder_path, mef.parent_id, mef.entry_type, mef.selected_cover \
+                    FROM media_entry_full mef \
+                    WHERE mef.id IN (SELECT id FROM descendants) AND mef.title LIKE ? \
+                    ORDER BY mef.sort_title COLLATE NOCASE ASC"),
                 None => format!("\
-                    SELECT me.id, me.title, {year_expr} as year, {end_year_expr} as end_year, me.folder_path, me.parent_id, met.name as entry_type, me.selected_cover \
-                    FROM media_entry me \
-                    JOIN media_entry_type met ON me.entry_type_id = met.id \
-                    WHERE me.title LIKE ? \
-                    ORDER BY me.sort_title COLLATE NOCASE ASC"),
+                    SELECT mef.id, mef.title, {year_expr} as year, {end_year_expr} as end_year, mef.folder_path, mef.parent_id, mef.entry_type, mef.selected_cover \
+                    FROM media_entry_full mef \
+                    WHERE mef.title LIKE ? \
+                    ORDER BY mef.sort_title COLLATE NOCASE ASC"),
             };
 
             let rows: Vec<(i64, String, Option<String>, Option<String>, String, Option<i64>, String, Option<String>)> = match parent_id {
@@ -1034,11 +1073,11 @@ pub async fn search_entries(
                         UNION ALL \
                         SELECT m.id FROM movie m JOIN descendants d ON m.parent_id = d.id \
                     ) \
-                    SELECT id, title, year, folder_path, parent_id, is_collection, selected_cover \
+                    SELECT id, title, SUBSTR(release_date, 1, 4) as year, folder_path, parent_id, is_collection, selected_cover \
                     FROM movie WHERE id IN (SELECT id FROM descendants) AND title LIKE ? \
                     ORDER BY sort_title COLLATE NOCASE ASC",
                 None => "\
-                    SELECT id, title, year, folder_path, parent_id, is_collection, selected_cover \
+                    SELECT id, title, SUBSTR(release_date, 1, 4) as year, folder_path, parent_id, is_collection, selected_cover \
                     FROM movie WHERE title LIKE ? ORDER BY sort_title COLLATE NOCASE ASC",
             };
 
@@ -1104,16 +1143,16 @@ pub async fn get_movie_detail(
         .map_err(|e| e.to_string())?;
 
     // Movie scalar fields
-    let movie_row: Option<(i64, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<i64>, Option<i64>)> =
+    let movie_row: Option<(i64, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<i64>, Option<i64>)> =
         sqlx::query_as(
-            "SELECT id, tmdb_id, imdb_id, rotten_tomatoes_id, plot, tagline, runtime, maturity_rating_id FROM movie WHERE id = ?",
+            "SELECT id, tmdb_id, imdb_id, rotten_tomatoes_id, release_date, plot, tagline, runtime, maturity_rating_id FROM movie WHERE id = ?",
         )
         .bind(entry_id)
         .fetch_optional(&pool)
         .await
         .map_err(|e| e.to_string())?;
 
-    let (id, tmdb_id, imdb_id, rotten_tomatoes_id, plot, tagline, runtime, maturity_rating_id) =
+    let (id, tmdb_id, imdb_id, rotten_tomatoes_id, release_date, plot, tagline, runtime, maturity_rating_id) =
         movie_row.ok_or("Movie not found")?;
 
     // Maturity rating name
@@ -1205,6 +1244,7 @@ pub async fn get_movie_detail(
         tmdb_id,
         imdb_id,
         rotten_tomatoes_id,
+        release_date,
         plot,
         tagline,
         runtime,
@@ -1247,10 +1287,10 @@ pub async fn update_movie_detail(
         .await
         .map_err(|e| e.to_string())?;
 
-    // Update media_entry title/year if provided
+    // Update movie title/year if provided
     if let Some(ref title) = detail.title {
         let sort_title = generate_sort_title(title, "en");
-        sqlx::query("UPDATE media_entry SET title = ?, sort_title = ? WHERE id = ?")
+        sqlx::query("UPDATE movie SET title = ?, sort_title = ? WHERE id = ?")
             .bind(title)
             .bind(&sort_title)
             .bind(entry_id)
@@ -1258,10 +1298,10 @@ pub async fn update_movie_detail(
             .await
             .map_err(|e| e.to_string())?;
     }
-    if let Some(ref year) = detail.year {
-        let year_val = if year.is_empty() { None } else { Some(year.as_str()) };
-        sqlx::query("UPDATE media_entry SET year = ? WHERE id = ?")
-            .bind(year_val)
+    if let Some(ref release_date) = detail.release_date {
+        let val = if release_date.is_empty() { None } else { Some(release_date.as_str()) };
+        sqlx::query("UPDATE movie SET release_date = ? WHERE id = ?")
+            .bind(val)
             .bind(entry_id)
             .execute(&pool)
             .await
@@ -1481,10 +1521,10 @@ pub async fn search_tmdb_movie(
         .fetch_optional(&state.app_db)
         .await
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| "No TMDB API token configured. Add one in Settings → Integrations.".to_string())?;
+        .ok_or_else(|| "No TMDB API token configured. Add one in settings.".to_string())?;
 
     if token.trim().is_empty() {
-        return Err("TMDB API token is empty. Add one in Settings → Integrations.".to_string());
+        return Err("TMDB API token is empty. Add one in settings.".to_string());
     }
 
     let client = reqwest::Client::new();
@@ -1508,7 +1548,7 @@ pub async fn get_tmdb_movie_detail(
         .fetch_optional(&state.app_db)
         .await
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| "No TMDB API token configured.".to_string())?;
+        .ok_or_else(|| "No TMDB API token configured. Add one in settings.".to_string())?;
 
     let client = reqwest::Client::new();
     crate::tmdb::get_movie_detail(&client, &token, tmdb_id).await
@@ -1521,7 +1561,7 @@ pub struct TmdbFieldSelection {
     pub plot: Option<String>,
     pub tagline: Option<String>,
     pub runtime: Option<i64>,
-    pub year: Option<String>,
+    pub release_date: Option<String>,
     pub maturity_rating: Option<String>,
     pub genres: Option<Vec<String>>,
     pub directors: Option<Vec<PersonUpdateInfo>>,
@@ -1602,11 +1642,11 @@ pub async fn apply_tmdb_metadata(
             .map_err(|e| e.to_string())?;
     }
 
-    // Year on media_entry
-    if let Some(ref year) = fields.year {
-        let year_val = if year.is_empty() { None } else { Some(year.as_str()) };
-        sqlx::query("UPDATE media_entry SET year = ? WHERE id = ?")
-            .bind(year_val)
+    // Release date on movie table
+    if let Some(ref release_date) = fields.release_date {
+        let val = if release_date.is_empty() { None } else { Some(release_date.as_str()) };
+        sqlx::query("UPDATE movie SET release_date = ? WHERE id = ?")
+            .bind(val)
             .bind(entry_id)
             .execute(&pool)
             .await
@@ -1810,9 +1850,9 @@ pub async fn download_tmdb_images(
         .await
         .map_err(|e| e.to_string())?;
 
-    // Get entry folder_path
+    // Get entry folder_path from view
     let entry_row: Option<(String,)> = sqlx::query_as(
-        "SELECT folder_path FROM media_entry WHERE id = ?",
+        "SELECT folder_path FROM media_entry_full WHERE id = ?",
     )
     .bind(entry_id)
     .fetch_optional(&pool)
@@ -1975,7 +2015,7 @@ pub async fn play_movie(
     let folder_path: String = match format.as_str() {
         "video" => {
             let row: Option<(String,)> = sqlx::query_as(
-                "SELECT folder_path FROM media_entry WHERE id = ?",
+                "SELECT folder_path FROM media_entry_full WHERE id = ?",
             )
             .bind(entry_id)
             .fetch_optional(&pool)
@@ -2349,21 +2389,33 @@ pub async fn update_sort_order(
         .await
         .map_err(|e| e.to_string())?;
 
-    let table = match format.as_str() {
-        "video" => "media_entry",
-
-        "music" => "artist",
-        _ => "movie",
-    };
-
-    for (i, id) in entry_ids.iter().enumerate() {
-        let q = format!("UPDATE {} SET sort_order = ? WHERE id = ?", table);
-        sqlx::query(&q)
-            .bind(i as i32)
-            .bind(id)
-            .execute(&pool)
-            .await
-            .map_err(|e| e.to_string())?;
+    match format.as_str() {
+        "video" => {
+            for (i, id) in entry_ids.iter().enumerate() {
+                // Update whichever detail table owns this entry
+                sqlx::query("UPDATE movie SET sort_order = ? WHERE id = ?")
+                    .bind(i as i32).bind(id).execute(&pool).await.map_err(|e| e.to_string())?;
+                sqlx::query("UPDATE show SET sort_order = ? WHERE id = ?")
+                    .bind(i as i32).bind(id).execute(&pool).await.map_err(|e| e.to_string())?;
+                sqlx::query("UPDATE collection SET sort_order = ? WHERE id = ?")
+                    .bind(i as i32).bind(id).execute(&pool).await.map_err(|e| e.to_string())?;
+            }
+        }
+        _ => {
+            let table = match format.as_str() {
+                "music" => "artist",
+                _ => "movie",
+            };
+            for (i, id) in entry_ids.iter().enumerate() {
+                let q = format!("UPDATE {} SET sort_order = ? WHERE id = ?", table);
+                sqlx::query(&q)
+                    .bind(i as i32)
+                    .bind(id)
+                    .execute(&pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+        }
     }
 
     pool.close().await;
@@ -2404,9 +2456,9 @@ pub async fn rename_entry(
 
         match format.as_str() {
             "video" => {
-                // Query media_entry + entry_type
+                // Query from view for folder_path, release_date (year extracted), entry_type
                 let entry_row: Option<(String, Option<String>, String)> = sqlx::query_as(
-                    "SELECT me.folder_path, me.year, met.name FROM media_entry me JOIN media_entry_type met ON me.entry_type_id = met.id WHERE me.id = ?",
+                    "SELECT folder_path, SUBSTR(release_date, 1, 4), entry_type FROM media_entry_full WHERE id = ?",
                 )
                 .bind(entry_id)
                 .fetch_optional(&pool)
@@ -2448,25 +2500,26 @@ pub async fn rename_entry(
                     let old_rel_prefix = format!("{}\\", folder_path);
                     let new_rel_prefix = format!("{}\\", new_rel_path);
 
-                    // Update this entry's folder_path
-                    sqlx::query("UPDATE media_entry SET folder_path = ? WHERE id = ?")
-                        .bind(&new_rel_path)
+                    // Update this entry's folder_path on the correct detail table
+                    match entry_type.as_str() {
+                        "movie" => sqlx::query("UPDATE movie SET folder_path = ? WHERE id = ?").bind(&new_rel_path).bind(entry_id).execute(&pool).await.map_err(|e| e.to_string())?,
+                        "show" => sqlx::query("UPDATE show SET folder_path = ? WHERE id = ?").bind(&new_rel_path).bind(entry_id).execute(&pool).await.map_err(|e| e.to_string())?,
+                        _ => sqlx::query("UPDATE collection SET folder_path = ? WHERE id = ?").bind(&new_rel_path).bind(entry_id).execute(&pool).await.map_err(|e| e.to_string())?,
+                    };
+
+                    // Update child folder_paths across all detail tables
+                    for tbl in &["movie", "show", "collection"] {
+                        sqlx::query(
+                            &format!("UPDATE {} SET folder_path = ? || SUBSTR(folder_path, ?) WHERE folder_path LIKE ? AND id != ?", tbl),
+                        )
+                        .bind(&new_rel_prefix)
+                        .bind((old_rel_prefix.len() + 1) as i32)
+                        .bind(format!("{}%", old_rel_prefix))
                         .bind(entry_id)
                         .execute(&pool)
                         .await
                         .map_err(|e| e.to_string())?;
-
-                    // Update child media_entry folder_paths (collections can nest)
-                    sqlx::query(
-                        "UPDATE media_entry SET folder_path = ? || SUBSTR(folder_path, ?) WHERE folder_path LIKE ? AND id != ?",
-                    )
-                    .bind(&new_rel_prefix)
-                    .bind((old_rel_prefix.len() + 1) as i32)
-                    .bind(format!("{}%", old_rel_prefix))
-                    .bind(entry_id)
-                    .execute(&pool)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                    }
 
                     // Update season folder_paths if this is a show
                     if entry_type == "show" {
@@ -2523,7 +2576,7 @@ pub async fn rename_entry(
             }
             "movies" => {
                 let entry_row: Option<(String, Option<String>)> = sqlx::query_as(
-                    "SELECT folder_path, year FROM movie WHERE id = ?",
+                    "SELECT folder_path, SUBSTR(release_date, 1, 4) FROM movie WHERE id = ?",
                 )
                 .bind(entry_id)
                 .fetch_optional(&pool)
@@ -2715,13 +2768,13 @@ pub async fn rename_entry(
 
     match format.as_str() {
         "video" => {
-            sqlx::query("UPDATE media_entry SET title = ?, sort_title = ? WHERE id = ?")
-                .bind(&new_title)
-                .bind(&sort_title)
-                .bind(entry_id)
-                .execute(&pool)
-                .await
-                .map_err(|e| e.to_string())?;
+            // Update whichever detail table owns this entry
+            sqlx::query("UPDATE movie SET title = ?, sort_title = ? WHERE id = ?")
+                .bind(&new_title).bind(&sort_title).bind(entry_id).execute(&pool).await.map_err(|e| e.to_string())?;
+            sqlx::query("UPDATE show SET title = ?, sort_title = ? WHERE id = ?")
+                .bind(&new_title).bind(&sort_title).bind(entry_id).execute(&pool).await.map_err(|e| e.to_string())?;
+            sqlx::query("UPDATE collection SET title = ?, sort_title = ? WHERE id = ?")
+                .bind(&new_title).bind(&sort_title).bind(entry_id).execute(&pool).await.map_err(|e| e.to_string())?;
         }
         "music" => {
             sqlx::query("UPDATE artist SET name = ?, sort_name = ? WHERE id = ?")
@@ -2813,7 +2866,7 @@ pub async fn move_entry(
         "video" => {
             // Get the entry being moved
             let entry_row: (String, Option<i64>) = sqlx::query_as(
-                "SELECT folder_path, parent_id FROM media_entry WHERE id = ?",
+                "SELECT folder_path, parent_id FROM media_entry_full WHERE id = ?",
             )
             .bind(entry_id)
             .fetch_optional(&pool)
@@ -2867,7 +2920,7 @@ pub async fn move_entry(
 
             let new_folder_path = if let Some(target_id) = new_parent_id {
                 let (parent_folder,): (String,) = sqlx::query_as(
-                    "SELECT folder_path FROM media_entry WHERE id = ?",
+                    "SELECT folder_path FROM media_entry_full WHERE id = ?",
                 )
                 .bind(target_id)
                 .fetch_optional(&pool)
@@ -2953,80 +3006,112 @@ pub async fn move_entry(
                     .await
                     .map_err(|e| e.to_string())?;
 
-                // Update selected_cover for this entry
-                sqlx::query("UPDATE media_entry SET selected_cover = REPLACE(selected_cover, ?, ?) WHERE selected_cover LIKE ? AND id = ?")
-                    .bind(&old_cache_abs)
-                    .bind(&new_cache_abs)
-                    .bind(format!("{}%", old_cache_abs))
-                    .bind(entry_id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                // Update selected_cover for this entry across all detail tables
+                for tbl in &["movie", "show", "collection"] {
+                    sqlx::query(&format!("UPDATE {} SET selected_cover = REPLACE(selected_cover, ?, ?) WHERE selected_cover LIKE ? AND id = ?", tbl))
+                        .bind(&old_cache_abs)
+                        .bind(&new_cache_abs)
+                        .bind(format!("{}%", old_cache_abs))
+                        .bind(entry_id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
 
-                // Update selected_cover for child entries
-                sqlx::query("UPDATE media_entry SET selected_cover = REPLACE(selected_cover, ?, ?) WHERE selected_cover LIKE ? AND id != ?")
-                    .bind(&old_cache_abs_prefix)
-                    .bind(&new_cache_abs_prefix)
-                    .bind(format!("{}%", old_cache_abs_prefix))
-                    .bind(entry_id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                // Update selected_cover for child entries across all detail tables
+                for tbl in &["movie", "show", "collection"] {
+                    sqlx::query(&format!("UPDATE {} SET selected_cover = REPLACE(selected_cover, ?, ?) WHERE selected_cover LIKE ? AND id != ?", tbl))
+                        .bind(&old_cache_abs_prefix)
+                        .bind(&new_cache_abs_prefix)
+                        .bind(format!("{}%", old_cache_abs_prefix))
+                        .bind(entry_id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
 
                 // Determine sort_order for the moved entry
+                // Note: sort_order is on detail tables but we can't use the view inside a transaction easily,
+                // so we query all three and take the first result
                 let new_sort_order: i64 = if let Some(before_id) = insert_before_id {
-                    let (before_order,): (i64,) = sqlx::query_as(
-                        "SELECT sort_order FROM media_entry WHERE id = ?",
-                    )
-                    .bind(before_id)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|e| e.to_string())?
-                    .ok_or("insert_before entry not found")?;
+                    // Get sort_order from whichever detail table owns this entry
+                    let before_order: i64 = {
+                        let r: Option<(i64,)> = sqlx::query_as("SELECT sort_order FROM movie WHERE id = ?")
+                            .bind(before_id).fetch_optional(&mut *tx).await.map_err(|e| e.to_string())?;
+                        if let Some((v,)) = r { v } else {
+                            let r: Option<(i64,)> = sqlx::query_as("SELECT sort_order FROM show WHERE id = ?")
+                                .bind(before_id).fetch_optional(&mut *tx).await.map_err(|e| e.to_string())?;
+                            if let Some((v,)) = r { v } else {
+                                let r: Option<(i64,)> = sqlx::query_as("SELECT sort_order FROM collection WHERE id = ?")
+                                    .bind(before_id).fetch_optional(&mut *tx).await.map_err(|e| e.to_string())?;
+                                r.ok_or("insert_before entry not found")?.0
+                            }
+                        }
+                    };
 
-                    sqlx::query(
-                        "UPDATE media_entry SET sort_order = sort_order + 1 WHERE parent_id IS ? AND sort_order >= ? AND id != ?",
-                    )
-                    .bind(new_parent_id)
-                    .bind(before_order)
-                    .bind(entry_id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                    // Increment sort_order for entries at/after insert position across all detail tables
+                    for tbl in &["movie", "show", "collection"] {
+                        sqlx::query(&format!(
+                            "UPDATE {} SET sort_order = sort_order + 1 WHERE id IN (SELECT id FROM media_entry WHERE parent_id IS ? AND id != ?) AND sort_order >= ?", tbl
+                        ))
+                        .bind(new_parent_id)
+                        .bind(entry_id)
+                        .bind(before_order)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    }
 
                     before_order
                 } else {
-                    let max_row: Option<(i64,)> = sqlx::query_as(
-                        "SELECT MAX(sort_order) FROM media_entry WHERE parent_id IS ?",
+                    // Get max sort_order from view-equivalent query
+                    let max_val: Option<(Option<i64>,)> = sqlx::query_as(
+                        "SELECT MAX(COALESCE(m.sort_order, s.sort_order, c.sort_order)) \
+                         FROM media_entry me \
+                         LEFT JOIN movie m ON me.id = m.id \
+                         LEFT JOIN show s ON me.id = s.id \
+                         LEFT JOIN collection c ON me.id = c.id \
+                         WHERE me.parent_id IS ?",
                     )
                     .bind(new_parent_id)
                     .fetch_optional(&mut *tx)
                     .await
                     .map_err(|e| e.to_string())?;
-                    max_row.and_then(|r| Some(r.0 + 1)).unwrap_or(0)
+                    max_val.and_then(|r| r.0).map(|v| v + 1).unwrap_or(0)
                 };
 
-                // Update parent_id, folder_path, and sort_order
-                sqlx::query("UPDATE media_entry SET parent_id = ?, folder_path = ?, sort_order = ? WHERE id = ?")
+                // Update parent_id on media_entry (structural data stays here)
+                sqlx::query("UPDATE media_entry SET parent_id = ? WHERE id = ?")
                     .bind(new_parent_id)
-                    .bind(&new_folder_path)
-                    .bind(new_sort_order)
                     .bind(entry_id)
                     .execute(&mut *tx)
                     .await
                     .map_err(|e| e.to_string())?;
 
-                // Update child folder_paths
-                sqlx::query(
-                    "UPDATE media_entry SET folder_path = ? || SUBSTR(folder_path, ?) WHERE folder_path LIKE ? AND id != ?",
-                )
-                .bind(&new_rel_prefix)
-                .bind((old_rel_prefix.len() + 1) as i32)
-                .bind(format!("{}%", old_rel_prefix))
-                .bind(entry_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| e.to_string())?;
+                // Update folder_path and sort_order on the correct detail table
+                for tbl in &["movie", "show", "collection"] {
+                    sqlx::query(&format!("UPDATE {} SET folder_path = ?, sort_order = ? WHERE id = ?", tbl))
+                        .bind(&new_folder_path)
+                        .bind(new_sort_order)
+                        .bind(entry_id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+
+                // Update child folder_paths across all detail tables
+                for tbl in &["movie", "show", "collection"] {
+                    sqlx::query(
+                        &format!("UPDATE {} SET folder_path = ? || SUBSTR(folder_path, ?) WHERE folder_path LIKE ? AND id != ?", tbl),
+                    )
+                    .bind(&new_rel_prefix)
+                    .bind((old_rel_prefix.len() + 1) as i32)
+                    .bind(format!("{}%", old_rel_prefix))
+                    .bind(entry_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                }
 
                 // Update season/episode paths if entry is a show
                 let (entry_type_name,): (String,) = sqlx::query_as(
@@ -3129,7 +3214,7 @@ pub async fn create_collection(
     // Determine the parent folder path on disk
     let parent_folder = if let Some(pid) = parent_id {
         let row: Option<(String,)> = sqlx::query_as(
-            "SELECT folder_path FROM media_entry WHERE id = ?",
+            "SELECT folder_path FROM media_entry_full WHERE id = ?",
         )
         .bind(pid)
         .fetch_optional(&pool)
@@ -3169,13 +3254,13 @@ pub async fn create_collection(
 
     // Determine sort_order (append at end)
     let max_order: (i64,) = if parent_id.is_some() {
-        sqlx::query_as("SELECT COALESCE(MAX(sort_order), -1) FROM media_entry WHERE parent_id = ?")
+        sqlx::query_as("SELECT COALESCE(MAX(sort_order), -1) FROM media_entry_full WHERE parent_id = ?")
             .bind(parent_id)
             .fetch_one(&pool)
             .await
             .map_err(|e| e.to_string())?
     } else {
-        sqlx::query_as("SELECT COALESCE(MAX(sort_order), -1) FROM media_entry WHERE parent_id IS NULL")
+        sqlx::query_as("SELECT COALESCE(MAX(sort_order), -1) FROM media_entry_full WHERE parent_id IS NULL")
             .fetch_one(&pool)
             .await
             .map_err(|e| e.to_string())?
@@ -3184,21 +3269,21 @@ pub async fn create_collection(
     let sort_title = generate_sort_title(&name, "en");
 
     let result = sqlx::query(
-        "INSERT INTO media_entry (parent_id, entry_type_id, title, folder_path, sort_title, sort_order) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO media_entry (parent_id, entry_type_id) VALUES (?, ?)",
     )
     .bind(parent_id)
     .bind(collection_type_id.0)
-    .bind(&name)
-    .bind(&rel_path)
-    .bind(&sort_title)
-    .bind(max_order.0 + 1)
     .execute(&pool)
     .await
     .map_err(|e| e.to_string())?;
 
     let entry_id = result.last_insert_rowid();
-    sqlx::query("INSERT INTO collection (id) VALUES (?)")
+    sqlx::query("INSERT INTO collection (id, title, folder_path, sort_title, sort_order) VALUES (?, ?, ?, ?, ?)")
         .bind(entry_id)
+        .bind(&name)
+        .bind(&rel_path)
+        .bind(&sort_title)
+        .bind(max_order.0 + 1)
         .execute(&pool)
         .await
         .map_err(|e| e.to_string())?;
@@ -3235,20 +3320,30 @@ pub async fn set_cover(
         .await
         .map_err(|e| e.to_string())?;
 
-    let table = match format.as_str() {
-        "video" => "media_entry",
-
-        "music" => "artist",
-        _ => "movie",
-    };
-
-    let q = format!("UPDATE {} SET selected_cover = ? WHERE id = ?", table);
-    sqlx::query(&q)
-        .bind(&cover_path)
-        .bind(entry_id)
-        .execute(&pool)
-        .await
-        .map_err(|e| e.to_string())?;
+    match format.as_str() {
+        "video" => {
+            // Update whichever detail table owns this entry
+            sqlx::query("UPDATE movie SET selected_cover = ? WHERE id = ?")
+                .bind(&cover_path).bind(entry_id).execute(&pool).await.map_err(|e| e.to_string())?;
+            sqlx::query("UPDATE show SET selected_cover = ? WHERE id = ?")
+                .bind(&cover_path).bind(entry_id).execute(&pool).await.map_err(|e| e.to_string())?;
+            sqlx::query("UPDATE collection SET selected_cover = ? WHERE id = ?")
+                .bind(&cover_path).bind(entry_id).execute(&pool).await.map_err(|e| e.to_string())?;
+        }
+        _ => {
+            let table = match format.as_str() {
+                "music" => "artist",
+                _ => "movie",
+            };
+            let q = format!("UPDATE {} SET selected_cover = ? WHERE id = ?", table);
+            sqlx::query(&q)
+                .bind(&cover_path)
+                .bind(entry_id)
+                .execute(&pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
 
     pool.close().await;
     Ok(())
@@ -3282,9 +3377,9 @@ pub async fn delete_entry(
         .await
         .map_err(|e| e.to_string())?;
 
-    // Get the entry's folder_path
+    // Get the entry's folder_path from the view
     let entry_row: Option<(String,)> = sqlx::query_as(
-        "SELECT folder_path FROM media_entry WHERE id = ?",
+        "SELECT folder_path FROM media_entry_full WHERE id = ?",
     )
     .bind(entry_id)
     .fetch_optional(&pool)
@@ -3385,7 +3480,7 @@ pub async fn check_entry_has_files(
         .map_err(|e| e.to_string())?;
 
     let entry_row: Option<(String,)> = sqlx::query_as(
-        "SELECT folder_path FROM media_entry WHERE id = ?",
+        "SELECT folder_path FROM media_entry_full WHERE id = ?",
     )
     .bind(entry_id)
     .fetch_optional(&pool)
@@ -3491,7 +3586,7 @@ async fn rescan_video_library(
 
     // Get all DB entries
     let db_rows: Vec<(i64, String, Option<i64>, i64)> = sqlx::query_as(
-        "SELECT id, folder_path, parent_id, entry_type_id FROM media_entry",
+        "SELECT id, folder_path, parent_id, entry_type_id FROM media_entry_full",
     )
     .fetch_all(pool)
     .await
@@ -3556,7 +3651,7 @@ async fn rescan_video_library(
                 None
             } else {
                 let row: Option<(i64,)> = sqlx::query_as(
-                    "SELECT id FROM media_entry WHERE folder_path = ?",
+                    "SELECT id FROM media_entry_full WHERE folder_path = ?",
                 )
                 .bind(parent_path)
                 .fetch_optional(pool)
@@ -3581,14 +3676,14 @@ async fn rescan_video_library(
         });
 
         let max_order: Option<(i32,)> = if let Some(pid) = parent_id {
-            sqlx::query_as("SELECT COALESCE(MAX(sort_order), -1) FROM media_entry WHERE parent_id = ?")
+            sqlx::query_as("SELECT COALESCE(MAX(sort_order), -1) FROM media_entry_full WHERE parent_id = ?")
                 .bind(pid)
                 .fetch_optional(pool)
                 .await
                 .map_err(|e| e.to_string())?
         } else {
             sqlx::query_as(
-                "SELECT COALESCE(MAX(sort_order), -1) FROM media_entry WHERE parent_id IS NULL",
+                "SELECT COALESCE(MAX(sort_order), -1) FROM media_entry_full WHERE parent_id IS NULL",
             )
             .fetch_optional(pool)
             .await
@@ -3599,21 +3694,20 @@ async fn rescan_video_library(
         if has_season && parent_id.is_none() {
             // TV show (only at root level)
             let result = sqlx::query(
-                "INSERT INTO media_entry (parent_id, entry_type_id, title, folder_path, sort_title, sort_order, year) VALUES (NULL, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO media_entry (parent_id, entry_type_id) VALUES (NULL, ?)",
             )
             .bind(show_type_id.0)
-            .bind(&title)
-            .bind(rel_path)
-            .bind(&sort_title)
-            .bind(sort_order)
-            .bind(&year)
             .execute(pool)
             .await
             .map_err(|e| e.to_string())?;
 
             let entry_id = result.last_insert_rowid();
-            sqlx::query("INSERT INTO show (id) VALUES (?)")
+            sqlx::query("INSERT INTO show (id, title, folder_path, sort_title, sort_order) VALUES (?, ?, ?, ?, ?)")
                 .bind(entry_id)
+                .bind(&title)
+                .bind(rel_path)
+                .bind(&sort_title)
+                .bind(sort_order)
                 .execute(pool)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -3626,22 +3720,21 @@ async fn rescan_video_library(
         } else if !subdirs.is_empty() {
             // Collection
             let result = sqlx::query(
-                "INSERT INTO media_entry (parent_id, entry_type_id, title, folder_path, sort_title, sort_order, year) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO media_entry (parent_id, entry_type_id) VALUES (?, ?)",
             )
             .bind(parent_id)
             .bind(collection_type_id.0)
-            .bind(&title)
-            .bind(rel_path)
-            .bind(&sort_title)
-            .bind(sort_order)
-            .bind(&year)
             .execute(pool)
             .await
             .map_err(|e| e.to_string())?;
 
             let entry_id = result.last_insert_rowid();
-            sqlx::query("INSERT INTO collection (id) VALUES (?)")
+            sqlx::query("INSERT INTO collection (id, title, folder_path, sort_title, sort_order) VALUES (?, ?, ?, ?, ?)")
                 .bind(entry_id)
+                .bind(&title)
+                .bind(rel_path)
+                .bind(&sort_title)
+                .bind(sort_order)
                 .execute(pool)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -3657,22 +3750,22 @@ async fn rescan_video_library(
             if has_video {
                 // Movie (leaf with video files)
                 let result = sqlx::query(
-                    "INSERT INTO media_entry (parent_id, entry_type_id, title, folder_path, sort_title, sort_order, year) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO media_entry (parent_id, entry_type_id) VALUES (?, ?)",
                 )
                 .bind(parent_id)
                 .bind(movie_type_id.0)
-                .bind(&title)
-                .bind(rel_path)
-                .bind(&sort_title)
-                .bind(sort_order)
-                .bind(&year)
                 .execute(pool)
                 .await
                 .map_err(|e| e.to_string())?;
 
                 let entry_id = result.last_insert_rowid();
-                sqlx::query("INSERT INTO movie (id) VALUES (?)")
+                sqlx::query("INSERT INTO movie (id, title, folder_path, sort_title, sort_order, release_date) VALUES (?, ?, ?, ?, ?, ?)")
                     .bind(entry_id)
+                    .bind(&title)
+                    .bind(rel_path)
+                    .bind(&sort_title)
+                    .bind(sort_order)
+                    .bind(&year)
                     .execute(pool)
                     .await
                     .map_err(|e| e.to_string())?;
@@ -3683,22 +3776,21 @@ async fn rescan_video_library(
             } else {
                 // Empty folder → collection
                 let result = sqlx::query(
-                    "INSERT INTO media_entry (parent_id, entry_type_id, title, folder_path, sort_title, sort_order, year) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO media_entry (parent_id, entry_type_id) VALUES (?, ?)",
                 )
                 .bind(parent_id)
                 .bind(collection_type_id.0)
-                .bind(&title)
-                .bind(rel_path)
-                .bind(&sort_title)
-                .bind(sort_order)
-                .bind(&year)
                 .execute(pool)
                 .await
                 .map_err(|e| e.to_string())?;
 
                 let entry_id = result.last_insert_rowid();
-                sqlx::query("INSERT INTO collection (id) VALUES (?)")
+                sqlx::query("INSERT INTO collection (id, title, folder_path, sort_title, sort_order) VALUES (?, ?, ?, ?, ?)")
                     .bind(entry_id)
+                    .bind(&title)
+                    .bind(rel_path)
+                    .bind(&sort_title)
+                    .bind(sort_order)
                     .execute(pool)
                     .await
                     .map_err(|e| e.to_string())?;
@@ -3724,7 +3816,7 @@ async fn rescan_video_library(
 
     // Rescan seasons/episodes for all shows
     let all_shows: Vec<(i64, String)> = sqlx::query_as(
-        "SELECT me.id, me.folder_path FROM media_entry me JOIN show s ON me.id = s.id",
+        "SELECT id, folder_path FROM show",
     )
     .fetch_all(pool)
     .await
@@ -4002,7 +4094,7 @@ async fn rescan_movies_library(
         let sort_title = generate_sort_title(&title, "en");
 
         sqlx::query(
-            "INSERT INTO movie (title, year, folder_path, parent_id, is_collection, sort_order, sort_title) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO movie (title, release_date, folder_path, parent_id, is_collection, sort_order, sort_title) VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&title)
         .bind(&year)
@@ -4216,7 +4308,7 @@ async fn rescan_music_library(
             let sort_order = max_order.map(|(v,)| v + 1).unwrap_or(0);
 
             sqlx::query(
-                "INSERT INTO album (artist_id, title, year, folder_path, sort_order, sort_title) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO album (artist_id, title, release_date, folder_path, sort_order, sort_title) VALUES (?, ?, ?, ?, ?, ?)",
             )
             .bind(artist_id)
             .bind(&album_title)
@@ -4637,7 +4729,7 @@ async fn scan_music_library(
                 .to_string();
 
             let result = sqlx::query(
-                "INSERT INTO album (artist_id, title, year, folder_path, sort_order, sort_title) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO album (artist_id, title, release_date, folder_path, sort_order, sort_title) VALUES (?, ?, ?, ?, ?, ?)",
             )
             .bind(artist_id)
             .bind(&album_title)
@@ -4742,7 +4834,7 @@ async fn scan_video_library(
             num.is_some()
         });
 
-        let (title, year) = parse_folder_name(&name);
+        let (title, _) = parse_folder_name(&name);
         let sort_title = generate_sort_title(&title, "en");
         let rel_path = path
             .strip_prefix(base_path)
@@ -4753,20 +4845,19 @@ async fn scan_video_library(
         if has_season {
             // TV show
             let result = sqlx::query(
-                "INSERT INTO media_entry (parent_id, entry_type_id, title, folder_path, sort_title, sort_order, year) VALUES (NULL, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO media_entry (parent_id, entry_type_id) VALUES (NULL, ?)",
             )
             .bind(show_type_id.0)
-            .bind(&title)
-            .bind(&rel_path)
-            .bind(&sort_title)
-            .bind(i as i32)
-            .bind(&year)
             .execute(pool)
             .await?;
 
             let entry_id = result.last_insert_rowid();
-            sqlx::query("INSERT INTO show (id) VALUES (?)")
+            sqlx::query("INSERT INTO show (id, title, folder_path, sort_title, sort_order) VALUES (?, ?, ?, ?, ?)")
                 .bind(entry_id)
+                .bind(&title)
+                .bind(&rel_path)
+                .bind(&sort_title)
+                .bind(i as i32)
                 .execute(pool)
                 .await?;
 
@@ -4910,21 +5001,21 @@ async fn scan_video_dir(
     if has_video_files {
         // Movie (leaf node with video files)
         let result = sqlx::query(
-            "INSERT INTO media_entry (parent_id, entry_type_id, title, folder_path, sort_title, sort_order, year) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO media_entry (parent_id, entry_type_id) VALUES (?, ?)",
         )
         .bind(parent_id)
         .bind(movie_type_id)
-        .bind(&title)
-        .bind(&rel_path)
-        .bind(&sort_title)
-        .bind(sort_order)
-        .bind(&year)
         .execute(pool)
         .await?;
 
         let entry_id = result.last_insert_rowid();
-        sqlx::query("INSERT INTO movie (id) VALUES (?)")
+        sqlx::query("INSERT INTO movie (id, title, folder_path, sort_title, sort_order, release_date) VALUES (?, ?, ?, ?, ?, ?)")
             .bind(entry_id)
+            .bind(&title)
+            .bind(&rel_path)
+            .bind(&sort_title)
+            .bind(sort_order)
+            .bind(&year)
             .execute(pool)
             .await?;
 
@@ -4932,21 +5023,20 @@ async fn scan_video_dir(
     } else {
         // Collection (has subdirs, or empty folder)
         let result = sqlx::query(
-            "INSERT INTO media_entry (parent_id, entry_type_id, title, folder_path, sort_title, sort_order, year) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO media_entry (parent_id, entry_type_id) VALUES (?, ?)",
         )
         .bind(parent_id)
         .bind(collection_type_id)
-        .bind(&title)
-        .bind(&rel_path)
-        .bind(&sort_title)
-        .bind(sort_order)
-        .bind(&year)
         .execute(pool)
         .await?;
 
         let entry_id = result.last_insert_rowid();
-        sqlx::query("INSERT INTO collection (id) VALUES (?)")
+        sqlx::query("INSERT INTO collection (id, title, folder_path, sort_title, sort_order) VALUES (?, ?, ?, ?, ?)")
             .bind(entry_id)
+            .bind(&title)
+            .bind(&rel_path)
+            .bind(&sort_title)
+            .bind(sort_order)
             .execute(pool)
             .await?;
 
@@ -5037,7 +5127,7 @@ async fn scan_dir(
         let sort_title = generate_sort_title(&title, "en");
 
         let result = sqlx::query(
-            "INSERT INTO movie (title, year, folder_path, parent_id, is_collection, sort_order, sort_title) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO movie (title, release_date, folder_path, parent_id, is_collection, sort_order, sort_title) VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&title)
         .bind(&year)
@@ -5487,7 +5577,7 @@ pub async fn search_tmdb_show(
         .fetch_optional(&state.app_db)
         .await
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| "No TMDB API token configured. Add one in Settings.".to_string())?;
+        .ok_or_else(|| "No TMDB API token configured. Add one in settings.".to_string())?;
 
     let client = reqwest::Client::new();
     let resp = crate::tmdb::search_tv(&client, &token, &query, year.as_deref()).await?;
@@ -5503,7 +5593,7 @@ pub async fn get_tmdb_show_detail(
         .fetch_optional(&state.app_db)
         .await
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| "No TMDB API token configured.".to_string())?;
+        .ok_or_else(|| "No TMDB API token configured. Add one in settings.".to_string())?;
 
     let client = reqwest::Client::new();
     crate::tmdb::get_tv_detail(&client, &token, tmdb_id).await
@@ -5519,7 +5609,7 @@ pub async fn get_tmdb_season_detail(
         .fetch_optional(&state.app_db)
         .await
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| "No TMDB API token configured.".to_string())?;
+        .ok_or_else(|| "No TMDB API token configured. Add one in settings.".to_string())?;
 
     let client = reqwest::Client::new();
     crate::tmdb::get_season_detail(&client, &token, tmdb_id, season_number).await
@@ -5536,7 +5626,7 @@ pub async fn get_tmdb_episode_detail(
         .fetch_optional(&state.app_db)
         .await
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| "No TMDB API token configured.".to_string())?;
+        .ok_or_else(|| "No TMDB API token configured. Add one in settings.".to_string())?;
 
     let client = reqwest::Client::new();
     crate::tmdb::get_episode_detail(&client, &token, tmdb_id, season_number, episode_number).await
@@ -5739,6 +5829,7 @@ pub async fn apply_tmdb_season_metadata(
 pub struct TmdbEpisodeFieldSelection {
     pub plot: Option<String>,
     pub runtime: Option<i64>,
+    pub release_date: Option<String>,
     pub cast: Option<Vec<CastUpdateInfo>>,
     pub crew: Option<Vec<CrewUpdateInfo>>,
 }
@@ -5759,6 +5850,10 @@ pub async fn apply_tmdb_episode_metadata(
     if let Some(runtime) = fields.runtime {
         sqlx::query("UPDATE episode SET runtime = ? WHERE id = ?")
             .bind(runtime).bind(episode_id).execute(&pool).await.map_err(|e| e.to_string())?;
+    }
+    if let Some(ref release_date) = fields.release_date {
+        sqlx::query("UPDATE episode SET release_date = ? WHERE id = ?")
+            .bind(release_date).bind(episode_id).execute(&pool).await.map_err(|e| e.to_string())?;
     }
 
     if let Some(ref cast) = fields.cast {
@@ -5797,7 +5892,7 @@ pub async fn apply_tmdb_season_episodes(
         .fetch_optional(&state.app_db)
         .await
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| "No TMDB API token configured.".to_string())?;
+        .ok_or_else(|| "No TMDB API token configured. Add one in settings.".to_string())?;
 
     let (pool, _) = open_library_pool(&state, &library_id).await?;
 
@@ -5839,6 +5934,12 @@ pub async fn apply_tmdb_season_episodes(
         if let Some(runtime) = tmdb_ep.runtime {
             sqlx::query("UPDATE episode SET runtime = COALESCE(runtime, ?) WHERE id = ? AND runtime IS NULL")
                 .bind(runtime).bind(local_id).execute(&pool).await.map_err(|e| e.to_string())?;
+        }
+        if let Some(ref air_date) = tmdb_ep.air_date {
+            if !air_date.is_empty() {
+                sqlx::query("UPDATE episode SET release_date = COALESCE(release_date, ?) WHERE id = ? AND release_date IS NULL")
+                    .bind(air_date).bind(local_id).execute(&pool).await.map_err(|e| e.to_string())?;
+            }
         }
 
         // Guest stars

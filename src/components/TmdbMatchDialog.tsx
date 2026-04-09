@@ -172,10 +172,10 @@ function buildReviewFields(
     tmdb.runtime != null ? `${tmdb.runtime} min` : ""
   );
   add(
-    "year",
-    "Year",
+    "release_date",
+    "Release Date",
     entryYear,
-    extractYear(tmdb.release_date)
+    tmdb.release_date ?? ""
   );
   add(
     "maturity_rating",
@@ -345,9 +345,8 @@ export function TmdbMatchDialog({
       if (isChecked("runtime") && selectedTmdb.runtime != null) {
         sel.runtime = selectedTmdb.runtime;
       }
-      if (isChecked("year")) {
-        const y = extractYear(selectedTmdb.release_date);
-        if (y) sel.year = y;
+      if (isChecked("release_date") && selectedTmdb.release_date) {
+        sel.release_date = selectedTmdb.release_date;
       }
       if (isChecked("maturity_rating")) {
         const cert = getUSCertification(selectedTmdb);

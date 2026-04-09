@@ -517,9 +517,10 @@ function App() {
           onDeleteEntry={deleteEntry}
           onEntryChanged={() => {
             if (selectedLibrary) {
-              // Invalidate the parent grid so going back shows fresh data (e.g. updated year)
-              const parentId = breadcrumbs.length >= 2 ? breadcrumbs[breadcrumbs.length - 2]?.id ?? null : null;
-              invalidateCache(selectedLibrary.id, parentId);
+              // Invalidate all ancestor grids so going back shows fresh data (e.g. updated year ranges on collections)
+              for (let i = 0; i < breadcrumbs.length - 1; i++) {
+                invalidateCache(selectedLibrary.id, breadcrumbs[i]?.id ?? null);
+              }
             }
           }}
           onRescan={() => {

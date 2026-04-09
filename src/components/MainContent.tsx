@@ -989,7 +989,7 @@ function EntryDetailPage({
   const startEditing = () => {
     setDraft({
       title: entry.title,
-      year: entry.year ?? "",
+      release_date: detail?.release_date ?? entry.year ?? "",
       tmdb_id: detail?.tmdb_id ?? null,
       imdb_id: detail?.imdb_id ?? null,
       rotten_tomatoes_id: detail?.rotten_tomatoes_id ?? null,
@@ -1058,10 +1058,10 @@ function EntryDetailPage({
                   className="rounded border border-input bg-transparent px-2 py-1 text-2xl font-bold outline-none"
                 />
                 <input
-                  value={draft.year ?? ""}
-                  onChange={(e) => updateDraft("year", e.target.value)}
-                  placeholder="Year"
-                  className="w-24 rounded border border-input bg-transparent px-2 py-1 text-sm outline-none"
+                  value={draft.release_date ?? ""}
+                  onChange={(e) => updateDraft("release_date", e.target.value)}
+                  placeholder="Release Date"
+                  className="w-36 rounded border border-input bg-transparent px-2 py-1 text-sm outline-none"
                 />
               </div>
             ) : (
@@ -1384,6 +1384,7 @@ function ShowDetailPage({
       const fields: TmdbEpisodeFieldSelection = {};
       if (tmdbEp.overview) fields.plot = tmdbEp.overview;
       if (tmdbEp.runtime) fields.runtime = tmdbEp.runtime;
+      if (tmdbEp.air_date) fields.release_date = tmdbEp.air_date;
       if (tmdbEp.guest_stars && tmdbEp.guest_stars.length > 0) {
         fields.cast = tmdbEp.guest_stars.map((c) => ({
           name: c.name,

@@ -59,6 +59,7 @@ export interface MovieDetail {
   tmdb_id: string | null;
   imdb_id: string | null;
   rotten_tomatoes_id: string | null;
+  release_date: string | null;
   plot: string | null;
   tagline: string | null;
   runtime: number | null;
@@ -180,7 +181,7 @@ export interface TmdbFieldSelection {
   plot?: string;
   tagline?: string;
   runtime?: number;
-  year?: string;
+  release_date?: string;
   maturity_rating?: string;
   genres?: string[];
   directors?: PersonUpdateInfo[];
@@ -196,7 +197,7 @@ export interface MovieDetailUpdate {
   imdb_id?: string | null;
   rotten_tomatoes_id?: string | null;
   title?: string;
-  year?: string;
+  release_date?: string;
   plot?: string | null;
   tagline?: string | null;
   runtime?: number | null;
@@ -299,6 +300,7 @@ export interface TmdbEpisodeSummary {
   name: string;
   overview: string | null;
   episode_number: number;
+  air_date: string | null;
   runtime: number | null;
   guest_stars: TmdbCastMember[];
   crew: TmdbCrewMember[];
@@ -309,6 +311,7 @@ export interface TmdbEpisodeDetail {
   name: string;
   overview: string | null;
   episode_number: number;
+  air_date: string | null;
   runtime: number | null;
   guest_stars: TmdbCastMember[];
   crew: TmdbCrewMember[];
@@ -341,6 +344,7 @@ export interface TmdbSeasonFieldSelection {
 export interface TmdbEpisodeFieldSelection {
   plot?: string;
   runtime?: number;
+  release_date?: string;
   cast?: CastUpdateInfo[];
   crew?: CrewUpdateInfo[];
 }

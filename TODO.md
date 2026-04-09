@@ -34,12 +34,13 @@ sidebar complications (complications like a watch)
       - actors
       - directors/producers
       - composers
-    - directors/producers
     - custom collections/playlists
 
 settings system where changes are all set at once on save button click, instead of on settings exit
 
 ## BIG STUFF NOW
+
+year everywhere except media_entry needs to become a full date. also add title to movie, show and collection. let there be duplication. i dont like it
 
 reduce zoom in out freedom. make it so that, from 100%, the user can go up twice max and down twice min
 
