@@ -58,6 +58,7 @@ pub struct MediaEntry {
     pub covers: Vec<String>,
     pub selected_cover: Option<String>,
     pub child_count: i64,
+    pub season_display: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -774,7 +775,18 @@ pub async fn get_entries(
                      NULLIF((SELECT MAX(yr) FROM ({collection_child_years})), (SELECT MIN(yr) FROM ({collection_child_years}))) \
                  END as end_year, \
                  mef.folder_path, mef.parent_id, mef.entry_type, mef.selected_cover, \
-                 (SELECT COUNT(*) FROM media_entry c WHERE c.parent_id = mef.id) as child_count \
+                 (SELECT COUNT(*) FROM media_entry c WHERE c.parent_id = mef.id) as child_count, \
+                 CASE WHEN mef.entry_type = 'show' THEN \
+                   (SELECT CASE \
+                     WHEN COUNT(*) = 0 THEN NULL \
+                     WHEN COUNT(*) = 1 AND MIN(s.season_number) IS NOT NULL THEN 'season ' || MIN(s.season_number) \
+                     WHEN COUNT(*) = 1 THEN '1 season' \
+                     WHEN COUNT(s.season_number) = COUNT(*) \
+                       AND COUNT(*) = (MAX(s.season_number) - MIN(s.season_number) + 1) \
+                       THEN 'seasons ' || MIN(s.season_number) || '\u{2013}' || MAX(s.season_number) \
+                     ELSE COUNT(*) || ' seasons' \
+                   END FROM season s WHERE s.show_id = mef.id) \
+                 END as season_display \
                  FROM media_entry_full mef"
             );
             let query_str = match parent_id {
@@ -782,7 +794,7 @@ pub async fn get_entries(
                 None => format!("{base_query} WHERE mef.parent_id IS NULL {order_clause}"),
             };
 
-            let rows: Vec<(i64, String, Option<String>, Option<String>, String, Option<i64>, String, Option<String>, i64)> = match parent_id {
+            let rows: Vec<(i64, String, Option<String>, Option<String>, String, Option<i64>, String, Option<String>, i64, Option<String>)> = match parent_id {
                 Some(pid) => {
                     sqlx::query_as(&query_str)
                         .bind(pid)
@@ -799,7 +811,7 @@ pub async fn get_entries(
 
             let entries: Vec<MediaEntry> = rows
                 .into_iter()
-                .map(|(id, title, year, end_year, folder_path, parent_id, entry_type, selected_cover, child_count)| {
+                .map(|(id, title, year, end_year, folder_path, parent_id, entry_type, selected_cover, child_count, season_display)| {
                     let covers = covers_map.remove(&folder_path).unwrap_or_default();
                     MediaEntry {
                         id,
@@ -812,6 +824,7 @@ pub async fn get_entries(
                         covers,
                         selected_cover,
                         child_count,
+                        season_display,
                     }
                 })
                 .collect();
@@ -854,6 +867,7 @@ pub async fn get_entries(
                         covers,
                         selected_cover,
                         child_count: 0,
+                        season_display: None,
                     }
                 })
                 .collect();
@@ -927,6 +941,7 @@ pub async fn get_entries(
                         covers,
                         selected_cover,
                         child_count: 0,
+                        season_display: None,
                     }
                 })
                 .collect();
@@ -1005,6 +1020,18 @@ pub async fn search_entries(
                   WHEN mef.entry_type = 'collection' THEN \
                     NULLIF((SELECT MAX(yr) FROM ({collection_child_years})), (SELECT MIN(yr) FROM ({collection_child_years}))) \
                 END");
+            let season_display_expr = "\
+                CASE WHEN mef.entry_type = 'show' THEN \
+                  (SELECT CASE \
+                    WHEN COUNT(*) = 0 THEN NULL \
+                    WHEN COUNT(*) = 1 AND MIN(s.season_number) IS NOT NULL THEN 'season ' || MIN(s.season_number) \
+                    WHEN COUNT(*) = 1 THEN '1 season' \
+                    WHEN COUNT(s.season_number) = COUNT(*) \
+                      AND COUNT(*) = (MAX(s.season_number) - MIN(s.season_number) + 1) \
+                      THEN 'seasons ' || MIN(s.season_number) || '\u{2013}' || MAX(s.season_number) \
+                    ELSE COUNT(*) || ' seasons' \
+                  END FROM season s WHERE s.show_id = mef.id) \
+                END";
             let query_str = match parent_id {
                 Some(_) => format!("\
                     WITH RECURSIVE descendants(id) AS ( \
@@ -1012,18 +1039,18 @@ pub async fn search_entries(
                         UNION ALL \
                         SELECT me.id FROM media_entry me JOIN descendants d ON me.parent_id = d.id \
                     ) \
-                    SELECT mef.id, mef.title, {year_expr} as year, {end_year_expr} as end_year, mef.folder_path, mef.parent_id, mef.entry_type, mef.selected_cover \
+                    SELECT mef.id, mef.title, {year_expr} as year, {end_year_expr} as end_year, mef.folder_path, mef.parent_id, mef.entry_type, mef.selected_cover, {season_display_expr} as season_display \
                     FROM media_entry_full mef \
                     WHERE mef.id IN (SELECT id FROM descendants) AND mef.title LIKE ? \
                     ORDER BY mef.sort_title COLLATE NOCASE ASC"),
                 None => format!("\
-                    SELECT mef.id, mef.title, {year_expr} as year, {end_year_expr} as end_year, mef.folder_path, mef.parent_id, mef.entry_type, mef.selected_cover \
+                    SELECT mef.id, mef.title, {year_expr} as year, {end_year_expr} as end_year, mef.folder_path, mef.parent_id, mef.entry_type, mef.selected_cover, {season_display_expr} as season_display \
                     FROM media_entry_full mef \
                     WHERE mef.title LIKE ? \
                     ORDER BY mef.sort_title COLLATE NOCASE ASC"),
             };
 
-            let rows: Vec<(i64, String, Option<String>, Option<String>, String, Option<i64>, String, Option<String>)> = match parent_id {
+            let rows: Vec<(i64, String, Option<String>, Option<String>, String, Option<i64>, String, Option<String>, Option<String>)> = match parent_id {
                 Some(pid) => {
                     sqlx::query_as(&query_str)
                         .bind(pid)
@@ -1041,9 +1068,9 @@ pub async fn search_entries(
             .map_err(|e| e.to_string())?;
 
             rows.into_iter()
-                .map(|(id, title, year, end_year, folder_path, parent_id, entry_type, selected_cover)| {
+                .map(|(id, title, year, end_year, folder_path, parent_id, entry_type, selected_cover, season_display)| {
                     let covers = covers_map.remove(&folder_path).unwrap_or_default();
-                    MediaEntry { id, title, year, end_year, folder_path, parent_id, entry_type, covers, selected_cover, child_count: 0 }
+                    MediaEntry { id, title, year, end_year, folder_path, parent_id, entry_type, covers, selected_cover, child_count: 0, season_display }
                 })
                 .collect()
         }
@@ -1060,7 +1087,7 @@ pub async fn search_entries(
             rows.into_iter()
                 .map(|(id, name, folder_path, selected_cover)| {
                     let covers = covers_map.remove(&folder_path).unwrap_or_default();
-                    MediaEntry { id, title: name, year: None, end_year: None, folder_path, parent_id: None, entry_type: "artist".to_string(), covers, selected_cover, child_count: 0 }
+                    MediaEntry { id, title: name, year: None, end_year: None, folder_path, parent_id: None, entry_type: "artist".to_string(), covers, selected_cover, child_count: 0, season_display: None }
                 })
                 .collect()
         }
@@ -1104,7 +1131,7 @@ pub async fn search_entries(
                     MediaEntry {
                         id, title, year, end_year: None, folder_path, parent_id,
                         entry_type: if is_collection != 0 { "collection".to_string() } else { "movie".to_string() },
-                        covers, selected_cover, child_count: 0,
+                        covers, selected_cover, child_count: 0, season_display: None,
                     }
                 })
                 .collect()

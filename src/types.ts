@@ -33,6 +33,7 @@ export interface MediaEntry {
   covers: string[];
   selected_cover: string | null;
   child_count: number;
+  season_display: string | null;
 }
 
 export interface BreadcrumbItem {

@@ -781,8 +781,8 @@ function SortableCoverCard({
           ) : (
             <>
               <p className="text-sm font-medium">{entry.title}</p>
-              {entry.year && (
-                <p className="text-xs text-muted-foreground">{entry.year}{entry.end_year ? `–${entry.end_year}` : ""}</p>
+              {(entry.season_display || entry.year) && (
+                <p className="text-xs text-muted-foreground">{[entry.season_display, entry.year && `${entry.year}${entry.end_year ? `–${entry.end_year}` : ""}`].filter(Boolean).join(", ")}</p>
               )}
             </>
           )}
@@ -872,8 +872,8 @@ function DragOverlayCard({
       </div>
       <div className="w-full" style={{ maxWidth: size }}>
         <p className="text-sm font-medium">{entry.title}</p>
-        {entry.year && (
-          <p className="text-xs text-muted-foreground">{entry.year}{entry.end_year ? `–${entry.end_year}` : ""}</p>
+        {(entry.season_display || entry.year) && (
+          <p className="text-xs text-muted-foreground">{[entry.season_display, entry.year && `${entry.year}${entry.end_year ? `–${entry.end_year}` : ""}`].filter(Boolean).join(", ")}</p>
         )}
       </div>
     </div>
@@ -1067,9 +1067,9 @@ function EntryDetailPage({
             ) : (
               <>
                 <h1 className="text-3xl font-bold">{entry.title}</h1>
-                {entry.year && (
+                {(entry.season_display || entry.year) && (
                   <p className="text-lg text-muted-foreground">
-                    {entry.year}{entry.end_year ? `–${entry.end_year}` : ""}
+                    {[entry.season_display, entry.year && `${entry.year}${entry.end_year ? `–${entry.end_year}` : ""}`].filter(Boolean).join(", ")}
                   </p>
                 )}
               </>
@@ -1442,9 +1442,9 @@ function ShowDetailPage({
         <div className="flex items-start justify-between gap-4">
           <div>
             <h1 className="text-3xl font-bold">{entry.title}</h1>
-            {entry.year && (
+            {(entry.season_display || entry.year) && (
               <p className="text-lg text-muted-foreground">
-                {entry.year}{entry.end_year ? `–${entry.end_year}` : ""}
+                {[entry.season_display, entry.year && `${entry.year}${entry.end_year ? `–${entry.end_year}` : ""}`].filter(Boolean).join(", ")}
               </p>
             )}
           </div>
