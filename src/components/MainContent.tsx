@@ -103,6 +103,20 @@ function getDisplayCover(entry: MediaEntry): string | null {
   return entry.covers[0] || null;
 }
 
+function formatReleaseDate(date: string | null | undefined): string | null {
+  if (!date) return null;
+  if (/^\d{4}$/.test(date)) return date;
+  if (/^\d{4}-\d{2}$/.test(date)) {
+    const [y, m] = date.split("-");
+    return new Date(+y, +m - 1).toLocaleString("en-US", { month: "long", year: "numeric" });
+  }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    const [y, m, d] = date.split("-");
+    return new Date(+y, +m - 1, +d).toLocaleString("en-US", { month: "long", day: "numeric", year: "numeric" });
+  }
+  return date;
+}
+
 interface MainContentProps {
   entries: MediaEntry[];
   searchResults: MediaEntry[] | null;
@@ -1060,18 +1074,17 @@ function EntryDetailPage({
                 <input
                   value={draft.release_date ?? ""}
                   onChange={(e) => updateDraft("release_date", e.target.value)}
-                  placeholder="Release Date"
+                  placeholder="YYYY, YYYY-MM, or YYYY-MM-DD"
                   className="w-36 rounded border border-input bg-transparent px-2 py-1 text-sm outline-none"
                 />
               </div>
             ) : (
               <>
                 <h1 className="text-3xl font-bold">{entry.title}</h1>
-                {(entry.season_display || entry.collection_display || entry.year) && (
-                  <p className="text-lg text-muted-foreground">
-                    {[entry.season_display || entry.collection_display, entry.year && `${entry.year}${entry.end_year ? `–${entry.end_year}` : ""}`].filter(Boolean).join(", ")}
-                  </p>
-                )}
+                {(() => {
+                  const dateDisplay = formatReleaseDate(detail?.release_date) ?? (entry.year && `${entry.year}${entry.end_year ? `–${entry.end_year}` : ""}`);
+                  return dateDisplay && <p className="text-lg text-muted-foreground">{dateDisplay}</p>;
+                })()}
               </>
             )}
           </div>
@@ -1569,7 +1582,7 @@ function ShowDetailPage({
               {episodes.map((ep) => {
                 const isExpanded = expandedEpisodeId === ep.id;
                 const epDetail = episodeDetails.get(ep.id);
-                const hasDetail = epDetail && (epDetail.plot || epDetail.runtime || epDetail.cast.length > 0 || epDetail.crew.length > 0);
+                const hasDetail = epDetail && (epDetail.release_date || epDetail.plot || epDetail.runtime || epDetail.cast.length > 0 || epDetail.crew.length > 0);
                 return (
                   <div key={ep.id} className="flex flex-col">
                     <div
@@ -1620,6 +1633,12 @@ function ShowDetailPage({
                         )}
                         {epDetail && hasDetail && (
                           <>
+                            {epDetail.release_date && (
+                              <div>
+                                <span className="text-muted-foreground">Air Date: </span>
+                                {formatReleaseDate(epDetail.release_date)}
+                              </div>
+                            )}
                             {epDetail.runtime && (
                               <div>
                                 <span className="text-muted-foreground">Runtime: </span>

@@ -5400,6 +5400,7 @@ pub struct EpisodeDetailLocal {
     pub id: i64,
     pub title: String,
     pub episode_number: Option<i64>,
+    pub release_date: Option<String>,
     pub plot: Option<String>,
     pub runtime: Option<i64>,
     pub cast: Vec<CastInfo>,
@@ -5629,15 +5630,15 @@ pub async fn get_episode_detail_local(
 ) -> Result<EpisodeDetailLocal, String> {
     let (pool, _) = open_library_pool(&state, &library_id).await?;
 
-    let row: Option<(String, Option<i64>, Option<String>, Option<i64>)> = sqlx::query_as(
-        "SELECT title, episode_number, plot, runtime FROM episode WHERE id = ?",
+    let row: Option<(String, Option<i64>, Option<String>, Option<String>, Option<i64>)> = sqlx::query_as(
+        "SELECT title, episode_number, release_date, plot, runtime FROM episode WHERE id = ?",
     )
     .bind(episode_id)
     .fetch_optional(&pool)
     .await
     .map_err(|e| e.to_string())?;
 
-    let (title, episode_number, plot, runtime) = row.ok_or("Episode not found")?;
+    let (title, episode_number, release_date, plot, runtime) = row.ok_or("Episode not found")?;
 
     let cast_rows: Vec<(i64, String, Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT p.id, p.name, p.image_path, ec.role FROM episode_cast ec JOIN person p ON ec.person_id = p.id WHERE ec.episode_id = ? ORDER BY ec.sort_order",
@@ -5663,6 +5664,7 @@ pub async fn get_episode_detail_local(
         id: episode_id,
         title,
         episode_number,
+        release_date,
         plot,
         runtime,
         cast,

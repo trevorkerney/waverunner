@@ -246,6 +246,7 @@ export interface EpisodeDetailLocal {
   id: number;
   title: string;
   episode_number: number | null;
+  release_date: string | null;
   plot: string | null;
   runtime: number | null;
   cast: CastInfo[];
