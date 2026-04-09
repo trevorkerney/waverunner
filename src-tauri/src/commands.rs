@@ -59,6 +59,7 @@ pub struct MediaEntry {
     pub selected_cover: Option<String>,
     pub child_count: i64,
     pub season_display: Option<String>,
+    pub collection_display: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -825,9 +826,47 @@ pub async fn get_entries(
                         selected_cover,
                         child_count,
                         season_display,
+                        collection_display: None,
                     }
                 })
                 .collect();
+
+            // Compute collection_display for collection entries
+            let mut entries = entries;
+            for entry in &mut entries {
+                if entry.entry_type == "collection" {
+                    let counts: Option<(i64, i64)> = sqlx::query_as(
+                        "WITH RECURSIVE descendants(id) AS ( \
+                            SELECT id FROM media_entry WHERE parent_id = ? \
+                            UNION ALL \
+                            SELECT me.id FROM media_entry me JOIN descendants d ON me.parent_id = d.id \
+                        ) \
+                        SELECT \
+                            COALESCE(SUM(CASE WHEN met.name = 'movie' THEN 1 ELSE 0 END), 0), \
+                            COALESCE(SUM(CASE WHEN met.name = 'show' THEN 1 ELSE 0 END), 0) \
+                        FROM descendants d \
+                        JOIN media_entry me ON d.id = me.id \
+                        JOIN media_entry_type met ON me.entry_type_id = met.id"
+                    )
+                    .bind(entry.id)
+                    .fetch_optional(&pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                    if let Some((movies, shows)) = counts {
+                        let mut parts = Vec::new();
+                        if movies > 0 {
+                            parts.push(if movies == 1 { "1 movie".to_string() } else { format!("{movies} movies") });
+                        }
+                        if shows > 0 {
+                            parts.push(if shows == 1 { "1 show".to_string() } else { format!("{shows} shows") });
+                        }
+                        if !parts.is_empty() {
+                            entry.collection_display = Some(parts.join(" and "));
+                        }
+                    }
+                }
+            }
 
             EntriesResponse {
                 entries,
@@ -868,6 +907,7 @@ pub async fn get_entries(
                         selected_cover,
                         child_count: 0,
                         season_display: None,
+                        collection_display: None,
                     }
                 })
                 .collect();
@@ -942,6 +982,7 @@ pub async fn get_entries(
                         selected_cover,
                         child_count: 0,
                         season_display: None,
+                        collection_display: None,
                     }
                 })
                 .collect();
@@ -1067,12 +1108,49 @@ pub async fn search_entries(
             }
             .map_err(|e| e.to_string())?;
 
-            rows.into_iter()
+            let mut entries: Vec<MediaEntry> = rows.into_iter()
                 .map(|(id, title, year, end_year, folder_path, parent_id, entry_type, selected_cover, season_display)| {
                     let covers = covers_map.remove(&folder_path).unwrap_or_default();
-                    MediaEntry { id, title, year, end_year, folder_path, parent_id, entry_type, covers, selected_cover, child_count: 0, season_display }
+                    MediaEntry { id, title, year, end_year, folder_path, parent_id, entry_type, covers, selected_cover, child_count: 0, season_display, collection_display: None }
                 })
-                .collect()
+                .collect();
+
+            for entry in &mut entries {
+                if entry.entry_type == "collection" {
+                    let counts: Option<(i64, i64)> = sqlx::query_as(
+                        "WITH RECURSIVE descendants(id) AS ( \
+                            SELECT id FROM media_entry WHERE parent_id = ? \
+                            UNION ALL \
+                            SELECT me.id FROM media_entry me JOIN descendants d ON me.parent_id = d.id \
+                        ) \
+                        SELECT \
+                            COALESCE(SUM(CASE WHEN met.name = 'movie' THEN 1 ELSE 0 END), 0), \
+                            COALESCE(SUM(CASE WHEN met.name = 'show' THEN 1 ELSE 0 END), 0) \
+                        FROM descendants d \
+                        JOIN media_entry me ON d.id = me.id \
+                        JOIN media_entry_type met ON me.entry_type_id = met.id"
+                    )
+                    .bind(entry.id)
+                    .fetch_optional(&pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                    if let Some((movies, shows)) = counts {
+                        let mut parts = Vec::new();
+                        if movies > 0 {
+                            parts.push(if movies == 1 { "1 movie".to_string() } else { format!("{movies} movies") });
+                        }
+                        if shows > 0 {
+                            parts.push(if shows == 1 { "1 show".to_string() } else { format!("{shows} shows") });
+                        }
+                        if !parts.is_empty() {
+                            entry.collection_display = Some(parts.join(" and "));
+                        }
+                    }
+                }
+            }
+
+            entries
         }
         "music" => {
             let rows: Vec<(i64, String, String, Option<String>)> =
@@ -1087,7 +1165,7 @@ pub async fn search_entries(
             rows.into_iter()
                 .map(|(id, name, folder_path, selected_cover)| {
                     let covers = covers_map.remove(&folder_path).unwrap_or_default();
-                    MediaEntry { id, title: name, year: None, end_year: None, folder_path, parent_id: None, entry_type: "artist".to_string(), covers, selected_cover, child_count: 0, season_display: None }
+                    MediaEntry { id, title: name, year: None, end_year: None, folder_path, parent_id: None, entry_type: "artist".to_string(), covers, selected_cover, child_count: 0, season_display: None, collection_display: None }
                 })
                 .collect()
         }
@@ -1131,7 +1209,7 @@ pub async fn search_entries(
                     MediaEntry {
                         id, title, year, end_year: None, folder_path, parent_id,
                         entry_type: if is_collection != 0 { "collection".to_string() } else { "movie".to_string() },
-                        covers, selected_cover, child_count: 0, season_display: None,
+                        covers, selected_cover, child_count: 0, season_display: None, collection_display: None,
                     }
                 })
                 .collect()
