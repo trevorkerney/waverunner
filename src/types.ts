@@ -351,3 +351,11 @@ export interface TmdbEpisodeFieldSelection {
   cast?: CastUpdateInfo[];
   crew?: CrewUpdateInfo[];
 }
+
+export interface PlayerTrack {
+  id: number;
+  type: "audio" | "sub" | "video";
+  title: string | null;
+  lang: string | null;
+  selected: boolean;
+}

@@ -2366,6 +2366,120 @@ pub async fn play_episode(
     Ok(())
 }
 
+#[tauri::command]
+pub async fn get_movie_file_path(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    entry_id: i64,
+) -> Result<String, String> {
+    let row: Option<(String, i32, String, String)> = sqlx::query_as(
+        "SELECT paths, portable, db_filename, format FROM libraries WHERE id = ?",
+    )
+    .bind(&library_id)
+    .fetch_optional(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let (paths_json, portable, db_filename, format) = row.ok_or("Library not found")?;
+    let lib_paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
+
+    let db_path = if portable != 0 {
+        PathBuf::from(&lib_paths[0]).join(".waverunner.db")
+    } else {
+        state.app_data_dir.join(&db_filename)
+    };
+
+    let pool = crate::db::connect_library_pool(&db_path).await.map_err(|e| e.to_string())?;
+
+    let folder_path: String = match format.as_str() {
+        "video" => {
+            let row: Option<(String,)> = sqlx::query_as(
+                "SELECT folder_path FROM media_entry_full WHERE id = ?",
+            )
+            .bind(entry_id)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            row.ok_or("Entry not found")?.0
+        }
+        _ => {
+            let row: Option<(String,)> = sqlx::query_as(
+                "SELECT folder_path FROM movie WHERE id = ?",
+            )
+            .bind(entry_id)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            row.ok_or("Entry not found")?.0
+        }
+    };
+
+    pool.close().await;
+
+    let root = resolve_entry_root(&lib_paths, &folder_path)
+        .ok_or("Could not find entry on disk")?;
+    let full_folder = PathBuf::from(root).join(&folder_path);
+
+    let video_file = std::fs::read_dir(&full_folder)
+        .map_err(|e| format!("Cannot read folder: {}", e))?
+        .filter_map(|e| e.ok())
+        .filter(|e| is_media_file(&e.path(), VIDEO_EXTENSIONS))
+        .map(|e| e.path())
+        .next()
+        .ok_or("No video file found in movie folder")?;
+
+    Ok(video_file.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+pub async fn get_episode_file_path(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    episode_id: i64,
+) -> Result<String, String> {
+    let row: Option<(String, i32, String)> = sqlx::query_as(
+        "SELECT paths, portable, db_filename FROM libraries WHERE id = ?",
+    )
+    .bind(&library_id)
+    .fetch_optional(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let (paths_json, portable, db_filename) = row.ok_or("Library not found")?;
+    let lib_paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
+
+    let db_path = if portable != 0 {
+        PathBuf::from(&lib_paths[0]).join(".waverunner.db")
+    } else {
+        state.app_data_dir.join(&db_filename)
+    };
+
+    let pool = crate::db::connect_library_pool(&db_path).await.map_err(|e| e.to_string())?;
+
+    let ep_row: Option<(String,)> = sqlx::query_as(
+        "SELECT file_path FROM episode WHERE id = ?",
+    )
+    .bind(episode_id)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    pool.close().await;
+
+    let file_path = ep_row.ok_or("Episode not found")?.0;
+
+    let mut full_path: Option<PathBuf> = None;
+    for p in &lib_paths {
+        let candidate = PathBuf::from(p).join(&file_path);
+        if candidate.exists() {
+            full_path = Some(candidate);
+            break;
+        }
+    }
+    let full_path = full_path.ok_or("Episode file not found on disk")?;
+
+    Ok(full_path.to_string_lossy().into_owned())
+}
 
 #[tauri::command]
 pub async fn set_sort_mode(

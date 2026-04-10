@@ -40,6 +40,7 @@ settings system where changes are all set at once on save button click, instead 
 
 add warning when playing entire seasons without episode numbers (they will likely play out of order)
 
+
 ## BIG STUFF NOW
 
 ensure scroll position is saved post tmdb metadata retrieval

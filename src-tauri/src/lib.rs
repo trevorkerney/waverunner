@@ -1,9 +1,12 @@
 mod commands;
 mod db;
+mod mpv;
+mod player;
 mod tmdb;
 
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
+use std::sync::Mutex;
 use sqlx::SqlitePool;
 use tauri::Manager;
 
@@ -11,6 +14,7 @@ pub struct AppState {
     pub app_data_dir: PathBuf,
     pub app_db: SqlitePool,
     pub cancel_creation: AtomicBool,
+    pub player: Mutex<Option<player::PlayerInner>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -41,6 +45,7 @@ pub fn run() {
                 app_data_dir,
                 app_db,
                 cancel_creation: AtomicBool::new(false),
+                player: Mutex::new(None),
             });
 
             if cfg!(debug_assertions) {
@@ -95,6 +100,16 @@ pub fn run() {
             commands::apply_tmdb_season_metadata,
             commands::apply_tmdb_episode_metadata,
             commands::apply_tmdb_season_episodes,
+            commands::get_movie_file_path,
+            commands::get_episode_file_path,
+            player::init_player,
+            player::destroy_player,
+            player::play_file,
+            player::play_url,
+            player::player_command,
+            player::set_player_property,
+            player::get_player_property,
+            player::get_player_tracks,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

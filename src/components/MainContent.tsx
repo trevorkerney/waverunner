@@ -144,6 +144,7 @@ interface MainContentProps {
   getCoverUrl: (filePath: string) => string;
   getFullCoverUrl: (filePath: string) => string;
   scrollContainerRef: RefObject<HTMLDivElement | null>;
+  onPlayFile?: (path: string, title: string) => void;
 }
 
 export function MainContent({
@@ -173,6 +174,7 @@ export function MainContent({
   getCoverUrl,
   getFullCoverUrl,
   scrollContainerRef,
+  onPlayFile,
 }: MainContentProps) {
   const [coverDialogEntry, setCoverDialogEntry] = useState<MediaEntry | null>(
     null
@@ -337,8 +339,8 @@ export function MainContent({
       <div ref={scrollContainerRef} className="flex-1 overflow-y-auto overflow-x-hidden p-4">
       {selectedEntry ? (
         selectedEntry.entry_type === "show"
-          ? <ShowDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getFullCoverUrl={getFullCoverUrl} onEntryChanged={onEntryChanged} />
-          : <EntryDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getFullCoverUrl={getFullCoverUrl} onEntryChanged={onEntryChanged} />
+          ? <ShowDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getFullCoverUrl={getFullCoverUrl} onEntryChanged={onEntryChanged} onPlayFile={onPlayFile} />
+          : <EntryDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getFullCoverUrl={getFullCoverUrl} onEntryChanged={onEntryChanged} onPlayFile={onPlayFile} />
       ) : (
       <ContextMenu>
         <ContextMenuTrigger render={<div className="flex min-h-full flex-col" />}>
@@ -971,11 +973,13 @@ function EntryDetailPage({
   selectedLibrary,
   getFullCoverUrl,
   onEntryChanged,
+  onPlayFile,
 }: {
   entry: MediaEntry;
   selectedLibrary: Library;
   getFullCoverUrl: (filePath: string) => string;
   onEntryChanged: () => void;
+  onPlayFile?: (path: string, title: string) => void;
 }) {
   const [detail, setDetail] = useState<MovieDetail | null>(null);
   const [editing, setEditing] = useState(false);
@@ -1093,7 +1097,12 @@ function EntryDetailPage({
               size="sm"
               onClick={async () => {
                 try {
-                  await invoke("play_movie", { libraryId: selectedLibrary.id, entryId: entry.id });
+                  if (onPlayFile) {
+                    const path = await invoke<string>("get_movie_file_path", { libraryId: selectedLibrary.id, entryId: entry.id });
+                    onPlayFile(path, entry.title);
+                  } else {
+                    await invoke("play_movie", { libraryId: selectedLibrary.id, entryId: entry.id });
+                  }
                 } catch (e) {
                   toast.error(String(e));
                 }
@@ -1222,11 +1231,13 @@ function ShowDetailPage({
   selectedLibrary,
   getFullCoverUrl,
   onEntryChanged,
+  onPlayFile,
 }: {
   entry: MediaEntry;
   selectedLibrary: Library;
   getFullCoverUrl: (filePath: string) => string;
   onEntryChanged: () => void;
+  onPlayFile?: (path: string, title: string) => void;
 }) {
   const [detail, setDetail] = useState<ShowDetail | null>(null);
   const [seasons, setSeasons] = useState<SeasonInfo[]>([]);
@@ -1612,10 +1623,18 @@ function ShowDetailPage({
                           e.stopPropagation();
                           (async () => {
                             try {
-                              await invoke("play_episode", {
-                                libraryId: selectedLibrary.id,
-                                episodeId: ep.id,
-                              });
+                              if (onPlayFile) {
+                                const path = await invoke<string>("get_episode_file_path", {
+                                  libraryId: selectedLibrary.id,
+                                  episodeId: ep.id,
+                                });
+                                onPlayFile(path, ep.title || `Episode ${ep.episode_number}`);
+                              } else {
+                                await invoke("play_episode", {
+                                  libraryId: selectedLibrary.id,
+                                  episodeId: ep.id,
+                                });
+                              }
                             } catch (err) {
                               toast.error(String(err));
                             }

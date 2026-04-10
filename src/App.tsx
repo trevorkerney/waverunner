@@ -4,6 +4,8 @@ import "./App.css";
 import { Titlebar } from "@/components/Titlebar";
 import { Sidebar } from "@/components/Sidebar";
 import { MainContent } from "@/components/MainContent";
+import { PlayerView } from "@/components/PlayerView";
+import { usePlayer } from "@/hooks/usePlayer";
 import { Toaster } from "@/components/ui/sonner";
 import { toast } from "sonner";
 import { relaunch } from "@tauri-apps/plugin-process";
@@ -21,6 +23,18 @@ function App() {
   const [searchResults, setSearchResults] = useState<MediaEntry[] | null>(null);
   const [selectedEntry, setSelectedEntry] = useState<MediaEntry | null>(null);
   const [loading, setLoading] = useState(false);
+  const [playerState, playerActions] = usePlayer();
+
+  const handlePlayFile = useCallback(
+    async (path: string, title: string) => {
+      try {
+        await playerActions.play(path, title);
+      } catch (e) {
+        toast.error(String(e));
+      }
+    },
+    [playerActions]
+  );
 
   // Cache: "libraryId:parentId" -> { entries, sortMode }
   const entryCacheRef = useRef<Map<string, { entries: MediaEntry[]; sort_mode: string }>>(new Map());
@@ -472,7 +486,10 @@ function App() {
 
   return (
     <div className="flex h-screen flex-col overflow-hidden">
-      <Titlebar />
+      {!(playerState.isActive && playerState.isFullscreen) && <Titlebar />}
+      {playerState.isActive ? (
+        <PlayerView state={playerState} actions={playerActions} />
+      ) : (
       <div className="flex flex-1 overflow-hidden">
         <Sidebar
           libraries={libraries}
@@ -534,8 +551,10 @@ function App() {
           getCoverUrl={getCoverUrl}
           getFullCoverUrl={getFullCoverUrl}
           scrollContainerRef={scrollContainerRef}
+          onPlayFile={handlePlayFile}
         />
       </div>
+      )}
       <Toaster position="top-center" />
     </div>
   );

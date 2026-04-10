@@ -31,3 +31,9 @@ old
 src-tauri/keys/updater.key
 
 RELEASE.md
+
+# Bundled native libraries (too large for GitHub, keep local)
+src-tauri/lib/*.dll
+src-tauri/lib/*.so
+src-tauri/lib/*.so.*
+src-tauri/lib/*.dylib

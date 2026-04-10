@@ -163,3 +163,10 @@
     background: oklch(1 0 0 / 28%);
   }
 }
+
+/* Player active — make webview transparent so mpv video shows through */
+html.player-active,
+html.player-active body,
+html.player-active #root {
+  background: transparent !important;
+}

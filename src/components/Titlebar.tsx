@@ -20,6 +20,8 @@ const MIN_ZOOM = 0.8;
 const MAX_ZOOM = 1.5;
 const ZOOM_STEP = 0.1;
 
+export const TITLEBAR_HEIGHT = 24; // px — keep in sync with h-6 class below
+
 export function Titlebar() {
   const [zoom, setZoom] = useState(() => {
     const stored = localStorage.getItem("app-zoom");
