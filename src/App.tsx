@@ -246,10 +246,11 @@ function App() {
     if (selectedEntry) {
       setSelectedEntry(null);
       setBreadcrumbs(newBreadcrumbs);
+      restoreScrollPosition(selectedLibrary.id, parentId);
     } else {
       loadEntries(selectedLibrary, parentId, newBreadcrumbs);
     }
-  }, [selectedLibrary, breadcrumbs, selectedEntry, loadEntries, saveScrollPosition]);
+  }, [selectedLibrary, breadcrumbs, selectedEntry, loadEntries, saveScrollPosition, restoreScrollPosition]);
 
   const goForward = useCallback(() => {
     if (!selectedLibrary || forwardStack.length === 0) return;

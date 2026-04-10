@@ -42,7 +42,19 @@ add warning when playing entire seasons without episode numbers (they will likel
 
 ## BIG STUFF NOW
 
-reduce zoom in out freedom. make it so that, from 100%, the user can go up twice max and down twice min
+ensure scroll position is saved post tmdb metadata retrieval
+
+ensure release date checkbox on review tmdb metadata screen is behaving properly (i.e. release date checkbox is defualt checked when tmdb has higher precision)
+
+make title rename on movie/show detail page automatically update when changed without needing refresh
+
+weird issue that should be accounted for. spongebob is the example here. I have seasons 1-6, also season 7 but season 7 has no episodes. All metadata obtained. Something is causing it to still need a refresh to update grid years
+
+star wars top level cover (deep nesting - inside star wars is a collection for each trilogy, containing movies and maybe tv) is not getting year range. not even a refresh fixes it
+
+add "add cover" option to collection context menu. should open file selector for selection
+
+movie/show detail page cover should have change cover in context menu
 
 show resolution and file size of each cover in carousel cover selection
 

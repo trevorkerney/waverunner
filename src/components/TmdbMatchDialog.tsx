@@ -58,6 +58,15 @@ function extractYear(releaseDate: string | null | undefined): string {
   return releaseDate.substring(0, 4);
 }
 
+// Returns 0 (empty), 1 (year), 2 (year-month), or 3 (year-month-day)
+function datePrecision(date: string | null | undefined): number {
+  if (!date) return 0;
+  if (/^\d{4}-\d{2}-\d{2}/.test(date)) return 3;
+  if (/^\d{4}-\d{2}/.test(date)) return 2;
+  if (/^\d{4}/.test(date)) return 1;
+  return 0;
+}
+
 function getUSCertification(tmdb: TmdbMovieDetail): string {
   if (!tmdb.releases?.countries) return "";
   const us = tmdb.releases.countries.find((c) => c.iso_3166_1 === "US");
@@ -142,8 +151,7 @@ interface ReviewField {
 
 function buildReviewFields(
   current: MovieDetail,
-  tmdb: TmdbMovieDetail,
-  entryYear: string | null
+  tmdb: TmdbMovieDetail
 ): ReviewField[] {
   const fields: ReviewField[] = [];
 
@@ -171,12 +179,19 @@ function buildReviewFields(
     current.runtime != null ? `${current.runtime} min` : null,
     tmdb.runtime != null ? `${tmdb.runtime} min` : ""
   );
-  add(
-    "release_date",
-    "Release Date",
-    entryYear,
-    tmdb.release_date ?? ""
-  );
+  // Release date: treat as "empty" (pre-checked) if TMDB has more precision than current.
+  // e.g. current = "2024" + tmdb = "2024-06-15" → pre-check to upgrade precision.
+  const curRelease = current.release_date ?? "";
+  const tmdbRelease = tmdb.release_date ?? "";
+  const releaseNeedsUpgrade =
+    datePrecision(tmdbRelease) > datePrecision(curRelease);
+  fields.push({
+    key: "release_date",
+    label: "Release Date",
+    currentDisplay: curRelease || "(empty)",
+    tmdbDisplay: tmdbRelease || "(empty)",
+    isEmpty: releaseNeedsUpgrade,
+  });
   add(
     "maturity_rating",
     "Maturity Rating",
@@ -301,7 +316,7 @@ export function TmdbMatchDialog({
 
         // Build initial check state — pre-check empty fields
         if (currentDetail) {
-          const fields = buildReviewFields(currentDetail, detail, entryYear);
+          const fields = buildReviewFields(currentDetail, detail);
           const checks: Record<string, FieldCheck> = {};
           for (const f of fields) {
             // Only pre-check if TMDB actually has data for this field
@@ -321,7 +336,7 @@ export function TmdbMatchDialog({
         setLoadingDetail(false);
       }
     },
-    [currentDetail, entryYear]
+    [currentDetail]
   );
 
   const applyMetadata = useCallback(async () => {
@@ -403,7 +418,7 @@ export function TmdbMatchDialog({
 
   const reviewFields =
     currentDetail && selectedTmdb
-      ? buildReviewFields(currentDetail, selectedTmdb, entryYear)
+      ? buildReviewFields(currentDetail, selectedTmdb)
       : [];
 
   const anyChecked = Object.values(fieldChecks).some((f) => f.checked);
