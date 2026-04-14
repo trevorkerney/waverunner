@@ -340,6 +340,13 @@ function App() {
     [selectedLibrary, breadcrumbs, sortMode, loadEntries, invalidateCache, updateCache]
   );
 
+  const applyTitleChange = useCallback((entryId: number, newTitle: string) => {
+    setEntries((prev) => prev.map((e) => (e.id === entryId ? { ...e, title: newTitle } : e)));
+    setSelectedEntry((prev) => (prev && prev.id === entryId ? { ...prev, title: newTitle } : prev));
+    setBreadcrumbs((prev) => prev.map((b) => (b.id === entryId ? { ...b, title: newTitle } : b)));
+    setForwardStack((prev) => prev.map((b) => (b.id === entryId ? { ...b, title: newTitle } : b)));
+  }, []);
+
   const renameEntry = useCallback(
     async (entryId: number, newTitle: string): Promise<string | null> => {
       if (!selectedLibrary) return "No library selected";
@@ -349,9 +356,7 @@ function App() {
           entryId,
           newTitle,
         });
-        setEntries((prev) =>
-          prev.map((e) => (e.id === entryId ? { ...e, title: newTitle } : e))
-        );
+        applyTitleChange(entryId, newTitle);
         const parentId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
         invalidateCache(selectedLibrary.id, parentId);
         return null;
@@ -359,7 +364,7 @@ function App() {
         return String(e);
       }
     },
-    [selectedLibrary, breadcrumbs, invalidateCache]
+    [selectedLibrary, breadcrumbs, invalidateCache, applyTitleChange]
   );
 
   const moveEntry = useCallback(
@@ -448,6 +453,9 @@ function App() {
         updateCache(selectedLibrary.id, parentId, updated, sortMode);
         return updated;
       });
+      setSelectedEntry((prev) =>
+        prev && prev.id === entryId ? { ...prev, selected_cover: coverPath } : prev
+      );
       try {
         await invoke("set_cover", {
           libraryId: selectedLibrary.id,
@@ -529,6 +537,7 @@ function App() {
           onSortModeChange={changeSortMode}
           onSortOrderChange={updateSortOrder}
           onRenameEntry={renameEntry}
+          onTitleChanged={applyTitleChange}
           onSetCover={setCover}
           onMoveEntry={moveEntry}
           onCreateCollection={createCollection}

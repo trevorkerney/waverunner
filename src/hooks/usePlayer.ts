@@ -222,8 +222,21 @@ export function usePlayer(): [PlayerState, PlayerActions] {
   const toggleFullscreen = useCallback(async () => {
     const appWindow = getCurrentWindow();
     const isFs = await appWindow.isFullscreen();
-    await appWindow.setFullscreen(!isFs);
-    setState((prev) => ({ ...prev, isFullscreen: !isFs }));
+    const goingFullscreen = !isFs;
+    await appWindow.setFullscreen(goingFullscreen);
+    setState((prev) => ({ ...prev, isFullscreen: goingFullscreen }));
+
+    if (goingFullscreen) {
+      // No titlebar in fullscreen — remove top margin so video uses full area
+      await invoke("set_player_property", { name: "video-margin-ratio-top", value: "0" });
+    } else {
+      // Restore titlebar margin
+      const size = await appWindow.innerSize();
+      if (size.height > 0) {
+        const ratio = TITLEBAR_HEIGHT / size.height;
+        await invoke("set_player_property", { name: "video-margin-ratio-top", value: ratio.toFixed(6) });
+      }
+    }
   }, []);
 
   const close = useCallback(async () => {

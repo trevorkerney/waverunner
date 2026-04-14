@@ -135,6 +135,7 @@ interface MainContentProps {
   onSortModeChange: (mode: string) => void;
   onSortOrderChange: (reordered: MediaEntry[]) => void;
   onRenameEntry: (entryId: number, newTitle: string) => Promise<string | null>;
+  onTitleChanged: (entryId: number, newTitle: string) => void;
   onSetCover: (entryId: number, coverPath: string | null) => void;
   onMoveEntry: (entryId: number, newParentId: number | null, insertBeforeId: number | null) => Promise<void>;
   onCreateCollection: (name: string, basePath?: string) => Promise<void>;
@@ -165,6 +166,7 @@ export function MainContent({
   onSortModeChange,
   onSortOrderChange,
   onRenameEntry,
+  onTitleChanged,
   onSetCover,
   onMoveEntry,
   onCreateCollection,
@@ -339,8 +341,8 @@ export function MainContent({
       <div ref={scrollContainerRef} className="flex-1 overflow-y-auto overflow-x-hidden p-4">
       {selectedEntry ? (
         selectedEntry.entry_type === "show"
-          ? <ShowDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getFullCoverUrl={getFullCoverUrl} onEntryChanged={onEntryChanged} onPlayFile={onPlayFile} />
-          : <EntryDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getFullCoverUrl={getFullCoverUrl} onEntryChanged={onEntryChanged} onPlayFile={onPlayFile} />
+          ? <ShowDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getFullCoverUrl={getFullCoverUrl} onEntryChanged={onEntryChanged} onTitleChanged={onTitleChanged} onChangeCover={() => setCoverDialogEntry(selectedEntry)} onPlayFile={onPlayFile} />
+          : <EntryDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getFullCoverUrl={getFullCoverUrl} onEntryChanged={onEntryChanged} onTitleChanged={onTitleChanged} onChangeCover={() => setCoverDialogEntry(selectedEntry)} onPlayFile={onPlayFile} />
       ) : (
       <ContextMenu>
         <ContextMenuTrigger render={<div className="flex min-h-full flex-col" />}>
@@ -973,12 +975,16 @@ function EntryDetailPage({
   selectedLibrary,
   getFullCoverUrl,
   onEntryChanged,
+  onTitleChanged,
+  onChangeCover,
   onPlayFile,
 }: {
   entry: MediaEntry;
   selectedLibrary: Library;
   getFullCoverUrl: (filePath: string) => string;
   onEntryChanged: () => void;
+  onTitleChanged: (entryId: number, newTitle: string) => void;
+  onChangeCover: () => void;
   onPlayFile?: (path: string, title: string) => void;
 }) {
   const [detail, setDetail] = useState<MovieDetail | null>(null);
@@ -1035,6 +1041,9 @@ function EntryDetailPage({
         detail: draft,
       });
       await loadDetail();
+      if (draft.title && draft.title !== entry.title) {
+        onTitleChanged(entry.id, draft.title);
+      }
       onEntryChanged();
       setEditing(false);
     } catch (e) {
@@ -1059,11 +1068,23 @@ function EntryDetailPage({
   return (
     <div className="flex gap-8 p-4">
       {coverSrc && (
-        <img
-          src={coverSrc}
-          alt={entry.title}
-          className="h-auto max-h-[500px] w-auto shrink-0 rounded-lg object-contain shadow-lg"
-        />
+        <ContextMenu>
+          <ContextMenuTrigger
+            render={
+              <img
+                src={coverSrc}
+                alt={entry.title}
+                className="h-auto max-h-[500px] w-auto shrink-0 rounded-lg object-contain shadow-lg"
+              />
+            }
+          />
+          <ContextMenuContent>
+            <ContextMenuItem onClick={onChangeCover} disabled={entry.covers.length <= 1}>
+              <ImageIcon size={14} />
+              Change Cover
+            </ContextMenuItem>
+          </ContextMenuContent>
+        </ContextMenu>
       )}
       <div className="flex min-w-0 flex-1 flex-col gap-4">
         <div className="flex items-start justify-between gap-4">
@@ -1231,12 +1252,16 @@ function ShowDetailPage({
   selectedLibrary,
   getFullCoverUrl,
   onEntryChanged,
+  onTitleChanged: _onTitleChanged,
+  onChangeCover,
   onPlayFile,
 }: {
   entry: MediaEntry;
   selectedLibrary: Library;
   getFullCoverUrl: (filePath: string) => string;
   onEntryChanged: () => void;
+  onTitleChanged: (entryId: number, newTitle: string) => void;
+  onChangeCover: () => void;
   onPlayFile?: (path: string, title: string) => void;
 }) {
   const [detail, setDetail] = useState<ShowDetail | null>(null);
@@ -1389,12 +1414,13 @@ function ShowDetailPage({
       // Reload episode details
       setEpisodeDetails(new Map());
       setExpandedEpisodeId(null);
+      onEntryChanged();
     } catch (e) {
       toast.error(String(e));
     } finally {
       setBulkEpisodesLoading(false);
     }
-  }, [detail, selectedSeason, selectedLibrary.id]);
+  }, [detail, selectedSeason, selectedLibrary.id, onEntryChanged]);
 
   const handleEpisodeTmdb = useCallback(async (ep: EpisodeInfo) => {
     if (!detail?.tmdb_id || !selectedSeason || selectedSeason.season_number == null || ep.episode_number == null) return;
@@ -1430,12 +1456,13 @@ function ShowDetailPage({
       });
       toast.success(`Episode ${ep.episode_number} metadata populated`);
       loadEpisodeDetail(ep.id);
+      onEntryChanged();
     } catch (e) {
       toast.error(String(e));
     } finally {
       setEpisodeTmdbLoading(null);
     }
-  }, [detail, selectedSeason, selectedLibrary.id, loadEpisodeDetail]);
+  }, [detail, selectedSeason, selectedLibrary.id, loadEpisodeDetail, onEntryChanged]);
 
   const toggleEpisode = useCallback((epId: number) => {
     if (expandedEpisodeId === epId) {
@@ -1456,11 +1483,23 @@ function ShowDetailPage({
   return (
     <div className="flex gap-8 p-4">
       {coverSrc && (
-        <img
-          src={coverSrc}
-          alt={entry.title}
-          className="h-auto max-h-[500px] w-auto shrink-0 rounded-lg object-contain shadow-lg"
-        />
+        <ContextMenu>
+          <ContextMenuTrigger
+            render={
+              <img
+                src={coverSrc}
+                alt={entry.title}
+                className="h-auto max-h-[500px] w-auto shrink-0 rounded-lg object-contain shadow-lg"
+              />
+            }
+          />
+          <ContextMenuContent>
+            <ContextMenuItem onClick={onChangeCover} disabled={entry.covers.length <= 1}>
+              <ImageIcon size={14} />
+              Change Cover
+            </ContextMenuItem>
+          </ContextMenuContent>
+        </ContextMenu>
       )}
       <div className="flex min-w-0 flex-1 flex-col gap-4">
         <div className="flex items-start justify-between gap-4">

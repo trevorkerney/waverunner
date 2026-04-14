@@ -745,16 +745,19 @@ pub async fn get_entries(
                 _ => "ORDER BY mef.sort_title COLLATE NOCASE ASC",
             };
 
-            // Subquery: all years from a collection's children (movies + shows' episodes)
+            // Subquery: all years from a collection's descendants (movies + shows' episodes), recursing through nested collections
             let collection_child_years = "\
+                WITH RECURSIVE coll_descendants(id) AS ( \
+                  SELECT id FROM media_entry WHERE parent_id = mef.id \
+                  UNION ALL \
+                  SELECT me_d.id FROM media_entry me_d JOIN coll_descendants d ON me_d.parent_id = d.id \
+                ) \
                 SELECT SUBSTR(m2.release_date, 1, 4) as yr FROM movie m2 \
-                  JOIN media_entry me2 ON m2.id = me2.id \
-                  WHERE me2.parent_id = mef.id AND m2.release_date IS NOT NULL \
+                  WHERE m2.id IN (SELECT id FROM coll_descendants) AND m2.release_date IS NOT NULL \
                 UNION ALL \
                 SELECT SUBSTR(e.release_date, 1, 4) as yr FROM episode e \
                   JOIN season s ON e.season_id = s.id \
-                  JOIN media_entry me2 ON s.show_id = me2.id \
-                  WHERE me2.parent_id = mef.id AND e.release_date IS NOT NULL";
+                  WHERE s.show_id IN (SELECT id FROM coll_descendants) AND e.release_date IS NOT NULL";
 
             // Subquery: all years from a show's episodes
             let show_episode_years = "\
@@ -1036,14 +1039,17 @@ pub async fn search_entries(
     let entries = match format.as_str() {
         "video" => {
             let collection_child_years = "\
+                WITH RECURSIVE coll_descendants(id) AS ( \
+                  SELECT id FROM media_entry WHERE parent_id = mef.id \
+                  UNION ALL \
+                  SELECT me_d.id FROM media_entry me_d JOIN coll_descendants d ON me_d.parent_id = d.id \
+                ) \
                 SELECT SUBSTR(m2.release_date, 1, 4) as yr FROM movie m2 \
-                  JOIN media_entry me2 ON m2.id = me2.id \
-                  WHERE me2.parent_id = mef.id AND m2.release_date IS NOT NULL \
+                  WHERE m2.id IN (SELECT id FROM coll_descendants) AND m2.release_date IS NOT NULL \
                 UNION ALL \
                 SELECT SUBSTR(e.release_date, 1, 4) as yr FROM episode e \
                   JOIN season s ON e.season_id = s.id \
-                  JOIN media_entry me2 ON s.show_id = me2.id \
-                  WHERE me2.parent_id = mef.id AND e.release_date IS NOT NULL";
+                  WHERE s.show_id IN (SELECT id FROM coll_descendants) AND e.release_date IS NOT NULL";
             let show_episode_years = "\
                 SELECT SUBSTR(e.release_date, 1, 4) as yr FROM episode e \
                   JOIN season s ON e.season_id = s.id \
@@ -5399,6 +5405,24 @@ fn parse_season_folder_name(name: &str) -> (String, Option<i32>) {
             if let Ok(n) = rest.parse::<i32>() {
                 return (name.to_string(), Some(n));
             }
+        }
+    }
+    // Match `S\d+` as a token anywhere in the name (scene-release style, e.g. "Game.of.Thrones.S01.1080p...")
+    // Token boundary: preceded by start/`.`/`_`/`-`/space, and not followed by `E\d` (which would be SxxExx = episode).
+    let bytes = lower.as_bytes();
+    for i in 0..bytes.len() {
+        if bytes[i] != b's' { continue; }
+        let left_ok = i == 0 || matches!(bytes[i - 1], b'.' | b'_' | b'-' | b' ');
+        if !left_ok { continue; }
+        let digits: String = lower[i + 1..].chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() { continue; }
+        let after = i + 1 + digits.len();
+        if after < bytes.len() && bytes[after] == b'e' {
+            let e_digits: String = lower[after + 1..].chars().take_while(|c| c.is_ascii_digit()).collect();
+            if !e_digits.is_empty() { continue; } // SxxExx — treat as episode, not season
+        }
+        if let Ok(n) = digits.parse::<i32>() {
+            return (name.to_string(), Some(n));
         }
     }
     (name.to_string(), None)

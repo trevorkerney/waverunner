@@ -43,19 +43,7 @@ add warning when playing entire seasons without episode numbers (they will likel
 
 ## BIG STUFF NOW
 
-ensure scroll position is saved post tmdb metadata retrieval
-
-ensure release date checkbox on review tmdb metadata screen is behaving properly (i.e. release date checkbox is defualt checked when tmdb has higher precision)
-
-make title rename on movie/show detail page automatically update when changed without needing refresh
-
-weird issue that should be accounted for. spongebob is the example here. I have seasons 1-6, also season 7 but season 7 has no episodes. All metadata obtained. Something is causing it to still need a refresh to update grid years
-
-star wars top level cover (deep nesting - inside star wars is a collection for each trilogy, containing movies and maybe tv) is not getting year range. not even a refresh fixes it
-
 add "add cover" option to collection context menu. should open file selector for selection
-
-movie/show detail page cover should have change cover in context menu
 
 show resolution and file size of each cover in carousel cover selection
 
@@ -64,3 +52,9 @@ button or ability to import media not currently on media drive. this can potenti
 highlight composers. tmdb has them as crew with job "Composer" or "Original Music Composer"
 
 tv shows have directors per episode, not season or show as a whole. tmdb has them in crew with 
+
+## Embedded Player
+
+CI/build script to auto-download libmpv-2.dll before `tauri build` so release builds always bundle it
+
+Git LFS for libmpv-2.dll as an alternative to the CI approach — keeps the DLL in the repo without bloating git history
