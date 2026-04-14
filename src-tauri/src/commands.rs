@@ -60,6 +60,7 @@ pub struct MediaEntry {
     pub child_count: i64,
     pub season_display: Option<String>,
     pub collection_display: Option<String>,
+    pub tmdb_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -787,6 +788,11 @@ pub async fn get_entries(
                      NULLIF((SELECT MAX(yr) FROM ({collection_child_years})), (SELECT MIN(yr) FROM ({collection_child_years}))) \
                  END as end_year, \
                  mef.folder_path, mef.parent_id, mef.entry_type, mef.selected_cover, \
+                 CASE \
+                   WHEN mef.entry_type = 'movie' THEN (SELECT tmdb_id FROM movie WHERE id = mef.id) \
+                   WHEN mef.entry_type = 'show' THEN (SELECT CAST(tmdb_id AS TEXT) FROM show WHERE id = mef.id) \
+                   ELSE NULL \
+                 END as tmdb_id, \
                  (SELECT COUNT(*) FROM media_entry c WHERE c.parent_id = mef.id) as child_count, \
                  CASE WHEN mef.entry_type = 'show' THEN \
                    (SELECT CASE \
@@ -806,7 +812,7 @@ pub async fn get_entries(
                 None => format!("{base_query} WHERE mef.parent_id IS NULL {order_clause}"),
             };
 
-            let rows: Vec<(i64, String, Option<String>, Option<String>, String, Option<i64>, String, Option<String>, i64, Option<String>)> = match parent_id {
+            let rows: Vec<(i64, String, Option<String>, Option<String>, String, Option<i64>, String, Option<String>, Option<String>, i64, Option<String>)> = match parent_id {
                 Some(pid) => {
                     sqlx::query_as(&query_str)
                         .bind(pid)
@@ -823,7 +829,7 @@ pub async fn get_entries(
 
             let entries: Vec<MediaEntry> = rows
                 .into_iter()
-                .map(|(id, title, year, end_year, folder_path, parent_id, entry_type, selected_cover, child_count, season_display)| {
+                .map(|(id, title, year, end_year, folder_path, parent_id, entry_type, selected_cover, tmdb_id, child_count, season_display)| {
                     let covers = covers_map.remove(&folder_path).unwrap_or_default();
                     MediaEntry {
                         id,
@@ -838,6 +844,7 @@ pub async fn get_entries(
                         child_count,
                         season_display,
                         collection_display: None,
+                        tmdb_id,
                     }
                 })
                 .collect();
@@ -919,6 +926,7 @@ pub async fn get_entries(
                         child_count: 0,
                         season_display: None,
                         collection_display: None,
+                        tmdb_id: None,
                     }
                 })
                 .collect();
@@ -953,16 +961,16 @@ pub async fn get_entries(
 
             let query_str = match parent_id {
                 Some(_) => format!(
-                    "SELECT id, title, SUBSTR(release_date, 1, 4) as year, folder_path, parent_id, is_collection, selected_cover FROM movie WHERE parent_id = ? {}",
+                    "SELECT id, title, SUBSTR(release_date, 1, 4) as year, folder_path, parent_id, is_collection, selected_cover, tmdb_id FROM movie WHERE parent_id = ? {}",
                     order_clause
                 ),
                 None => format!(
-                    "SELECT id, title, SUBSTR(release_date, 1, 4) as year, folder_path, parent_id, is_collection, selected_cover FROM movie WHERE parent_id IS NULL {}",
+                    "SELECT id, title, SUBSTR(release_date, 1, 4) as year, folder_path, parent_id, is_collection, selected_cover, tmdb_id FROM movie WHERE parent_id IS NULL {}",
                     order_clause
                 ),
             };
 
-            let rows: Vec<(i64, String, Option<String>, String, Option<i64>, i32, Option<String>)> = match parent_id {
+            let rows: Vec<(i64, String, Option<String>, String, Option<i64>, i32, Option<String>, Option<String>)> = match parent_id {
                 Some(pid) => {
                     sqlx::query_as(&query_str)
                         .bind(pid)
@@ -979,7 +987,7 @@ pub async fn get_entries(
 
             let entries: Vec<MediaEntry> = rows
                 .into_iter()
-                .map(|(id, title, year, folder_path, parent_id, is_collection, selected_cover)| {
+                .map(|(id, title, year, folder_path, parent_id, is_collection, selected_cover, tmdb_id)| {
                     let covers = covers_map.remove(&folder_path).unwrap_or_default();
                     MediaEntry {
                         id,
@@ -994,6 +1002,7 @@ pub async fn get_entries(
                         child_count: 0,
                         season_display: None,
                         collection_display: None,
+                        tmdb_id,
                     }
                 })
                 .collect();
@@ -1094,18 +1103,30 @@ pub async fn search_entries(
                         UNION ALL \
                         SELECT me.id FROM media_entry me JOIN descendants d ON me.parent_id = d.id \
                     ) \
-                    SELECT mef.id, mef.title, {year_expr} as year, {end_year_expr} as end_year, mef.folder_path, mef.parent_id, mef.entry_type, mef.selected_cover, {season_display_expr} as season_display \
+                    SELECT mef.id, mef.title, {year_expr} as year, {end_year_expr} as end_year, mef.folder_path, mef.parent_id, mef.entry_type, mef.selected_cover, \
+                    CASE \
+                      WHEN mef.entry_type = 'movie' THEN (SELECT tmdb_id FROM movie WHERE id = mef.id) \
+                      WHEN mef.entry_type = 'show' THEN (SELECT CAST(tmdb_id AS TEXT) FROM show WHERE id = mef.id) \
+                      ELSE NULL \
+                    END as tmdb_id, \
+                    {season_display_expr} as season_display \
                     FROM media_entry_full mef \
                     WHERE mef.id IN (SELECT id FROM descendants) AND mef.title LIKE ? \
                     ORDER BY mef.sort_title COLLATE NOCASE ASC"),
                 None => format!("\
-                    SELECT mef.id, mef.title, {year_expr} as year, {end_year_expr} as end_year, mef.folder_path, mef.parent_id, mef.entry_type, mef.selected_cover, {season_display_expr} as season_display \
+                    SELECT mef.id, mef.title, {year_expr} as year, {end_year_expr} as end_year, mef.folder_path, mef.parent_id, mef.entry_type, mef.selected_cover, \
+                    CASE \
+                      WHEN mef.entry_type = 'movie' THEN (SELECT tmdb_id FROM movie WHERE id = mef.id) \
+                      WHEN mef.entry_type = 'show' THEN (SELECT CAST(tmdb_id AS TEXT) FROM show WHERE id = mef.id) \
+                      ELSE NULL \
+                    END as tmdb_id, \
+                    {season_display_expr} as season_display \
                     FROM media_entry_full mef \
                     WHERE mef.title LIKE ? \
                     ORDER BY mef.sort_title COLLATE NOCASE ASC"),
             };
 
-            let rows: Vec<(i64, String, Option<String>, Option<String>, String, Option<i64>, String, Option<String>, Option<String>)> = match parent_id {
+            let rows: Vec<(i64, String, Option<String>, Option<String>, String, Option<i64>, String, Option<String>, Option<String>, Option<String>)> = match parent_id {
                 Some(pid) => {
                     sqlx::query_as(&query_str)
                         .bind(pid)
@@ -1123,9 +1144,9 @@ pub async fn search_entries(
             .map_err(|e| e.to_string())?;
 
             let mut entries: Vec<MediaEntry> = rows.into_iter()
-                .map(|(id, title, year, end_year, folder_path, parent_id, entry_type, selected_cover, season_display)| {
+                .map(|(id, title, year, end_year, folder_path, parent_id, entry_type, selected_cover, tmdb_id, season_display)| {
                     let covers = covers_map.remove(&folder_path).unwrap_or_default();
-                    MediaEntry { id, title, year, end_year, folder_path, parent_id, entry_type, covers, selected_cover, child_count: 0, season_display, collection_display: None }
+                    MediaEntry { id, title, year, end_year, folder_path, parent_id, entry_type, covers, selected_cover, child_count: 0, season_display, collection_display: None, tmdb_id }
                 })
                 .collect();
 
@@ -1179,7 +1200,7 @@ pub async fn search_entries(
             rows.into_iter()
                 .map(|(id, name, folder_path, selected_cover)| {
                     let covers = covers_map.remove(&folder_path).unwrap_or_default();
-                    MediaEntry { id, title: name, year: None, end_year: None, folder_path, parent_id: None, entry_type: "artist".to_string(), covers, selected_cover, child_count: 0, season_display: None, collection_display: None }
+                    MediaEntry { id, title: name, year: None, end_year: None, folder_path, parent_id: None, entry_type: "artist".to_string(), covers, selected_cover, child_count: 0, season_display: None, collection_display: None, tmdb_id: None }
                 })
                 .collect()
         }
@@ -1192,15 +1213,15 @@ pub async fn search_entries(
                         UNION ALL \
                         SELECT m.id FROM movie m JOIN descendants d ON m.parent_id = d.id \
                     ) \
-                    SELECT id, title, SUBSTR(release_date, 1, 4) as year, folder_path, parent_id, is_collection, selected_cover \
+                    SELECT id, title, SUBSTR(release_date, 1, 4) as year, folder_path, parent_id, is_collection, selected_cover, tmdb_id \
                     FROM movie WHERE id IN (SELECT id FROM descendants) AND title LIKE ? \
                     ORDER BY sort_title COLLATE NOCASE ASC",
                 None => "\
-                    SELECT id, title, SUBSTR(release_date, 1, 4) as year, folder_path, parent_id, is_collection, selected_cover \
+                    SELECT id, title, SUBSTR(release_date, 1, 4) as year, folder_path, parent_id, is_collection, selected_cover, tmdb_id \
                     FROM movie WHERE title LIKE ? ORDER BY sort_title COLLATE NOCASE ASC",
             };
 
-            let rows: Vec<(i64, String, Option<String>, String, Option<i64>, i32, Option<String>)> = match parent_id {
+            let rows: Vec<(i64, String, Option<String>, String, Option<i64>, i32, Option<String>, Option<String>)> = match parent_id {
                 Some(pid) => {
                     sqlx::query_as(query_str)
                         .bind(pid)
@@ -1218,12 +1239,12 @@ pub async fn search_entries(
             .map_err(|e| e.to_string())?;
 
             rows.into_iter()
-                .map(|(id, title, year, folder_path, parent_id, is_collection, selected_cover)| {
+                .map(|(id, title, year, folder_path, parent_id, is_collection, selected_cover, tmdb_id)| {
                     let covers = covers_map.remove(&folder_path).unwrap_or_default();
                     MediaEntry {
                         id, title, year, end_year: None, folder_path, parent_id,
                         entry_type: if is_collection != 0 { "collection".to_string() } else { "movie".to_string() },
-                        covers, selected_cover, child_count: 0, season_display: None, collection_display: None,
+                        covers, selected_cover, child_count: 0, season_display: None, collection_display: None, tmdb_id,
                     }
                 })
                 .collect()
@@ -2043,6 +2064,232 @@ pub async fn download_tmdb_images(
 
     pool.close().await;
     Ok(())
+}
+
+#[tauri::command]
+pub async fn add_cover(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    entry_id: i64,
+    source_path: String,
+) -> Result<String, String> {
+    let row: Option<(String, i32, String)> = sqlx::query_as(
+        "SELECT paths, portable, db_filename FROM libraries WHERE id = ?",
+    )
+    .bind(&library_id)
+    .fetch_optional(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let (paths_json, portable, db_filename) = row.ok_or("Library not found")?;
+    let lib_paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
+
+    let db_path = if portable != 0 {
+        PathBuf::from(&lib_paths[0]).join(".waverunner.db")
+    } else {
+        state.app_data_dir.join(&db_filename)
+    };
+
+    let pool = crate::db::connect_library_pool(&db_path)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let entry_row: Option<(String,)> = sqlx::query_as(
+        "SELECT folder_path FROM media_entry_full WHERE id = ?",
+    )
+    .bind(entry_id)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let (folder_path,) = entry_row.ok_or("Entry not found")?;
+
+    let root = resolve_entry_root(&lib_paths, &folder_path)
+        .ok_or("Could not resolve entry folder on disk")?;
+    let library_base = PathBuf::from(root);
+    let target_dir = library_base.join(&folder_path).join("covers");
+    std::fs::create_dir_all(&target_dir).map_err(|e| format!("Failed to create covers dir: {e}"))?;
+
+    let src = PathBuf::from(&source_path);
+    if !src.exists() {
+        return Err("Source file does not exist".into());
+    }
+    if !is_image_file(&src) {
+        return Err("File is not a supported image".into());
+    }
+
+    let stem = src.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "cover".into());
+    let ext = src.extension().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "jpg".into());
+    let mut target_name = format!("{stem}.{ext}");
+    let mut target_path = target_dir.join(&target_name);
+    let mut counter = 1;
+    while target_path.exists() {
+        target_name = format!("{stem}_{counter}.{ext}");
+        target_path = target_dir.join(&target_name);
+        counter += 1;
+    }
+
+    std::fs::copy(&src, &target_path).map_err(|e| format!("Failed to copy cover: {e}"))?;
+
+    let cache_base = state.app_data_dir.join("cache").join(&library_id);
+    sync_cached_images_for_entry(
+        &pool, &cache_base, &library_base, &folder_path, "covers", "cover",
+    )
+    .await?;
+
+    let cached_path: Option<(String,)> = sqlx::query_as(
+        "SELECT cached_path FROM cached_images WHERE entry_folder_path = ? AND image_type = 'cover' AND source_filename = ?",
+    )
+    .bind(&folder_path)
+    .bind(&target_name)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    pool.close().await;
+
+    cached_path
+        .map(|(p,)| p)
+        .ok_or_else(|| "Cover added but cache path not found".into())
+}
+
+#[tauri::command]
+pub async fn delete_cover(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    entry_id: i64,
+    cover_path: String,
+) -> Result<Option<String>, String> {
+    let row: Option<(String, i32, String, String)> = sqlx::query_as(
+        "SELECT paths, portable, db_filename, format FROM libraries WHERE id = ?",
+    )
+    .bind(&library_id)
+    .fetch_optional(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let (paths_json, portable, db_filename, format) = row.ok_or("Library not found")?;
+    let lib_paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
+
+    let db_path = if portable != 0 {
+        PathBuf::from(&lib_paths[0]).join(".waverunner.db")
+    } else {
+        state.app_data_dir.join(&db_filename)
+    };
+
+    let pool = crate::db::connect_library_pool(&db_path)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let entry_row: Option<(String,)> = sqlx::query_as(
+        "SELECT folder_path FROM media_entry_full WHERE id = ?",
+    )
+    .bind(entry_id)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let (folder_path,) = entry_row.ok_or("Entry not found")?;
+
+    let source_row: Option<(String,)> = sqlx::query_as(
+        "SELECT source_filename FROM cached_images WHERE entry_folder_path = ? AND image_type = 'cover' AND cached_path = ?",
+    )
+    .bind(&folder_path)
+    .bind(&cover_path)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let (source_filename,) = source_row.ok_or("Cover not found in cache")?;
+
+    let root = resolve_entry_root(&lib_paths, &folder_path)
+        .ok_or("Could not resolve entry folder on disk")?;
+    let library_base = PathBuf::from(root);
+    let source_file = library_base.join(&folder_path).join("covers").join(&source_filename);
+
+    if source_file.exists() {
+        std::fs::remove_file(&source_file)
+            .map_err(|e| format!("Failed to delete cover file: {e}"))?;
+    }
+
+    let cache_base = state.app_data_dir.join("cache").join(&library_id);
+    sync_cached_images_for_entry(
+        &pool, &cache_base, &library_base, &folder_path, "covers", "cover",
+    )
+    .await?;
+
+    // Determine if the deleted cover was selected; if so pick a new one
+    let current_selected: Option<String> = match format.as_str() {
+        "video" => {
+            let mut found: Option<Option<String>> = None;
+            for table in ["movie", "show", "collection"] {
+                let q = format!("SELECT selected_cover FROM {} WHERE id = ?", table);
+                let r: Option<(Option<String>,)> = sqlx::query_as(&q)
+                    .bind(entry_id)
+                    .fetch_optional(&pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if let Some((v,)) = r {
+                    found = Some(v);
+                    break;
+                }
+            }
+            found.flatten()
+        }
+        _ => {
+            let table = match format.as_str() {
+                "music" => "artist",
+                _ => "movie",
+            };
+            let q = format!("SELECT selected_cover FROM {} WHERE id = ?", table);
+            let r: Option<(Option<String>,)> = sqlx::query_as(&q)
+                .bind(entry_id)
+                .fetch_optional(&pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            r.and_then(|(v,)| v)
+        }
+    };
+    let new_selected: Option<String> = if current_selected.as_deref() == Some(cover_path.as_str()) {
+        let remaining: Option<(String,)> = sqlx::query_as(
+            "SELECT cached_path FROM cached_images WHERE entry_folder_path = ? AND image_type = 'cover' LIMIT 1",
+        )
+        .bind(&folder_path)
+        .fetch_optional(&pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        let new_val = remaining.map(|(p,)| p);
+
+        match format.as_str() {
+            "video" => {
+                sqlx::query("UPDATE movie SET selected_cover = ? WHERE id = ?")
+                    .bind(&new_val).bind(entry_id).execute(&pool).await.map_err(|e| e.to_string())?;
+                sqlx::query("UPDATE show SET selected_cover = ? WHERE id = ?")
+                    .bind(&new_val).bind(entry_id).execute(&pool).await.map_err(|e| e.to_string())?;
+                sqlx::query("UPDATE collection SET selected_cover = ? WHERE id = ?")
+                    .bind(&new_val).bind(entry_id).execute(&pool).await.map_err(|e| e.to_string())?;
+            }
+            _ => {
+                let table = match format.as_str() {
+                    "music" => "artist",
+                    _ => "movie",
+                };
+                let q = format!("UPDATE {} SET selected_cover = ? WHERE id = ?", table);
+                sqlx::query(&q)
+                    .bind(&new_val)
+                    .bind(entry_id)
+                    .execute(&pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        new_val
+    } else {
+        current_selected
+    };
+
+    pool.close().await;
+    Ok(new_selected)
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

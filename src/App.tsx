@@ -9,6 +9,7 @@ import { usePlayer } from "@/hooks/usePlayer";
 import { Toaster } from "@/components/ui/sonner";
 import { toast } from "sonner";
 import { relaunch } from "@tauri-apps/plugin-process";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { Library, MediaEntry, EntriesResponse, BreadcrumbItem } from "@/types";
 
 function App() {
@@ -471,6 +472,71 @@ function App() {
     [selectedLibrary, breadcrumbs, sortMode, loadEntries, invalidateCache, updateCache]
   );
 
+  const addCover = useCallback(
+    async (entryId: number) => {
+      if (!selectedLibrary) return;
+      const selected = await openDialog({
+        multiple: false,
+        directory: false,
+        filters: [{ name: "Image", extensions: ["jpg", "jpeg", "png", "webp", "bmp", "gif"] }],
+      });
+      if (!selected || typeof selected !== "string") return;
+      try {
+        const newCoverPath = await invoke<string>("add_cover", {
+          libraryId: selectedLibrary.id,
+          entryId,
+          sourcePath: selected,
+        });
+        const updateEntry = (e: MediaEntry) =>
+          e.id === entryId
+            ? { ...e, covers: [...e.covers, newCoverPath], selected_cover: newCoverPath }
+            : e;
+        const parentId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
+        setEntries((prev) => {
+          const updated = prev.map(updateEntry);
+          updateCache(selectedLibrary.id, parentId, updated, sortMode);
+          return updated;
+        });
+        setSelectedEntry((prev) => (prev && prev.id === entryId ? updateEntry(prev) : prev));
+        await invoke("set_cover", {
+          libraryId: selectedLibrary.id,
+          entryId,
+          coverPath: newCoverPath,
+        });
+      } catch (e) {
+        toast.error(String(e));
+      }
+    },
+    [selectedLibrary, breadcrumbs, sortMode, updateCache]
+  );
+
+  const deleteCover = useCallback(
+    async (entryId: number, coverPath: string) => {
+      if (!selectedLibrary) return;
+      try {
+        const newSelected = await invoke<string | null>("delete_cover", {
+          libraryId: selectedLibrary.id,
+          entryId,
+          coverPath,
+        });
+        const updateEntry = (e: MediaEntry) =>
+          e.id === entryId
+            ? { ...e, covers: e.covers.filter((c) => c !== coverPath), selected_cover: newSelected }
+            : e;
+        const parentId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
+        setEntries((prev) => {
+          const updated = prev.map(updateEntry);
+          updateCache(selectedLibrary.id, parentId, updated, sortMode);
+          return updated;
+        });
+        setSelectedEntry((prev) => (prev && prev.id === entryId ? updateEntry(prev) : prev));
+      } catch (e) {
+        toast.error(String(e));
+      }
+    },
+    [selectedLibrary, breadcrumbs, sortMode, updateCache]
+  );
+
   useEffect(() => {
     const onMouseDown = (e: MouseEvent) => {
       if (e.button === 3) {
@@ -539,6 +605,8 @@ function App() {
           onRenameEntry={renameEntry}
           onTitleChanged={applyTitleChange}
           onSetCover={setCover}
+          onAddCover={addCover}
+          onDeleteCover={deleteCover}
           onMoveEntry={moveEntry}
           onCreateCollection={createCollection}
           onDeleteEntry={deleteEntry}

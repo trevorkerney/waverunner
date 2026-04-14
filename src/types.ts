@@ -35,6 +35,7 @@ export interface MediaEntry {
   child_count: number;
   season_display: string | null;
   collection_display: string | null;
+  tmdb_id: string | null;
 }
 
 export interface BreadcrumbItem {

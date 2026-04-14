@@ -61,6 +61,8 @@ pub fn run() {
             commands::set_setting,
             commands::get_app_version,
             commands::get_file_size,
+            commands::add_cover,
+            commands::delete_cover,
             commands::check_for_update,
             commands::download_and_install_update,
             commands::create_library,

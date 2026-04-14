@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef, useEffect, type RefObject } from "react";
+import { useState, useCallback, useRef, useEffect, useMemo, type RefObject } from "react";
 import {
   DndContext,
   closestCenter,
@@ -91,7 +91,7 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
-import { Library, MediaEntry, BreadcrumbItem, MovieDetail, MovieDetailUpdate, SeasonInfo, EpisodeInfo, ShowDetail, SeasonDetailLocal, EpisodeDetailLocal, TmdbSeasonDetail, TmdbEpisodeDetail, TmdbSeasonFieldSelection, TmdbEpisodeFieldSelection } from "@/types";
+import { Library, MediaEntry, BreadcrumbItem, MovieDetail, MovieDetailUpdate, SeasonInfo, EpisodeInfo, ShowDetail, SeasonDetailLocal, EpisodeDetailLocal, TmdbSeasonDetail, TmdbEpisodeDetail, TmdbShowFieldSelection, TmdbSeasonFieldSelection, TmdbEpisodeFieldSelection, CastUpdateInfo, CrewUpdateInfo } from "@/types";
 import { TmdbMatchDialog } from "@/components/TmdbMatchDialog";
 import { TmdbShowMatchDialog } from "@/components/TmdbShowMatchDialog";
 import { TmdbImageBrowserDialog } from "@/components/TmdbImageBrowserDialog";
@@ -137,6 +137,8 @@ interface MainContentProps {
   onRenameEntry: (entryId: number, newTitle: string) => Promise<string | null>;
   onTitleChanged: (entryId: number, newTitle: string) => void;
   onSetCover: (entryId: number, coverPath: string | null) => void;
+  onAddCover: (entryId: number) => Promise<void>;
+  onDeleteCover: (entryId: number, coverPath: string) => Promise<void>;
   onMoveEntry: (entryId: number, newParentId: number | null, insertBeforeId: number | null) => Promise<void>;
   onCreateCollection: (name: string, basePath?: string) => Promise<void>;
   onDeleteEntry: (entryId: number, deleteFromDisk: boolean) => Promise<void>;
@@ -168,6 +170,8 @@ export function MainContent({
   onRenameEntry,
   onTitleChanged,
   onSetCover,
+  onAddCover,
+  onDeleteCover,
   onMoveEntry,
   onCreateCollection,
   onDeleteEntry,
@@ -181,6 +185,40 @@ export function MainContent({
   const [coverDialogEntry, setCoverDialogEntry] = useState<MediaEntry | null>(
     null
   );
+  const [coverDialogMode, setCoverDialogMode] = useState<"select" | "delete">("select");
+
+  const openCoverDialog = useCallback((entry: MediaEntry, mode: "select" | "delete") => {
+    setCoverDialogMode(mode);
+    setCoverDialogEntry(entry);
+  }, []);
+
+  const [tmdbImagesEntry, setTmdbImagesEntry] = useState<{ entry: MediaEntry; tmdbId: string } | null>(null);
+
+  const openTmdbImages = useCallback(async (entry: MediaEntry) => {
+    if (!selectedLibrary) return;
+    try {
+      const cmd = entry.entry_type === "show" ? "get_show_detail" : "get_movie_detail";
+      const detail = await invoke<{ tmdb_id: string | null }>(cmd, {
+        libraryId: selectedLibrary.id,
+        entryId: entry.id,
+      });
+      if (!detail.tmdb_id) {
+        toast.error("Match to TMDB first");
+        return;
+      }
+      setTmdbImagesEntry({ entry, tmdbId: detail.tmdb_id });
+    } catch (e) {
+      toast.error(String(e));
+    }
+  }, [selectedLibrary]);
+
+  // Keep the dialog's entry in sync with the live entries/selectedEntry so covers list updates after delete
+  const liveCoverDialogEntry = useMemo(() => {
+    if (!coverDialogEntry) return null;
+    if (selectedEntry?.id === coverDialogEntry.id) return selectedEntry;
+    const found = entries.find((e) => e.id === coverDialogEntry.id);
+    return found ?? coverDialogEntry;
+  }, [coverDialogEntry, entries, selectedEntry]);
   const isSearching = searchResults != null;
   const filteredEntries = isSearching ? searchResults : entries;
 
@@ -341,8 +379,8 @@ export function MainContent({
       <div ref={scrollContainerRef} className="flex-1 overflow-y-auto overflow-x-hidden p-4">
       {selectedEntry ? (
         selectedEntry.entry_type === "show"
-          ? <ShowDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getFullCoverUrl={getFullCoverUrl} onEntryChanged={onEntryChanged} onTitleChanged={onTitleChanged} onChangeCover={() => setCoverDialogEntry(selectedEntry)} onPlayFile={onPlayFile} />
-          : <EntryDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getFullCoverUrl={getFullCoverUrl} onEntryChanged={onEntryChanged} onTitleChanged={onTitleChanged} onChangeCover={() => setCoverDialogEntry(selectedEntry)} onPlayFile={onPlayFile} />
+          ? <ShowDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getFullCoverUrl={getFullCoverUrl} onEntryChanged={onEntryChanged} onTitleChanged={onTitleChanged} onChangeCover={() => openCoverDialog(selectedEntry, "select")} onAddCover={() => onAddCover(selectedEntry.id)} onDeleteCover={() => openCoverDialog(selectedEntry, "delete")} onPlayFile={onPlayFile} />
+          : <EntryDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getFullCoverUrl={getFullCoverUrl} onEntryChanged={onEntryChanged} onTitleChanged={onTitleChanged} onChangeCover={() => openCoverDialog(selectedEntry, "select")} onAddCover={() => onAddCover(selectedEntry.id)} onDeleteCover={() => openCoverDialog(selectedEntry, "delete")} onPlayFile={onPlayFile} />
       ) : (
       <ContextMenu>
         <ContextMenuTrigger render={<div className="flex min-h-full flex-col" />}>
@@ -401,7 +439,10 @@ export function MainContent({
                     size={coverSize}
                     onNavigate={onNavigate}
                     onRename={onRenameEntry}
-                    onChangeCover={() => setCoverDialogEntry(entry)}
+                    onChangeCover={() => openCoverDialog(entry, "select")}
+                    onAddCover={() => onAddCover(entry.id)}
+                    onAddCoverFromTmdb={() => openTmdbImages(entry)}
+                    onDeleteCover={() => openCoverDialog(entry, "delete")}
                     onDelete={async (entry) => {
                       if (entry.entry_type === "collection" && entry.child_count === 0) {
                         if (selectedLibrary?.managed) {
@@ -612,18 +653,35 @@ export function MainContent({
       </Dialog>
 
       {/* Cover Carousel Dialog */}
-      {coverDialogEntry && (
+      {liveCoverDialogEntry && (
         <CoverCarouselDialog
-          entry={coverDialogEntry}
+          entry={liveCoverDialogEntry}
+          mode={coverDialogMode}
           open={!!coverDialogEntry}
           onOpenChange={(open) => {
             if (!open) setCoverDialogEntry(null);
           }}
           onSelect={(coverPath) => {
-            onSetCover(coverDialogEntry.id, coverPath);
+            onSetCover(liveCoverDialogEntry.id, coverPath);
             setCoverDialogEntry(null);
           }}
+          onDelete={async (coverPath) => {
+            const wasLast = liveCoverDialogEntry.covers.length <= 1;
+            await onDeleteCover(liveCoverDialogEntry.id, coverPath);
+            if (wasLast) setCoverDialogEntry(null);
+          }}
           getCoverUrl={getFullCoverUrl}
+        />
+      )}
+
+      {tmdbImagesEntry && selectedLibrary && (
+        <TmdbImageBrowserDialog
+          open={!!tmdbImagesEntry}
+          onOpenChange={(open) => { if (!open) setTmdbImagesEntry(null); }}
+          libraryId={selectedLibrary.id}
+          entryId={tmdbImagesEntry.entry.id}
+          tmdbId={tmdbImagesEntry.tmdbId}
+          onDownloaded={() => { onEntryChanged(); }}
         />
       )}
     </main>
@@ -636,6 +694,9 @@ function SortableCoverCard({
   onNavigate,
   onRename,
   onChangeCover,
+  onAddCover,
+  onAddCoverFromTmdb,
+  onDeleteCover,
   onDelete,
   getCoverUrl,
   isDragActive,
@@ -647,6 +708,9 @@ function SortableCoverCard({
   onNavigate: (entry: MediaEntry) => void;
   onRename: (entryId: number, newTitle: string) => Promise<string | null>;
   onChangeCover: () => void;
+  onAddCover: () => void;
+  onAddCoverFromTmdb: () => void;
+  onDeleteCover: () => void;
   onDelete: (entry: MediaEntry) => Promise<void>;
   getCoverUrl: (filePath: string) => string;
   isDragActive: boolean;
@@ -811,16 +875,26 @@ function SortableCoverCard({
           <Pencil size={14} />
           Rename
         </ContextMenuItem>
-        {entry.covers.length > 1 && (
-          <ContextMenuItem onClick={onChangeCover}>
-            <ImageIcon size={14} />
-            Change Cover
-          </ContextMenuItem>
-        )}
+        <ContextMenuItem onClick={onAddCover}>
+          <ImageIcon size={14} />
+          Add local cover
+        </ContextMenuItem>
+        <ContextMenuItem onClick={onAddCoverFromTmdb} disabled={entry.entry_type === "collection" || !entry.tmdb_id}>
+          <ImageIcon size={14} />
+          Add cover from TMDB
+        </ContextMenuItem>
+        <ContextMenuItem onClick={onChangeCover} disabled={entry.covers.length <= 1}>
+          <ImageIcon size={14} />
+          Change cover
+        </ContextMenuItem>
+        <ContextMenuItem onClick={onDeleteCover} disabled={entry.covers.length < 1}>
+          <Trash2 size={14} />
+          Delete cover
+        </ContextMenuItem>
         {!(entry.entry_type === "collection" && entry.child_count > 0) && (
           <ContextMenuItem onClick={() => onDelete(entry)} className="text-destructive focus:text-destructive">
             <Trash2 size={14} />
-            Delete
+            {entry.entry_type === "collection" ? "Delete collection" : "Delete media"}
           </ContextMenuItem>
         )}
       </ContextMenuContent>
@@ -900,15 +974,19 @@ function DragOverlayCard({
 
 function CoverCarouselDialog({
   entry,
+  mode,
   open,
   onOpenChange,
   onSelect,
+  onDelete,
   getCoverUrl,
 }: {
   entry: MediaEntry;
+  mode: "select" | "delete";
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onSelect: (coverPath: string) => void;
+  onDelete: (coverPath: string) => Promise<void>;
   getCoverUrl: (filePath: string) => string;
 }) {
   const currentCover = getDisplayCover(entry);
@@ -986,13 +1064,25 @@ function CoverCarouselDialog({
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)}>
-            Cancel
+            {mode === "delete" ? "Close" : "Cancel"}
           </Button>
-          <Button
-            onClick={() => onSelect(entry.covers[selectedIndex])}
-          >
-            Select
-          </Button>
+          {mode === "delete" ? (
+            <Button
+              variant="destructive"
+              onClick={async () => {
+                const cover = entry.covers[selectedIndex];
+                if (!cover) return;
+                await onDelete(cover);
+                setSelectedIndex((prev) => Math.max(0, Math.min(prev, entry.covers.length - 2)));
+              }}
+            >
+              Delete
+            </Button>
+          ) : (
+            <Button onClick={() => onSelect(entry.covers[selectedIndex])}>
+              Select
+            </Button>
+          )}
         </DialogFooter>
       </DialogContent>
     </Dialog>
@@ -1006,6 +1096,8 @@ function EntryDetailPage({
   onEntryChanged,
   onTitleChanged,
   onChangeCover,
+  onAddCover,
+  onDeleteCover,
   onPlayFile,
 }: {
   entry: MediaEntry;
@@ -1014,6 +1106,8 @@ function EntryDetailPage({
   onEntryChanged: () => void;
   onTitleChanged: (entryId: number, newTitle: string) => void;
   onChangeCover: () => void;
+  onAddCover: () => void;
+  onDeleteCover: () => void;
   onPlayFile?: (path: string, title: string) => void;
 }) {
   const [detail, setDetail] = useState<MovieDetail | null>(null);
@@ -1108,14 +1202,27 @@ function EntryDetailPage({
             }
           />
           <ContextMenuContent>
+            <ContextMenuItem onClick={onAddCover}>
+              <ImageIcon size={14} />
+              Add local cover
+            </ContextMenuItem>
+            <ContextMenuItem onClick={() => setTmdbImagesOpen(true)} disabled={!detail?.tmdb_id}>
+              <ImageIcon size={14} />
+              Add cover from TMDB
+            </ContextMenuItem>
             <ContextMenuItem onClick={onChangeCover} disabled={entry.covers.length <= 1}>
               <ImageIcon size={14} />
-              Change Cover
+              Change cover
+            </ContextMenuItem>
+            <ContextMenuItem onClick={onDeleteCover} disabled={entry.covers.length < 1}>
+              <Trash2 size={14} />
+              Delete cover
             </ContextMenuItem>
           </ContextMenuContent>
         </ContextMenu>
       )}
-      <div className="flex min-w-0 flex-1 flex-col gap-4">
+      <ContextMenu>
+        <ContextMenuTrigger render={<div className="flex min-w-0 flex-1 flex-col gap-4" />}>
         <div className="flex items-start justify-between gap-4">
           <div>
             {editing ? (
@@ -1161,30 +1268,13 @@ function EntryDetailPage({
               <Play size={14} />
               Play
             </Button>
-            {editing ? (
+            {editing && (
               <>
                 <Button size="sm" variant="outline" onClick={() => setEditing(false)} disabled={saving}>
                   Cancel
                 </Button>
                 <Button size="sm" onClick={saveDetail} disabled={saving}>
                   {saving ? "Saving..." : "Save"}
-                </Button>
-              </>
-            ) : (
-              <>
-                <Button size="sm" variant="outline" onClick={() => setTmdbDialogOpen(true)}>
-                  <Film size={14} />
-                  {detail?.tmdb_id ? "Re-match TMDB" : "Match TMDB"}
-                </Button>
-                {detail?.tmdb_id && (
-                  <Button size="sm" variant="outline" onClick={() => setTmdbImagesOpen(true)}>
-                    <ImageIcon size={14} />
-                    TMDB Images
-                  </Button>
-                )}
-                <Button size="sm" variant="outline" onClick={startEditing}>
-                  <Pencil size={14} />
-                  Edit
                 </Button>
               </>
             )}
@@ -1228,9 +1318,22 @@ function EntryDetailPage({
             <EditField label="TMDB ID" value={draft.tmdb_id ?? ""} onChange={(v) => updateDraft("tmdb_id", v || null)} />
             <EditField label="IMDB ID" value={draft.imdb_id ?? ""} onChange={(v) => updateDraft("imdb_id", v || null)} />
             <EditField label="Rotten Tomatoes ID" value={draft.rotten_tomatoes_id ?? ""} onChange={(v) => updateDraft("rotten_tomatoes_id", v || null)} />
+            <PeopleListEdit label="Cast" items={draft.cast ?? []} onChange={(items) => updateDraft("cast", items)} secondaryField="role" secondaryLabel="Role" />
+            <PeopleListEdit label="Crew" items={draft.crew ?? []} onChange={(items) => updateDraft("crew", items)} secondaryField="job" secondaryLabel="Job" />
           </div>
         )}
-      </div>
+        </ContextMenuTrigger>
+        <ContextMenuContent>
+          <ContextMenuItem onClick={() => setTmdbDialogOpen(true)}>
+            <Film size={14} />
+            {detail?.tmdb_id ? "Rematch TMDB" : "Match TMDB"}
+          </ContextMenuItem>
+          <ContextMenuItem onClick={startEditing}>
+            <Pencil size={14} />
+            Edit
+          </ContextMenuItem>
+        </ContextMenuContent>
+      </ContextMenu>
       <TmdbMatchDialog
         open={tmdbDialogOpen}
         onOpenChange={setTmdbDialogOpen}
@@ -1283,6 +1386,8 @@ function ShowDetailPage({
   onEntryChanged,
   onTitleChanged: _onTitleChanged,
   onChangeCover,
+  onAddCover,
+  onDeleteCover,
   onPlayFile,
 }: {
   entry: MediaEntry;
@@ -1291,6 +1396,8 @@ function ShowDetailPage({
   onEntryChanged: () => void;
   onTitleChanged: (entryId: number, newTitle: string) => void;
   onChangeCover: () => void;
+  onAddCover: () => void;
+  onDeleteCover: () => void;
   onPlayFile?: (path: string, title: string) => void;
 }) {
   const [detail, setDetail] = useState<ShowDetail | null>(null);
@@ -1306,6 +1413,15 @@ function ShowDetailPage({
   const [bulkEpisodesLoading, setBulkEpisodesLoading] = useState(false);
   const [episodeTmdbLoading, setEpisodeTmdbLoading] = useState<number | null>(null);
   const [bulkConfirmOpen, setBulkConfirmOpen] = useState(false);
+  const [showEditing, setShowEditing] = useState(false);
+  const [showDraft, setShowDraft] = useState<TmdbShowFieldSelection>({});
+  const [showSaving, setShowSaving] = useState(false);
+  const [seasonEditing, setSeasonEditing] = useState(false);
+  const [seasonDraft, setSeasonDraft] = useState<TmdbSeasonFieldSelection>({});
+  const [seasonSaving, setSeasonSaving] = useState(false);
+  const [editingEpisodeId, setEditingEpisodeId] = useState<number | null>(null);
+  const [episodeDraft, setEpisodeDraft] = useState<TmdbEpisodeFieldSelection>({});
+  const [episodeSaving, setEpisodeSaving] = useState(false);
   const selectedSeason = seasons.find((s) => s.id === selectedSeasonId);
   const selectedSeasonLabel = selectedSeason
     ? (selectedSeason.season_number != null ? `Season ${selectedSeason.season_number}` : selectedSeason.title)
@@ -1493,6 +1609,108 @@ function ShowDetailPage({
     }
   }, [detail, selectedSeason, selectedLibrary.id, loadEpisodeDetail, onEntryChanged]);
 
+  const startEditShow = useCallback(() => {
+    if (!detail) return;
+    setSeasonEditing(false);
+    setEditingEpisodeId(null);
+    setShowDraft({
+      plot: detail.plot ?? "",
+      tagline: detail.tagline ?? "",
+      maturity_rating: detail.maturity_rating ?? "",
+      genres: [...detail.genres],
+      creators: detail.creators.map((p) => ({ name: p.name, tmdb_id: null })),
+      cast: detail.cast.map((c) => ({ name: c.name, role: c.role, tmdb_id: null })),
+      crew: detail.crew.map((c) => ({ name: c.name, job: c.job, tmdb_id: null })),
+      producers: detail.producers.map((p) => ({ name: p.name, tmdb_id: null })),
+      studios: [...detail.studios],
+      keywords: [...detail.keywords],
+    });
+    setShowEditing(true);
+  }, [detail]);
+
+  const saveShow = useCallback(async () => {
+    setShowSaving(true);
+    try {
+      await invoke("apply_tmdb_show_metadata", {
+        libraryId: selectedLibrary.id,
+        showId: entry.id,
+        fields: showDraft,
+      });
+      await loadDetail();
+      onEntryChanged();
+      setShowEditing(false);
+    } catch (e) {
+      toast.error(String(e));
+    } finally {
+      setShowSaving(false);
+    }
+  }, [selectedLibrary.id, entry.id, showDraft, loadDetail, onEntryChanged]);
+
+  const startEditSeason = useCallback(() => {
+    if (!seasonDetail) return;
+    setShowEditing(false);
+    setEditingEpisodeId(null);
+    setSeasonDraft({
+      plot: seasonDetail.plot ?? "",
+      cast: seasonDetail.cast.map((c) => ({ name: c.name, role: c.role, tmdb_id: null })),
+      crew: seasonDetail.crew.map((c) => ({ name: c.name, job: c.job, tmdb_id: null })),
+      directors: seasonDetail.directors.map((p) => ({ name: p.name, tmdb_id: null })),
+      producers: seasonDetail.producers.map((p) => ({ name: p.name, tmdb_id: null })),
+    });
+    setSeasonEditing(true);
+  }, [seasonDetail]);
+
+  const saveSeason = useCallback(async () => {
+    if (!selectedSeason) return;
+    setSeasonSaving(true);
+    try {
+      await invoke("apply_tmdb_season_metadata", {
+        libraryId: selectedLibrary.id,
+        seasonId: selectedSeason.id,
+        fields: seasonDraft,
+      });
+      loadSeasonDetail(selectedSeason.id);
+      setSeasonEditing(false);
+    } catch (e) {
+      toast.error(String(e));
+    } finally {
+      setSeasonSaving(false);
+    }
+  }, [selectedLibrary.id, selectedSeason, seasonDraft, loadSeasonDetail]);
+
+  const startEditEpisode = useCallback((ep: EpisodeInfo) => {
+    setShowEditing(false);
+    setSeasonEditing(false);
+    const d = episodeDetails.get(ep.id);
+    setEpisodeDraft({
+      plot: d?.plot ?? "",
+      runtime: d?.runtime ?? undefined,
+      release_date: d?.release_date ?? "",
+      cast: d?.cast.map((c) => ({ name: c.name, role: c.role, tmdb_id: null })) ?? [],
+      crew: d?.crew.map((c) => ({ name: c.name, job: c.job, tmdb_id: null })) ?? [],
+    });
+    setEditingEpisodeId(ep.id);
+  }, [episodeDetails]);
+
+  const saveEpisode = useCallback(async () => {
+    if (editingEpisodeId == null) return;
+    setEpisodeSaving(true);
+    try {
+      await invoke("apply_tmdb_episode_metadata", {
+        libraryId: selectedLibrary.id,
+        episodeId: editingEpisodeId,
+        fields: episodeDraft,
+      });
+      loadEpisodeDetail(editingEpisodeId);
+      onEntryChanged();
+      setEditingEpisodeId(null);
+    } catch (e) {
+      toast.error(String(e));
+    } finally {
+      setEpisodeSaving(false);
+    }
+  }, [selectedLibrary.id, editingEpisodeId, episodeDraft, loadEpisodeDetail, onEntryChanged]);
+
   const toggleEpisode = useCallback((epId: number) => {
     if (expandedEpisodeId === epId) {
       setExpandedEpisodeId(null);
@@ -1523,14 +1741,27 @@ function ShowDetailPage({
             }
           />
           <ContextMenuContent>
+            <ContextMenuItem onClick={onAddCover}>
+              <ImageIcon size={14} />
+              Add local cover
+            </ContextMenuItem>
+            <ContextMenuItem onClick={() => setTmdbImagesOpen(true)} disabled={!detail?.tmdb_id}>
+              <ImageIcon size={14} />
+              Add cover from TMDB
+            </ContextMenuItem>
             <ContextMenuItem onClick={onChangeCover} disabled={entry.covers.length <= 1}>
               <ImageIcon size={14} />
-              Change Cover
+              Change cover
+            </ContextMenuItem>
+            <ContextMenuItem onClick={onDeleteCover} disabled={entry.covers.length < 1}>
+              <Trash2 size={14} />
+              Delete cover
             </ContextMenuItem>
           </ContextMenuContent>
         </ContextMenu>
       )}
-      <div className="flex min-w-0 flex-1 flex-col gap-4">
+      <ContextMenu>
+        <ContextMenuTrigger render={<div className="flex min-w-0 flex-1 flex-col gap-4" />}>
         <div className="flex items-start justify-between gap-4">
           <div>
             <h1 className="text-3xl font-bold">{entry.title}</h1>
@@ -1540,22 +1771,10 @@ function ShowDetailPage({
               </p>
             )}
           </div>
-          <div className="flex gap-2">
-            <Button size="sm" variant="outline" onClick={() => setTmdbDialogOpen(true)}>
-              <Film size={14} />
-              {detail?.tmdb_id ? "Re-match TMDB" : "Match TMDB"}
-            </Button>
-            {detail?.tmdb_id && (
-              <Button size="sm" variant="outline" onClick={() => setTmdbImagesOpen(true)}>
-                <ImageIcon size={14} />
-                TMDB Images
-              </Button>
-            )}
-          </div>
         </div>
 
         {/* Show metadata */}
-        {detail && (
+        {detail && !showEditing && (
           <div className="flex flex-col gap-3">
             {detail.tagline && (
               <p className="text-sm italic text-muted-foreground">{detail.tagline}</p>
@@ -1600,6 +1819,25 @@ function ShowDetailPage({
           </div>
         )}
 
+        {showEditing && (
+          <div className="flex flex-col gap-3 text-sm">
+            <EditField label="Tagline" value={showDraft.tagline ?? ""} onChange={(v) => setShowDraft((p) => ({ ...p, tagline: v }))} />
+            <EditField label="Plot" value={showDraft.plot ?? ""} onChange={(v) => setShowDraft((p) => ({ ...p, plot: v }))} multiline />
+            <EditField label="Maturity Rating" value={showDraft.maturity_rating ?? ""} onChange={(v) => setShowDraft((p) => ({ ...p, maturity_rating: v }))} />
+            <EditField label="Genres (comma-separated)" value={(showDraft.genres ?? []).join(", ")} onChange={(v) => setShowDraft((p) => ({ ...p, genres: v.split(",").map((s) => s.trim()).filter(Boolean) }))} />
+            <EditField label="Creators (comma-separated)" value={(showDraft.creators ?? []).map((c) => c.name).join(", ")} onChange={(v) => setShowDraft((p) => ({ ...p, creators: v.split(",").map((s) => s.trim()).filter(Boolean).map((name) => ({ name, tmdb_id: null })) }))} />
+            <EditField label="Producers (comma-separated)" value={(showDraft.producers ?? []).map((c) => c.name).join(", ")} onChange={(v) => setShowDraft((p) => ({ ...p, producers: v.split(",").map((s) => s.trim()).filter(Boolean).map((name) => ({ name, tmdb_id: null })) }))} />
+            <PeopleListEdit label="Cast" items={showDraft.cast ?? []} onChange={(items) => setShowDraft((p) => ({ ...p, cast: items }))} secondaryField="role" secondaryLabel="Role" />
+            <PeopleListEdit label="Crew" items={showDraft.crew ?? []} onChange={(items) => setShowDraft((p) => ({ ...p, crew: items }))} secondaryField="job" secondaryLabel="Job" />
+            <EditField label="Studios (comma-separated)" value={(showDraft.studios ?? []).join(", ")} onChange={(v) => setShowDraft((p) => ({ ...p, studios: v.split(",").map((s) => s.trim()).filter(Boolean) }))} />
+            <EditField label="Keywords (comma-separated)" value={(showDraft.keywords ?? []).join(", ")} onChange={(v) => setShowDraft((p) => ({ ...p, keywords: v.split(",").map((s) => s.trim()).filter(Boolean) }))} />
+            <div className="flex gap-2">
+              <Button size="sm" variant="outline" onClick={() => setShowEditing(false)} disabled={showSaving}>Cancel</Button>
+              <Button size="sm" onClick={saveShow} disabled={showSaving}>{showSaving ? "Saving..." : "Save"}</Button>
+            </div>
+          </div>
+        )}
+
         {/* Seasons + episodes */}
         {seasons.length > 0 && (
           <div className="flex flex-col gap-3">
@@ -1619,40 +1857,58 @@ function ShowDetailPage({
                   ))}
                 </SelectContent>
               </Select>
-              {canSeasonTmdb && (
-                <>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    disabled={seasonTmdbLoading}
-                    onClick={handleSeasonTmdb}
-                  >
-                    <Tv size={14} />
-                    {seasonTmdbLoading ? "Loading..." : "Populate Season from TMDB"}
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    disabled={bulkEpisodesLoading}
-                    onClick={() => setBulkConfirmOpen(true)}
-                  >
-                    <Film size={14} />
-                    {bulkEpisodesLoading ? "Loading..." : "Fetch Episode Details"}
-                  </Button>
-                </>
-              )}
             </div>
 
             {/* Season metadata */}
-            {seasonDetail && (seasonDetail.plot || seasonDetail.cast.length > 0 || seasonDetail.directors.length > 0 || seasonDetail.crew.length > 0 || seasonDetail.producers.length > 0) && (
-              <div className="flex flex-col gap-2 rounded-md border p-3">
-                {seasonDetail.plot && (
-                  <p className="text-sm">{seasonDetail.plot}</p>
-                )}
-                <TruncatedList label="Cast" items={seasonDetail.cast.map((c) => c.role ? `${c.name} (${c.role})` : c.name)} />
-                <TruncatedList label="Directors" items={seasonDetail.directors.map((d) => d.name)} />
-                <TruncatedList label="Crew" items={seasonDetail.crew.map((c) => c.job ? `${c.name} (${c.job})` : c.name)} />
-                <TruncatedList label="Producers" items={seasonDetail.producers.map((p) => p.name)} />
+            {selectedSeason && !seasonEditing && (() => {
+              const hasMeta = seasonDetail && (seasonDetail.plot || seasonDetail.cast.length > 0 || seasonDetail.directors.length > 0 || seasonDetail.crew.length > 0 || seasonDetail.producers.length > 0);
+              const episodesNumbered = episodes.length > 0 && episodes.every((e) => e.episode_number != null);
+              return (
+                <ContextMenu>
+                  <ContextMenuTrigger render={<div className="flex flex-col gap-2 rounded-md border p-3" />}>
+                    {!seasonDetail && <Spinner className="h-4 w-4" />}
+                    {seasonDetail && !hasMeta && (
+                      <p className="text-sm text-muted-foreground">No metadata</p>
+                    )}
+                    {seasonDetail && hasMeta && (
+                      <>
+                        {seasonDetail.plot && <p className="text-sm">{seasonDetail.plot}</p>}
+                        <TruncatedList label="Cast" items={seasonDetail.cast.map((c) => c.role ? `${c.name} (${c.role})` : c.name)} />
+                        <TruncatedList label="Directors" items={seasonDetail.directors.map((d) => d.name)} />
+                        <TruncatedList label="Crew" items={seasonDetail.crew.map((c) => c.job ? `${c.name} (${c.job})` : c.name)} />
+                        <TruncatedList label="Producers" items={seasonDetail.producers.map((p) => p.name)} />
+                      </>
+                    )}
+                  </ContextMenuTrigger>
+                  <ContextMenuContent>
+                    <ContextMenuItem onClick={startEditSeason} disabled={!seasonDetail}>
+                      <Pencil size={14} />
+                      Edit
+                    </ContextMenuItem>
+                    <ContextMenuItem onClick={handleSeasonTmdb} disabled={!canSeasonTmdb || seasonTmdbLoading}>
+                      <Tv size={14} />
+                      {seasonTmdbLoading ? "Loading..." : "Populate season from TMDB"}
+                    </ContextMenuItem>
+                    <ContextMenuItem onClick={() => setBulkConfirmOpen(true)} disabled={!canSeasonTmdb || bulkEpisodesLoading || !episodesNumbered}>
+                      <Film size={14} />
+                      {bulkEpisodesLoading ? "Loading..." : "Fetch all episodes' details"}
+                    </ContextMenuItem>
+                  </ContextMenuContent>
+                </ContextMenu>
+              );
+            })()}
+
+            {selectedSeason && seasonEditing && (
+              <div className="flex flex-col gap-3 rounded-md border p-3 text-sm">
+                <EditField label="Plot" value={seasonDraft.plot ?? ""} onChange={(v) => setSeasonDraft((p) => ({ ...p, plot: v }))} multiline />
+                <EditField label="Directors (comma-separated)" value={(seasonDraft.directors ?? []).map((c) => c.name).join(", ")} onChange={(v) => setSeasonDraft((p) => ({ ...p, directors: v.split(",").map((s) => s.trim()).filter(Boolean).map((name) => ({ name, tmdb_id: null })) }))} />
+                <EditField label="Producers (comma-separated)" value={(seasonDraft.producers ?? []).map((c) => c.name).join(", ")} onChange={(v) => setSeasonDraft((p) => ({ ...p, producers: v.split(",").map((s) => s.trim()).filter(Boolean).map((name) => ({ name, tmdb_id: null })) }))} />
+                <PeopleListEdit label="Cast" items={seasonDraft.cast ?? []} onChange={(items) => setSeasonDraft((p) => ({ ...p, cast: items }))} secondaryField="role" secondaryLabel="Role" />
+                <PeopleListEdit label="Crew" items={seasonDraft.crew ?? []} onChange={(items) => setSeasonDraft((p) => ({ ...p, crew: items }))} secondaryField="job" secondaryLabel="Job" />
+                <div className="flex gap-2">
+                  <Button size="sm" variant="outline" onClick={() => setSeasonEditing(false)} disabled={seasonSaving}>Cancel</Button>
+                  <Button size="sm" onClick={saveSeason} disabled={seasonSaving}>{seasonSaving ? "Saving..." : "Save"}</Button>
+                </div>
               </div>
             )}
 
@@ -1664,26 +1920,20 @@ function ShowDetailPage({
                 const hasDetail = epDetail && (epDetail.release_date || epDetail.plot || epDetail.runtime || epDetail.cast.length > 0 || epDetail.crew.length > 0);
                 return (
                   <div key={ep.id} className="flex flex-col">
-                    <div
-                      className="flex cursor-pointer items-center gap-3 rounded-md px-3 py-2 hover:bg-accent"
-                      onClick={() => toggleEpisode(ep.id)}
-                    >
+                    <ContextMenu>
+                      <ContextMenuTrigger
+                        render={
+                          <div
+                            className="flex cursor-pointer items-center gap-3 rounded-md px-3 py-2 hover:bg-accent"
+                            onClick={() => toggleEpisode(ep.id)}
+                          />
+                        }
+                      >
                       {isExpanded ? <ChevronDown size={14} className="shrink-0 text-muted-foreground" /> : <ChevronRight size={14} className="shrink-0 text-muted-foreground" />}
                       <span className="w-8 text-right text-sm text-muted-foreground">
                         {ep.episode_number != null ? ep.episode_number : "–"}
                       </span>
                       <span className="flex-1 truncate text-sm">{ep.title}</span>
-                      {canSeasonTmdb && ep.episode_number != null && (
-                        <Button
-                          size="sm"
-                          variant="ghost"
-                          disabled={episodeTmdbLoading === ep.id}
-                          onClick={(e) => { e.stopPropagation(); handleEpisodeTmdb(ep); }}
-                          title="Fetch from TMDB"
-                        >
-                          {episodeTmdbLoading === ep.id ? <Spinner className="h-3.5 w-3.5" /> : <Tv size={14} />}
-                        </Button>
-                      )}
                       <Button
                         size="sm"
                         variant="ghost"
@@ -1711,34 +1961,72 @@ function ShowDetailPage({
                       >
                         <Play size={14} />
                       </Button>
-                    </div>
-                    {isExpanded && (
-                      <div className="ml-14 mb-1 flex flex-col gap-1 rounded-md border p-3 text-sm">
-                        {!epDetail && <Spinner className="h-4 w-4" />}
-                        {epDetail && !hasDetail && (
-                          <p className="text-muted-foreground">No metadata</p>
-                        )}
-                        {epDetail && hasDetail && (
-                          <>
-                            {epDetail.release_date && (
-                              <div>
-                                <span className="text-muted-foreground">Air Date: </span>
-                                {formatReleaseDate(epDetail.release_date)}
-                              </div>
-                            )}
-                            {epDetail.runtime && (
-                              <div>
-                                <span className="text-muted-foreground">Runtime: </span>
-                                {epDetail.runtime} min
-                              </div>
-                            )}
-                            {epDetail.plot && (
-                              <p>{epDetail.plot}</p>
-                            )}
-                            <TruncatedList label="Guest Stars" items={epDetail.cast.map((c) => c.role ? `${c.name} (${c.role})` : c.name)} />
-                            <TruncatedList label="Crew" items={epDetail.crew.map((c) => c.job ? `${c.name} (${c.job})` : c.name)} />
-                          </>
-                        )}
+                      </ContextMenuTrigger>
+                      <ContextMenuContent>
+                        <ContextMenuItem
+                          onClick={() => handleEpisodeTmdb(ep)}
+                          disabled={!canSeasonTmdb || ep.episode_number == null || episodeTmdbLoading === ep.id}
+                        >
+                          <Film size={14} />
+                          {episodeTmdbLoading === ep.id ? "Loading..." : "Fetch from TMDB"}
+                        </ContextMenuItem>
+                      </ContextMenuContent>
+                    </ContextMenu>
+                    {isExpanded && editingEpisodeId !== ep.id && (
+                      <ContextMenu>
+                        <ContextMenuTrigger render={<div className="ml-14 mb-1 flex flex-col gap-1 rounded-md border p-3 text-sm" />}>
+                          {!epDetail && <Spinner className="h-4 w-4" />}
+                          {epDetail && !hasDetail && (
+                            <p className="text-muted-foreground">No metadata</p>
+                          )}
+                          {epDetail && hasDetail && (
+                            <>
+                              {epDetail.release_date && (
+                                <div>
+                                  <span className="text-muted-foreground">Air Date: </span>
+                                  {formatReleaseDate(epDetail.release_date)}
+                                </div>
+                              )}
+                              {epDetail.runtime && (
+                                <div>
+                                  <span className="text-muted-foreground">Runtime: </span>
+                                  {epDetail.runtime} min
+                                </div>
+                              )}
+                              {epDetail.plot && (
+                                <p>{epDetail.plot}</p>
+                              )}
+                              <TruncatedList label="Guest Stars" items={epDetail.cast.map((c) => c.role ? `${c.name} (${c.role})` : c.name)} />
+                              <TruncatedList label="Crew" items={epDetail.crew.map((c) => c.job ? `${c.name} (${c.job})` : c.name)} />
+                            </>
+                          )}
+                        </ContextMenuTrigger>
+                        <ContextMenuContent>
+                          <ContextMenuItem onClick={() => startEditEpisode(ep)} disabled={!epDetail}>
+                            <Pencil size={14} />
+                            Edit
+                          </ContextMenuItem>
+                          <ContextMenuItem
+                            onClick={() => handleEpisodeTmdb(ep)}
+                            disabled={!canSeasonTmdb || ep.episode_number == null || episodeTmdbLoading === ep.id}
+                          >
+                            <Film size={14} />
+                            {episodeTmdbLoading === ep.id ? "Loading..." : "Fetch from TMDB"}
+                          </ContextMenuItem>
+                        </ContextMenuContent>
+                      </ContextMenu>
+                    )}
+                    {isExpanded && editingEpisodeId === ep.id && (
+                      <div className="ml-14 mb-1 flex flex-col gap-3 rounded-md border p-3 text-sm">
+                        <EditField label="Air Date" value={episodeDraft.release_date ?? ""} onChange={(v) => setEpisodeDraft((p) => ({ ...p, release_date: v }))} />
+                        <EditField label="Runtime (min)" value={episodeDraft.runtime != null ? String(episodeDraft.runtime) : ""} onChange={(v) => setEpisodeDraft((p) => ({ ...p, runtime: v ? Number(v) : undefined }))} />
+                        <EditField label="Plot" value={episodeDraft.plot ?? ""} onChange={(v) => setEpisodeDraft((p) => ({ ...p, plot: v }))} multiline />
+                        <PeopleListEdit label="Guest Stars" items={episodeDraft.cast ?? []} onChange={(items) => setEpisodeDraft((p) => ({ ...p, cast: items }))} secondaryField="role" secondaryLabel="Role" />
+                        <PeopleListEdit label="Crew" items={episodeDraft.crew ?? []} onChange={(items) => setEpisodeDraft((p) => ({ ...p, crew: items }))} secondaryField="job" secondaryLabel="Job" />
+                        <div className="flex gap-2">
+                          <Button size="sm" variant="outline" onClick={() => setEditingEpisodeId(null)} disabled={episodeSaving}>Cancel</Button>
+                          <Button size="sm" onClick={saveEpisode} disabled={episodeSaving}>{episodeSaving ? "Saving..." : "Save"}</Button>
+                        </div>
                       </div>
                     )}
                   </div>
@@ -1754,7 +2042,18 @@ function ShowDetailPage({
         {seasons.length === 0 && (
           <p className="text-sm text-muted-foreground">No seasons</p>
         )}
-      </div>
+        </ContextMenuTrigger>
+        <ContextMenuContent>
+          <ContextMenuItem onClick={() => setTmdbDialogOpen(true)}>
+            <Film size={14} />
+            {detail?.tmdb_id ? "Rematch TMDB" : "Match TMDB"}
+          </ContextMenuItem>
+          <ContextMenuItem onClick={startEditShow} disabled={!detail}>
+            <Pencil size={14} />
+            Edit
+          </ContextMenuItem>
+        </ContextMenuContent>
+      </ContextMenu>
 
       <TmdbShowMatchDialog
         open={tmdbDialogOpen}
@@ -1794,6 +2093,57 @@ function ShowDetailPage({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+    </div>
+  );
+}
+
+function PeopleListEdit<T extends CastUpdateInfo | CrewUpdateInfo>({
+  label,
+  items,
+  onChange,
+  secondaryField,
+  secondaryLabel,
+}: {
+  label: string;
+  items: T[];
+  onChange: (items: T[]) => void;
+  secondaryField: "role" | "job";
+  secondaryLabel: string;
+}) {
+  const update = (i: number, patch: Partial<T>) => {
+    const next = items.slice();
+    next[i] = { ...next[i], ...patch };
+    onChange(next);
+  };
+  const remove = (i: number) => onChange(items.filter((_, idx) => idx !== i));
+  const add = () => onChange([...items, { name: "", [secondaryField]: null, tmdb_id: null } as unknown as T]);
+  return (
+    <div className="flex flex-col gap-1">
+      <label className="text-xs font-medium text-muted-foreground">{label}</label>
+      <div className="flex flex-col gap-1">
+        {items.map((item, i) => (
+          <div key={i} className="flex gap-1">
+            <input
+              value={item.name}
+              onChange={(e) => update(i, { name: e.target.value } as Partial<T>)}
+              placeholder="Name"
+              className="flex-1 rounded border border-input bg-transparent px-2 py-1 text-sm outline-none"
+            />
+            <input
+              value={(item as unknown as Record<string, string | null>)[secondaryField] ?? ""}
+              onChange={(e) => update(i, { [secondaryField]: e.target.value || null } as unknown as Partial<T>)}
+              placeholder={secondaryLabel}
+              className="flex-1 rounded border border-input bg-transparent px-2 py-1 text-sm outline-none"
+            />
+            <Button size="sm" variant="ghost" onClick={() => remove(i)}>
+              <Trash2 size={14} />
+            </Button>
+          </div>
+        ))}
+        <Button size="sm" variant="outline" onClick={add} className="w-fit">
+          + Add
+        </Button>
+      </div>
     </div>
   );
 }
