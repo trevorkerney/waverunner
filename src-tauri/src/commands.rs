@@ -311,6 +311,14 @@ pub async fn get_app_version() -> Result<String, String> {
     Ok(env!("CARGO_PKG_VERSION").to_string())
 }
 
+#[tauri::command]
+pub async fn get_file_size(path: String) -> Result<u64, String> {
+    tokio::fs::metadata(&path)
+        .await
+        .map(|m| m.len())
+        .map_err(|e| e.to_string())
+}
+
 const GITHUB_RELEASES_API: &str =
     "https://api.github.com/repos/trevorkerney/waverunner/releases";
 

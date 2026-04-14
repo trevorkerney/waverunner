@@ -60,6 +60,7 @@ pub fn run() {
             commands::get_settings,
             commands::set_setting,
             commands::get_app_version,
+            commands::get_file_size,
             commands::check_for_update,
             commands::download_and_install_update,
             commands::create_library,

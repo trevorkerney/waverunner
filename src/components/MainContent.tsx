@@ -917,6 +917,8 @@ function CoverCarouselDialog({
     : 0;
   const [selectedIndex, setSelectedIndex] = useState(startIndex);
   const [api, setApi] = useState<CarouselApi>();
+  const [dims, setDims] = useState<Map<number, { w: number; h: number }>>(new Map());
+  const [sizes, setSizes] = useState<Map<number, number>>(new Map());
 
   useEffect(() => {
     if (!api) return;
@@ -926,6 +928,24 @@ function CoverCarouselDialog({
       api.off("select", onSelectSlide);
     };
   }, [api]);
+
+  useEffect(() => {
+    entry.covers.forEach((cover, i) => {
+      if (sizes.has(i)) return;
+      invoke<number>("get_file_size", { path: cover })
+        .then((n) => setSizes((prev) => new Map(prev).set(i, n)))
+        .catch(() => {});
+    });
+  }, [entry.covers, sizes]);
+
+  const fmtSize = (bytes: number) => {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  };
+
+  const selDim = dims.get(selectedIndex);
+  const selSize = sizes.get(selectedIndex);
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -943,6 +963,13 @@ function CoverCarouselDialog({
                       src={getCoverUrl(cover)}
                       alt={`Cover ${i + 1}`}
                       className="max-h-[400px] rounded-md object-contain"
+                      onLoad={(e) => {
+                        const img = e.currentTarget;
+                        setDims((prev) => {
+                          if (prev.has(i)) return prev;
+                          return new Map(prev).set(i, { w: img.naturalWidth, h: img.naturalHeight });
+                        });
+                      }}
                     />
                   </div>
                 </CarouselItem>
@@ -953,6 +980,8 @@ function CoverCarouselDialog({
           </Carousel>
           <p className="mt-2 text-center text-sm text-muted-foreground">
             {selectedIndex + 1} / {entry.covers.length}
+            {selDim && ` · ${selDim.w}×${selDim.h}`}
+            {selSize != null && ` · ${fmtSize(selSize)}`}
           </p>
         </div>
         <DialogFooter>
