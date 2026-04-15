@@ -61,6 +61,23 @@ pub struct MpvEventProperty {
     pub data: *mut c_void,
 }
 
+/// Mirrors `struct mpv_event_end_file` — only the leading `reason` field is used.
+#[repr(C)]
+pub struct MpvEventEndFile {
+    pub reason: c_int,
+    pub error: c_int,
+    // (other fields omitted — we never read them)
+}
+
+#[allow(dead_code)]
+pub mod end_file_reason {
+    pub const EOF: i32 = 0;
+    pub const STOP: i32 = 2;
+    pub const QUIT: i32 = 3;
+    pub const ERROR: i32 = 4;
+    pub const REDIRECT: i32 = 5;
+}
+
 // ---------------------------------------------------------------------------
 // Function‐pointer type aliases
 // ---------------------------------------------------------------------------

@@ -170,3 +170,9 @@ html.player-active body,
 html.player-active #root {
   background: transparent !important;
 }
+
+/* Marquee scroll — container defines visible width, child slides right→left */
+.marquee {
+  overflow: hidden;
+  white-space: nowrap;
+}

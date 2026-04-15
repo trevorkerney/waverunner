@@ -2,16 +2,16 @@ import { useCallback, useRef, useState } from "react";
 import { PlayerState, PlayerActions } from "../../hooks/usePlayer";
 import { Slider } from "../ui/slider";
 import {
-  Play,
-  Pause,
   Volume2,
   VolumeX,
   Maximize,
   Minimize,
+  Minimize2,
   X,
   Subtitles,
   AudioLines,
 } from "lucide-react";
+import { Switch } from "../ui/switch";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -45,6 +45,8 @@ export function ControlsOverlay({
 }: ControlsOverlayProps) {
   const [seekDragValue, setSeekDragValue] = useState<number | null>(null);
   const seekDragRef = useRef<number | null>(null);
+  const [hoverRatio, setHoverRatio] = useState<number | null>(null);
+  const lastVolumeRef = useRef(state.volume > 0 ? state.volume : 100);
 
   const handleSeekDrag = useCallback(
     (value: number | readonly number[]) => {
@@ -69,11 +71,26 @@ export function ControlsOverlay({
   const handleVolume = useCallback(
     (value: number | readonly number[]) => {
       const v = Array.isArray(value) ? value[0] : value;
+      if (v > 0) lastVolumeRef.current = v;
       actions.setVolume(v);
+      if (v > 0 && state.muted) actions.toggleMute();
       onInteraction();
     },
-    [actions, onInteraction]
+    [actions, onInteraction, state.muted]
   );
+
+  const handleMuteClick = useCallback(() => {
+    const effective = state.muted ? 0 : state.volume;
+    if (effective > 0) {
+      lastVolumeRef.current = state.volume;
+      actions.setVolume(0);
+    } else {
+      const restore = lastVolumeRef.current > 0 ? lastVolumeRef.current : 100;
+      actions.setVolume(restore);
+      if (state.muted) actions.toggleMute();
+    }
+    onInteraction();
+  }, [actions, onInteraction, state.muted, state.volume]);
 
   return (
     <div
@@ -87,12 +104,26 @@ export function ControlsOverlay({
         <h2 className="text-white text-sm font-medium truncate max-w-[70%]">
           {state.title}
         </h2>
-        <button
-          onClick={() => actions.close()}
-          className="text-white/80 hover:text-white transition-colors p-1"
-        >
-          <X className="h-5 w-5" />
-        </button>
+        <div className="flex items-center gap-2">
+          {!state.isFullscreen && (
+            <button
+              onClick={() => {
+                actions.toggleMinimize();
+                onInteraction();
+              }}
+              className="rounded bg-black/50 p-1 text-white/80 hover:bg-black/70 hover:text-white transition-colors"
+              title="Minimize"
+            >
+              <Minimize2 className="h-5 w-5" />
+            </button>
+          )}
+          <button
+            onClick={() => actions.close()}
+            className="rounded bg-black/50 p-1 text-white/80 hover:bg-black/70 hover:text-white transition-colors"
+          >
+            <X className="h-5 w-5" />
+          </button>
+        </div>
       </div>
 
       {/* Spacer — clicks pass through to PlayerView */}
@@ -102,9 +133,17 @@ export function ControlsOverlay({
       <div className="px-4 pb-3 pt-6 bg-gradient-to-t from-black/70 to-transparent">
         {/* Seek bar */}
         <div
-          className="mb-2"
+          className="relative mb-2"
           onPointerUp={handleSeekCommit}
-          onPointerLeave={handleSeekCommit}
+          onPointerLeave={() => {
+            setHoverRatio(null);
+            handleSeekCommit();
+          }}
+          onPointerMove={(e) => {
+            const rect = e.currentTarget.getBoundingClientRect();
+            const r = (e.clientX - rect.left) / rect.width;
+            setHoverRatio(Math.max(0, Math.min(1, r)));
+          }}
         >
           <Slider
             value={[seekDragValue ?? state.currentTime]}
@@ -112,31 +151,19 @@ export function ControlsOverlay({
             max={state.duration || 1}
             onValueChange={handleSeekDrag}
           />
+          {hoverRatio !== null && (
+            <div
+              className="pointer-events-none absolute left-0 top-1/2 h-1 -translate-y-1/2 rounded-full bg-white/25"
+              style={{ width: `${hoverRatio * 100}%` }}
+            />
+          )}
         </div>
 
         {/* Controls row */}
         <div className="flex items-center gap-3">
-          {/* Play/Pause */}
-          <button
-            onClick={() => {
-              actions.togglePause();
-              onInteraction();
-            }}
-            className="text-white hover:text-white/80 transition-colors"
-          >
-            {state.isPlaying ? (
-              <Pause className="h-5 w-5" />
-            ) : (
-              <Play className="h-5 w-5" />
-            )}
-          </button>
-
           {/* Volume */}
           <button
-            onClick={() => {
-              actions.toggleMute();
-              onInteraction();
-            }}
+            onClick={handleMuteClick}
             className="text-white hover:text-white/80 transition-colors"
           >
             {state.muted || state.volume === 0 ? (
@@ -166,6 +193,20 @@ export function ControlsOverlay({
 
           {/* Spacer */}
           <div className="flex-1" />
+
+          {/* Auto-play next (episodes only) */}
+          {state.context.kind === "episode" && (
+            <label className="flex items-center gap-2 mr-4 text-white/80 text-xs select-none cursor-pointer">
+              <Switch
+                checked={state.autoPlayNext}
+                onCheckedChange={() => {
+                  actions.toggleAutoPlayNext();
+                  onInteraction();
+                }}
+              />
+              Autoplay
+            </label>
+          )}
 
           {/* Audio tracks */}
           {state.audioTracks.length > 1 && (

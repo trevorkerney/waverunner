@@ -148,6 +148,7 @@ interface MainContentProps {
   getFullCoverUrl: (filePath: string) => string;
   scrollContainerRef: RefObject<HTMLDivElement | null>;
   onPlayFile?: (path: string, title: string) => void;
+  onPlayEpisode?: (args: { libraryId: string; showId: number; showTitle: string; startEpisodeId: number }) => void;
 }
 
 export function MainContent({
@@ -181,6 +182,7 @@ export function MainContent({
   getFullCoverUrl,
   scrollContainerRef,
   onPlayFile,
+  onPlayEpisode,
 }: MainContentProps) {
   const [coverDialogEntry, setCoverDialogEntry] = useState<MediaEntry | null>(
     null
@@ -306,7 +308,7 @@ export function MainContent({
         <>
           {/* Breadcrumbs */}
           <Breadcrumb className="border-b border-border">
-            <BreadcrumbList className="!flex-nowrap overflow-x-auto px-4 py-2 pr-8">
+            <BreadcrumbList className="!flex-nowrap overflow-x-auto px-4 py-2 pr-8 text-xs font-medium">
               {breadcrumbs.map((crumb, i) => (
                 <BreadcrumbUIItem key={i} className="whitespace-nowrap">
                   {i > 0 && <BreadcrumbSeparator />}
@@ -379,7 +381,7 @@ export function MainContent({
       <div ref={scrollContainerRef} className="flex-1 overflow-y-auto overflow-x-hidden p-4">
       {selectedEntry ? (
         selectedEntry.entry_type === "show"
-          ? <ShowDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getFullCoverUrl={getFullCoverUrl} onEntryChanged={onEntryChanged} onTitleChanged={onTitleChanged} onChangeCover={() => openCoverDialog(selectedEntry, "select")} onAddCover={() => onAddCover(selectedEntry.id)} onDeleteCover={() => openCoverDialog(selectedEntry, "delete")} onPlayFile={onPlayFile} />
+          ? <ShowDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getFullCoverUrl={getFullCoverUrl} onEntryChanged={onEntryChanged} onTitleChanged={onTitleChanged} onChangeCover={() => openCoverDialog(selectedEntry, "select")} onAddCover={() => onAddCover(selectedEntry.id)} onDeleteCover={() => openCoverDialog(selectedEntry, "delete")} onPlayEpisode={onPlayEpisode} />
           : <EntryDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getFullCoverUrl={getFullCoverUrl} onEntryChanged={onEntryChanged} onTitleChanged={onTitleChanged} onChangeCover={() => openCoverDialog(selectedEntry, "select")} onAddCover={() => onAddCover(selectedEntry.id)} onDeleteCover={() => openCoverDialog(selectedEntry, "delete")} onPlayFile={onPlayFile} />
       ) : (
       <ContextMenu>
@@ -1388,7 +1390,7 @@ function ShowDetailPage({
   onChangeCover,
   onAddCover,
   onDeleteCover,
-  onPlayFile,
+  onPlayEpisode,
 }: {
   entry: MediaEntry;
   selectedLibrary: Library;
@@ -1398,7 +1400,7 @@ function ShowDetailPage({
   onChangeCover: () => void;
   onAddCover: () => void;
   onDeleteCover: () => void;
-  onPlayFile?: (path: string, title: string) => void;
+  onPlayEpisode?: (args: { libraryId: string; showId: number; showTitle: string; startEpisodeId: number }) => void;
 }) {
   const [detail, setDetail] = useState<ShowDetail | null>(null);
   const [seasons, setSeasons] = useState<SeasonInfo[]>([]);
@@ -1941,12 +1943,13 @@ function ShowDetailPage({
                           e.stopPropagation();
                           (async () => {
                             try {
-                              if (onPlayFile) {
-                                const path = await invoke<string>("get_episode_file_path", {
+                              if (onPlayEpisode) {
+                                onPlayEpisode({
                                   libraryId: selectedLibrary.id,
-                                  episodeId: ep.id,
+                                  showId: entry.id,
+                                  showTitle: entry.title,
+                                  startEpisodeId: ep.id,
                                 });
-                                onPlayFile(path, ep.title || `Episode ${ep.episode_number}`);
                               } else {
                                 await invoke("play_episode", {
                                   libraryId: selectedLibrary.id,

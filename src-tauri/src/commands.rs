@@ -2460,6 +2460,16 @@ pub struct EpisodeInfo {
     pub sort_order: i64,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ShowEpisodeFlat {
+    pub episode_id: i64,
+    pub season_id: i64,
+    pub season_number: Option<i64>,
+    pub episode_number: Option<i64>,
+    pub title: String,
+    pub file_path: String,
+}
+
 #[tauri::command]
 pub async fn get_show_seasons(
     state: tauri::State<'_, AppState>,
@@ -2549,6 +2559,57 @@ pub async fn get_season_episodes(
             episode_number,
             file_path,
             sort_order,
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub async fn get_show_episodes(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    show_id: i64,
+) -> Result<Vec<ShowEpisodeFlat>, String> {
+    let row: Option<(String, i32, String)> = sqlx::query_as(
+        "SELECT paths, portable, db_filename FROM libraries WHERE id = ?",
+    )
+    .bind(&library_id)
+    .fetch_optional(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let (paths_json, portable, db_filename) = row.ok_or("Library not found")?;
+    let paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
+
+    let db_path = if portable != 0 {
+        PathBuf::from(&paths[0]).join(".waverunner.db")
+    } else {
+        state.app_data_dir.join(&db_filename)
+    };
+
+    let pool = crate::db::connect_library_pool(&db_path).await.map_err(|e| e.to_string())?;
+
+    let rows: Vec<(i64, i64, Option<i64>, Option<i64>, String, String)> = sqlx::query_as(
+        "SELECT e.id, s.id, s.season_number, e.episode_number, e.title, e.file_path \
+         FROM episode e JOIN season s ON e.season_id = s.id \
+         WHERE s.show_id = ? \
+         ORDER BY s.sort_order, s.season_number, e.sort_order, e.episode_number",
+    )
+    .bind(show_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    pool.close().await;
+
+    Ok(rows
+        .into_iter()
+        .map(|(episode_id, season_id, season_number, episode_number, title, file_path)| ShowEpisodeFlat {
+            episode_id,
+            season_id,
+            season_number,
+            episode_number,
+            title,
+            file_path,
         })
         .collect())
 }

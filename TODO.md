@@ -43,11 +43,11 @@ add warning when playing entire seasons without episode numbers (they will likel
 
 ## BIG STUFF NOW
 
-add "add cover" option to collection context menu. should open file selector for selection
-
-show resolution and file size of each cover in carousel cover selection
+need some kind of resume where left off functionality
 
 button or ability to import media not currently on media drive. this can potentially provide another method of making collections as well
+
+bind comma and period to prev frame and next frame on player
 
 highlight composers. tmdb has them as crew with job "Composer" or "Original Music Composer"
 

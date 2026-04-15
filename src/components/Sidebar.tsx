@@ -2,7 +2,7 @@ import { useCallback, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
-import { ChevronLeft, ChevronRight, Plus, Trash2, RefreshCw } from "lucide-react";
+import { Trash2, RefreshCw, FolderPlus } from "lucide-react";
 import {
   ContextMenu,
   ContextMenuTrigger,
@@ -19,6 +19,8 @@ import {
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { CreateLibraryDialog } from "@/components/CreateLibraryDialog";
+import { PlayerDock } from "@/components/player/PlayerDock";
+import { PlayerState, PlayerActions } from "@/hooks/usePlayer";
 import { Library } from "@/types";
 
 const MIN_WIDTH = 180;
@@ -32,6 +34,8 @@ interface SidebarProps {
   onLibraryCreated: () => void;
   onLibraryDeleted: () => void;
   onLibraryRescanned: () => void;
+  playerState: PlayerState;
+  playerActions: PlayerActions;
 }
 
 export function Sidebar({
@@ -41,73 +45,54 @@ export function Sidebar({
   onLibraryCreated,
   onLibraryDeleted,
   onLibraryRescanned,
+  playerState,
+  playerActions,
 }: SidebarProps) {
   const [width, setWidth] = useState(DEFAULT_WIDTH);
-  const [collapsed, setCollapsed] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Library | null>(null);
-  const widthBeforeCollapse = useRef(DEFAULT_WIDTH);
-  const didDrag = useRef(false);
   const isResizing = useRef(false);
 
-  const startResize = useCallback(
-    (e: React.MouseEvent) => {
-      if (collapsed) return;
-      e.preventDefault();
-      isResizing.current = true;
-      didDrag.current = false;
-      setDragging(true);
+  const startResize = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    isResizing.current = true;
+    setDragging(true);
 
-      const onMouseMove = (e: MouseEvent) => {
-        if (!isResizing.current) return;
-        didDrag.current = true;
-        const newWidth = Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, e.clientX));
-        setWidth(newWidth);
-      };
+    const onMouseMove = (e: MouseEvent) => {
+      if (!isResizing.current) return;
+      const newWidth = Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, e.clientX));
+      setWidth(newWidth);
+    };
 
-      const onMouseUp = () => {
-        isResizing.current = false;
-        setDragging(false);
-        document.removeEventListener("mousemove", onMouseMove);
-        document.removeEventListener("mouseup", onMouseUp);
-      };
+    const onMouseUp = () => {
+      isResizing.current = false;
+      setDragging(false);
+      document.removeEventListener("mousemove", onMouseMove);
+      document.removeEventListener("mouseup", onMouseUp);
+    };
 
-      document.addEventListener("mousemove", onMouseMove);
-      document.addEventListener("mouseup", onMouseUp);
-    },
-    [collapsed]
-  );
+    document.addEventListener("mousemove", onMouseMove);
+    document.addEventListener("mouseup", onMouseUp);
+  }, []);
 
-  const handleClick = useCallback(() => {
-    if (didDrag.current) return;
-    if (collapsed) {
-      setWidth(widthBeforeCollapse.current);
-      setCollapsed(false);
-    } else {
-      widthBeforeCollapse.current = width;
-      setCollapsed(true);
-    }
-  }, [collapsed, width]);
+  const dockActive = playerState.isActive && playerState.isMinimized;
 
   return (
-    <div className="relative flex h-full flex-shrink-0">
-      <aside
-        className={`flex h-full flex-col overflow-hidden border-r border-border bg-sidebar text-sidebar-foreground ${dragging ? "" : "transition-[width] duration-200"}`}
-        style={{ width: collapsed ? 0 : width }}
-      >
-        <div className="flex items-center justify-between border-b border-border px-3 py-2">
+    <div
+      className={`relative flex h-full flex-shrink-0 flex-col text-sidebar-foreground ${dragging ? "" : "transition-[width] duration-200"}`}
+      style={{ width }}
+    >
+      <aside className="flex flex-1 flex-col overflow-hidden bg-sidebar">
+        <div className="flex items-center justify-between border-b border-border px-4 py-2">
           <span className="text-xs font-medium text-muted-foreground whitespace-nowrap">
-            Libraries
+            Your library
           </span>
-          <button
-            onClick={() => setDialogOpen(true)}
-            className="rounded-sm p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
-          >
-            <Plus size={14} />
-          </button>
         </div>
-        <nav className="flex-1 overflow-y-auto p-1">
+        <ContextMenu>
+          <ContextMenuTrigger
+            render={<nav className="flex-1 overflow-y-auto p-1" />}
+          >
           {libraries.length === 0 ? (
             <p className="px-2 py-1.5 text-sm text-muted-foreground whitespace-nowrap">
               No libraries yet
@@ -161,15 +146,25 @@ export function Sidebar({
               </ContextMenu>
             ))
           )}
-        </nav>
+          </ContextMenuTrigger>
+          <ContextMenuContent>
+            <ContextMenuItem onClick={() => setDialogOpen(true)}>
+              <FolderPlus size={14} />
+              Create library
+            </ContextMenuItem>
+          </ContextMenuContent>
+        </ContextMenu>
       </aside>
+      {dockActive && <PlayerDock state={playerState} actions={playerActions} />}
+      {/* Right-edge border: bg-sidebar underlay + bg-border overlay so the
+          translucent border color blends consistently regardless of what sits
+          behind. Rendered after all siblings so it paints on top. */}
+      <div className="pointer-events-none absolute right-0 top-0 bottom-0 w-px bg-sidebar" />
+      <div className="pointer-events-none absolute right-0 top-0 bottom-0 w-px bg-border" />
       <div
         onMouseDown={startResize}
-        onClick={handleClick}
-        className={`z-10 flex w-4 items-center justify-center rounded-r-sm text-muted-foreground hover:bg-accent ${collapsed ? "cursor-pointer" : "cursor-col-resize"}`}
-      >
-        {collapsed ? <ChevronRight size={14} /> : <ChevronLeft size={14} />}
-      </div>
+        className="absolute top-0 bottom-0 right-0 z-10 w-2 translate-x-1/2 cursor-col-resize"
+      />
       <CreateLibraryDialog
         open={dialogOpen}
         onOpenChange={setDialogOpen}

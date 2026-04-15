@@ -37,6 +37,27 @@ function App() {
     [playerActions]
   );
 
+  const handlePlayEpisode = useCallback(
+    async (args: { libraryId: string; showId: number; showTitle: string; startEpisodeId: number }) => {
+      try {
+        await playerActions.playEpisode(args);
+      } catch (e) {
+        toast.error(String(e));
+      }
+    },
+    [playerActions]
+  );
+
+  // Keep webview transparent while player is active (full or minimized), so
+  // mpv video shows through the transparent dock/takeover region.
+  useEffect(() => {
+    if (playerState.isActive) {
+      document.documentElement.classList.add("player-active");
+    } else {
+      document.documentElement.classList.remove("player-active");
+    }
+  }, [playerState.isActive]);
+
   // Cache: "libraryId:parentId" -> { entries, sortMode }
   const entryCacheRef = useRef<Map<string, { entries: MediaEntry[]; sort_mode: string }>>(new Map());
   // Scroll position cache: "libraryId:parentId" -> scrollTop
@@ -561,7 +582,7 @@ function App() {
   return (
     <div className="flex h-screen flex-col overflow-hidden">
       {!(playerState.isActive && playerState.isFullscreen) && <Titlebar />}
-      {playerState.isActive ? (
+      {playerState.isActive && !playerState.isMinimized ? (
         <PlayerView state={playerState} actions={playerActions} />
       ) : (
       <div className="flex flex-1 overflow-hidden">
@@ -584,6 +605,8 @@ function App() {
               loadEntries(selectedLibrary, parentId, breadcrumbs);
             }
           }}
+          playerState={playerState}
+          playerActions={playerActions}
         />
         <MainContent
           entries={entries}
@@ -629,6 +652,7 @@ function App() {
           getFullCoverUrl={getFullCoverUrl}
           scrollContainerRef={scrollContainerRef}
           onPlayFile={handlePlayFile}
+          onPlayEpisode={handlePlayEpisode}
         />
       </div>
       )}

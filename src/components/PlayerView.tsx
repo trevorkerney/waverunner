@@ -1,6 +1,7 @@
 import { useEffect, useCallback, useRef, useState } from "react";
 import { PlayerState, PlayerActions } from "../hooks/usePlayer";
 import { ControlsOverlay } from "./player/ControlsOverlay";
+import { CenterTransport } from "./player/CenterTransport";
 import { Loader2 } from "lucide-react";
 
 interface PlayerViewProps {
@@ -8,41 +9,29 @@ interface PlayerViewProps {
   actions: PlayerActions;
 }
 
+const IDLE_MS = 3000;
+
 export function PlayerView({ state, actions }: PlayerViewProps) {
   const [showControls, setShowControls] = useState(true);
   const hideTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Auto-hide controls after 3s of inactivity
+  // Auto-hide after IDLE_MS of no mouse movement, regardless of playing/paused.
   const resetHideTimer = useCallback(() => {
     setShowControls(true);
     if (hideTimeoutRef.current) clearTimeout(hideTimeoutRef.current);
-    hideTimeoutRef.current = setTimeout(() => {
-      if (state.isPlaying) setShowControls(false);
-    }, 3000);
-  }, [state.isPlaying]);
-
-  // Show controls when paused
-  useEffect(() => {
-    if (!state.isPlaying) {
-      setShowControls(true);
-      if (hideTimeoutRef.current) clearTimeout(hideTimeoutRef.current);
-    } else {
-      resetHideTimer();
-    }
-  }, [state.isPlaying, resetHideTimer]);
-
-  // Toggle transparency class on html element
-  useEffect(() => {
-    document.documentElement.classList.add("player-active");
-    return () => {
-      document.documentElement.classList.remove("player-active");
-    };
+    hideTimeoutRef.current = setTimeout(() => setShowControls(false), IDLE_MS);
   }, []);
+
+  useEffect(() => {
+    resetHideTimer();
+    return () => {
+      if (hideTimeoutRef.current) clearTimeout(hideTimeoutRef.current);
+    };
+  }, [resetHideTimer]);
 
   // Keyboard shortcuts
   useEffect(() => {
     const handleKey = (e: KeyboardEvent) => {
-      // Don't handle if typing in an input
       if (
         e.target instanceof HTMLInputElement ||
         e.target instanceof HTMLTextAreaElement
@@ -101,13 +90,16 @@ export function PlayerView({ state, actions }: PlayerViewProps) {
     return () => window.removeEventListener("keydown", handleKey);
   }, [state.volume, state.isFullscreen, actions, resetHideTimer]);
 
+  const ctx = state.context;
+  const hasPrev = ctx.kind === "episode" && ctx.index > 0;
+  const hasNext = ctx.kind === "episode" && ctx.index < ctx.episodes.length - 1;
+
   return (
     <div
       className="relative flex-1 overflow-hidden"
       style={{ background: state.loading ? "black" : "transparent" }}
       onMouseMove={resetHideTimer}
       onClick={(e) => {
-        // Click on the transparent area (not controls) toggles pause
         if (e.target === e.currentTarget) {
           actions.togglePause();
           resetHideTimer();
@@ -130,6 +122,25 @@ export function PlayerView({ state, actions }: PlayerViewProps) {
         actions={actions}
         visible={showControls}
         onInteraction={resetHideTimer}
+      />
+
+      <CenterTransport
+        isPlaying={state.isPlaying}
+        hasPrev={hasPrev}
+        hasNext={hasNext}
+        visible={showControls && !state.loading}
+        onPrev={() => {
+          actions.playPreviousEpisode();
+          resetHideTimer();
+        }}
+        onPlayPause={() => {
+          actions.togglePause();
+          resetHideTimer();
+        }}
+        onNext={() => {
+          actions.playNextEpisode();
+          resetHideTimer();
+        }}
       />
     </div>
   );

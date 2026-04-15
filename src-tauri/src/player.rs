@@ -162,6 +162,24 @@ pub fn get_player_property(
     }
 }
 
+#[tauri::command]
+pub fn set_player_region(
+    state: State<'_, AppState>,
+    left: f64,
+    right: f64,
+    top: f64,
+    bottom: f64,
+) -> Result<(), String> {
+    let clamp = |v: f64| v.max(0.0).min(1.0);
+    with_mpv(&state, |mpv| {
+        mpv.set_property_string("video-margin-ratio-left", &format!("{:.6}", clamp(left)))?;
+        mpv.set_property_string("video-margin-ratio-right", &format!("{:.6}", clamp(right)))?;
+        mpv.set_property_string("video-margin-ratio-top", &format!("{:.6}", clamp(top)))?;
+        mpv.set_property_string("video-margin-ratio-bottom", &format!("{:.6}", clamp(bottom)))?;
+        Ok(())
+    })
+}
+
 /// Get all audio/subtitle tracks as JSON array.
 #[tauri::command]
 pub fn get_player_tracks(state: State<'_, AppState>) -> Result<String, String> {
@@ -271,11 +289,14 @@ fn event_loop(app: &AppHandle, shutdown: &AtomicBool) {
             None => break,
         };
 
-        let event = inner.mpv.wait_event(0.02); // 20ms — keep short to avoid blocking commands
+        // Non-blocking poll: keep the lock hold time minimal so UI commands
+        // (set_player_region while dragging the sidebar, etc.) don't stall.
+        let event = inner.mpv.wait_event(0.0);
 
         match event.event_id {
             mpv::event_id::NONE => {
                 drop(guard);
+                std::thread::sleep(std::time::Duration::from_millis(4));
                 continue;
             }
             mpv::event_id::SHUTDOWN => {
@@ -304,8 +325,14 @@ fn event_loop(app: &AppHandle, shutdown: &AtomicBool) {
                 }
             }
             mpv::event_id::END_FILE => {
+                let reason = if !event.data.is_null() {
+                    let ef = unsafe { &*(event.data as *const mpv::MpvEventEndFile) };
+                    ef.reason as i32
+                } else {
+                    -1
+                };
                 drop(guard);
-                let _ = app.emit("mpv-end-file", ());
+                let _ = app.emit("mpv-end-file", serde_json::json!({ "reason": reason }));
             }
             mpv::event_id::FILE_LOADED => {
                 // Now that a file is loaded and playing, start observing pause

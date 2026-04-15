@@ -353,6 +353,35 @@ export interface TmdbEpisodeFieldSelection {
   crew?: CrewUpdateInfo[];
 }
 
+export interface ShowEpisodeFlat {
+  episode_id: number;
+  season_id: number;
+  season_number: number | null;
+  episode_number: number | null;
+  title: string;
+  file_path: string;
+}
+
+export interface EpisodeRef {
+  episodeId: number;
+  seasonId: number;
+  seasonNumber: number | null;
+  episodeNumber: number | null;
+  title: string;
+}
+
+export type PlayerContext =
+  | { kind: "none" }
+  | { kind: "movie" }
+  | {
+      kind: "episode";
+      libraryId: string;
+      showId: number;
+      showTitle: string;
+      episodes: EpisodeRef[];
+      index: number;
+    };
+
 export interface PlayerTrack {
   id: number;
   type: "audio" | "sub" | "video";
