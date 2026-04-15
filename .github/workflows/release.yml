@@ -13,8 +13,6 @@ jobs:
         include:
           - platform: windows-latest
             args: ""
-          - platform: macos-latest
-            args: "--bundles dmg,updater"
 
     runs-on: ${{ matrix.platform }}
     permissions:
