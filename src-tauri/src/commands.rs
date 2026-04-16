@@ -748,12 +748,6 @@ pub async fn get_entries(
                 None => default_sort_mode,
             };
 
-            let order_clause = match sort_mode.as_str() {
-                "year" => "ORDER BY year ASC, mef.sort_title COLLATE NOCASE ASC",
-                "custom" => "ORDER BY mef.sort_order ASC, mef.sort_title COLLATE NOCASE ASC",
-                _ => "ORDER BY mef.sort_title COLLATE NOCASE ASC",
-            };
-
             // Subquery: all years from a collection's descendants (movies + shows' episodes), recursing through nested collections
             let collection_child_years = "\
                 WITH RECURSIVE coll_descendants(id) AS ( \
@@ -773,6 +767,36 @@ pub async fn get_entries(
                 SELECT SUBSTR(e.release_date, 1, 4) as yr FROM episode e \
                   JOIN season s ON e.season_id = s.id \
                   WHERE s.show_id = mef.id AND e.release_date IS NOT NULL";
+
+            // Parallel full-date subqueries for date-based sorting
+            let collection_child_dates = "\
+                WITH RECURSIVE coll_descendants(id) AS ( \
+                  SELECT id FROM media_entry WHERE parent_id = mef.id \
+                  UNION ALL \
+                  SELECT me_d.id FROM media_entry me_d JOIN coll_descendants d ON me_d.parent_id = d.id \
+                ) \
+                SELECT m2.release_date as dt FROM movie m2 \
+                  WHERE m2.id IN (SELECT id FROM coll_descendants) AND m2.release_date IS NOT NULL \
+                UNION ALL \
+                SELECT e.release_date as dt FROM episode e \
+                  JOIN season s ON e.season_id = s.id \
+                  WHERE s.show_id IN (SELECT id FROM coll_descendants) AND e.release_date IS NOT NULL";
+            let show_episode_dates = "\
+                SELECT e.release_date as dt FROM episode e \
+                  JOIN season s ON e.season_id = s.id \
+                  WHERE s.show_id = mef.id AND e.release_date IS NOT NULL";
+            let sort_date_expr = format!("\
+                CASE \
+                  WHEN mef.entry_type = 'movie' THEN mef.release_date \
+                  WHEN mef.entry_type = 'show' THEN (SELECT MIN(dt) FROM ({show_episode_dates})) \
+                  WHEN mef.entry_type = 'collection' THEN (SELECT MIN(dt) FROM ({collection_child_dates})) \
+                END");
+
+            let order_clause: String = match sort_mode.as_str() {
+                "year" | "date" => format!("ORDER BY {sort_date_expr} ASC, mef.sort_title COLLATE NOCASE ASC"),
+                "custom" => "ORDER BY mef.sort_order ASC, mef.sort_title COLLATE NOCASE ASC".to_string(),
+                _ => "ORDER BY mef.sort_title COLLATE NOCASE ASC".to_string(),
+            };
 
             let base_query = format!(
                 "SELECT mef.id, mef.title, \
@@ -954,7 +978,7 @@ pub async fn get_entries(
             };
 
             let order_clause = match sort_mode.as_str() {
-                "year" => "ORDER BY year ASC, sort_title COLLATE NOCASE ASC",
+                "year" | "date" => "ORDER BY release_date ASC, sort_title COLLATE NOCASE ASC",
                 "custom" => "ORDER BY sort_order ASC, sort_title COLLATE NOCASE ASC",
                 _ => "ORDER BY sort_title COLLATE NOCASE ASC",
             };
@@ -2810,7 +2834,7 @@ pub async fn set_sort_mode(
     entry_id: Option<i64>,
     sort_mode: String,
 ) -> Result<(), String> {
-    if !["alpha", "year", "custom"].contains(&sort_mode.as_str()) {
+    if !["alpha", "date", "custom"].contains(&sort_mode.as_str()) {
         return Err("Invalid sort mode".to_string());
     }
 

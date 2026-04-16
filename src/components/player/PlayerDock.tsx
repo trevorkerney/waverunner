@@ -63,25 +63,13 @@ export function PlayerDock({ state, actions }: PlayerDockProps) {
   const hasPrev = ctx.kind === "episode" && ctx.index > 0;
   const hasNext = ctx.kind === "episode" && ctx.index < ctx.episodes.length - 1;
 
-  const lastVolumeRef = useRef(state.volume > 0 ? state.volume : 100);
-
   const handleVolume = (value: number | readonly number[]) => {
     const v = Array.isArray(value) ? value[0] : value;
-    if (v > 0) lastVolumeRef.current = v;
     actions.setVolume(v);
-    if (v > 0 && state.muted) actions.toggleMute();
   };
 
   const handleMuteClick = () => {
-    const effective = state.muted ? 0 : state.volume;
-    if (effective > 0) {
-      lastVolumeRef.current = state.volume;
-      actions.setVolume(0);
-    } else {
-      const restore = lastVolumeRef.current > 0 ? lastVolumeRef.current : 100;
-      actions.setVolume(restore);
-      if (state.muted) actions.toggleMute();
-    }
+    actions.toggleMute();
   };
 
   useEffect(() => {

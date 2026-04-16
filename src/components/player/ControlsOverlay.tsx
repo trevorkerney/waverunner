@@ -46,7 +46,6 @@ export function ControlsOverlay({
   const [seekDragValue, setSeekDragValue] = useState<number | null>(null);
   const seekDragRef = useRef<number | null>(null);
   const [hoverRatio, setHoverRatio] = useState<number | null>(null);
-  const lastVolumeRef = useRef(state.volume > 0 ? state.volume : 100);
 
   const handleSeekDrag = useCallback(
     (value: number | readonly number[]) => {
@@ -71,26 +70,16 @@ export function ControlsOverlay({
   const handleVolume = useCallback(
     (value: number | readonly number[]) => {
       const v = Array.isArray(value) ? value[0] : value;
-      if (v > 0) lastVolumeRef.current = v;
       actions.setVolume(v);
-      if (v > 0 && state.muted) actions.toggleMute();
       onInteraction();
     },
-    [actions, onInteraction, state.muted]
+    [actions, onInteraction]
   );
 
   const handleMuteClick = useCallback(() => {
-    const effective = state.muted ? 0 : state.volume;
-    if (effective > 0) {
-      lastVolumeRef.current = state.volume;
-      actions.setVolume(0);
-    } else {
-      const restore = lastVolumeRef.current > 0 ? lastVolumeRef.current : 100;
-      actions.setVolume(restore);
-      if (state.muted) actions.toggleMute();
-    }
+    actions.toggleMute();
     onInteraction();
-  }, [actions, onInteraction, state.muted, state.volume]);
+  }, [actions, onInteraction]);
 
   return (
     <div

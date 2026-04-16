@@ -345,16 +345,16 @@ export function MainContent({
                 <ArrowUpDown size={12} />
                 {sortMode === "alpha"
                   ? "A\u2013Z"
-                  : sortMode === "year"
-                    ? "Year"
+                  : sortMode === "date" || sortMode === "year"
+                    ? "Date"
                     : "Custom"}
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
                 <DropdownMenuItem onClick={() => onSortModeChange("alpha")}>
                   Alphabetical
                 </DropdownMenuItem>
-                <DropdownMenuItem onClick={() => onSortModeChange("year")}>
-                  Year
+                <DropdownMenuItem onClick={() => onSortModeChange("date")}>
+                  Date
                 </DropdownMenuItem>
                 <DropdownMenuItem onClick={() => onSortModeChange("custom")}>
                   Custom

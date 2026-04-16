@@ -582,10 +582,10 @@ function App() {
   return (
     <div className="flex h-screen flex-col overflow-hidden">
       {!(playerState.isActive && playerState.isFullscreen) && <Titlebar />}
-      {playerState.isActive && !playerState.isMinimized ? (
+      {playerState.isActive && !playerState.isMinimized && (
         <PlayerView state={playerState} actions={playerActions} />
-      ) : (
-      <div className="flex flex-1 overflow-hidden">
+      )}
+      <div className={`flex flex-1 overflow-hidden${playerState.isActive && !playerState.isMinimized ? " hidden" : ""}`}>
         <Sidebar
           libraries={libraries}
           selectedLibrary={selectedLibrary}
@@ -655,7 +655,6 @@ function App() {
           onPlayEpisode={handlePlayEpisode}
         />
       </div>
-      )}
       <Toaster position="top-center" />
     </div>
   );

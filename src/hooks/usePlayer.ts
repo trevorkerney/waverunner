@@ -94,6 +94,7 @@ export function usePlayer(): [PlayerState, PlayerActions] {
   const draggingRef = useRef<"seek" | "volume" | null>(null);
   const lastUserSeek = useRef(0);
   const lastUserVolume = useRef(0);
+  const lastNonZeroVolume = useRef(100);
   const SUPPRESS_MS = 300;
 
   // Load persisted autoPlayNext
@@ -167,9 +168,12 @@ export function usePlayer(): [PlayerState, PlayerActions] {
                 return { ...prev, duration: (value as number) ?? 0 };
               case "pause":
                 return { ...prev, isPlaying: !(value as boolean) };
-              case "volume":
+              case "volume": {
+                const val = (value as number) ?? 100;
+                if (val > 0) lastNonZeroVolume.current = val;
                 if (draggingRef.current === "volume" || Date.now() - lastUserVolume.current < SUPPRESS_MS) return prev;
-                return { ...prev, volume: (value as number) ?? 100 };
+                return { ...prev, volume: val };
+              }
               case "mute":
                 return { ...prev, muted: (value as boolean) ?? false };
               case "eof-reached":
@@ -359,16 +363,38 @@ export function usePlayer(): [PlayerState, PlayerActions] {
 
   const setVolume = useCallback(async (vol: number) => {
     lastUserVolume.current = Date.now();
-    setState((prev) => ({ ...prev, volume: vol }));
+    if (vol > 0) lastNonZeroVolume.current = vol;
+    const wasMuted = stateRef.current.muted;
+    setState((prev) => ({
+      ...prev,
+      volume: vol,
+      muted: vol > 0 ? false : prev.muted,
+    }));
     await invoke("set_player_property", {
       name: "volume",
       value: vol.toString(),
     });
+    if (vol > 0 && wasMuted) {
+      await invoke("player_command", { cmd: "cycle", args: ["mute"] });
+    }
   }, []);
 
   const toggleMute = useCallback(async () => {
-    setState((prev) => ({ ...prev, muted: !prev.muted }));
-    await invoke("player_command", { cmd: "cycle", args: ["mute"] });
+    const cur = stateRef.current;
+    const effective = cur.muted ? 0 : cur.volume;
+    lastUserVolume.current = Date.now();
+    if (effective > 0) {
+      if (cur.volume > 0) lastNonZeroVolume.current = cur.volume;
+      setState((prev) => ({ ...prev, volume: 0 }));
+      await invoke("set_player_property", { name: "volume", value: "0" });
+    } else {
+      const restore = lastNonZeroVolume.current > 0 ? lastNonZeroVolume.current : 100;
+      setState((prev) => ({ ...prev, volume: restore, muted: false }));
+      await invoke("set_player_property", { name: "volume", value: restore.toString() });
+      if (cur.muted) {
+        await invoke("player_command", { cmd: "cycle", args: ["mute"] });
+      }
+    }
   }, []);
 
   const setAudioTrack = useCallback(async (id: number) => {
