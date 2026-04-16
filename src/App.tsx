@@ -589,6 +589,75 @@ function App() {
     };
   }, [goBack, goForward]);
 
+  // Global player keyboard shortcuts. Live at the App level so they fire
+  // whether the player is in full-takeover mode or minimized into the dock,
+  // and regardless of whatever the user last clicked in the library/sidebar.
+  useEffect(() => {
+    if (!playerState.isActive) return;
+    const handleKey = (e: KeyboardEvent) => {
+      const t = e.target;
+      // Ignore when the user is typing in a text field. The slider thumb
+      // renders as <input type="range">, so don't blanket-skip all inputs —
+      // we explicitly want arrow keys to seek even when the seek bar has
+      // focus from a prior click.
+      if (
+        (t instanceof HTMLInputElement &&
+          !["range", "checkbox", "radio", "button", "submit", "reset"].includes(
+            t.type
+          )) ||
+        t instanceof HTMLTextAreaElement ||
+        (t instanceof HTMLElement && t.isContentEditable)
+      ) {
+        return;
+      }
+      switch (e.key) {
+        case " ":
+          e.preventDefault();
+          playerActions.togglePause();
+          break;
+        case "ArrowLeft":
+          e.preventDefault();
+          playerActions.seek(-10);
+          break;
+        case "ArrowRight":
+          e.preventDefault();
+          playerActions.seek(10);
+          break;
+        case "ArrowUp":
+          e.preventDefault();
+          playerActions.setVolume(Math.min(playerState.volume + 5, 100));
+          break;
+        case "ArrowDown":
+          e.preventDefault();
+          playerActions.setVolume(Math.max(playerState.volume - 5, 0));
+          break;
+        case "f":
+        case "F":
+          e.preventDefault();
+          playerActions.toggleFullscreen();
+          break;
+        case "m":
+        case "M":
+          e.preventDefault();
+          playerActions.toggleMute();
+          break;
+        case "Escape":
+          e.preventDefault();
+          if (playerState.isFullscreen) {
+            playerActions.toggleFullscreen();
+          } else {
+            playerActions.close();
+          }
+          break;
+      }
+    };
+    // Capture phase: run before React's root listener can be stopped by a
+    // descendant's stopPropagation (e.g. the seek bar wrapper killing the
+    // slider thumb's keydown also kills native bubble propagation).
+    window.addEventListener("keydown", handleKey, true);
+    return () => window.removeEventListener("keydown", handleKey, true);
+  }, [playerState.isActive, playerState.volume, playerState.isFullscreen, playerActions]);
+
   return (
     <div className="flex h-screen flex-col overflow-hidden">
       {!(playerState.isActive && playerState.isFullscreen) && <Titlebar />}

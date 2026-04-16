@@ -133,6 +133,26 @@ export function ControlsOverlay({
             const r = (e.clientX - rect.left) / rect.width;
             setHoverRatio(Math.max(0, Math.min(1, r)));
           }}
+          onKeyDownCapture={(e) => {
+            // The slider thumb is a native <input type="range">. Arrow keys
+            // would (a) trigger the browser's built-in range-increment and
+            // (b) fire base-ui's onKeyDown. Both need to be blocked so the
+            // global player handler can do its 10s seek instead of the bar
+            // drifting by 1 sec per press.
+            switch (e.key) {
+              case "ArrowLeft":
+              case "ArrowRight":
+              case "ArrowUp":
+              case "ArrowDown":
+              case "PageUp":
+              case "PageDown":
+              case "Home":
+              case "End":
+                e.preventDefault();
+                e.stopPropagation();
+                break;
+            }
+          }}
         >
           <Slider
             value={[seekDragValue ?? state.currentTime]}

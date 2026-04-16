@@ -45,6 +45,8 @@ add warning when playing entire seasons without episode numbers (they will likel
 
 ## BIG STUFF NOW
 
+arrow keys break seek bar on player. pressing them seems to bring the player out of sync with the seek bar, meaning it becomes incorrect. Actually looking further, it seems the issue occurs when the user hits left or right arrow keys, WHILE they are hovering the seek bar with their cursor. ACTUALLY, even further, when a user clicks to seek to a certain point, remains hovering the seekbar, and starts hitting left/right arrow, the seekbar slowly moves by the second in the direction provided by the arrow keys - the player does not sync to the new seekbar location UNTIL the user stops hovering the seekbar. Once they stop the hover, the player skips to the seek bar position
+
 weird bugs when changing and viewing media covers, specifically when looking at the hobbit collection media and john wick 3. only pattern i see here is media inside collections, idk tho. basically it is just not displaying covers in the change cover and delete cover menus, which messes up their ui pretty bad. also when this happens the cover doesnt show up in detail view sometimes
 
 adding year to media should add it to movie/show folder name

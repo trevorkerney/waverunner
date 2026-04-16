@@ -29,66 +29,29 @@ export function PlayerView({ state, actions }: PlayerViewProps) {
     };
   }, [resetHideTimer]);
 
-  // Keyboard shortcuts
+  // Reveal the controls when the user uses any player keyboard shortcut so
+  // they get visual feedback for arrow-seek / volume / pause without needing
+  // to wiggle the mouse. Action handling itself lives at the App level.
   useEffect(() => {
     const handleKey = (e: KeyboardEvent) => {
-      if (
-        e.target instanceof HTMLInputElement ||
-        e.target instanceof HTMLTextAreaElement
-      )
-        return;
-
       switch (e.key) {
         case " ":
-          e.preventDefault();
-          actions.togglePause();
-          resetHideTimer();
-          break;
         case "ArrowLeft":
-          e.preventDefault();
-          actions.seek(-10);
-          resetHideTimer();
-          break;
         case "ArrowRight":
-          e.preventDefault();
-          actions.seek(10);
-          resetHideTimer();
-          break;
         case "ArrowUp":
-          e.preventDefault();
-          actions.setVolume(Math.min(state.volume + 5, 100));
-          resetHideTimer();
-          break;
         case "ArrowDown":
-          e.preventDefault();
-          actions.setVolume(Math.max(state.volume - 5, 0));
-          resetHideTimer();
-          break;
-        case "f":
-        case "F":
-          e.preventDefault();
-          actions.toggleFullscreen();
-          break;
         case "m":
         case "M":
-          e.preventDefault();
-          actions.toggleMute();
           resetHideTimer();
-          break;
-        case "Escape":
-          e.preventDefault();
-          if (state.isFullscreen) {
-            actions.toggleFullscreen();
-          } else {
-            actions.close();
-          }
           break;
       }
     };
-
-    window.addEventListener("keydown", handleKey);
-    return () => window.removeEventListener("keydown", handleKey);
-  }, [state.volume, state.isFullscreen, actions, resetHideTimer]);
+    // Capture phase so the slider wrapper's stopPropagation can't suppress
+    // this — we still want pressing arrow keys with the seek bar focused to
+    // reveal the overlay.
+    window.addEventListener("keydown", handleKey, true);
+    return () => window.removeEventListener("keydown", handleKey, true);
+  }, [resetHideTimer]);
 
   const ctx = state.context;
   const hasPrev = ctx.kind === "episode" && ctx.index > 0;
