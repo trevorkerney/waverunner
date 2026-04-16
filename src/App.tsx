@@ -469,7 +469,10 @@ function App() {
   const setCover = useCallback(
     async (entryId: number, coverPath: string | null) => {
       if (!selectedLibrary) return;
-      const parentId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
+      const last = breadcrumbs[breadcrumbs.length - 1];
+      const parentId = last?.id === entryId
+        ? (breadcrumbs[breadcrumbs.length - 2]?.id ?? null)
+        : (last?.id ?? null);
       setEntries((prev) => {
         const updated = prev.map((e) => (e.id === entryId ? { ...e, selected_cover: coverPath } : e));
         updateCache(selectedLibrary.id, parentId, updated, sortMode);
@@ -512,7 +515,10 @@ function App() {
           e.id === entryId
             ? { ...e, covers: [...e.covers, newCoverPath], selected_cover: newCoverPath }
             : e;
-        const parentId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
+        const last = breadcrumbs[breadcrumbs.length - 1];
+        const parentId = last?.id === entryId
+          ? (breadcrumbs[breadcrumbs.length - 2]?.id ?? null)
+          : (last?.id ?? null);
         setEntries((prev) => {
           const updated = prev.map(updateEntry);
           updateCache(selectedLibrary.id, parentId, updated, sortMode);
@@ -544,7 +550,10 @@ function App() {
           e.id === entryId
             ? { ...e, covers: e.covers.filter((c) => c !== coverPath), selected_cover: newSelected }
             : e;
-        const parentId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
+        const last = breadcrumbs[breadcrumbs.length - 1];
+        const parentId = last?.id === entryId
+          ? (breadcrumbs[breadcrumbs.length - 2]?.id ?? null)
+          : (last?.id ?? null);
         setEntries((prev) => {
           const updated = prev.map(updateEntry);
           updateCache(selectedLibrary.id, parentId, updated, sortMode);
