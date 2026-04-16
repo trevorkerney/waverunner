@@ -45,13 +45,7 @@ add warning when playing entire seasons without episode numbers (they will likel
 
 ## BIG STUFF NOW
 
-sort by release year should be sort by release date, assuming its not already doing this with year. either way it needs to be renamed to date not year
-
-Changing cover in detail view doesnt persist after leaving detail view
-
-weird bugs when changing and viewing media covers, specifically when looking at the hobbit collection media and john wick 3. pattern here is media inside collections. basically it is just not displaying covers in the change cover and delete cover menus, which messes up their ui pretty bad. also when this happens the cover doesnt show up in detail view sometimes
-
-going into a media and matching it to tmdb causes the app to forget where the user was scrolled before going into the collection and sends them back to the top when they go back up instead of where they were
+weird bugs when changing and viewing media covers, specifically when looking at the hobbit collection media and john wick 3. only pattern i see here is media inside collections, idk tho. basically it is just not displaying covers in the change cover and delete cover menus, which messes up their ui pretty bad. also when this happens the cover doesnt show up in detail view sometimes
 
 adding year to media should add it to movie/show folder name
 

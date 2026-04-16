@@ -6318,7 +6318,7 @@ dependencies = [
 
 [[package]]
 name = "waverunner"
-version = "1.0.0-alpha.5"
+version = "1.0.0-alpha.6"
 dependencies = [
  "async-recursion",
  "dirs",
