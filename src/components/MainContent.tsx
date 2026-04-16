@@ -1256,12 +1256,8 @@ function EntryDetailPage({
               size="sm"
               onClick={async () => {
                 try {
-                  if (onPlayFile) {
-                    const path = await invoke<string>("get_movie_file_path", { libraryId: selectedLibrary.id, entryId: entry.id });
-                    onPlayFile(path, entry.title);
-                  } else {
-                    await invoke("play_movie", { libraryId: selectedLibrary.id, entryId: entry.id });
-                  }
+                  const path = await invoke<string>("get_movie_file_path", { libraryId: selectedLibrary.id, entryId: entry.id });
+                  onPlayFile?.(path, entry.title);
                 } catch (e) {
                   toast.error(String(e));
                 }
@@ -1941,25 +1937,16 @@ function ShowDetailPage({
                         variant="ghost"
                         onClick={(e) => {
                           e.stopPropagation();
-                          (async () => {
-                            try {
-                              if (onPlayEpisode) {
-                                onPlayEpisode({
-                                  libraryId: selectedLibrary.id,
-                                  showId: entry.id,
-                                  showTitle: entry.title,
-                                  startEpisodeId: ep.id,
-                                });
-                              } else {
-                                await invoke("play_episode", {
-                                  libraryId: selectedLibrary.id,
-                                  episodeId: ep.id,
-                                });
-                              }
-                            } catch (err) {
-                              toast.error(String(err));
-                            }
-                          })();
+                          try {
+                            onPlayEpisode?.({
+                              libraryId: selectedLibrary.id,
+                              showId: entry.id,
+                              showTitle: entry.title,
+                              startEpisodeId: ep.id,
+                            });
+                          } catch (err) {
+                            toast.error(String(err));
+                          }
                         }}
                       >
                         <Play size={14} />

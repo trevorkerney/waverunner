@@ -18,8 +18,6 @@ export interface PlayerState {
   isMinimized: boolean;
   loading: boolean;
   title: string;
-  eofReached: boolean;
-  seeking: boolean;
   context: PlayerContext;
   autoPlayNext: boolean;
 }
@@ -33,7 +31,6 @@ export interface PlayEpisodeArgs {
 
 export interface PlayerActions {
   play: (path: string, title: string) => Promise<void>;
-  playUrl: (url: string, title: string) => Promise<void>;
   playEpisode: (args: PlayEpisodeArgs) => Promise<void>;
   playNextEpisode: () => Promise<void>;
   playPreviousEpisode: () => Promise<void>;
@@ -50,7 +47,6 @@ export interface PlayerActions {
   setPlayerRegion: (rect: { left: number; right: number; top: number; bottom: number }) => Promise<void>;
   toggleAutoPlayNext: () => Promise<void>;
   close: () => Promise<void>;
-  refreshTracks: () => Promise<void>;
   setDragging: (field: "seek" | "volume" | null) => void;
 }
 
@@ -67,8 +63,6 @@ const initialState: PlayerState = {
   isMinimized: false,
   loading: false,
   title: "",
-  eofReached: false,
-  seeking: false,
   context: { kind: "none" },
   autoPlayNext: true,
 };
@@ -139,7 +133,6 @@ export function usePlayer(): [PlayerState, PlayerActions] {
         ...prev,
         loading: true,
         isPlaying: true,
-        eofReached: false,
         title: episodeTitle(ctx.showTitle, ep),
         context: { ...ctx, index: newIndex },
       }));
@@ -176,10 +169,6 @@ export function usePlayer(): [PlayerState, PlayerActions] {
               }
               case "mute":
                 return { ...prev, muted: (value as boolean) ?? false };
-              case "eof-reached":
-                return { ...prev, eofReached: (value as boolean) ?? false };
-              case "seeking":
-                return { ...prev, seeking: (value as boolean) ?? false };
               case "track-list/count":
                 refreshTracksInternal();
                 return prev;
@@ -206,10 +195,10 @@ export function usePlayer(): [PlayerState, PlayerActions] {
           cur.context.index < cur.context.episodes.length - 1
         ) {
           playEpisodeAtIndex(cur.context.index + 1).catch(() => {
-            setState((p) => ({ ...p, eofReached: true, isPlaying: false }));
+            setState((p) => ({ ...p, isPlaying: false }));
           });
         } else {
-          setState((prev) => ({ ...prev, eofReached: true, isPlaying: false }));
+          setState((prev) => ({ ...prev, isPlaying: false }));
         }
       });
 
@@ -232,7 +221,6 @@ export function usePlayer(): [PlayerState, PlayerActions] {
       title,
       isActive: true,
       isPlaying: true,
-      eofReached: false,
       context: { kind: "movie" },
     }));
     try {
@@ -246,46 +234,19 @@ export function usePlayer(): [PlayerState, PlayerActions] {
     }
   }, []);
 
-  const playUrl = useCallback(async (url: string, title: string) => {
-    const wasActive = stateRef.current.isActive;
-    setState((prev) => ({
-      ...prev,
-      loading: true,
-      title,
-      isActive: true,
-      isPlaying: true,
-      eofReached: false,
-      context: { kind: "movie" },
-    }));
-    try {
-      if (!wasActive) {
-        await invoke("init_player", { titlebarHeight: TITLEBAR_HEIGHT });
-      }
-      await invoke("play_url", { url });
-    } catch (e) {
-      setState((prev) => ({ ...prev, loading: false, isActive: wasActive }));
-      throw e;
-    }
-  }, []);
-
   const playEpisode = useCallback(async (args: PlayEpisodeArgs) => {
     const { libraryId, showId, showTitle, startEpisodeId } = args;
-    let episodes: EpisodeRef[];
-    try {
-      const flat = await invoke<ShowEpisodeFlat[]>("get_show_episodes", {
-        libraryId,
-        showId,
-      });
-      episodes = flat.map((f) => ({
-        episodeId: f.episode_id,
-        seasonId: f.season_id,
-        seasonNumber: f.season_number,
-        episodeNumber: f.episode_number,
-        title: f.title,
-      }));
-    } catch (e) {
-      throw e;
-    }
+    const flat = await invoke<ShowEpisodeFlat[]>("get_show_episodes", {
+      libraryId,
+      showId,
+    });
+    const episodes: EpisodeRef[] = flat.map((f) => ({
+      episodeId: f.episode_id,
+      seasonId: f.season_id,
+      seasonNumber: f.season_number,
+      episodeNumber: f.episode_number,
+      title: f.title,
+    }));
 
     const index = episodes.findIndex((e) => e.episodeId === startEpisodeId);
     if (index < 0) throw new Error("Episode not found in show");
@@ -306,7 +267,6 @@ export function usePlayer(): [PlayerState, PlayerActions] {
       title,
       isActive: true,
       isPlaying: true,
-      eofReached: false,
       context: ctx,
     }));
 
@@ -488,7 +448,6 @@ export function usePlayer(): [PlayerState, PlayerActions] {
 
   const actions: PlayerActions = {
     play,
-    playUrl,
     playEpisode,
     playNextEpisode,
     playPreviousEpisode,
@@ -505,7 +464,6 @@ export function usePlayer(): [PlayerState, PlayerActions] {
     setPlayerRegion,
     toggleAutoPlayNext,
     close,
-    refreshTracks: refreshTracksInternal,
     setDragging,
   };
 

@@ -124,11 +124,6 @@ pub fn play_file(state: State<'_, AppState>, path: String) -> Result<(), String>
 }
 
 #[tauri::command]
-pub fn play_url(state: State<'_, AppState>, url: String) -> Result<(), String> {
-    with_mpv(&state, |mpv| mpv.command(&["loadfile", &url]))
-}
-
-#[tauri::command]
 pub fn player_command(
     state: State<'_, AppState>,
     cmd: String,
@@ -148,18 +143,6 @@ pub fn set_player_property(
     value: String,
 ) -> Result<(), String> {
     with_mpv(&state, |mpv| mpv.set_property_string(&name, &value))
-}
-
-#[tauri::command]
-pub fn get_player_property(
-    state: State<'_, AppState>,
-    name: String,
-) -> Result<Option<String>, String> {
-    let guard = state.player.lock().map_err(|e| e.to_string())?;
-    match guard.as_ref() {
-        Some(inner) => Ok(inner.mpv.get_property_string(&name)),
-        None => Err("Player not initialised".into()),
-    }
 }
 
 #[tauri::command]

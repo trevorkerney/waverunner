@@ -7,13 +7,6 @@ export interface Library {
   db_filename: string;
   default_sort_mode: string;
   managed: boolean;
-  player_path: string | null;
-  player_args: string | null;
-}
-
-export interface DetectedPlayer {
-  name: string;
-  path: string;
 }
 
 export interface EntriesResponse {

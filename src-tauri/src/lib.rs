@@ -80,12 +80,8 @@ pub fn run() {
             commands::create_collection,
             commands::set_cover,
             commands::rescan_library,
-            commands::detect_players,
-            commands::set_library_player,
-            commands::play_movie,
             commands::get_show_seasons,
             commands::get_season_episodes,
-            commands::play_episode,
             commands::delete_entry,
             commands::check_entry_has_files,
             commands::search_tmdb_movie,
@@ -110,10 +106,8 @@ pub fn run() {
             player::set_player_region,
             player::destroy_player,
             player::play_file,
-            player::play_url,
             player::player_command,
             player::set_player_property,
-            player::get_player_property,
             player::get_player_tracks,
         ])
         .run(tauri::generate_context!())
