@@ -37,6 +37,11 @@ jobs:
         with:
           workspaces: src-tauri
 
+      - name: Download libmpv (Windows)
+        if: matrix.platform == 'windows-latest'
+        run: |
+          curl -L -o src-tauri/lib/libmpv-2.dll "https://github.com/trevorkerney/waverunner/releases/download/deps-v1/libmpv-2.dll"
+
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 

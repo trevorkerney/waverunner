@@ -221,6 +221,7 @@ export function usePlayer(): [PlayerState, PlayerActions] {
   }, [state.isActive, refreshTracksInternal, playEpisodeAtIndex]);
 
   const play = useCallback(async (path: string, title: string) => {
+    const wasActive = stateRef.current.isActive;
     setState((prev) => ({
       ...prev,
       loading: true,
@@ -231,15 +232,18 @@ export function usePlayer(): [PlayerState, PlayerActions] {
       context: { kind: "movie" },
     }));
     try {
-      await invoke("init_player", { titlebarHeight: TITLEBAR_HEIGHT });
+      if (!wasActive) {
+        await invoke("init_player", { titlebarHeight: TITLEBAR_HEIGHT });
+      }
       await invoke("play_file", { path });
     } catch (e) {
-      setState((prev) => ({ ...prev, loading: false, isActive: false, isPlaying: false }));
+      setState((prev) => ({ ...prev, loading: false, isActive: wasActive, isPlaying: false }));
       throw e;
     }
   }, []);
 
   const playUrl = useCallback(async (url: string, title: string) => {
+    const wasActive = stateRef.current.isActive;
     setState((prev) => ({
       ...prev,
       loading: true,
@@ -250,10 +254,12 @@ export function usePlayer(): [PlayerState, PlayerActions] {
       context: { kind: "movie" },
     }));
     try {
-      await invoke("init_player", { titlebarHeight: TITLEBAR_HEIGHT });
+      if (!wasActive) {
+        await invoke("init_player", { titlebarHeight: TITLEBAR_HEIGHT });
+      }
       await invoke("play_url", { url });
     } catch (e) {
-      setState((prev) => ({ ...prev, loading: false, isActive: false }));
+      setState((prev) => ({ ...prev, loading: false, isActive: wasActive }));
       throw e;
     }
   }, []);
