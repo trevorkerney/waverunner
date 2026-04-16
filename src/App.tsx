@@ -222,13 +222,14 @@ function App() {
         setEntries(res.entries);
         setSortMode(res.sort_mode);
         setBreadcrumbs(breadcrumb);
+        restoreScrollPosition(library.id, parentId);
       } catch (e) {
         console.error("Failed to load entries:", e);
       } finally {
         setLoading(false);
       }
     },
-    []
+    [restoreScrollPosition]
   );
 
   const selectLibrary = useCallback(
