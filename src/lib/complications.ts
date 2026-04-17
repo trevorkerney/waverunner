@@ -13,7 +13,7 @@ function videoComplications(libraryId: string): ComplicationNode[] {
   return [
     { id: "all",     label: "All",    iconName: "Library", view: { kind: "library-root", libraryId } },
     { id: "movies",  label: "Movies", iconName: "Film",    view: { kind: "movies-only",  libraryId } },
-    { id: "shows",   label: "Shows",  iconName: "Tv",      view: { kind: "shows-only",   libraryId } },
+    { id: "shows",   label: "TV",     iconName: "Tv",      view: { kind: "shows-only",   libraryId } },
     {
       id: "people",
       label: "People",

@@ -2,7 +2,7 @@ import { useCallback, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
-import { Trash2, RefreshCw, FolderPlus } from "lucide-react";
+import { Trash2, RefreshCw, FolderPlus, ChevronRight } from "lucide-react";
 import {
   ContextMenu,
   ContextMenuTrigger,
@@ -21,6 +21,8 @@ import { Button } from "@/components/ui/button";
 import { CreateLibraryDialog } from "@/components/CreateLibraryDialog";
 import { PlayerDock } from "@/components/player/PlayerDock";
 import { PlayerState, PlayerActions } from "@/hooks/usePlayer";
+import { SidebarTree } from "@/components/SidebarTree";
+import { getComplicationsForLibrary } from "@/lib/complications";
 import { Library, ViewSpec } from "@/types";
 
 const MIN_WIDTH = 180;
@@ -45,9 +47,9 @@ interface SidebarProps {
 export function Sidebar({
   libraries,
   selectedLibrary,
-  activeView: _activeView,
+  activeView,
   onSelectLibrary,
-  onSelectView: _onSelectView,
+  onSelectView,
   onLibraryCreated,
   onLibraryDeleted,
   onLibraryRescanned,
@@ -58,7 +60,18 @@ export function Sidebar({
   const [dragging, setDragging] = useState(false);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Library | null>(null);
+  // Track libraries the user has explicitly collapsed; default is expanded.
+  const [collapsedLibs, setCollapsedLibs] = useState<Set<string>>(new Set());
   const isResizing = useRef(false);
+
+  const toggleLibExpand = useCallback((libId: string) => {
+    setCollapsedLibs((prev) => {
+      const next = new Set(prev);
+      if (next.has(libId)) next.delete(libId);
+      else next.add(libId);
+      return next;
+    });
+  }, []);
 
   const startResize = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
@@ -104,53 +117,89 @@ export function Sidebar({
               No libraries yet
             </p>
           ) : (
-            libraries.map((lib) => (
-              <ContextMenu key={lib.id}>
-                <ContextMenuTrigger
-                  render={
-                    <button
-                      onClick={() => onSelectLibrary(lib)}
-                    />
-                  }
-                  className={`flex w-full items-center rounded-sm truncate px-2 py-1.5 text-left text-sm ${
-                    selectedLibrary?.id === lib.id
-                      ? "bg-sidebar-accent text-sidebar-accent-foreground"
-                      : "text-sidebar-foreground hover:bg-sidebar-accent/50"
-                  }`}
-                >
-                  {lib.name}
-                </ContextMenuTrigger>
-                <ContextMenuContent>
-                  <ContextMenuItem
-                    onClick={async () => {
-                      const toastId = toast.loading("Rescanning...");
-                      const unlisten = await listen<string>("scan-progress", (event) => {
-                        toast.loading(event.payload, { id: toastId });
-                      });
-                      try {
-                        await invoke("rescan_library", { libraryId: lib.id });
-                        toast.success("Rescan complete", { id: toastId });
-                        onLibraryRescanned();
-                      } catch (err) {
-                        toast.error(String(err), { id: toastId });
-                      } finally {
-                        unlisten();
+            libraries.map((lib) => {
+              const expanded = !collapsedLibs.has(lib.id);
+              const isSelected = selectedLibrary?.id === lib.id;
+              return (
+                <div key={lib.id} className="flex flex-col">
+                  <ContextMenu>
+                    <ContextMenuTrigger
+                      render={
+                        <button
+                          onClick={() => {
+                            onSelectLibrary(lib);
+                            setCollapsedLibs((prev) => {
+                              if (!prev.has(lib.id)) return prev;
+                              const next = new Set(prev);
+                              next.delete(lib.id);
+                              return next;
+                            });
+                          }}
+                        />
                       }
-                    }}
-                  >
-                    <RefreshCw size={14} />
-                    Rescan
-                  </ContextMenuItem>
-                  <ContextMenuItem
-                    onClick={() => setDeleteTarget(lib)}
-                    className="text-destructive focus:text-destructive"
-                  >
-                    <Trash2 size={14} />
-                    Delete
-                  </ContextMenuItem>
-                </ContextMenuContent>
-              </ContextMenu>
-            ))
+                      className={`flex w-full items-center gap-1 rounded-sm truncate py-1.5 pr-2 pl-1 text-left text-sm ${
+                        isSelected
+                          ? "bg-sidebar-accent text-sidebar-accent-foreground"
+                          : "text-sidebar-foreground hover:bg-sidebar-accent/50"
+                      }`}
+                    >
+                      <span
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          toggleLibExpand(lib.id);
+                        }}
+                        className="flex h-4 w-4 flex-shrink-0 items-center justify-center"
+                      >
+                        <ChevronRight
+                          size={12}
+                          className={`transition-transform ${expanded ? "rotate-90" : ""}`}
+                        />
+                      </span>
+                      <span className="truncate">{lib.name}</span>
+                    </ContextMenuTrigger>
+                    <ContextMenuContent>
+                      <ContextMenuItem
+                        onClick={async () => {
+                          const toastId = toast.loading("Rescanning...");
+                          const unlisten = await listen<string>("scan-progress", (event) => {
+                            toast.loading(event.payload, { id: toastId });
+                          });
+                          try {
+                            await invoke("rescan_library", { libraryId: lib.id });
+                            toast.success("Rescan complete", { id: toastId });
+                            onLibraryRescanned();
+                          } catch (err) {
+                            toast.error(String(err), { id: toastId });
+                          } finally {
+                            unlisten();
+                          }
+                        }}
+                      >
+                        <RefreshCw size={14} />
+                        Rescan
+                      </ContextMenuItem>
+                      <ContextMenuItem
+                        onClick={() => setDeleteTarget(lib)}
+                        className="text-destructive focus:text-destructive"
+                      >
+                        <Trash2 size={14} />
+                        Delete
+                      </ContextMenuItem>
+                    </ContextMenuContent>
+                  </ContextMenu>
+                  {expanded && (
+                    <SidebarTree
+                      nodes={getComplicationsForLibrary(lib)}
+                      activeView={isSelected ? activeView : null}
+                      onSelectView={(view) => {
+                        onSelectView(view);
+                      }}
+                      depth={1}
+                    />
+                  )}
+                </div>
+              );
+            })
           )}
           </ContextMenuTrigger>
           <ContextMenuContent>

@@ -178,27 +178,37 @@ function App() {
           parentId,
           query: search.trim(),
         });
-        await preloadCovers(results);
-        setSearchResults(results);
+        // Scope results to the active sidebar view. In movies-only/shows-only the user
+        // expects search to honor that scope; All (library-root) searches everything.
+        const filtered =
+          activeView?.kind === "movies-only" ? results.filter((r) => r.entry_type === "movie")
+          : activeView?.kind === "shows-only" ? results.filter((r) => r.entry_type === "show")
+          : results;
+        await preloadCovers(filtered);
+        setSearchResults(filtered);
       } catch (e) {
         console.error("Search failed:", e);
         setSearchResults(null);
       }
     }, 200);
     return () => clearTimeout(timer);
-  }, [search, selectedLibrary, breadcrumbs, preloadCovers]);
+  }, [search, selectedLibrary, breadcrumbs, activeView, preloadCovers]);
 
   const saveScrollPosition = useCallback(() => {
     if (!selectedLibrary || !scrollContainerRef.current) return;
     const parentId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
-    const key = `${selectedLibrary.id}:${parentId}`;
+    const kind = activeView?.kind ?? "library-root";
+    const key = `${selectedLibrary.id}:${kind}:${parentId}`;
     scrollCacheRef.current.set(key, scrollContainerRef.current.scrollTop);
-  }, [selectedLibrary, breadcrumbs]);
+  }, [selectedLibrary, breadcrumbs, activeView]);
 
-  const restoreScrollPosition = useCallback((libraryId: string, parentId: number | null) => {
-    const key = `${libraryId}:${parentId}`;
-    const saved = scrollCacheRef.current.get(key);
-    if (saved != null && scrollContainerRef.current) {
+  // restoreScrollPosition: apply the saved scroll for a (library, view-kind, parent) triple,
+  // or reset to top when none is saved. Scroll keys include view kind so sidebar switches
+  // don't leak scroll between views (library-root at parentId=null is distinct from movies-only at parentId=null).
+  const restoreScrollPosition = useCallback((libraryId: string, kind: string, parentId: number | null) => {
+    const key = `${libraryId}:${kind}:${parentId}`;
+    const saved = scrollCacheRef.current.get(key) ?? 0;
+    if (scrollContainerRef.current) {
       // Double rAF: first waits for React commit, second waits for layout/paint
       requestAnimationFrame(() => {
         requestAnimationFrame(() => {
@@ -210,8 +220,19 @@ function App() {
     }
   }, []);
 
+  const resetScrollToTop = useCallback(() => {
+    if (!scrollContainerRef.current) return;
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        if (scrollContainerRef.current) {
+          scrollContainerRef.current.scrollTop = 0;
+        }
+      });
+    });
+  }, []);
+
   const loadView = useCallback(
-    async (view: ViewSpec, parentId: number | null, breadcrumb: BreadcrumbItem[]) => {
+    async (view: ViewSpec, parentId: number | null, breadcrumb: BreadcrumbItem[], restoreScroll: boolean = true) => {
       // people-list and playlists produce their own result types; everything else lands as MediaEntry[].
       if (view.kind === "people-list") {
         const key = viewCacheKey(view);
@@ -282,7 +303,8 @@ function App() {
         setEntries(cached.entries);
         setSortMode(cached.sort_mode);
         setBreadcrumbs(breadcrumb);
-        if (useRootCache) restoreScrollPosition(view.libraryId, parentId);
+        if (restoreScroll && useRootCache) restoreScrollPosition(view.libraryId, view.kind, parentId);
+        else if (!restoreScroll) resetScrollToTop();
         return;
       }
 
@@ -326,14 +348,15 @@ function App() {
         setEntries(entries);
         setSortMode(sort_mode);
         setBreadcrumbs(breadcrumb);
-        if (useRootCache) restoreScrollPosition(view.libraryId, parentId);
+        if (restoreScroll && useRootCache) restoreScrollPosition(view.libraryId, view.kind, parentId);
+        else if (!restoreScroll) resetScrollToTop();
       } catch (e) {
         console.error("Failed to load view:", e);
       } finally {
         setLoading(false);
       }
     },
-    [restoreScrollPosition, preloadCovers]
+    [restoreScrollPosition, resetScrollToTop, preloadCovers]
   );
 
   // Thin wrapper for the existing call sites that drive library-root navigation by (library, parentId).
@@ -343,35 +366,89 @@ function App() {
     [loadView]
   );
 
+  // Re-fetch the grid entries behind the detail page without touching breadcrumbs or
+  // navigating away. Fires after a detail-page edit so going back shows fresh year/covers/etc.
+  const refreshGridInPlace = useCallback(async () => {
+    if (!selectedLibrary || !activeView) return;
+    const view = activeView;
+    // The grid parent is the breadcrumb one above the detail entry; if the detail
+    // page is at the top level, parent is null.
+    const gridParentId = breadcrumbs.length >= 2
+      ? breadcrumbs[breadcrumbs.length - 2]?.id ?? null
+      : null;
+    try {
+      let fresh: MediaEntry[] = [];
+      let fresh_sort = sortMode;
+      if (view.kind === "library-root") {
+        const res = await invoke<EntriesResponse>("get_entries", {
+          libraryId: view.libraryId,
+          parentId: gridParentId,
+        });
+        fresh = res.entries;
+        fresh_sort = res.sort_mode;
+        entryCacheRef.current.set(`${view.libraryId}:${gridParentId}`, { entries: fresh, sort_mode: fresh_sort });
+      } else if (view.kind === "movies-only" || view.kind === "shows-only") {
+        const res = await invoke<EntriesResponse>("get_entries", {
+          libraryId: view.libraryId,
+          parentId: null,
+          entryTypeFilter: view.kind === "movies-only" ? "movie" : "show",
+        });
+        fresh = res.entries;
+        fresh_sort = res.sort_mode;
+        viewEntriesCacheRef.current.set(viewCacheKey(view), { entries: fresh, sort_mode: fresh_sort });
+      } else if (view.kind === "person-detail") {
+        fresh = await invoke<MediaEntry[]>("get_entries_for_person", {
+          libraryId: view.libraryId,
+          personId: view.personId,
+          role: view.role,
+        });
+        fresh_sort = "alpha";
+        viewEntriesCacheRef.current.set(viewCacheKey(view), { entries: fresh, sort_mode: fresh_sort });
+      } else {
+        return; // people-list / playlists don't render a media entry grid
+      }
+      await preloadCovers(fresh);
+      setEntries(fresh);
+      setSortMode(fresh_sort);
+    } catch (e) {
+      console.error("Failed to refresh grid:", e);
+    }
+  }, [selectedLibrary, activeView, breadcrumbs, sortMode, preloadCovers]);
+
   const selectLibrary = useCallback(
     (library: Library) => {
-      saveScrollPosition();
-      setActiveView({ kind: "library-root", libraryId: library.id });
+      // Sidebar library clicks land at the top like other sidebar switches.
+      const view: ViewSpec = { kind: "library-root", libraryId: library.id };
+      setActiveView(view);
       setSelectedEntry(null);
       setSearch("");
-      loadEntries(library, null, [{ id: null, title: library.name }]);
+      setForwardStack([]);
+      loadView(view, null, [{ id: null, title: library.name }], false);
     },
-    [loadEntries, saveScrollPosition]
+    [loadView]
   );
 
   const selectView = useCallback(
     (view: ViewSpec) => {
-      saveScrollPosition();
+      // Sidebar view switches intentionally discard scroll — they always land at the top.
+      // Don't save outgoing scroll; pass restoreScroll=false so loadView resets to 0.
+      // Also clear the forward stack so mouse-forward can't cross into a stale view's history.
       setActiveView(view);
       setSelectedEntry(null);
       setSearch("");
+      setForwardStack([]);
       const lib = libraries.find((l) => l.id === view.libraryId);
       const libLabel = lib?.name ?? "Library";
       const viewLabel: string =
         view.kind === "library-root" ? libLabel
         : view.kind === "movies-only" ? `${libLabel} — Movies`
-        : view.kind === "shows-only" ? `${libLabel} — Shows`
+        : view.kind === "shows-only" ? `${libLabel} — TV`
         : view.kind === "playlists" ? `${libLabel} — Playlists`
         : view.kind === "people-list" ? `${libLabel} — ${view.role}`
         : `${libLabel} — Person`;
-      loadView(view, null, [{ id: null, title: viewLabel }]);
+      loadView(view, null, [{ id: null, title: viewLabel }], false);
     },
-    [libraries, loadView, saveScrollPosition]
+    [libraries, loadView]
   );
 
   const navigateTo = useCallback(
@@ -414,11 +491,11 @@ function App() {
     if (selectedEntry) {
       setSelectedEntry(null);
       setBreadcrumbs(newBreadcrumbs);
-      restoreScrollPosition(selectedLibrary.id, parentId);
+      restoreScrollPosition(selectedLibrary.id, activeView?.kind ?? "library-root", parentId);
     } else {
       loadEntries(selectedLibrary, parentId, newBreadcrumbs);
     }
-  }, [selectedLibrary, breadcrumbs, selectedEntry, loadEntries, saveScrollPosition, restoreScrollPosition]);
+  }, [selectedLibrary, breadcrumbs, selectedEntry, loadEntries, saveScrollPosition, restoreScrollPosition, activeView]);
 
   const goForward = useCallback(() => {
     if (!selectedLibrary || forwardStack.length === 0) return;
@@ -440,6 +517,12 @@ function App() {
   const invalidateCache = useCallback((libraryId?: string, parentId?: number | null) => {
     if (libraryId != null && parentId !== undefined) {
       entryCacheRef.current.delete(`${libraryId}:${parentId}`);
+      // Filtered views (movies-only/shows-only/person-detail) flatten across the library,
+      // so any parent-scoped mutation can leave them stale. Wipe them for this library.
+      const prefix = `${libraryId}:`;
+      for (const key of viewEntriesCacheRef.current.keys()) {
+        if (key.startsWith(prefix)) viewEntriesCacheRef.current.delete(key);
+      }
     } else if (libraryId != null) {
       // Invalidate everything for this library across all view caches.
       const prefix = `${libraryId}:`;
@@ -869,6 +952,10 @@ function App() {
               for (let i = 0; i < breadcrumbs.length - 1; i++) {
                 invalidateCache(selectedLibrary.id, breadcrumbs[i]?.id ?? null);
               }
+              // Also refresh the in-memory grid entries behind the detail page so
+              // derived fields (year, end_year, covers, season_display) update when
+              // the user hits back — cache invalidation alone only helps on view-switch.
+              refreshGridInPlace();
             }
           }}
           onRescan={() => {
