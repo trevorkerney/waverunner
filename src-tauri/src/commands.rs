@@ -223,6 +223,139 @@ async fn ensure_person(pool: &SqlitePool, name: &str, tmdb_id: Option<i64>) -> R
     }
 }
 
+/// Number of profile images to fetch per person on first TMDB apply.
+const PROFILE_IMAGE_COUNT: usize = 3;
+
+/// Download up to PROFILE_IMAGE_COUNT TMDB profile images for every person in `persons`
+/// that currently has none. Called after each apply_* command has finished its DB work.
+/// Errors are logged and swallowed — apply itself shouldn't fail because of image downloads.
+async fn process_person_images(
+    pool: &SqlitePool,
+    app_data_dir: &Path,
+    persons: Vec<(i64, i64)>, // (person_db_id, tmdb_id)
+) {
+    if persons.is_empty() {
+        return;
+    }
+
+    // Dedup: same person (by db id) may appear in multiple role lists of one apply.
+    let mut seen = std::collections::HashSet::new();
+    let persons: Vec<(i64, i64)> = persons.into_iter().filter(|p| seen.insert(p.0)).collect();
+
+    // Narrow to people who have zero images today. Skip the rest entirely.
+    let mut needs_images: Vec<(i64, i64)> = Vec::new();
+    for (person_db_id, tmdb_id) in &persons {
+        let count: Result<(i64,), _> = sqlx::query_as("SELECT COUNT(*) FROM person_image WHERE person_id = ?")
+            .bind(person_db_id)
+            .fetch_one(pool)
+            .await;
+        if let Ok((0,)) = count {
+            needs_images.push((*person_db_id, *tmdb_id));
+        }
+    }
+    if needs_images.is_empty() {
+        return;
+    }
+
+    // Token is optional — apply commands still work without TMDB, image download just no-ops.
+    let token: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE key = 'tmdb_api_token'")
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+    let Some(token) = token.filter(|t| !t.is_empty()) else {
+        return;
+    };
+
+    let cache_dir = app_data_dir.join("people_images");
+    if std::fs::create_dir_all(&cache_dir).is_err() {
+        return;
+    }
+
+    let client = reqwest::Client::new();
+
+    // Fan out: each person is independent, run them concurrently.
+    let futures = needs_images.into_iter().map(|(person_db_id, tmdb_id)| {
+        let pool = pool.clone();
+        let client = client.clone();
+        let token = token.clone();
+        let cache_dir = cache_dir.clone();
+        async move {
+            if let Err(e) = download_person_images_one(&pool, &client, &token, &cache_dir, person_db_id, tmdb_id).await {
+                eprintln!("person image download failed (tmdb_id={tmdb_id}): {e}");
+            }
+        }
+    });
+    futures::future::join_all(futures).await;
+}
+
+async fn download_person_images_one(
+    pool: &SqlitePool,
+    client: &reqwest::Client,
+    token: &str,
+    cache_dir: &Path,
+    person_db_id: i64,
+    tmdb_id: i64,
+) -> Result<(), String> {
+    let images = crate::tmdb::get_person_images(client, token, tmdb_id).await?;
+    if images.is_empty() {
+        return Ok(());
+    }
+
+    let mut first_local: Option<String> = None;
+
+    for (i, img) in images.into_iter().take(PROFILE_IMAGE_COUNT).enumerate() {
+        // Filename keyed by tmdb_id so rows remain meaningful if the DB is rebuilt.
+        let filename = format!("{}_{}.jpg", tmdb_id, i);
+        let local_path = cache_dir.join(&filename);
+
+        // Skip on-disk write if the file somehow already exists (e.g. prior partial apply).
+        if !local_path.exists() {
+            let url = format!("https://image.tmdb.org/t/p/w185{}", img.file_path);
+            let resp = client
+                .get(&url)
+                .send()
+                .await
+                .map_err(|e| format!("download failed: {e}"))?;
+            if !resp.status().is_success() {
+                continue;
+            }
+            let bytes = resp
+                .bytes()
+                .await
+                .map_err(|e| format!("read bytes: {e}"))?;
+            std::fs::write(&local_path, &bytes).map_err(|e| format!("write file: {e}"))?;
+        }
+
+        sqlx::query(
+            "INSERT OR IGNORE INTO person_image (person_id, filename, tmdb_path, sort_order) VALUES (?, ?, ?, ?)",
+        )
+        .bind(person_db_id)
+        .bind(&filename)
+        .bind(&img.file_path)
+        .bind(i as i64)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        if i == 0 {
+            first_local = Some(local_path.to_string_lossy().to_string());
+        }
+    }
+
+    // Set image_path to the primary (first) image, but only if the person didn't already have one.
+    if let Some(path) = first_local {
+        sqlx::query("UPDATE person SET image_path = ? WHERE id = ? AND image_path IS NULL")
+            .bind(&path)
+            .bind(person_db_id)
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
+}
+
 fn uuid_simple() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()
@@ -1466,6 +1599,9 @@ pub async fn apply_tmdb_metadata(
     entry_id: i64,
     fields: TmdbFieldSelection,
 ) -> Result<(), String> {
+    // Collect (person_db_id, tmdb_id) for post-apply profile-image fetch.
+    let mut new_people: Vec<(i64, i64)> = Vec::new();
+
     // Scalar fields on movie table — only write if provided (Some)
     if let Some(ref tmdb_id) = fields.tmdb_id {
         sqlx::query("UPDATE movie SET tmdb_id = ? WHERE id = ?")
@@ -1572,6 +1708,7 @@ pub async fn apply_tmdb_metadata(
             .map_err(|e| e.to_string())?;
         for d in directors {
             let person_id = ensure_person(&state.app_db, &d.name, d.tmdb_id).await?;
+            if let Some(tid) = d.tmdb_id { new_people.push((person_id, tid)); }
             sqlx::query("INSERT INTO movie_director (movie_id, person_id) VALUES (?, ?)")
                 .bind(entry_id)
                 .bind(person_id)
@@ -1589,6 +1726,7 @@ pub async fn apply_tmdb_metadata(
             .map_err(|e| e.to_string())?;
         for (i, c) in cast.iter().enumerate() {
             let person_id = ensure_person(&state.app_db, &c.name, c.tmdb_id).await?;
+            if let Some(tid) = c.tmdb_id { new_people.push((person_id, tid)); }
             sqlx::query("INSERT INTO movie_cast (movie_id, person_id, role, sort_order) VALUES (?, ?, ?, ?)")
                 .bind(entry_id)
                 .bind(person_id)
@@ -1608,6 +1746,7 @@ pub async fn apply_tmdb_metadata(
             .map_err(|e| e.to_string())?;
         for c in crew {
             let person_id = ensure_person(&state.app_db, &c.name, c.tmdb_id).await?;
+            if let Some(tid) = c.tmdb_id { new_people.push((person_id, tid)); }
             sqlx::query("INSERT INTO movie_crew (movie_id, person_id, job) VALUES (?, ?, ?)")
                 .bind(entry_id)
                 .bind(person_id)
@@ -1626,6 +1765,7 @@ pub async fn apply_tmdb_metadata(
             .map_err(|e| e.to_string())?;
         for p in producers {
             let person_id = ensure_person(&state.app_db, &p.name, p.tmdb_id).await?;
+            if let Some(tid) = p.tmdb_id { new_people.push((person_id, tid)); }
             sqlx::query("INSERT INTO movie_producer (movie_id, person_id) VALUES (?, ?)")
                 .bind(entry_id)
                 .bind(person_id)
@@ -1677,6 +1817,7 @@ pub async fn apply_tmdb_metadata(
         }
     }
 
+    process_person_images(&state.app_db, &state.app_data_dir, new_people).await;
     Ok(())
 }
 
@@ -5374,7 +5515,7 @@ pub async fn apply_tmdb_show_metadata(
     show_id: i64,
     fields: TmdbShowFieldSelection,
 ) -> Result<(), String> {
-    // Uses shared app_db pool
+    let mut new_people: Vec<(i64, i64)> = Vec::new();
 
     // Scalar fields on show table
     if let Some(ref tmdb_id) = fields.tmdb_id {
@@ -5421,6 +5562,7 @@ pub async fn apply_tmdb_show_metadata(
         sqlx::query("DELETE FROM show_creator WHERE show_id = ?").bind(show_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         for c in creators {
             let person_id = ensure_person(&state.app_db, &c.name, c.tmdb_id).await?;
+            if let Some(tid) = c.tmdb_id { new_people.push((person_id, tid)); }
             sqlx::query("INSERT INTO show_creator (show_id, person_id) VALUES (?, ?)")
                 .bind(show_id).bind(person_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         }
@@ -5430,6 +5572,7 @@ pub async fn apply_tmdb_show_metadata(
         sqlx::query("DELETE FROM show_cast WHERE show_id = ?").bind(show_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         for (i, c) in cast.iter().enumerate() {
             let person_id = ensure_person(&state.app_db, &c.name, c.tmdb_id).await?;
+            if let Some(tid) = c.tmdb_id { new_people.push((person_id, tid)); }
             sqlx::query("INSERT INTO show_cast (show_id, person_id, role, sort_order) VALUES (?, ?, ?, ?)")
                 .bind(show_id).bind(person_id).bind(&c.role).bind(i as i64).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         }
@@ -5439,6 +5582,7 @@ pub async fn apply_tmdb_show_metadata(
         sqlx::query("DELETE FROM show_crew WHERE show_id = ?").bind(show_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         for c in crew {
             let person_id = ensure_person(&state.app_db, &c.name, c.tmdb_id).await?;
+            if let Some(tid) = c.tmdb_id { new_people.push((person_id, tid)); }
             sqlx::query("INSERT INTO show_crew (show_id, person_id, job) VALUES (?, ?, ?)")
                 .bind(show_id).bind(person_id).bind(&c.job).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         }
@@ -5448,6 +5592,7 @@ pub async fn apply_tmdb_show_metadata(
         sqlx::query("DELETE FROM show_producer WHERE show_id = ?").bind(show_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         for p in producers {
             let person_id = ensure_person(&state.app_db, &p.name, p.tmdb_id).await?;
+            if let Some(tid) = p.tmdb_id { new_people.push((person_id, tid)); }
             sqlx::query("INSERT INTO show_producer (show_id, person_id) VALUES (?, ?)")
                 .bind(show_id).bind(person_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         }
@@ -5471,6 +5616,7 @@ pub async fn apply_tmdb_show_metadata(
         }
     }
 
+    process_person_images(&state.app_db, &state.app_data_dir, new_people).await;
     Ok(())
 }
 
@@ -5491,7 +5637,7 @@ pub async fn apply_tmdb_season_metadata(
     season_id: i64,
     fields: TmdbSeasonFieldSelection,
 ) -> Result<(), String> {
-    // Uses shared app_db pool
+    let mut new_people: Vec<(i64, i64)> = Vec::new();
 
     if let Some(ref plot) = fields.plot {
         sqlx::query("UPDATE season SET plot = ? WHERE id = ?")
@@ -5502,6 +5648,7 @@ pub async fn apply_tmdb_season_metadata(
         sqlx::query("DELETE FROM season_cast WHERE season_id = ?").bind(season_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         for (i, c) in cast.iter().enumerate() {
             let person_id = ensure_person(&state.app_db, &c.name, c.tmdb_id).await?;
+            if let Some(tid) = c.tmdb_id { new_people.push((person_id, tid)); }
             sqlx::query("INSERT INTO season_cast (season_id, person_id, role, sort_order) VALUES (?, ?, ?, ?)")
                 .bind(season_id).bind(person_id).bind(&c.role).bind(i as i64).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         }
@@ -5511,6 +5658,7 @@ pub async fn apply_tmdb_season_metadata(
         sqlx::query("DELETE FROM season_crew WHERE season_id = ?").bind(season_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         for c in crew {
             let person_id = ensure_person(&state.app_db, &c.name, c.tmdb_id).await?;
+            if let Some(tid) = c.tmdb_id { new_people.push((person_id, tid)); }
             sqlx::query("INSERT INTO season_crew (season_id, person_id, job) VALUES (?, ?, ?)")
                 .bind(season_id).bind(person_id).bind(&c.job).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         }
@@ -5520,6 +5668,7 @@ pub async fn apply_tmdb_season_metadata(
         sqlx::query("DELETE FROM season_director WHERE season_id = ?").bind(season_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         for d in directors {
             let person_id = ensure_person(&state.app_db, &d.name, d.tmdb_id).await?;
+            if let Some(tid) = d.tmdb_id { new_people.push((person_id, tid)); }
             sqlx::query("INSERT INTO season_director (season_id, person_id) VALUES (?, ?)")
                 .bind(season_id).bind(person_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         }
@@ -5529,11 +5678,13 @@ pub async fn apply_tmdb_season_metadata(
         sqlx::query("DELETE FROM season_producer WHERE season_id = ?").bind(season_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         for p in producers {
             let person_id = ensure_person(&state.app_db, &p.name, p.tmdb_id).await?;
+            if let Some(tid) = p.tmdb_id { new_people.push((person_id, tid)); }
             sqlx::query("INSERT INTO season_producer (season_id, person_id) VALUES (?, ?)")
                 .bind(season_id).bind(person_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         }
     }
 
+    process_person_images(&state.app_db, &state.app_data_dir, new_people).await;
     Ok(())
 }
 
@@ -5554,7 +5705,7 @@ pub async fn apply_tmdb_episode_metadata(
     episode_id: i64,
     fields: TmdbEpisodeFieldSelection,
 ) -> Result<(), String> {
-    // Uses shared app_db pool
+    let mut new_people: Vec<(i64, i64)> = Vec::new();
 
     if let Some(ref plot) = fields.plot {
         sqlx::query("UPDATE episode SET plot = ? WHERE id = ?")
@@ -5573,6 +5724,7 @@ pub async fn apply_tmdb_episode_metadata(
         sqlx::query("DELETE FROM episode_cast WHERE episode_id = ?").bind(episode_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         for (i, c) in cast.iter().enumerate() {
             let person_id = ensure_person(&state.app_db, &c.name, c.tmdb_id).await?;
+            if let Some(tid) = c.tmdb_id { new_people.push((person_id, tid)); }
             sqlx::query("INSERT INTO episode_cast (episode_id, person_id, role, sort_order) VALUES (?, ?, ?, ?)")
                 .bind(episode_id).bind(person_id).bind(&c.role).bind(i as i64).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         }
@@ -5582,11 +5734,13 @@ pub async fn apply_tmdb_episode_metadata(
         sqlx::query("DELETE FROM episode_crew WHERE episode_id = ?").bind(episode_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         for c in crew {
             let person_id = ensure_person(&state.app_db, &c.name, c.tmdb_id).await?;
+            if let Some(tid) = c.tmdb_id { new_people.push((person_id, tid)); }
             sqlx::query("INSERT INTO episode_crew (episode_id, person_id, job) VALUES (?, ?, ?)")
                 .bind(episode_id).bind(person_id).bind(&c.job).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         }
     }
 
+    process_person_images(&state.app_db, &state.app_data_dir, new_people).await;
     Ok(())
 }
 
@@ -5605,7 +5759,7 @@ pub async fn apply_tmdb_season_episodes(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "No TMDB API token configured. Add one in settings.".to_string())?;
 
-    // Uses shared app_db pool
+    let mut new_people: Vec<(i64, i64)> = Vec::new();
 
     // Get local episodes for this season
     let local_episodes: Vec<(i64, Option<i64>)> = sqlx::query_as(
@@ -5661,6 +5815,7 @@ pub async fn apply_tmdb_season_episodes(
             if existing.0 == 0 {
                 for (i, gs) in tmdb_ep.guest_stars.iter().enumerate() {
                     let person_id = ensure_person(&state.app_db, &gs.name, Some(gs.id)).await?;
+                    new_people.push((person_id, gs.id));
                     sqlx::query("INSERT INTO episode_cast (episode_id, person_id, role, sort_order) VALUES (?, ?, ?, ?)")
                         .bind(local_id).bind(person_id).bind(&gs.character).bind(i as i64)
                         .execute(&state.app_db).await.map_err(|e| e.to_string())?;
@@ -5675,6 +5830,7 @@ pub async fn apply_tmdb_season_episodes(
             if existing.0 == 0 {
                 for c in &tmdb_ep.crew {
                     let person_id = ensure_person(&state.app_db, &c.name, Some(c.id)).await?;
+                    new_people.push((person_id, c.id));
                     sqlx::query("INSERT INTO episode_crew (episode_id, person_id, job) VALUES (?, ?, ?)")
                         .bind(local_id).bind(person_id).bind(&c.job)
                         .execute(&state.app_db).await.map_err(|e| e.to_string())?;
@@ -5685,5 +5841,6 @@ pub async fn apply_tmdb_season_episodes(
         applied_count += 1;
     }
 
+    process_person_images(&state.app_db, &state.app_data_dir, new_people).await;
     Ok(applied_count)
 }
