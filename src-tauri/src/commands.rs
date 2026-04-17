@@ -39,7 +39,6 @@ pub struct Library {
     pub paths: Vec<String>,
     pub format: String,
     pub portable: bool,
-    pub db_filename: String,
     pub default_sort_mode: String,
     pub managed: bool,
 }
@@ -73,6 +72,14 @@ pub struct PersonInfo {
     pub id: i64,
     pub name: String,
     pub image_path: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PersonSummary {
+    pub id: i64,
+    pub name: String,
+    pub image_path: Option<String>,
+    pub work_count: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -216,42 +223,6 @@ async fn ensure_person(pool: &SqlitePool, name: &str, tmdb_id: Option<i64>) -> R
     }
 }
 
-fn sanitize_db_filename(name: &str) -> String {
-    let sanitized: String = name
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '_' {
-                c.to_ascii_lowercase()
-            } else if c == ' ' {
-                '-'
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let trimmed = sanitized.trim_matches(|c| c == '-' || c == '_').to_string();
-    if trimmed.is_empty() {
-        "library".to_string()
-    } else {
-        trimmed
-    }
-}
-
-fn unique_db_filename(app_data_dir: &PathBuf, base: &str) -> String {
-    let candidate = format!("{}.db", base);
-    if !app_data_dir.join(&candidate).exists() {
-        return candidate;
-    }
-    let mut n = 2;
-    loop {
-        let candidate = format!("{}-{}.db", base, n);
-        if !app_data_dir.join(&candidate).exists() {
-            return candidate;
-        }
-        n += 1;
-    }
-}
-
 fn uuid_simple() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()
@@ -259,14 +230,6 @@ fn uuid_simple() -> String {
         .unwrap()
         .as_nanos();
     format!("{:x}", now)
-}
-
-fn get_library_db_path(app_data_dir: &PathBuf, lib: &Library) -> PathBuf {
-    if lib.portable {
-        PathBuf::from(&lib.paths[0]).join(".waverunner.db")
-    } else {
-        app_data_dir.join(&lib.db_filename)
-    }
 }
 
 /// Given a list of root paths and a relative folder_path, find which root contains it.
@@ -468,31 +431,6 @@ pub async fn create_library(
 
     let id = uuid_simple();
 
-    let db_filename = if portable {
-        ".waverunner.db".to_string()
-    } else {
-        let base = sanitize_db_filename(&name);
-        unique_db_filename(&state.app_data_dir, &base)
-    };
-
-    let db_path = get_library_db_path(
-        &state.app_data_dir,
-        &Library {
-            id: id.clone(),
-            name: name.clone(),
-            paths: paths.clone(),
-            format: format.clone(),
-            portable,
-            db_filename: db_filename.clone(),
-            default_sort_mode: "alpha".to_string(),
-            managed,
-        },
-    );
-
-    let pool = crate::db::create_library_pool(&db_path, &format)
-        .await
-        .map_err(|e| e.to_string())?;
-
     let cache_base = state.app_data_dir.join("cache").join(&id);
     std::fs::create_dir_all(&cache_base).map_err(|e| e.to_string())?;
 
@@ -504,45 +442,50 @@ pub async fn create_library(
         paths: paths.clone(),
         format: format.clone(),
         portable,
-        db_filename: db_filename.clone(),
         default_sort_mode: "alpha".to_string(),
         managed,
     };
 
-    // Insert with creating=1 before scanning so startup cleanup can find it
     sqlx::query(
-        "INSERT INTO libraries (id, name, paths, format, portable, db_filename, default_sort_mode, managed, creating) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)",
+        "INSERT INTO library (id, name, paths, format, portable, default_sort_mode, managed, creating) VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
     )
     .bind(&library.id)
     .bind(&library.name)
     .bind(&paths_json)
     .bind(&library.format)
     .bind(library.portable as i32)
-    .bind(&library.db_filename)
     .bind(&library.default_sort_mode)
     .bind(library.managed as i32)
     .execute(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
 
-    // Reset cancellation flag
     state.cancel_creation.store(false, Ordering::SeqCst);
     let cancel = &state.cancel_creation;
+    let pool = &state.app_db;
 
     let scan_result: Result<(), String> = async {
         match format.as_str() {
             "video" => {
-                sqlx::query("DELETE FROM media_entry").execute(&pool).await.map_err(|e| e.to_string())?;
+                sqlx::query("DELETE FROM media_entry WHERE library_id = ?")
+                    .bind(&id)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 for p in &paths {
                     let lib_path = PathBuf::from(p);
-                    scan_video_library(&app, &pool, &lib_path, &cache_base, cancel).await.map_err(|e| e.to_string())?;
+                    scan_video_library(&app, pool, &id, &lib_path, &cache_base, cancel).await.map_err(|e| e.to_string())?;
                 }
             }
             "music" => {
-                sqlx::query("DELETE FROM artist").execute(&pool).await.map_err(|e| e.to_string())?;
+                sqlx::query("DELETE FROM media_entry WHERE library_id = ?")
+                    .bind(&id)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 for p in &paths {
                     let lib_path = PathBuf::from(p);
-                    scan_music_library(&app, &pool, &lib_path, &cache_base, cancel).await.map_err(|e| e.to_string())?;
+                    scan_music_library(&app, pool, &id, &lib_path, &cache_base, cancel).await.map_err(|e| e.to_string())?;
                 }
             }
             _ => return Err(format!("Unsupported library format: {}", format)),
@@ -550,11 +493,9 @@ pub async fn create_library(
         Ok(())
     }.await;
 
-    pool.close().await;
-
     match scan_result {
         Ok(()) => {
-            sqlx::query("UPDATE libraries SET creating = 0 WHERE id = ?")
+            sqlx::query("UPDATE library SET creating = 0 WHERE id = ?")
                 .bind(&id)
                 .execute(&state.app_db)
                 .await
@@ -562,10 +503,8 @@ pub async fn create_library(
             Ok(library)
         }
         Err(e) => {
-            // Cleanup: remove DB file, cache, and libraries row
-            let _ = std::fs::remove_file(&db_path);
             delete_cache_for_library(&state.app_data_dir, &id);
-            let _ = sqlx::query("DELETE FROM libraries WHERE id = ?")
+            let _ = sqlx::query("DELETE FROM library WHERE id = ?")
                 .bind(&id)
                 .execute(&state.app_db)
                 .await;
@@ -590,23 +529,16 @@ pub async fn cleanup_incomplete_libraries(
     app_data_dir: &Path,
     app_db: &sqlx::SqlitePool,
 ) -> Result<(), String> {
-    let rows: Vec<(String, String, i32, String)> = sqlx::query_as(
-        "SELECT id, paths, portable, db_filename FROM libraries WHERE creating = 1",
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT id FROM library WHERE creating = 1",
     )
     .fetch_all(app_db)
     .await
     .map_err(|e| e.to_string())?;
 
-    for (id, paths_json, portable, db_filename) in rows {
-        let paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
-        let db_path = if portable != 0 && !paths.is_empty() {
-            PathBuf::from(&paths[0]).join(".waverunner.db")
-        } else {
-            app_data_dir.join(&db_filename)
-        };
-        let _ = std::fs::remove_file(&db_path);
+    for (id,) in rows {
         delete_cache_for_library(app_data_dir, &id);
-        let _ = sqlx::query("DELETE FROM libraries WHERE id = ?")
+        let _ = sqlx::query("DELETE FROM library WHERE id = ?")
             .bind(&id)
             .execute(app_db)
             .await;
@@ -616,8 +548,8 @@ pub async fn cleanup_incomplete_libraries(
 
 #[tauri::command]
 pub async fn get_libraries(state: tauri::State<'_, AppState>) -> Result<Vec<Library>, String> {
-    let rows: Vec<(String, String, String, String, i32, String, String, i32)> = sqlx::query_as(
-        "SELECT id, name, paths, format, portable, db_filename, default_sort_mode, managed FROM libraries WHERE creating = 0 ORDER BY name",
+    let rows: Vec<(String, String, String, String, i32, String, i32)> = sqlx::query_as(
+        "SELECT id, name, paths, format, portable, default_sort_mode, managed FROM library WHERE creating = 0 ORDER BY name",
     )
     .fetch_all(&state.app_db)
     .await
@@ -625,13 +557,12 @@ pub async fn get_libraries(state: tauri::State<'_, AppState>) -> Result<Vec<Libr
 
     Ok(rows
         .into_iter()
-        .map(|(id, name, paths_json, format, portable, db_filename, default_sort_mode, managed)| Library {
+        .map(|(id, name, paths_json, format, portable, default_sort_mode, managed)| Library {
             id,
             name,
             paths: serde_json::from_str(&paths_json).unwrap_or_default(),
             format,
             portable: portable != 0,
-            db_filename,
             default_sort_mode,
             managed: managed != 0,
         })
@@ -643,24 +574,6 @@ pub async fn delete_library(
     state: tauri::State<'_, AppState>,
     library_id: String,
 ) -> Result<(), String> {
-    let row: Option<(String, String, i32, String)> = sqlx::query_as(
-        "SELECT id, paths, portable, db_filename FROM libraries WHERE id = ?",
-    )
-    .bind(&library_id)
-    .fetch_optional(&state.app_db)
-    .await
-    .map_err(|e| e.to_string())?;
-
-    let (_, paths_json, portable, db_filename) = row.ok_or("Library not found")?;
-    let paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
-
-    let db_path = if portable != 0 {
-        PathBuf::from(&paths[0]).join(".waverunner.db")
-    } else {
-        state.app_data_dir.join(&db_filename)
-    };
-
-    // Delete cache first — if it fails (e.g. files locked), abort the whole delete
     let cache_dir = state.app_data_dir.join("cache").join(&library_id);
     if cache_dir.exists() {
         std::fs::remove_dir_all(&cache_dir).map_err(|e| {
@@ -668,17 +581,7 @@ pub async fn delete_library(
         })?;
     }
 
-    if db_path.exists() {
-        std::fs::remove_file(&db_path).map_err(|e| {
-            format!(
-                "Could not delete the database file: {} — {}",
-                db_path.display(),
-                e
-            )
-        })?;
-    }
-
-    sqlx::query("DELETE FROM libraries WHERE id = ?")
+    sqlx::query("DELETE FROM library WHERE id = ?")
         .bind(&library_id)
         .execute(&state.app_db)
         .await
@@ -692,46 +595,43 @@ pub async fn get_entries(
     state: tauri::State<'_, AppState>,
     library_id: String,
     parent_id: Option<i64>,
+    entry_type_filter: Option<String>,
 ) -> Result<EntriesResponse, String> {
-    let row: Option<(String, i32, String, String, String)> = sqlx::query_as(
-        "SELECT paths, portable, db_filename, default_sort_mode, format FROM libraries WHERE id = ?",
-    )
-    .bind(&library_id)
-    .fetch_optional(&state.app_db)
-    .await
-    .map_err(|e| e.to_string())?;
-
-    let (paths_json, portable, db_filename, default_sort_mode, format) = row.ok_or("Library not found")?;
-    let _paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
-
-    let db_path = if portable != 0 {
-        PathBuf::from(&_paths[0]).join(".waverunner.db")
-    } else {
-        state.app_data_dir.join(&db_filename)
+    // Validate entry_type_filter against the known set so we can safely interpolate it.
+    let validated_type: Option<&'static str> = match entry_type_filter.as_deref() {
+        None => None,
+        Some("movie") => Some("movie"),
+        Some("show") => Some("show"),
+        Some("collection") => Some("collection"),
+        Some(other) => return Err(format!("Invalid entry_type_filter: {}", other)),
     };
 
-    let pool = crate::db::connect_library_pool(&db_path)
-        .await
-        .map_err(|e| e.to_string())?;
+    let (format, _paths, default_sort_mode) = get_library_meta(&state.app_db, &library_id).await?;
 
-    let mut covers_map = get_all_cached_covers(&pool)
+    let mut covers_map = get_all_cached_covers(&state.app_db, &library_id)
         .await
         .map_err(|e| e.to_string())?;
 
     let result = match format.as_str() {
         "video" => {
-            let sort_mode = match parent_id {
-                Some(pid) => {
-                    let row: Option<(String,)> = sqlx::query_as(
-                        "SELECT sort_mode FROM collection WHERE id = ?",
-                    )
-                    .bind(pid)
-                    .fetch_optional(&pool)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                    row.map(|(m,)| m).unwrap_or(default_sort_mode)
+            // Type-filtered views are flat across the library, so they always use the library default sort.
+            // Otherwise the sort comes from the collection (when navigated into one) or the library default.
+            let sort_mode = if validated_type.is_some() {
+                default_sort_mode.clone()
+            } else {
+                match parent_id {
+                    Some(pid) => {
+                        let row: Option<(String,)> = sqlx::query_as(
+                            "SELECT sort_mode FROM media_collection WHERE id = ?",
+                        )
+                        .bind(pid)
+                        .fetch_optional(&state.app_db)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                        row.map(|(m,)| m).unwrap_or_else(|| default_sort_mode.clone())
+                    }
+                    None => default_sort_mode.clone(),
                 }
-                None => default_sort_mode,
             };
 
             // Subquery: all years from a collection's descendants (movies + shows' episodes), recursing through nested collections
@@ -817,23 +717,33 @@ pub async fn get_entries(
                  END as season_display \
                  FROM media_entry_full mef"
             );
-            let query_str = match parent_id {
-                Some(_) => format!("{base_query} WHERE mef.parent_id = ? {order_clause}"),
-                None => format!("{base_query} WHERE mef.parent_id IS NULL {order_clause}"),
+            // When entry_type_filter is set, return a flat list across the whole library
+            // (parent_id is intentionally ignored — "all movies" means every movie, even nested ones).
+            let where_clause: String = if let Some(t) = validated_type {
+                format!("WHERE mef.library_id = ? AND mef.entry_type = '{t}'")
+            } else if parent_id.is_some() {
+                "WHERE mef.library_id = ? AND mef.parent_id = ?".to_string()
+            } else {
+                "WHERE mef.library_id = ? AND mef.parent_id IS NULL".to_string()
             };
+            let query_str = format!("{base_query} {where_clause} {order_clause}");
 
-            let rows: Vec<(i64, String, Option<String>, Option<String>, String, Option<i64>, String, Option<String>, Option<String>, i64, Option<String>)> = match parent_id {
-                Some(pid) => {
-                    sqlx::query_as(&query_str)
-                        .bind(pid)
-                        .fetch_all(&pool)
-                        .await
-                }
-                None => {
-                    sqlx::query_as(&query_str)
-                        .fetch_all(&pool)
-                        .await
-                }
+            let rows: Vec<(i64, String, Option<String>, Option<String>, String, Option<i64>, String, Option<String>, Option<String>, i64, Option<String>)> = if validated_type.is_some() {
+                sqlx::query_as(&query_str)
+                    .bind(&library_id)
+                    .fetch_all(&state.app_db)
+                    .await
+            } else if let Some(pid) = parent_id {
+                sqlx::query_as(&query_str)
+                    .bind(&library_id)
+                    .bind(pid)
+                    .fetch_all(&state.app_db)
+                    .await
+            } else {
+                sqlx::query_as(&query_str)
+                    .bind(&library_id)
+                    .fetch_all(&state.app_db)
+                    .await
             }
             .map_err(|e| e.to_string())?;
 
@@ -877,7 +787,7 @@ pub async fn get_entries(
                         JOIN media_entry_type met ON me.entry_type_id = met.id"
                     )
                     .bind(entry.id)
-                    .fetch_optional(&pool)
+                    .fetch_optional(&state.app_db)
                     .await
                     .map_err(|e| e.to_string())?;
 
@@ -904,28 +814,31 @@ pub async fn get_entries(
         }
         "music" => {
             let order_clause = match default_sort_mode.as_str() {
-                "custom" => "ORDER BY sort_order ASC, sort_name COLLATE NOCASE ASC",
-                _ => "ORDER BY sort_name COLLATE NOCASE ASC",
+                "custom" => "ORDER BY mef.sort_order ASC, mef.sort_title COLLATE NOCASE ASC",
+                _ => "ORDER BY mef.sort_title COLLATE NOCASE ASC",
             };
 
             let query_str = format!(
-                "SELECT id, name, folder_path, selected_cover FROM artist {}",
+                "SELECT mef.id, mef.title, mef.folder_path, mef.selected_cover \
+                 FROM media_entry_full mef \
+                 WHERE mef.library_id = ? AND mef.parent_id IS NULL AND mef.entry_type = 'artist' {}",
                 order_clause
             );
 
             let rows: Vec<(i64, String, String, Option<String>)> =
                 sqlx::query_as(&query_str)
-                    .fetch_all(&pool)
+                    .bind(&library_id)
+                    .fetch_all(&state.app_db)
                     .await
                     .map_err(|e| e.to_string())?;
 
             let entries: Vec<MediaEntry> = rows
                 .into_iter()
-                .map(|(id, name, folder_path, selected_cover)| {
+                .map(|(id, title, folder_path, selected_cover)| {
                     let covers = covers_map.remove(&folder_path).unwrap_or_default();
                     MediaEntry {
                         id,
-                        title: name,
+                        title,
                         year: None,
                         end_year: None,
                         folder_path,
@@ -948,12 +861,10 @@ pub async fn get_entries(
             }
         }
         _ => {
-            pool.close().await;
             return Err(format!("Unsupported library format: {}", format));
         }
     };
 
-    pool.close().await;
     Ok(result)
 }
 
@@ -964,28 +875,9 @@ pub async fn search_entries(
     parent_id: Option<i64>,
     query: String,
 ) -> Result<Vec<MediaEntry>, String> {
-    let row: Option<(String, i32, String, String, String)> = sqlx::query_as(
-        "SELECT paths, portable, db_filename, default_sort_mode, format FROM libraries WHERE id = ?",
-    )
-    .bind(&library_id)
-    .fetch_optional(&state.app_db)
-    .await
-    .map_err(|e| e.to_string())?;
+    let (format, _paths, _default_sort_mode) = get_library_meta(&state.app_db, &library_id).await?;
 
-    let (paths_json, portable, db_filename, _default_sort_mode, format) = row.ok_or("Library not found")?;
-    let _paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
-
-    let db_path = if portable != 0 {
-        PathBuf::from(&_paths[0]).join(".waverunner.db")
-    } else {
-        state.app_data_dir.join(&db_filename)
-    };
-
-    let pool = crate::db::connect_library_pool(&db_path)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let mut covers_map = get_all_cached_covers(&pool)
+    let mut covers_map = get_all_cached_covers(&state.app_db, &library_id)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -1049,7 +941,7 @@ pub async fn search_entries(
                     END as tmdb_id, \
                     {season_display_expr} as season_display \
                     FROM media_entry_full mef \
-                    WHERE mef.id IN (SELECT id FROM descendants) AND mef.title LIKE ? \
+                    WHERE mef.library_id = ? AND mef.id IN (SELECT id FROM descendants) AND mef.title LIKE ? \
                     ORDER BY mef.sort_title COLLATE NOCASE ASC"),
                 None => format!("\
                     SELECT mef.id, mef.title, {year_expr} as year, {end_year_expr} as end_year, mef.folder_path, mef.parent_id, mef.entry_type, mef.selected_cover, \
@@ -1060,7 +952,7 @@ pub async fn search_entries(
                     END as tmdb_id, \
                     {season_display_expr} as season_display \
                     FROM media_entry_full mef \
-                    WHERE mef.title LIKE ? \
+                    WHERE mef.library_id = ? AND mef.title LIKE ? \
                     ORDER BY mef.sort_title COLLATE NOCASE ASC"),
             };
 
@@ -1068,14 +960,16 @@ pub async fn search_entries(
                 Some(pid) => {
                     sqlx::query_as(&query_str)
                         .bind(pid)
+                        .bind(&library_id)
                         .bind(&like_pattern)
-                        .fetch_all(&pool)
+                        .fetch_all(&state.app_db)
                         .await
                 }
                 None => {
                     sqlx::query_as(&query_str)
+                        .bind(&library_id)
                         .bind(&like_pattern)
-                        .fetch_all(&pool)
+                        .fetch_all(&state.app_db)
                         .await
                 }
             }
@@ -1104,7 +998,7 @@ pub async fn search_entries(
                         JOIN media_entry_type met ON me.entry_type_id = met.id"
                     )
                     .bind(entry.id)
-                    .fetch_optional(&pool)
+                    .fetch_optional(&state.app_db)
                     .await
                     .map_err(|e| e.to_string())?;
 
@@ -1128,56 +1022,37 @@ pub async fn search_entries(
         "music" => {
             let rows: Vec<(i64, String, String, Option<String>)> =
                 sqlx::query_as(
-                    "SELECT id, name, folder_path, selected_cover FROM artist WHERE name LIKE ? ORDER BY sort_name COLLATE NOCASE ASC",
+                    "SELECT mef.id, mef.title, mef.folder_path, mef.selected_cover \
+                     FROM media_entry_full mef \
+                     WHERE mef.library_id = ? AND mef.entry_type = 'artist' AND mef.title LIKE ? \
+                     ORDER BY mef.sort_title COLLATE NOCASE ASC",
                 )
+                .bind(&library_id)
                 .bind(&like_pattern)
-                .fetch_all(&pool)
+                .fetch_all(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
 
             rows.into_iter()
-                .map(|(id, name, folder_path, selected_cover)| {
+                .map(|(id, title, folder_path, selected_cover)| {
                     let covers = covers_map.remove(&folder_path).unwrap_or_default();
-                    MediaEntry { id, title: name, year: None, end_year: None, folder_path, parent_id: None, entry_type: "artist".to_string(), covers, selected_cover, child_count: 0, season_display: None, collection_display: None, tmdb_id: None }
+                    MediaEntry { id, title, year: None, end_year: None, folder_path, parent_id: None, entry_type: "artist".to_string(), covers, selected_cover, child_count: 0, season_display: None, collection_display: None, tmdb_id: None }
                 })
                 .collect()
         }
         _ => {
-            pool.close().await;
             return Err(format!("Unsupported library format: {}", format));
         }
     };
 
-    pool.close().await;
     Ok(entries)
 }
 
 #[tauri::command]
 pub async fn get_movie_detail(
     state: tauri::State<'_, AppState>,
-    library_id: String,
     entry_id: i64,
 ) -> Result<MovieDetail, String> {
-    let row: Option<(String, i32, String)> = sqlx::query_as(
-        "SELECT paths, portable, db_filename FROM libraries WHERE id = ?",
-    )
-    .bind(&library_id)
-    .fetch_optional(&state.app_db)
-    .await
-    .map_err(|e| e.to_string())?;
-
-    let (paths_json, portable, db_filename) = row.ok_or("Library not found")?;
-    let _paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
-
-    let db_path = if portable != 0 {
-        PathBuf::from(&_paths[0]).join(".waverunner.db")
-    } else {
-        state.app_data_dir.join(&db_filename)
-    };
-
-    let pool = crate::db::connect_library_pool(&db_path)
-        .await
-        .map_err(|e| e.to_string())?;
 
     // Movie scalar fields
     let movie_row: Option<(i64, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<i64>, Option<i64>)> =
@@ -1185,7 +1060,7 @@ pub async fn get_movie_detail(
             "SELECT id, tmdb_id, imdb_id, rotten_tomatoes_id, release_date, plot, tagline, runtime, maturity_rating_id FROM movie WHERE id = ?",
         )
         .bind(entry_id)
-        .fetch_optional(&pool)
+        .fetch_optional(&state.app_db)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -1196,7 +1071,7 @@ pub async fn get_movie_detail(
     let maturity_rating: Option<String> = if let Some(mr_id) = maturity_rating_id {
         let mr_row: Option<(String,)> = sqlx::query_as("SELECT name FROM maturity_rating WHERE id = ?")
             .bind(mr_id)
-            .fetch_optional(&pool)
+            .fetch_optional(&state.app_db)
             .await
             .map_err(|e| e.to_string())?;
         mr_row.map(|(name,)| name)
@@ -1209,7 +1084,7 @@ pub async fn get_movie_detail(
         "SELECT g.name FROM movie_genre mg JOIN genre g ON mg.genre_id = g.id WHERE mg.movie_id = ? ORDER BY g.name",
     )
     .bind(entry_id)
-    .fetch_all(&pool)
+    .fetch_all(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
     let genres: Vec<String> = genre_rows.into_iter().map(|(n,)| n).collect();
@@ -1219,7 +1094,7 @@ pub async fn get_movie_detail(
         "SELECT p.id, p.name, p.image_path FROM movie_director md JOIN person p ON md.person_id = p.id WHERE md.movie_id = ? ORDER BY p.name",
     )
     .bind(entry_id)
-    .fetch_all(&pool)
+    .fetch_all(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
     let directors: Vec<PersonInfo> = director_rows.into_iter().map(|(id, name, image_path)| PersonInfo { id, name, image_path }).collect();
@@ -1229,7 +1104,7 @@ pub async fn get_movie_detail(
         "SELECT p.id, p.name, p.image_path, mc.role FROM movie_cast mc JOIN person p ON mc.person_id = p.id WHERE mc.movie_id = ? ORDER BY mc.sort_order",
     )
     .bind(entry_id)
-    .fetch_all(&pool)
+    .fetch_all(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
     let cast: Vec<CastInfo> = cast_rows.into_iter().map(|(id, name, image_path, role)| CastInfo { id, name, image_path, role }).collect();
@@ -1239,7 +1114,7 @@ pub async fn get_movie_detail(
         "SELECT p.id, p.name, p.image_path, mc.job FROM movie_crew mc JOIN person p ON mc.person_id = p.id WHERE mc.movie_id = ? ORDER BY p.name",
     )
     .bind(entry_id)
-    .fetch_all(&pool)
+    .fetch_all(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
     let crew: Vec<CrewInfo> = crew_rows.into_iter().map(|(id, name, image_path, job)| CrewInfo { id, name, image_path, job }).collect();
@@ -1249,7 +1124,7 @@ pub async fn get_movie_detail(
         "SELECT p.id, p.name, p.image_path FROM movie_producer mp JOIN person p ON mp.person_id = p.id WHERE mp.movie_id = ? ORDER BY p.name",
     )
     .bind(entry_id)
-    .fetch_all(&pool)
+    .fetch_all(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
     let producers: Vec<PersonInfo> = producer_rows.into_iter().map(|(id, name, image_path)| PersonInfo { id, name, image_path }).collect();
@@ -1259,7 +1134,7 @@ pub async fn get_movie_detail(
         "SELECT s.name FROM movie_studio ms JOIN studio s ON ms.studio_id = s.id WHERE ms.movie_id = ? ORDER BY s.name",
     )
     .bind(entry_id)
-    .fetch_all(&pool)
+    .fetch_all(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
     let studios: Vec<String> = studio_rows.into_iter().map(|(n,)| n).collect();
@@ -1269,12 +1144,11 @@ pub async fn get_movie_detail(
         "SELECT k.name FROM movie_keyword mk JOIN keyword k ON mk.keyword_id = k.id WHERE mk.movie_id = ? ORDER BY k.name",
     )
     .bind(entry_id)
-    .fetch_all(&pool)
+    .fetch_all(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
     let keywords: Vec<String> = keyword_rows.into_iter().map(|(n,)| n).collect();
 
-    pool.close().await;
 
     Ok(MovieDetail {
         id,
@@ -1299,31 +1173,9 @@ pub async fn get_movie_detail(
 #[tauri::command]
 pub async fn update_movie_detail(
     state: tauri::State<'_, AppState>,
-    library_id: String,
     entry_id: i64,
     detail: MovieDetailUpdate,
 ) -> Result<(), String> {
-    let row: Option<(String, i32, String)> = sqlx::query_as(
-        "SELECT paths, portable, db_filename FROM libraries WHERE id = ?",
-    )
-    .bind(&library_id)
-    .fetch_optional(&state.app_db)
-    .await
-    .map_err(|e| e.to_string())?;
-
-    let (paths_json, portable, db_filename) = row.ok_or("Library not found")?;
-    let _paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
-
-    let db_path = if portable != 0 {
-        PathBuf::from(&_paths[0]).join(".waverunner.db")
-    } else {
-        state.app_data_dir.join(&db_filename)
-    };
-
-    let pool = crate::db::connect_library_pool(&db_path)
-        .await
-        .map_err(|e| e.to_string())?;
-
     // Update movie title/year if provided
     if let Some(ref title) = detail.title {
         let sort_title = generate_sort_title(title, "en");
@@ -1331,7 +1183,7 @@ pub async fn update_movie_detail(
             .bind(title)
             .bind(&sort_title)
             .bind(entry_id)
-            .execute(&pool)
+            .execute(&state.app_db)
             .await
             .map_err(|e| e.to_string())?;
     }
@@ -1340,7 +1192,7 @@ pub async fn update_movie_detail(
         sqlx::query("UPDATE movie SET release_date = ? WHERE id = ?")
             .bind(val)
             .bind(entry_id)
-            .execute(&pool)
+            .execute(&state.app_db)
             .await
             .map_err(|e| e.to_string())?;
     }
@@ -1358,7 +1210,7 @@ pub async fn update_movie_detail(
     .bind(&detail.tagline)
     .bind(&detail.runtime)
     .bind(entry_id)
-    .execute(&pool)
+    .execute(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
 
@@ -1367,19 +1219,19 @@ pub async fn update_movie_detail(
         if mr_name.is_empty() {
             sqlx::query("UPDATE movie SET maturity_rating_id = NULL WHERE id = ?")
                 .bind(entry_id)
-                .execute(&pool)
+                .execute(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
         } else {
             sqlx::query("INSERT OR IGNORE INTO maturity_rating (name) VALUES (?)")
                 .bind(mr_name)
-                .execute(&pool)
+                .execute(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
             sqlx::query("UPDATE movie SET maturity_rating_id = (SELECT id FROM maturity_rating WHERE name = ?) WHERE id = ?")
                 .bind(mr_name)
                 .bind(entry_id)
-                .execute(&pool)
+                .execute(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
         }
@@ -1389,19 +1241,19 @@ pub async fn update_movie_detail(
     if let Some(ref genres) = detail.genres {
         sqlx::query("DELETE FROM movie_genre WHERE movie_id = ?")
             .bind(entry_id)
-            .execute(&pool)
+            .execute(&state.app_db)
             .await
             .map_err(|e| e.to_string())?;
         for genre_name in genres {
             sqlx::query("INSERT OR IGNORE INTO genre (name) VALUES (?)")
                 .bind(genre_name)
-                .execute(&pool)
+                .execute(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
             sqlx::query("INSERT INTO movie_genre (movie_id, genre_id) VALUES (?, (SELECT id FROM genre WHERE name = ?))")
                 .bind(entry_id)
                 .bind(genre_name)
-                .execute(&pool)
+                .execute(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
         }
@@ -1411,19 +1263,19 @@ pub async fn update_movie_detail(
     if let Some(ref directors) = detail.directors {
         sqlx::query("DELETE FROM movie_director WHERE movie_id = ?")
             .bind(entry_id)
-            .execute(&pool)
+            .execute(&state.app_db)
             .await
             .map_err(|e| e.to_string())?;
         for name in directors {
             sqlx::query("INSERT OR IGNORE INTO person (name) VALUES (?)")
                 .bind(name)
-                .execute(&pool)
+                .execute(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
             sqlx::query("INSERT INTO movie_director (movie_id, person_id) VALUES (?, (SELECT id FROM person WHERE name = ?))")
                 .bind(entry_id)
                 .bind(name)
-                .execute(&pool)
+                .execute(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
         }
@@ -1433,13 +1285,13 @@ pub async fn update_movie_detail(
     if let Some(ref cast) = detail.cast {
         sqlx::query("DELETE FROM movie_cast WHERE movie_id = ?")
             .bind(entry_id)
-            .execute(&pool)
+            .execute(&state.app_db)
             .await
             .map_err(|e| e.to_string())?;
         for (i, c) in cast.iter().enumerate() {
             sqlx::query("INSERT OR IGNORE INTO person (name) VALUES (?)")
                 .bind(&c.name)
-                .execute(&pool)
+                .execute(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
             sqlx::query("INSERT INTO movie_cast (movie_id, person_id, role, sort_order) VALUES (?, (SELECT id FROM person WHERE name = ?), ?, ?)")
@@ -1447,7 +1299,7 @@ pub async fn update_movie_detail(
                 .bind(&c.name)
                 .bind(&c.role)
                 .bind(i as i64)
-                .execute(&pool)
+                .execute(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
         }
@@ -1457,20 +1309,20 @@ pub async fn update_movie_detail(
     if let Some(ref crew) = detail.crew {
         sqlx::query("DELETE FROM movie_crew WHERE movie_id = ?")
             .bind(entry_id)
-            .execute(&pool)
+            .execute(&state.app_db)
             .await
             .map_err(|e| e.to_string())?;
         for c in crew {
             sqlx::query("INSERT OR IGNORE INTO person (name) VALUES (?)")
                 .bind(&c.name)
-                .execute(&pool)
+                .execute(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
             sqlx::query("INSERT INTO movie_crew (movie_id, person_id, job) VALUES (?, (SELECT id FROM person WHERE name = ?), ?)")
                 .bind(entry_id)
                 .bind(&c.name)
                 .bind(&c.job)
-                .execute(&pool)
+                .execute(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
         }
@@ -1480,19 +1332,19 @@ pub async fn update_movie_detail(
     if let Some(ref producers) = detail.producers {
         sqlx::query("DELETE FROM movie_producer WHERE movie_id = ?")
             .bind(entry_id)
-            .execute(&pool)
+            .execute(&state.app_db)
             .await
             .map_err(|e| e.to_string())?;
         for name in producers {
             sqlx::query("INSERT OR IGNORE INTO person (name) VALUES (?)")
                 .bind(name)
-                .execute(&pool)
+                .execute(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
             sqlx::query("INSERT INTO movie_producer (movie_id, person_id) VALUES (?, (SELECT id FROM person WHERE name = ?))")
                 .bind(entry_id)
                 .bind(name)
-                .execute(&pool)
+                .execute(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
         }
@@ -1502,19 +1354,19 @@ pub async fn update_movie_detail(
     if let Some(ref studios) = detail.studios {
         sqlx::query("DELETE FROM movie_studio WHERE movie_id = ?")
             .bind(entry_id)
-            .execute(&pool)
+            .execute(&state.app_db)
             .await
             .map_err(|e| e.to_string())?;
         for name in studios {
             sqlx::query("INSERT OR IGNORE INTO studio (name) VALUES (?)")
                 .bind(name)
-                .execute(&pool)
+                .execute(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
             sqlx::query("INSERT INTO movie_studio (movie_id, studio_id) VALUES (?, (SELECT id FROM studio WHERE name = ?))")
                 .bind(entry_id)
                 .bind(name)
-                .execute(&pool)
+                .execute(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
         }
@@ -1524,25 +1376,24 @@ pub async fn update_movie_detail(
     if let Some(ref keywords) = detail.keywords {
         sqlx::query("DELETE FROM movie_keyword WHERE movie_id = ?")
             .bind(entry_id)
-            .execute(&pool)
+            .execute(&state.app_db)
             .await
             .map_err(|e| e.to_string())?;
         for name in keywords {
             sqlx::query("INSERT OR IGNORE INTO keyword (name) VALUES (?)")
                 .bind(name)
-                .execute(&pool)
+                .execute(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
             sqlx::query("INSERT INTO movie_keyword (movie_id, keyword_id) VALUES (?, (SELECT id FROM keyword WHERE name = ?))")
                 .bind(entry_id)
                 .bind(name)
-                .execute(&pool)
+                .execute(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
         }
     }
 
-    pool.close().await;
     Ok(())
 }
 
@@ -1612,37 +1463,15 @@ pub struct TmdbFieldSelection {
 #[tauri::command]
 pub async fn apply_tmdb_metadata(
     state: tauri::State<'_, AppState>,
-    library_id: String,
     entry_id: i64,
     fields: TmdbFieldSelection,
 ) -> Result<(), String> {
-    let row: Option<(String, i32, String)> = sqlx::query_as(
-        "SELECT paths, portable, db_filename FROM libraries WHERE id = ?",
-    )
-    .bind(&library_id)
-    .fetch_optional(&state.app_db)
-    .await
-    .map_err(|e| e.to_string())?;
-
-    let (paths_json, portable, db_filename) = row.ok_or("Library not found")?;
-    let paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
-
-    let db_path = if portable != 0 {
-        PathBuf::from(&paths[0]).join(".waverunner.db")
-    } else {
-        state.app_data_dir.join(&db_filename)
-    };
-
-    let pool = crate::db::connect_library_pool(&db_path)
-        .await
-        .map_err(|e| e.to_string())?;
-
     // Scalar fields on movie table — only write if provided (Some)
     if let Some(ref tmdb_id) = fields.tmdb_id {
         sqlx::query("UPDATE movie SET tmdb_id = ? WHERE id = ?")
             .bind(tmdb_id)
             .bind(entry_id)
-            .execute(&pool)
+            .execute(&state.app_db)
             .await
             .map_err(|e| e.to_string())?;
     }
@@ -1650,7 +1479,7 @@ pub async fn apply_tmdb_metadata(
         sqlx::query("UPDATE movie SET imdb_id = ? WHERE id = ?")
             .bind(imdb_id)
             .bind(entry_id)
-            .execute(&pool)
+            .execute(&state.app_db)
             .await
             .map_err(|e| e.to_string())?;
     }
@@ -1658,7 +1487,7 @@ pub async fn apply_tmdb_metadata(
         sqlx::query("UPDATE movie SET plot = ? WHERE id = ?")
             .bind(plot)
             .bind(entry_id)
-            .execute(&pool)
+            .execute(&state.app_db)
             .await
             .map_err(|e| e.to_string())?;
     }
@@ -1666,7 +1495,7 @@ pub async fn apply_tmdb_metadata(
         sqlx::query("UPDATE movie SET tagline = ? WHERE id = ?")
             .bind(tagline)
             .bind(entry_id)
-            .execute(&pool)
+            .execute(&state.app_db)
             .await
             .map_err(|e| e.to_string())?;
     }
@@ -1674,7 +1503,7 @@ pub async fn apply_tmdb_metadata(
         sqlx::query("UPDATE movie SET runtime = ? WHERE id = ?")
             .bind(runtime)
             .bind(entry_id)
-            .execute(&pool)
+            .execute(&state.app_db)
             .await
             .map_err(|e| e.to_string())?;
     }
@@ -1685,7 +1514,7 @@ pub async fn apply_tmdb_metadata(
         sqlx::query("UPDATE movie SET release_date = ? WHERE id = ?")
             .bind(val)
             .bind(entry_id)
-            .execute(&pool)
+            .execute(&state.app_db)
             .await
             .map_err(|e| e.to_string())?;
     }
@@ -1695,19 +1524,19 @@ pub async fn apply_tmdb_metadata(
         if mr_name.is_empty() {
             sqlx::query("UPDATE movie SET maturity_rating_id = NULL WHERE id = ?")
                 .bind(entry_id)
-                .execute(&pool)
+                .execute(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
         } else {
             sqlx::query("INSERT OR IGNORE INTO maturity_rating (name) VALUES (?)")
                 .bind(mr_name)
-                .execute(&pool)
+                .execute(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
             sqlx::query("UPDATE movie SET maturity_rating_id = (SELECT id FROM maturity_rating WHERE name = ?) WHERE id = ?")
                 .bind(mr_name)
                 .bind(entry_id)
-                .execute(&pool)
+                .execute(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
         }
@@ -1717,19 +1546,19 @@ pub async fn apply_tmdb_metadata(
     if let Some(ref genres) = fields.genres {
         sqlx::query("DELETE FROM movie_genre WHERE movie_id = ?")
             .bind(entry_id)
-            .execute(&pool)
+            .execute(&state.app_db)
             .await
             .map_err(|e| e.to_string())?;
         for name in genres {
             sqlx::query("INSERT OR IGNORE INTO genre (name) VALUES (?)")
                 .bind(name)
-                .execute(&pool)
+                .execute(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
             sqlx::query("INSERT INTO movie_genre (movie_id, genre_id) VALUES (?, (SELECT id FROM genre WHERE name = ?))")
                 .bind(entry_id)
                 .bind(name)
-                .execute(&pool)
+                .execute(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
         }
@@ -1738,15 +1567,15 @@ pub async fn apply_tmdb_metadata(
     if let Some(ref directors) = fields.directors {
         sqlx::query("DELETE FROM movie_director WHERE movie_id = ?")
             .bind(entry_id)
-            .execute(&pool)
+            .execute(&state.app_db)
             .await
             .map_err(|e| e.to_string())?;
         for d in directors {
-            let person_id = ensure_person(&pool, &d.name, d.tmdb_id).await?;
+            let person_id = ensure_person(&state.app_db, &d.name, d.tmdb_id).await?;
             sqlx::query("INSERT INTO movie_director (movie_id, person_id) VALUES (?, ?)")
                 .bind(entry_id)
                 .bind(person_id)
-                .execute(&pool)
+                .execute(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
         }
@@ -1755,17 +1584,17 @@ pub async fn apply_tmdb_metadata(
     if let Some(ref cast) = fields.cast {
         sqlx::query("DELETE FROM movie_cast WHERE movie_id = ?")
             .bind(entry_id)
-            .execute(&pool)
+            .execute(&state.app_db)
             .await
             .map_err(|e| e.to_string())?;
         for (i, c) in cast.iter().enumerate() {
-            let person_id = ensure_person(&pool, &c.name, c.tmdb_id).await?;
+            let person_id = ensure_person(&state.app_db, &c.name, c.tmdb_id).await?;
             sqlx::query("INSERT INTO movie_cast (movie_id, person_id, role, sort_order) VALUES (?, ?, ?, ?)")
                 .bind(entry_id)
                 .bind(person_id)
                 .bind(&c.role)
                 .bind(i as i64)
-                .execute(&pool)
+                .execute(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
         }
@@ -1774,16 +1603,16 @@ pub async fn apply_tmdb_metadata(
     if let Some(ref crew) = fields.crew {
         sqlx::query("DELETE FROM movie_crew WHERE movie_id = ?")
             .bind(entry_id)
-            .execute(&pool)
+            .execute(&state.app_db)
             .await
             .map_err(|e| e.to_string())?;
         for c in crew {
-            let person_id = ensure_person(&pool, &c.name, c.tmdb_id).await?;
+            let person_id = ensure_person(&state.app_db, &c.name, c.tmdb_id).await?;
             sqlx::query("INSERT INTO movie_crew (movie_id, person_id, job) VALUES (?, ?, ?)")
                 .bind(entry_id)
                 .bind(person_id)
                 .bind(&c.job)
-                .execute(&pool)
+                .execute(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
         }
@@ -1792,15 +1621,15 @@ pub async fn apply_tmdb_metadata(
     if let Some(ref producers) = fields.producers {
         sqlx::query("DELETE FROM movie_producer WHERE movie_id = ?")
             .bind(entry_id)
-            .execute(&pool)
+            .execute(&state.app_db)
             .await
             .map_err(|e| e.to_string())?;
         for p in producers {
-            let person_id = ensure_person(&pool, &p.name, p.tmdb_id).await?;
+            let person_id = ensure_person(&state.app_db, &p.name, p.tmdb_id).await?;
             sqlx::query("INSERT INTO movie_producer (movie_id, person_id) VALUES (?, ?)")
                 .bind(entry_id)
                 .bind(person_id)
-                .execute(&pool)
+                .execute(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
         }
@@ -1809,19 +1638,19 @@ pub async fn apply_tmdb_metadata(
     if let Some(ref studios) = fields.studios {
         sqlx::query("DELETE FROM movie_studio WHERE movie_id = ?")
             .bind(entry_id)
-            .execute(&pool)
+            .execute(&state.app_db)
             .await
             .map_err(|e| e.to_string())?;
         for name in studios {
             sqlx::query("INSERT OR IGNORE INTO studio (name) VALUES (?)")
                 .bind(name)
-                .execute(&pool)
+                .execute(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
             sqlx::query("INSERT INTO movie_studio (movie_id, studio_id) VALUES (?, (SELECT id FROM studio WHERE name = ?))")
                 .bind(entry_id)
                 .bind(name)
-                .execute(&pool)
+                .execute(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
         }
@@ -1830,25 +1659,24 @@ pub async fn apply_tmdb_metadata(
     if let Some(ref keywords) = fields.keywords {
         sqlx::query("DELETE FROM movie_keyword WHERE movie_id = ?")
             .bind(entry_id)
-            .execute(&pool)
+            .execute(&state.app_db)
             .await
             .map_err(|e| e.to_string())?;
         for name in keywords {
             sqlx::query("INSERT OR IGNORE INTO keyword (name) VALUES (?)")
                 .bind(name)
-                .execute(&pool)
+                .execute(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
             sqlx::query("INSERT INTO movie_keyword (movie_id, keyword_id) VALUES (?, (SELECT id FROM keyword WHERE name = ?))")
                 .bind(entry_id)
                 .bind(name)
-                .execute(&pool)
+                .execute(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
         }
     }
 
-    pool.close().await;
     Ok(())
 }
 
@@ -1866,33 +1694,14 @@ pub async fn download_tmdb_images(
     entry_id: i64,
     images: Vec<TmdbImageDownload>,
 ) -> Result<(), String> {
-    let row: Option<(String, i32, String)> = sqlx::query_as(
-        "SELECT paths, portable, db_filename FROM libraries WHERE id = ?",
-    )
-    .bind(&library_id)
-    .fetch_optional(&state.app_db)
-    .await
-    .map_err(|e| e.to_string())?;
-
-    let (paths_json, portable, db_filename) = row.ok_or("Library not found")?;
-    let lib_paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
-
-    let db_path = if portable != 0 {
-        PathBuf::from(&lib_paths[0]).join(".waverunner.db")
-    } else {
-        state.app_data_dir.join(&db_filename)
-    };
-
-    let pool = crate::db::connect_library_pool(&db_path)
-        .await
-        .map_err(|e| e.to_string())?;
+    let lib_paths = get_library_paths(&state.app_db, &library_id).await?;
 
     // Get entry folder_path from view
     let entry_row: Option<(String,)> = sqlx::query_as(
         "SELECT folder_path FROM media_entry_full WHERE id = ?",
     )
     .bind(entry_id)
-    .fetch_optional(&pool)
+    .fetch_optional(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
 
@@ -1948,18 +1757,17 @@ pub async fn download_tmdb_images(
 
     if downloaded_covers {
         sync_cached_images_for_entry(
-            &pool, &cache_base, &library_base, &folder_path, "covers", "cover",
+            &state.app_db, &library_id, &cache_base, &library_base, &folder_path, "covers", "cover",
         )
         .await?;
     }
     if downloaded_backgrounds {
         sync_cached_images_for_entry(
-            &pool, &cache_base, &library_base, &folder_path, "backgrounds", "background",
+            &state.app_db, &library_id, &cache_base, &library_base, &folder_path, "backgrounds", "background",
         )
         .await?;
     }
 
-    pool.close().await;
     Ok(())
 }
 
@@ -1970,32 +1778,13 @@ pub async fn add_cover(
     entry_id: i64,
     source_path: String,
 ) -> Result<String, String> {
-    let row: Option<(String, i32, String)> = sqlx::query_as(
-        "SELECT paths, portable, db_filename FROM libraries WHERE id = ?",
-    )
-    .bind(&library_id)
-    .fetch_optional(&state.app_db)
-    .await
-    .map_err(|e| e.to_string())?;
-
-    let (paths_json, portable, db_filename) = row.ok_or("Library not found")?;
-    let lib_paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
-
-    let db_path = if portable != 0 {
-        PathBuf::from(&lib_paths[0]).join(".waverunner.db")
-    } else {
-        state.app_data_dir.join(&db_filename)
-    };
-
-    let pool = crate::db::connect_library_pool(&db_path)
-        .await
-        .map_err(|e| e.to_string())?;
+    let lib_paths = get_library_paths(&state.app_db, &library_id).await?;
 
     let entry_row: Option<(String,)> = sqlx::query_as(
         "SELECT folder_path FROM media_entry_full WHERE id = ?",
     )
     .bind(entry_id)
-    .fetch_optional(&pool)
+    .fetch_optional(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
 
@@ -2030,20 +1819,20 @@ pub async fn add_cover(
 
     let cache_base = state.app_data_dir.join("cache").join(&library_id);
     sync_cached_images_for_entry(
-        &pool, &cache_base, &library_base, &folder_path, "covers", "cover",
+        &state.app_db, &library_id, &cache_base, &library_base, &folder_path, "covers", "cover",
     )
     .await?;
 
     let cached_path: Option<(String,)> = sqlx::query_as(
-        "SELECT cached_path FROM cached_images WHERE entry_folder_path = ? AND image_type = 'cover' AND source_filename = ?",
+        "SELECT cached_path FROM cached_images WHERE library_id = ? AND entry_folder_path = ? AND image_type = 'cover' AND source_filename = ?",
     )
+    .bind(&library_id)
     .bind(&folder_path)
     .bind(&target_name)
-    .fetch_optional(&pool)
+    .fetch_optional(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
 
-    pool.close().await;
 
     cached_path
         .map(|(p,)| p)
@@ -2057,43 +1846,26 @@ pub async fn delete_cover(
     entry_id: i64,
     cover_path: String,
 ) -> Result<Option<String>, String> {
-    let row: Option<(String, i32, String, String)> = sqlx::query_as(
-        "SELECT paths, portable, db_filename, format FROM libraries WHERE id = ?",
-    )
-    .bind(&library_id)
-    .fetch_optional(&state.app_db)
-    .await
-    .map_err(|e| e.to_string())?;
-
-    let (paths_json, portable, db_filename, format) = row.ok_or("Library not found")?;
-    let lib_paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
-
-    let db_path = if portable != 0 {
-        PathBuf::from(&lib_paths[0]).join(".waverunner.db")
-    } else {
-        state.app_data_dir.join(&db_filename)
-    };
-
-    let pool = crate::db::connect_library_pool(&db_path)
-        .await
-        .map_err(|e| e.to_string())?;
+    let (format, _paths, _default_sort_mode) = get_library_meta(&state.app_db, &library_id).await?;
+    let lib_paths = _paths;
 
     let entry_row: Option<(String,)> = sqlx::query_as(
         "SELECT folder_path FROM media_entry_full WHERE id = ?",
     )
     .bind(entry_id)
-    .fetch_optional(&pool)
+    .fetch_optional(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
 
     let (folder_path,) = entry_row.ok_or("Entry not found")?;
 
     let source_row: Option<(String,)> = sqlx::query_as(
-        "SELECT source_filename FROM cached_images WHERE entry_folder_path = ? AND image_type = 'cover' AND cached_path = ?",
+        "SELECT source_filename FROM cached_images WHERE library_id = ? AND entry_folder_path = ? AND image_type = 'cover' AND cached_path = ?",
     )
+    .bind(&library_id)
     .bind(&folder_path)
     .bind(&cover_path)
-    .fetch_optional(&pool)
+    .fetch_optional(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
 
@@ -2111,7 +1883,7 @@ pub async fn delete_cover(
 
     let cache_base = state.app_data_dir.join("cache").join(&library_id);
     sync_cached_images_for_entry(
-        &pool, &cache_base, &library_base, &folder_path, "covers", "cover",
+        &state.app_db, &library_id, &cache_base, &library_base, &folder_path, "covers", "cover",
     )
     .await?;
 
@@ -2119,11 +1891,11 @@ pub async fn delete_cover(
     let current_selected: Option<String> = match format.as_str() {
         "video" => {
             let mut found: Option<Option<String>> = None;
-            for table in ["movie", "show", "collection"] {
+            for table in ["movie", "show", "media_collection"] {
                 let q = format!("SELECT selected_cover FROM {} WHERE id = ?", table);
                 let r: Option<(Option<String>,)> = sqlx::query_as(&q)
                     .bind(entry_id)
-                    .fetch_optional(&pool)
+                    .fetch_optional(&state.app_db)
                     .await
                     .map_err(|e| e.to_string())?;
                 if let Some((v,)) = r {
@@ -2138,22 +1910,22 @@ pub async fn delete_cover(
                 "SELECT selected_cover FROM artist WHERE id = ?",
             )
             .bind(entry_id)
-            .fetch_optional(&pool)
+            .fetch_optional(&state.app_db)
             .await
             .map_err(|e| e.to_string())?;
             r.and_then(|(v,)| v)
         }
         _ => {
-            pool.close().await;
             return Err(format!("Unsupported library format: {}", format));
         }
     };
     let new_selected: Option<String> = if current_selected.as_deref() == Some(cover_path.as_str()) {
         let remaining: Option<(String,)> = sqlx::query_as(
-            "SELECT cached_path FROM cached_images WHERE entry_folder_path = ? AND image_type = 'cover' LIMIT 1",
+            "SELECT cached_path FROM cached_images WHERE library_id = ? AND entry_folder_path = ? AND image_type = 'cover' LIMIT 1",
         )
+        .bind(&library_id)
         .bind(&folder_path)
-        .fetch_optional(&pool)
+        .fetch_optional(&state.app_db)
         .await
         .map_err(|e| e.to_string())?;
         let new_val = remaining.map(|(p,)| p);
@@ -2161,22 +1933,21 @@ pub async fn delete_cover(
         match format.as_str() {
             "video" => {
                 sqlx::query("UPDATE movie SET selected_cover = ? WHERE id = ?")
-                    .bind(&new_val).bind(entry_id).execute(&pool).await.map_err(|e| e.to_string())?;
+                    .bind(&new_val).bind(entry_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
                 sqlx::query("UPDATE show SET selected_cover = ? WHERE id = ?")
-                    .bind(&new_val).bind(entry_id).execute(&pool).await.map_err(|e| e.to_string())?;
-                sqlx::query("UPDATE collection SET selected_cover = ? WHERE id = ?")
-                    .bind(&new_val).bind(entry_id).execute(&pool).await.map_err(|e| e.to_string())?;
+                    .bind(&new_val).bind(entry_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
+                sqlx::query("UPDATE media_collection SET selected_cover = ? WHERE id = ?")
+                    .bind(&new_val).bind(entry_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
             }
             "music" => {
                 sqlx::query("UPDATE artist SET selected_cover = ? WHERE id = ?")
                     .bind(&new_val)
                     .bind(entry_id)
-                    .execute(&pool)
+                    .execute(&state.app_db)
                     .await
                     .map_err(|e| e.to_string())?;
             }
             _ => {
-                pool.close().await;
                 return Err(format!("Unsupported library format: {}", format));
             }
         }
@@ -2185,7 +1956,6 @@ pub async fn delete_cover(
         current_selected
     };
 
-    pool.close().await;
     Ok(new_selected)
 }
 
@@ -2219,37 +1989,16 @@ pub struct ShowEpisodeFlat {
 #[tauri::command]
 pub async fn get_show_seasons(
     state: tauri::State<'_, AppState>,
-    library_id: String,
     show_id: i64,
 ) -> Result<Vec<SeasonInfo>, String> {
-    let row: Option<(String, i32, String)> = sqlx::query_as(
-        "SELECT paths, portable, db_filename FROM libraries WHERE id = ?",
-    )
-    .bind(&library_id)
-    .fetch_optional(&state.app_db)
-    .await
-    .map_err(|e| e.to_string())?;
-
-    let (paths_json, portable, db_filename) = row.ok_or("Library not found")?;
-    let paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
-
-    let db_path = if portable != 0 {
-        PathBuf::from(&paths[0]).join(".waverunner.db")
-    } else {
-        state.app_data_dir.join(&db_filename)
-    };
-
-    let pool = crate::db::connect_library_pool(&db_path).await.map_err(|e| e.to_string())?;
-
     let rows: Vec<(i64, String, Option<i64>, i64)> = sqlx::query_as(
         "SELECT id, title, season_number, sort_order FROM season WHERE show_id = ? ORDER BY sort_order",
     )
     .bind(show_id)
-    .fetch_all(&pool)
+    .fetch_all(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
 
-    pool.close().await;
 
     Ok(rows
         .into_iter()
@@ -2265,37 +2014,16 @@ pub async fn get_show_seasons(
 #[tauri::command]
 pub async fn get_season_episodes(
     state: tauri::State<'_, AppState>,
-    library_id: String,
     season_id: i64,
 ) -> Result<Vec<EpisodeInfo>, String> {
-    let row: Option<(String, i32, String)> = sqlx::query_as(
-        "SELECT paths, portable, db_filename FROM libraries WHERE id = ?",
-    )
-    .bind(&library_id)
-    .fetch_optional(&state.app_db)
-    .await
-    .map_err(|e| e.to_string())?;
-
-    let (paths_json, portable, db_filename) = row.ok_or("Library not found")?;
-    let paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
-
-    let db_path = if portable != 0 {
-        PathBuf::from(&paths[0]).join(".waverunner.db")
-    } else {
-        state.app_data_dir.join(&db_filename)
-    };
-
-    let pool = crate::db::connect_library_pool(&db_path).await.map_err(|e| e.to_string())?;
-
     let rows: Vec<(i64, String, Option<i64>, String, i64)> = sqlx::query_as(
         "SELECT id, title, episode_number, file_path, sort_order FROM episode WHERE season_id = ? ORDER BY sort_order",
     )
     .bind(season_id)
-    .fetch_all(&pool)
+    .fetch_all(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
 
-    pool.close().await;
 
     Ok(rows
         .into_iter()
@@ -2312,28 +2040,8 @@ pub async fn get_season_episodes(
 #[tauri::command]
 pub async fn get_show_episodes(
     state: tauri::State<'_, AppState>,
-    library_id: String,
     show_id: i64,
 ) -> Result<Vec<ShowEpisodeFlat>, String> {
-    let row: Option<(String, i32, String)> = sqlx::query_as(
-        "SELECT paths, portable, db_filename FROM libraries WHERE id = ?",
-    )
-    .bind(&library_id)
-    .fetch_optional(&state.app_db)
-    .await
-    .map_err(|e| e.to_string())?;
-
-    let (paths_json, portable, db_filename) = row.ok_or("Library not found")?;
-    let paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
-
-    let db_path = if portable != 0 {
-        PathBuf::from(&paths[0]).join(".waverunner.db")
-    } else {
-        state.app_data_dir.join(&db_filename)
-    };
-
-    let pool = crate::db::connect_library_pool(&db_path).await.map_err(|e| e.to_string())?;
-
     let rows: Vec<(i64, i64, Option<i64>, Option<i64>, String, String)> = sqlx::query_as(
         "SELECT e.id, s.id, s.season_number, e.episode_number, e.title, e.file_path \
          FROM episode e JOIN season s ON e.season_id = s.id \
@@ -2341,11 +2049,10 @@ pub async fn get_show_episodes(
          ORDER BY s.sort_order, s.season_number, e.sort_order, e.episode_number",
     )
     .bind(show_id)
-    .fetch_all(&pool)
+    .fetch_all(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
 
-    pool.close().await;
 
     Ok(rows
         .into_iter()
@@ -2360,30 +2067,261 @@ pub async fn get_show_episodes(
         .collect())
 }
 
+// ---------- Sidebar complications: people + custom collections ----------
+
+// Builds the role-works CTE that maps person_id -> distinct (kind, eid) tuples a person contributed to,
+// where eid is a movie.id or show.id. The result is suitable as a CTE prefix for both
+// get_people_in_library (group by person) and get_entries_for_person (filter by person).
+// Validated against a known set so the resulting SQL is safe to splice into a query string.
+fn role_works_cte(role: &str) -> Result<&'static str, String> {
+    match role {
+        "actor" => Ok(
+            "WITH role_works AS ( \
+               SELECT person_id, 'movie' AS kind, movie_id AS eid FROM movie_cast \
+               UNION SELECT person_id, 'show', show_id FROM show_cast \
+               UNION SELECT sec.person_id, 'show', ss.show_id \
+                       FROM season_cast sec JOIN season ss ON sec.season_id = ss.id \
+               UNION SELECT ec.person_id, 'show', ss.show_id \
+                       FROM episode_cast ec \
+                       JOIN episode e ON ec.episode_id = e.id \
+                       JOIN season ss ON e.season_id = ss.id \
+             )"
+        ),
+        "director_producer" => Ok(
+            "WITH role_works AS ( \
+               SELECT person_id, 'movie' AS kind, movie_id AS eid FROM movie_director \
+               UNION SELECT person_id, 'movie', movie_id FROM movie_producer \
+               UNION SELECT person_id, 'movie', movie_id FROM movie_crew \
+                       WHERE job IN ('Director','Producer','Executive Producer','Co-Producer') \
+               UNION SELECT person_id, 'show', show_id FROM show_creator \
+               UNION SELECT person_id, 'show', show_id FROM show_producer \
+               UNION SELECT person_id, 'show', show_id FROM show_crew \
+                       WHERE job IN ('Director','Producer','Executive Producer','Co-Producer') \
+               UNION SELECT sd.person_id, 'show', ss.show_id \
+                       FROM season_director sd JOIN season ss ON sd.season_id = ss.id \
+               UNION SELECT sp.person_id, 'show', ss.show_id \
+                       FROM season_producer sp JOIN season ss ON sp.season_id = ss.id \
+               UNION SELECT sc.person_id, 'show', ss.show_id \
+                       FROM season_crew sc JOIN season ss ON sc.season_id = ss.id \
+                       WHERE sc.job IN ('Director','Producer','Executive Producer','Co-Producer') \
+               UNION SELECT ec.person_id, 'show', ss.show_id \
+                       FROM episode_crew ec \
+                       JOIN episode e ON ec.episode_id = e.id \
+                       JOIN season ss ON e.season_id = ss.id \
+                       WHERE ec.job IN ('Director','Producer','Executive Producer','Co-Producer') \
+             )"
+        ),
+        "composer" => Ok(
+            "WITH role_works AS ( \
+               SELECT person_id, 'movie' AS kind, movie_id AS eid FROM movie_crew \
+                 WHERE job IN ('Composer','Original Music Composer') \
+               UNION SELECT person_id, 'show', show_id FROM show_crew \
+                 WHERE job IN ('Composer','Original Music Composer') \
+               UNION SELECT sc.person_id, 'show', ss.show_id \
+                       FROM season_crew sc JOIN season ss ON sc.season_id = ss.id \
+                       WHERE sc.job IN ('Composer','Original Music Composer') \
+               UNION SELECT ec.person_id, 'show', ss.show_id \
+                       FROM episode_crew ec \
+                       JOIN episode e ON ec.episode_id = e.id \
+                       JOIN season ss ON e.season_id = ss.id \
+                       WHERE ec.job IN ('Composer','Original Music Composer') \
+             )"
+        ),
+        other => Err(format!("Invalid role: {}", other)),
+    }
+}
+
+async fn get_library_meta(
+    app_db: &SqlitePool,
+    library_id: &str,
+) -> Result<(String, Vec<String>, String), String> {
+    let row: Option<(String, String, String)> = sqlx::query_as(
+        "SELECT format, paths, default_sort_mode FROM library WHERE id = ?",
+    )
+    .bind(library_id)
+    .fetch_optional(app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    let (format, paths_json, sort_mode) = row.ok_or("Library not found")?;
+    let paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
+    Ok((format, paths, sort_mode))
+}
+
+#[tauri::command]
+pub async fn get_people_in_library(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    role: String,
+) -> Result<Vec<PersonSummary>, String> {
+    let cte = role_works_cte(&role)?;
+    let (format, _paths, _default_sort_mode) = get_library_meta(&state.app_db, &library_id).await?;
+    if format != "video" {
+        return Err("People browsing is only supported for video libraries".to_string());
+    }
+
+    let query = format!(
+        "{cte} \
+         SELECT p.id, p.name, p.image_path, COUNT(*) AS work_count \
+         FROM person p \
+         JOIN role_works rw ON rw.person_id = p.id \
+         GROUP BY p.id \
+         ORDER BY p.name COLLATE NOCASE ASC"
+    );
+
+    let rows: Vec<(i64, String, Option<String>, i64)> = sqlx::query_as(&query)
+        .fetch_all(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(id, name, image_path, work_count)| PersonSummary {
+            id,
+            name,
+            image_path,
+            work_count,
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub async fn get_entries_for_person(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    person_id: i64,
+    role: String,
+) -> Result<Vec<MediaEntry>, String> {
+    let cte = role_works_cte(&role)?;
+    let (format, _paths, _default_sort_mode) = get_library_meta(&state.app_db, &library_id).await?;
+    if format != "video" {
+        return Err("People browsing is only supported for video libraries".to_string());
+    }
+
+    let mut covers_map = get_all_cached_covers(&state.app_db, &library_id)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let query = format!(
+        "{cte} \
+         SELECT mef.id, mef.title, \
+           CASE WHEN mef.entry_type = 'movie' THEN SUBSTR(mef.release_date, 1, 4) ELSE NULL END AS year, \
+           mef.folder_path, mef.parent_id, mef.entry_type, mef.selected_cover, \
+           CASE \
+             WHEN mef.entry_type = 'movie' THEN (SELECT tmdb_id FROM movie WHERE id = mef.id) \
+             WHEN mef.entry_type = 'show' THEN (SELECT CAST(tmdb_id AS TEXT) FROM show WHERE id = mef.id) \
+             ELSE NULL \
+           END AS tmdb_id \
+         FROM media_entry_full mef \
+         WHERE mef.library_id = ? AND mef.id IN (SELECT eid FROM role_works WHERE person_id = ?) \
+         ORDER BY mef.sort_title COLLATE NOCASE ASC"
+    );
+
+    let rows: Vec<(i64, String, Option<String>, String, Option<i64>, String, Option<String>, Option<String>)> =
+        sqlx::query_as(&query)
+            .bind(&library_id)
+            .bind(person_id)
+            .fetch_all(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+
+    let entries: Vec<MediaEntry> = rows
+        .into_iter()
+        .map(|(id, title, year, folder_path, parent_id, entry_type, selected_cover, tmdb_id)| {
+            let covers = covers_map.remove(&folder_path).unwrap_or_default();
+            MediaEntry {
+                id,
+                title,
+                year,
+                end_year: None,
+                folder_path,
+                parent_id,
+                entry_type,
+                covers,
+                selected_cover,
+                child_count: 0,
+                season_display: None,
+                collection_display: None,
+                tmdb_id,
+            }
+        })
+        .collect();
+
+    Ok(entries)
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PlaylistSummary {
+    pub id: i64,
+    pub title: String,
+    pub selected_cover: Option<String>,
+}
+
+#[tauri::command]
+pub async fn get_playlists(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+) -> Result<Vec<PlaylistSummary>, String> {
+    let rows: Vec<(i64, String, Option<String>)> = sqlx::query_as(
+        "SELECT id, title, selected_cover FROM media_playlist WHERE library_id = ? ORDER BY sort_order ASC, title COLLATE NOCASE ASC",
+    )
+    .bind(&library_id)
+    .fetch_all(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    let playlists = rows
+        .into_iter()
+        .map(|(id, title, selected_cover)| PlaylistSummary { id, title, selected_cover })
+        .collect();
+    Ok(playlists)
+}
+
+#[tauri::command]
+pub async fn create_playlist(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    title: String,
+) -> Result<i64, String> {
+    let sort_title = title.to_lowercase();
+    let max_order: (i64,) = sqlx::query_as("SELECT COALESCE(MAX(sort_order), 0) FROM media_playlist WHERE library_id = ?")
+        .bind(&library_id)
+        .fetch_one(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+    let result = sqlx::query(
+        "INSERT INTO media_playlist (library_id, title, sort_title, sort_order) VALUES (?, ?, ?, ?)",
+    )
+    .bind(&library_id)
+    .bind(&title)
+    .bind(&sort_title)
+    .bind(max_order.0 + 1)
+    .execute(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    let id = result.last_insert_rowid();
+    Ok(id)
+}
+
+#[tauri::command]
+pub async fn delete_playlist(
+    state: tauri::State<'_, AppState>,
+    playlist_id: i64,
+) -> Result<(), String> {
+    sqlx::query("DELETE FROM media_playlist WHERE id = ?")
+        .bind(playlist_id)
+        .execute(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn get_movie_file_path(
     state: tauri::State<'_, AppState>,
     library_id: String,
     entry_id: i64,
 ) -> Result<String, String> {
-    let row: Option<(String, i32, String, String)> = sqlx::query_as(
-        "SELECT paths, portable, db_filename, format FROM libraries WHERE id = ?",
-    )
-    .bind(&library_id)
-    .fetch_optional(&state.app_db)
-    .await
-    .map_err(|e| e.to_string())?;
-
-    let (paths_json, portable, db_filename, format) = row.ok_or("Library not found")?;
-    let lib_paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
-
-    let db_path = if portable != 0 {
-        PathBuf::from(&lib_paths[0]).join(".waverunner.db")
-    } else {
-        state.app_data_dir.join(&db_filename)
-    };
-
-    let pool = crate::db::connect_library_pool(&db_path).await.map_err(|e| e.to_string())?;
+    let (format, _paths, _default_sort_mode) = get_library_meta(&state.app_db, &library_id).await?;
+    let lib_paths = _paths;
 
     let folder_path: String = match format.as_str() {
         "video" => {
@@ -2391,18 +2329,16 @@ pub async fn get_movie_file_path(
                 "SELECT folder_path FROM media_entry_full WHERE id = ?",
             )
             .bind(entry_id)
-            .fetch_optional(&pool)
+            .fetch_optional(&state.app_db)
             .await
             .map_err(|e| e.to_string())?;
             row.ok_or("Entry not found")?.0
         }
         _ => {
-            pool.close().await;
             return Err(format!("Unsupported library format: {}", format));
         }
     };
 
-    pool.close().await;
 
     let root = resolve_entry_root(&lib_paths, &folder_path)
         .ok_or("Could not find entry on disk")?;
@@ -2425,34 +2361,16 @@ pub async fn get_episode_file_path(
     library_id: String,
     episode_id: i64,
 ) -> Result<String, String> {
-    let row: Option<(String, i32, String)> = sqlx::query_as(
-        "SELECT paths, portable, db_filename FROM libraries WHERE id = ?",
-    )
-    .bind(&library_id)
-    .fetch_optional(&state.app_db)
-    .await
-    .map_err(|e| e.to_string())?;
-
-    let (paths_json, portable, db_filename) = row.ok_or("Library not found")?;
-    let lib_paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
-
-    let db_path = if portable != 0 {
-        PathBuf::from(&lib_paths[0]).join(".waverunner.db")
-    } else {
-        state.app_data_dir.join(&db_filename)
-    };
-
-    let pool = crate::db::connect_library_pool(&db_path).await.map_err(|e| e.to_string())?;
+    let lib_paths = get_library_paths(&state.app_db, &library_id).await?;
 
     let ep_row: Option<(String,)> = sqlx::query_as(
         "SELECT file_path FROM episode WHERE id = ?",
     )
     .bind(episode_id)
-    .fetch_optional(&pool)
+    .fetch_optional(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
 
-    pool.close().await;
 
     let file_path = ep_row.ok_or("Episode not found")?.0;
 
@@ -2481,7 +2399,7 @@ pub async fn set_sort_mode(
     }
 
     let row: Option<(String,)> = sqlx::query_as(
-        "SELECT format FROM libraries WHERE id = ?",
+        "SELECT format FROM library WHERE id = ?",
     )
     .bind(&library_id)
     .fetch_optional(&state.app_db)
@@ -2493,42 +2411,19 @@ pub async fn set_sort_mode(
     match entry_id {
         Some(eid) if format == "video" => {
             // Set sort_mode on a collection entry (video)
-            let lib_row: Option<(String, i32, String)> = sqlx::query_as(
-                "SELECT paths, portable, db_filename FROM libraries WHERE id = ?",
-            )
-            .bind(&library_id)
-            .fetch_optional(&state.app_db)
-            .await
-            .map_err(|e| e.to_string())?;
-
-            let (paths_json, portable, db_filename) = lib_row.ok_or("Library not found")?;
-            let lib_paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
-
-            let db_path = if portable != 0 {
-                PathBuf::from(&lib_paths[0]).join(".waverunner.db")
-            } else {
-                state.app_data_dir.join(&db_filename)
-            };
-
-            let pool = crate::db::connect_library_pool(&db_path)
-                .await
-                .map_err(|e| e.to_string())?;
-
-            sqlx::query("UPDATE collection SET sort_mode = ? WHERE id = ?")
+            sqlx::query("UPDATE media_collection SET sort_mode = ? WHERE id = ?")
                 .bind(&sort_mode)
                 .bind(eid)
-                .execute(&pool)
+                .execute(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
-
-            pool.close().await;
         }
         Some(_) if format != "video" && format != "music" => {
             return Err(format!("Unsupported library format: {}", format));
         }
         _ => {
             // Set default_sort_mode on the library (root-level default, or music)
-            sqlx::query("UPDATE libraries SET default_sort_mode = ? WHERE id = ?")
+            sqlx::query("UPDATE library SET default_sort_mode = ? WHERE id = ?")
                 .bind(&sort_mode)
                 .bind(&library_id)
                 .execute(&state.app_db)
@@ -2546,37 +2441,18 @@ pub async fn update_sort_order(
     library_id: String,
     entry_ids: Vec<i64>,
 ) -> Result<(), String> {
-    let row: Option<(String, i32, String, String)> = sqlx::query_as(
-        "SELECT paths, portable, db_filename, format FROM libraries WHERE id = ?",
-    )
-    .bind(&library_id)
-    .fetch_optional(&state.app_db)
-    .await
-    .map_err(|e| e.to_string())?;
-
-    let (paths_json, portable, db_filename, format) = row.ok_or("Library not found")?;
-    let lib_paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
-
-    let db_path = if portable != 0 {
-        PathBuf::from(&lib_paths[0]).join(".waverunner.db")
-    } else {
-        state.app_data_dir.join(&db_filename)
-    };
-
-    let pool = crate::db::connect_library_pool(&db_path)
-        .await
-        .map_err(|e| e.to_string())?;
+    let (format, _paths, _default_sort_mode) = get_library_meta(&state.app_db, &library_id).await?;
 
     match format.as_str() {
         "video" => {
             for (i, id) in entry_ids.iter().enumerate() {
                 // Update whichever detail table owns this entry
                 sqlx::query("UPDATE movie SET sort_order = ? WHERE id = ?")
-                    .bind(i as i32).bind(id).execute(&pool).await.map_err(|e| e.to_string())?;
+                    .bind(i as i32).bind(id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
                 sqlx::query("UPDATE show SET sort_order = ? WHERE id = ?")
-                    .bind(i as i32).bind(id).execute(&pool).await.map_err(|e| e.to_string())?;
-                sqlx::query("UPDATE collection SET sort_order = ? WHERE id = ?")
-                    .bind(i as i32).bind(id).execute(&pool).await.map_err(|e| e.to_string())?;
+                    .bind(i as i32).bind(id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
+                sqlx::query("UPDATE media_collection SET sort_order = ? WHERE id = ?")
+                    .bind(i as i32).bind(id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
             }
         }
         "music" => {
@@ -2584,18 +2460,16 @@ pub async fn update_sort_order(
                 sqlx::query("UPDATE artist SET sort_order = ? WHERE id = ?")
                     .bind(i as i32)
                     .bind(id)
-                    .execute(&pool)
+                    .execute(&state.app_db)
                     .await
                     .map_err(|e| e.to_string())?;
             }
         }
         _ => {
-            pool.close().await;
             return Err(format!("Unsupported library format: {}", format));
         }
     }
 
-    pool.close().await;
     Ok(())
 }
 
@@ -2606,24 +2480,11 @@ pub async fn rename_entry(
     entry_id: i64,
     new_title: String,
 ) -> Result<(), String> {
-    let row: Option<(String, i32, String, i32, String)> = sqlx::query_as(
-        "SELECT paths, portable, db_filename, managed, format FROM libraries WHERE id = ?",
-    )
-    .bind(&library_id)
-    .fetch_optional(&state.app_db)
-    .await
-    .map_err(|e| e.to_string())?;
-
-    let (paths_json, portable, db_filename, managed, format) = row.ok_or("Library not found")?;
-    let lib_paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
-
-    let db_path = if portable != 0 {
-        PathBuf::from(&lib_paths[0]).join(".waverunner.db")
-    } else {
-        state.app_data_dir.join(&db_filename)
-    };
-
-    let pool = crate::db::connect_library_pool(&db_path)
+    let (format, _paths, _default_sort_mode) = get_library_meta(&state.app_db, &library_id).await?;
+    let lib_paths: Vec<String> = _paths;
+    let managed: i32 = sqlx::query_scalar("SELECT managed FROM library WHERE id = ?")
+        .bind(&library_id)
+        .fetch_one(&state.app_db)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -2638,7 +2499,7 @@ pub async fn rename_entry(
                     "SELECT folder_path, SUBSTR(release_date, 1, 4), entry_type FROM media_entry_full WHERE id = ?",
                 )
                 .bind(entry_id)
-                .fetch_optional(&pool)
+                .fetch_optional(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
 
@@ -2661,7 +2522,6 @@ pub async fn rename_entry(
 
                 if old_full_path != new_full_path {
                     if new_full_path.exists() {
-                        pool.close().await;
                         return Err(format!("A folder named '{}' already exists", new_folder_name));
                     }
 
@@ -2679,13 +2539,13 @@ pub async fn rename_entry(
 
                     // Update this entry's folder_path on the correct detail table
                     match entry_type.as_str() {
-                        "movie" => sqlx::query("UPDATE movie SET folder_path = ? WHERE id = ?").bind(&new_rel_path).bind(entry_id).execute(&pool).await.map_err(|e| e.to_string())?,
-                        "show" => sqlx::query("UPDATE show SET folder_path = ? WHERE id = ?").bind(&new_rel_path).bind(entry_id).execute(&pool).await.map_err(|e| e.to_string())?,
-                        _ => sqlx::query("UPDATE collection SET folder_path = ? WHERE id = ?").bind(&new_rel_path).bind(entry_id).execute(&pool).await.map_err(|e| e.to_string())?,
+                        "movie" => sqlx::query("UPDATE movie SET folder_path = ? WHERE id = ?").bind(&new_rel_path).bind(entry_id).execute(&state.app_db).await.map_err(|e| e.to_string())?,
+                        "show" => sqlx::query("UPDATE show SET folder_path = ? WHERE id = ?").bind(&new_rel_path).bind(entry_id).execute(&state.app_db).await.map_err(|e| e.to_string())?,
+                        _ => sqlx::query("UPDATE media_collection SET folder_path = ? WHERE id = ?").bind(&new_rel_path).bind(entry_id).execute(&state.app_db).await.map_err(|e| e.to_string())?,
                     };
 
                     // Update child folder_paths across all detail tables
-                    for tbl in &["movie", "show", "collection"] {
+                    for tbl in &["movie", "show", "media_collection"] {
                         sqlx::query(
                             &format!("UPDATE {} SET folder_path = ? || SUBSTR(folder_path, ?) WHERE folder_path LIKE ? AND id != ?", tbl),
                         )
@@ -2693,7 +2553,7 @@ pub async fn rename_entry(
                         .bind((old_rel_prefix.len() + 1) as i32)
                         .bind(format!("{}%", old_rel_prefix))
                         .bind(entry_id)
-                        .execute(&pool)
+                        .execute(&state.app_db)
                         .await
                         .map_err(|e| e.to_string())?;
                     }
@@ -2706,7 +2566,7 @@ pub async fn rename_entry(
                         .bind(&new_rel_prefix)
                         .bind((old_rel_prefix.len() + 1) as i32)
                         .bind(entry_id)
-                        .execute(&pool)
+                        .execute(&state.app_db)
                         .await
                         .map_err(|e| e.to_string())?;
 
@@ -2716,7 +2576,7 @@ pub async fn rename_entry(
                         .bind(&new_rel_prefix)
                         .bind((old_rel_prefix.len() + 1) as i32)
                         .bind(entry_id)
-                        .execute(&pool)
+                        .execute(&state.app_db)
                         .await
                         .map_err(|e| e.to_string())?;
                     }
@@ -2736,7 +2596,7 @@ pub async fn rename_entry(
                         .bind(&old_cache_abs)
                         .bind(&new_cache_abs)
                         .bind(&folder_path)
-                        .execute(&pool)
+                        .execute(&state.app_db)
                         .await
                         .map_err(|e| e.to_string())?;
                     let old_rel_prefix_ci = format!("{}\\", folder_path);
@@ -2746,7 +2606,7 @@ pub async fn rename_entry(
                         .bind(&old_cache_abs_prefix)
                         .bind(&new_cache_abs_prefix)
                         .bind(format!("{}%", old_rel_prefix_ci))
-                        .execute(&pool)
+                        .execute(&state.app_db)
                         .await
                         .map_err(|e| e.to_string())?;
                 }
@@ -2756,7 +2616,7 @@ pub async fn rename_entry(
                     "SELECT folder_path FROM artist WHERE id = ?",
                 )
                 .bind(entry_id)
-                .fetch_optional(&pool)
+                .fetch_optional(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
 
@@ -2770,7 +2630,6 @@ pub async fn rename_entry(
 
                 if old_full_path != new_full_path {
                     if new_full_path.exists() {
-                        pool.close().await;
                         return Err(format!("A folder named '{}' already exists", safe_title));
                     }
 
@@ -2790,7 +2649,7 @@ pub async fn rename_entry(
                     sqlx::query("UPDATE artist SET folder_path = ? WHERE id = ?")
                         .bind(&new_rel_path)
                         .bind(entry_id)
-                        .execute(&pool)
+                        .execute(&state.app_db)
                         .await
                         .map_err(|e| e.to_string())?;
 
@@ -2801,7 +2660,7 @@ pub async fn rename_entry(
                     .bind(&new_rel_prefix)
                     .bind((old_rel_prefix.len() + 1) as i32)
                     .bind(entry_id)
-                    .execute(&pool)
+                    .execute(&state.app_db)
                     .await
                     .map_err(|e| e.to_string())?;
 
@@ -2812,7 +2671,7 @@ pub async fn rename_entry(
                     .bind(&new_rel_prefix)
                     .bind((old_rel_prefix.len() + 1) as i32)
                     .bind(entry_id)
-                    .execute(&pool)
+                    .execute(&state.app_db)
                     .await
                     .map_err(|e| e.to_string())?;
 
@@ -2832,7 +2691,7 @@ pub async fn rename_entry(
                         .bind(&old_cache_abs)
                         .bind(&new_cache_abs)
                         .bind(&folder_path)
-                        .execute(&pool)
+                        .execute(&state.app_db)
                         .await
                         .map_err(|e| e.to_string())?;
                     let old_rel_prefix_ci = format!("{}\\", folder_path);
@@ -2842,13 +2701,12 @@ pub async fn rename_entry(
                         .bind(&old_cache_abs_prefix)
                         .bind(&new_cache_abs_prefix)
                         .bind(format!("{}%", old_rel_prefix_ci))
-                        .execute(&pool)
+                        .execute(&state.app_db)
                         .await
                         .map_err(|e| e.to_string())?;
                 }
             }
             _ => {
-                pool.close().await;
                 return Err(format!("Unsupported library format: {}", format));
             }
         }
@@ -2860,28 +2718,26 @@ pub async fn rename_entry(
         "video" => {
             // Update whichever detail table owns this entry
             sqlx::query("UPDATE movie SET title = ?, sort_title = ? WHERE id = ?")
-                .bind(&new_title).bind(&sort_title).bind(entry_id).execute(&pool).await.map_err(|e| e.to_string())?;
+                .bind(&new_title).bind(&sort_title).bind(entry_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
             sqlx::query("UPDATE show SET title = ?, sort_title = ? WHERE id = ?")
-                .bind(&new_title).bind(&sort_title).bind(entry_id).execute(&pool).await.map_err(|e| e.to_string())?;
-            sqlx::query("UPDATE collection SET title = ?, sort_title = ? WHERE id = ?")
-                .bind(&new_title).bind(&sort_title).bind(entry_id).execute(&pool).await.map_err(|e| e.to_string())?;
+                .bind(&new_title).bind(&sort_title).bind(entry_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
+            sqlx::query("UPDATE media_collection SET title = ?, sort_title = ? WHERE id = ?")
+                .bind(&new_title).bind(&sort_title).bind(entry_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         }
         "music" => {
             sqlx::query("UPDATE artist SET name = ?, sort_name = ? WHERE id = ?")
                 .bind(&new_title)
                 .bind(&sort_title)
                 .bind(entry_id)
-                .execute(&pool)
+                .execute(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
         }
         _ => {
-            pool.close().await;
             return Err(format!("Unsupported library format: {}", format));
         }
     }
 
-    pool.close().await;
     Ok(())
 }
 
@@ -2926,24 +2782,11 @@ pub async fn move_entry(
     new_parent_id: Option<i64>,
     insert_before_id: Option<i64>,
 ) -> Result<(), String> {
-    let row: Option<(String, i32, String, i32, String)> = sqlx::query_as(
-        "SELECT paths, portable, db_filename, managed, format FROM libraries WHERE id = ?",
-    )
-    .bind(&library_id)
-    .fetch_optional(&state.app_db)
-    .await
-    .map_err(|e| e.to_string())?;
-
-    let (paths_json, portable, db_filename, managed, format) = row.ok_or("Library not found")?;
-    let lib_paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
-
-    let db_path = if portable != 0 {
-        PathBuf::from(&lib_paths[0]).join(".waverunner.db")
-    } else {
-        state.app_data_dir.join(&db_filename)
-    };
-
-    let pool = crate::db::connect_library_pool(&db_path)
+    let (format, _paths, _default_sort_mode) = get_library_meta(&state.app_db, &library_id).await?;
+    let lib_paths: Vec<String> = _paths;
+    let managed: i32 = sqlx::query_scalar("SELECT managed FROM library WHERE id = ?")
+        .bind(&library_id)
+        .fetch_one(&state.app_db)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -2954,7 +2797,7 @@ pub async fn move_entry(
                 "SELECT folder_path, parent_id FROM media_entry_full WHERE id = ?",
             )
             .bind(entry_id)
-            .fetch_optional(&pool)
+            .fetch_optional(&state.app_db)
             .await
             .map_err(|e| e.to_string())?
             .ok_or("Entry not found")?;
@@ -2963,14 +2806,12 @@ pub async fn move_entry(
 
             // No-op if already in the target parent
             if old_parent_id == new_parent_id {
-                pool.close().await;
                 return Ok(());
             }
 
             // Prevent moving into self or a descendant
             if let Some(target_id) = new_parent_id {
                 if target_id == entry_id {
-                    pool.close().await;
                     return Err("Cannot move entry into itself".to_string());
                 }
                 // Walk up from target to root, ensure we don't hit entry_id
@@ -2980,13 +2821,12 @@ pub async fn move_entry(
                         "SELECT parent_id FROM media_entry WHERE id = ?",
                     )
                     .bind(cid)
-                    .fetch_optional(&pool)
+                    .fetch_optional(&state.app_db)
                     .await
                     .map_err(|e| e.to_string())?;
                     match parent {
                         Some((Some(pid),)) => {
                             if pid == entry_id {
-                                pool.close().await;
                                 return Err("Cannot move entry into its own descendant".to_string());
                             }
                             check_id = Some(pid);
@@ -3008,7 +2848,7 @@ pub async fn move_entry(
                     "SELECT folder_path FROM media_entry_full WHERE id = ?",
                 )
                 .bind(target_id)
-                .fetch_optional(&pool)
+                .fetch_optional(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?
                 .ok_or("Target collection not found")?;
@@ -3038,7 +2878,6 @@ pub async fn move_entry(
 
                 if old_full_path != new_full_path {
                     if new_full_path.exists() {
-                        pool.close().await;
                         return Err(format!(
                             "A folder named '{}' already exists at the destination",
                             folder_name
@@ -3065,7 +2904,7 @@ pub async fn move_entry(
             let new_cache_abs_prefix = format!("{}\\", new_cache_abs);
 
             let db_result: Result<(), String> = async {
-                let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+                let mut tx = state.app_db.begin().await.map_err(|e| e.to_string())?;
 
                 let old_rel_prefix = format!("{}\\", old_folder_path);
                 let new_rel_prefix = format!("{}\\", new_folder_path);
@@ -3092,7 +2931,7 @@ pub async fn move_entry(
                     .map_err(|e| e.to_string())?;
 
                 // Update selected_cover for this entry across all detail tables
-                for tbl in &["movie", "show", "collection"] {
+                for tbl in &["movie", "show", "media_collection"] {
                     sqlx::query(&format!("UPDATE {} SET selected_cover = REPLACE(selected_cover, ?, ?) WHERE selected_cover LIKE ? AND id = ?", tbl))
                         .bind(&old_cache_abs)
                         .bind(&new_cache_abs)
@@ -3104,7 +2943,7 @@ pub async fn move_entry(
                 }
 
                 // Update selected_cover for child entries across all detail tables
-                for tbl in &["movie", "show", "collection"] {
+                for tbl in &["movie", "show", "media_collection"] {
                     sqlx::query(&format!("UPDATE {} SET selected_cover = REPLACE(selected_cover, ?, ?) WHERE selected_cover LIKE ? AND id != ?", tbl))
                         .bind(&old_cache_abs_prefix)
                         .bind(&new_cache_abs_prefix)
@@ -3127,7 +2966,7 @@ pub async fn move_entry(
                             let r: Option<(i64,)> = sqlx::query_as("SELECT sort_order FROM show WHERE id = ?")
                                 .bind(before_id).fetch_optional(&mut *tx).await.map_err(|e| e.to_string())?;
                             if let Some((v,)) = r { v } else {
-                                let r: Option<(i64,)> = sqlx::query_as("SELECT sort_order FROM collection WHERE id = ?")
+                                let r: Option<(i64,)> = sqlx::query_as("SELECT sort_order FROM media_collection WHERE id = ?")
                                     .bind(before_id).fetch_optional(&mut *tx).await.map_err(|e| e.to_string())?;
                                 r.ok_or("insert_before entry not found")?.0
                             }
@@ -3135,7 +2974,7 @@ pub async fn move_entry(
                     };
 
                     // Increment sort_order for entries at/after insert position across all detail tables
-                    for tbl in &["movie", "show", "collection"] {
+                    for tbl in &["movie", "show", "media_collection"] {
                         sqlx::query(&format!(
                             "UPDATE {} SET sort_order = sort_order + 1 WHERE id IN (SELECT id FROM media_entry WHERE parent_id IS ? AND id != ?) AND sort_order >= ?", tbl
                         ))
@@ -3155,7 +2994,7 @@ pub async fn move_entry(
                          FROM media_entry me \
                          LEFT JOIN movie m ON me.id = m.id \
                          LEFT JOIN show s ON me.id = s.id \
-                         LEFT JOIN collection c ON me.id = c.id \
+                         LEFT JOIN media_collection c ON me.id = c.id \
                          WHERE me.parent_id IS ?",
                     )
                     .bind(new_parent_id)
@@ -3174,7 +3013,7 @@ pub async fn move_entry(
                     .map_err(|e| e.to_string())?;
 
                 // Update folder_path and sort_order on the correct detail table
-                for tbl in &["movie", "show", "collection"] {
+                for tbl in &["movie", "show", "media_collection"] {
                     sqlx::query(&format!("UPDATE {} SET folder_path = ?, sort_order = ? WHERE id = ?", tbl))
                         .bind(&new_folder_path)
                         .bind(new_sort_order)
@@ -3185,7 +3024,7 @@ pub async fn move_entry(
                 }
 
                 // Update child folder_paths across all detail tables
-                for tbl in &["movie", "show", "collection"] {
+                for tbl in &["movie", "show", "media_collection"] {
                     sqlx::query(
                         &format!("UPDATE {} SET folder_path = ? || SUBSTR(folder_path, ?) WHERE folder_path LIKE ? AND id != ?", tbl),
                     )
@@ -3243,17 +3082,14 @@ pub async fn move_entry(
                 if cache_moved {
                     let _ = move_dir(&new_cache, &old_cache);
                 }
-                pool.close().await;
                 return Err(e);
             }
         }
         _ => {
-            pool.close().await;
             return Err("Move is only supported for video format libraries".to_string());
         }
     }
 
-    pool.close().await;
     Ok(())
 }
 
@@ -3265,34 +3101,19 @@ pub async fn create_collection(
     parent_id: Option<i64>,
     base_path: Option<String>,
 ) -> Result<(), String> {
-    let row: Option<(String, i32, String, i32, String)> = sqlx::query_as(
-        "SELECT paths, portable, db_filename, managed, format FROM libraries WHERE id = ?",
-    )
-    .bind(&library_id)
-    .fetch_optional(&state.app_db)
-    .await
-    .map_err(|e| e.to_string())?;
-
-    let (paths_json, portable, db_filename, managed, format) = row.ok_or("Library not found")?;
+    let (format, _paths, _default_sort_mode) = get_library_meta(&state.app_db, &library_id).await?;
     if format != "video" {
         return Err("Collections are only supported for video libraries".to_string());
     }
-
-    let lib_paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
-
-    let db_path = if portable != 0 {
-        PathBuf::from(&lib_paths[0]).join(".waverunner.db")
-    } else {
-        state.app_data_dir.join(&db_filename)
-    };
-
-    let pool = crate::db::connect_library_pool(&db_path)
+    let lib_paths: Vec<String> = _paths;
+    let managed: i32 = sqlx::query_scalar("SELECT managed FROM library WHERE id = ?")
+        .bind(&library_id)
+        .fetch_one(&state.app_db)
         .await
         .map_err(|e| e.to_string())?;
 
     let safe_name = sanitize_filename(&name);
     if safe_name.is_empty() {
-        pool.close().await;
         return Err("Invalid collection name".to_string());
     }
 
@@ -3302,7 +3123,7 @@ pub async fn create_collection(
             "SELECT folder_path FROM media_entry_full WHERE id = ?",
         )
         .bind(pid)
-        .fetch_optional(&pool)
+        .fetch_optional(&state.app_db)
         .await
         .map_err(|e| e.to_string())?;
         row.ok_or("Parent entry not found")?.0
@@ -3323,7 +3144,6 @@ pub async fn create_collection(
         );
         let full_path = lib_base.join(&rel_path);
         if full_path.exists() {
-            pool.close().await;
             return Err(format!("A folder named '{}' already exists", safe_name));
         }
         std::fs::create_dir_all(&full_path)
@@ -3333,7 +3153,7 @@ pub async fn create_collection(
     // Get the collection entry type id
     let collection_type_id: (i64,) =
         sqlx::query_as("SELECT id FROM media_entry_type WHERE name = 'collection'")
-            .fetch_one(&pool)
+            .fetch_one(&state.app_db)
             .await
             .map_err(|e| e.to_string())?;
 
@@ -3341,12 +3161,12 @@ pub async fn create_collection(
     let max_order: (i64,) = if parent_id.is_some() {
         sqlx::query_as("SELECT COALESCE(MAX(sort_order), -1) FROM media_entry_full WHERE parent_id = ?")
             .bind(parent_id)
-            .fetch_one(&pool)
+            .fetch_one(&state.app_db)
             .await
             .map_err(|e| e.to_string())?
     } else {
         sqlx::query_as("SELECT COALESCE(MAX(sort_order), -1) FROM media_entry_full WHERE parent_id IS NULL")
-            .fetch_one(&pool)
+            .fetch_one(&state.app_db)
             .await
             .map_err(|e| e.to_string())?
     };
@@ -3354,26 +3174,26 @@ pub async fn create_collection(
     let sort_title = generate_sort_title(&name, "en");
 
     let result = sqlx::query(
-        "INSERT INTO media_entry (parent_id, entry_type_id) VALUES (?, ?)",
+        "INSERT INTO media_entry (library_id, parent_id, entry_type_id) VALUES (?, ?, ?)",
     )
+    .bind(&library_id)
     .bind(parent_id)
     .bind(collection_type_id.0)
-    .execute(&pool)
+    .execute(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
 
     let entry_id = result.last_insert_rowid();
-    sqlx::query("INSERT INTO collection (id, title, folder_path, sort_title, sort_order) VALUES (?, ?, ?, ?, ?)")
+    sqlx::query("INSERT INTO media_collection (id, title, folder_path, sort_title, sort_order) VALUES (?, ?, ?, ?, ?)")
         .bind(entry_id)
         .bind(&name)
         .bind(&rel_path)
         .bind(&sort_title)
         .bind(max_order.0 + 1)
-        .execute(&pool)
+        .execute(&state.app_db)
         .await
         .map_err(|e| e.to_string())?;
 
-    pool.close().await;
     Ok(())
 }
 
@@ -3384,52 +3204,31 @@ pub async fn set_cover(
     entry_id: i64,
     cover_path: Option<String>,
 ) -> Result<(), String> {
-    let row: Option<(String, i32, String, String)> = sqlx::query_as(
-        "SELECT paths, portable, db_filename, format FROM libraries WHERE id = ?",
-    )
-    .bind(&library_id)
-    .fetch_optional(&state.app_db)
-    .await
-    .map_err(|e| e.to_string())?;
-
-    let (paths_json, portable, db_filename, format) = row.ok_or("Library not found")?;
-    let lib_paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
-
-    let db_path = if portable != 0 {
-        PathBuf::from(&lib_paths[0]).join(".waverunner.db")
-    } else {
-        state.app_data_dir.join(&db_filename)
-    };
-
-    let pool = crate::db::connect_library_pool(&db_path)
-        .await
-        .map_err(|e| e.to_string())?;
+    let (format, _paths, _default_sort_mode) = get_library_meta(&state.app_db, &library_id).await?;
 
     match format.as_str() {
         "video" => {
             // Update whichever detail table owns this entry
             sqlx::query("UPDATE movie SET selected_cover = ? WHERE id = ?")
-                .bind(&cover_path).bind(entry_id).execute(&pool).await.map_err(|e| e.to_string())?;
+                .bind(&cover_path).bind(entry_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
             sqlx::query("UPDATE show SET selected_cover = ? WHERE id = ?")
-                .bind(&cover_path).bind(entry_id).execute(&pool).await.map_err(|e| e.to_string())?;
-            sqlx::query("UPDATE collection SET selected_cover = ? WHERE id = ?")
-                .bind(&cover_path).bind(entry_id).execute(&pool).await.map_err(|e| e.to_string())?;
+                .bind(&cover_path).bind(entry_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
+            sqlx::query("UPDATE media_collection SET selected_cover = ? WHERE id = ?")
+                .bind(&cover_path).bind(entry_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         }
         "music" => {
             sqlx::query("UPDATE artist SET selected_cover = ? WHERE id = ?")
                 .bind(&cover_path)
                 .bind(entry_id)
-                .execute(&pool)
+                .execute(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
         }
         _ => {
-            pool.close().await;
             return Err(format!("Unsupported library format: {}", format));
         }
     }
 
-    pool.close().await;
     Ok(())
 }
 
@@ -3440,24 +3239,10 @@ pub async fn delete_entry(
     entry_id: i64,
     delete_from_disk: bool,
 ) -> Result<(), String> {
-    let row: Option<(String, i32, String, i32)> = sqlx::query_as(
-        "SELECT paths, portable, db_filename, managed FROM libraries WHERE id = ?",
-    )
-    .bind(&library_id)
-    .fetch_optional(&state.app_db)
-    .await
-    .map_err(|e| e.to_string())?;
-
-    let (paths_json, portable, db_filename, managed) = row.ok_or("Library not found")?;
-    let lib_paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
-
-    let db_path = if portable != 0 {
-        PathBuf::from(&lib_paths[0]).join(".waverunner.db")
-    } else {
-        state.app_data_dir.join(&db_filename)
-    };
-
-    let pool = crate::db::connect_library_pool(&db_path)
+    let lib_paths = get_library_paths(&state.app_db, &library_id).await?;
+    let managed: i32 = sqlx::query_scalar("SELECT managed FROM library WHERE id = ?")
+        .bind(&library_id)
+        .fetch_one(&state.app_db)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -3466,7 +3251,7 @@ pub async fn delete_entry(
         "SELECT folder_path FROM media_entry_full WHERE id = ?",
     )
     .bind(entry_id)
-    .fetch_optional(&pool)
+    .fetch_optional(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
 
@@ -3518,21 +3303,21 @@ pub async fn delete_entry(
     }
 
     // Remove cached_images DB rows for this entry and descendants
-    sqlx::query("DELETE FROM cached_images WHERE entry_folder_path = ? OR entry_folder_path LIKE ?")
+    sqlx::query("DELETE FROM cached_images WHERE library_id = ? AND (entry_folder_path = ? OR entry_folder_path LIKE ?)")
+        .bind(&library_id)
         .bind(&folder_path)
         .bind(format!("{}\\%", folder_path))
-        .execute(&pool)
+        .execute(&state.app_db)
         .await
         .map_err(|e| e.to_string())?;
 
     // Delete from DB (CASCADE handles children, movie, collection, show tables)
     sqlx::query("DELETE FROM media_entry WHERE id = ?")
         .bind(entry_id)
-        .execute(&pool)
+        .execute(&state.app_db)
         .await
         .map_err(|e| e.to_string())?;
 
-    pool.close().await;
     Ok(())
 }
 
@@ -3542,37 +3327,17 @@ pub async fn check_entry_has_files(
     library_id: String,
     entry_id: i64,
 ) -> Result<bool, String> {
-    let row: Option<(String, i32, String)> = sqlx::query_as(
-        "SELECT paths, portable, db_filename FROM libraries WHERE id = ?",
-    )
-    .bind(&library_id)
-    .fetch_optional(&state.app_db)
-    .await
-    .map_err(|e| e.to_string())?;
-
-    let (paths_json, portable, db_filename) = row.ok_or("Library not found")?;
-    let lib_paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
-
-    let db_path = if portable != 0 {
-        PathBuf::from(&lib_paths[0]).join(".waverunner.db")
-    } else {
-        state.app_data_dir.join(&db_filename)
-    };
-
-    let pool = crate::db::connect_library_pool(&db_path)
-        .await
-        .map_err(|e| e.to_string())?;
+    let lib_paths = get_library_paths(&state.app_db, &library_id).await?;
 
     let entry_row: Option<(String,)> = sqlx::query_as(
         "SELECT folder_path FROM media_entry_full WHERE id = ?",
     )
     .bind(entry_id)
-    .fetch_optional(&pool)
+    .fetch_optional(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
 
     let (folder_path,) = entry_row.ok_or("Entry not found")?;
-    pool.close().await;
 
     if let Some(root) = resolve_entry_root(&lib_paths, &folder_path) {
         let full_path = PathBuf::from(root).join(&folder_path);
@@ -3595,44 +3360,26 @@ pub async fn rescan_library(
     state: tauri::State<'_, AppState>,
     library_id: String,
 ) -> Result<(), String> {
-    let row: Option<(String, i32, String, String)> = sqlx::query_as(
-        "SELECT paths, portable, db_filename, format FROM libraries WHERE id = ?",
-    )
-    .bind(&library_id)
-    .fetch_optional(&state.app_db)
-    .await
-    .map_err(|e| e.to_string())?;
-
-    let (paths_json, portable, db_filename, format) = row.ok_or("Library not found")?;
-    let lib_paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
-
-    let db_path = if portable != 0 {
-        PathBuf::from(&lib_paths[0]).join(".waverunner.db")
-    } else {
-        state.app_data_dir.join(&db_filename)
-    };
-
-    let pool = crate::db::connect_library_pool(&db_path)
-        .await
-        .map_err(|e| e.to_string())?;
+    let (format, _paths, _default_sort_mode) = get_library_meta(&state.app_db, &library_id).await?;
+    let lib_paths = _paths;
 
     let cache_base = state.app_data_dir.join("cache").join(&library_id);
     std::fs::create_dir_all(&cache_base).map_err(|e| e.to_string())?;
 
     let base_paths: Vec<PathBuf> = lib_paths.iter().map(|p| PathBuf::from(p)).collect();
     match format.as_str() {
-        "video" => rescan_video_library(&app, &pool, &base_paths, &cache_base).await?,
-        "music" => rescan_music_library(&app, &pool, &base_paths, &cache_base).await?,
+        "video" => rescan_video_library(&app, &state.app_db, &library_id, &base_paths, &cache_base).await?,
+        "music" => rescan_music_library(&app, &state.app_db, &library_id, &base_paths, &cache_base).await?,
         _ => return Err(format!("Unsupported library format: {}", format)),
     }
 
-    pool.close().await;
     Ok(())
 }
 
 async fn rescan_video_library(
     app: &tauri::AppHandle,
     pool: &sqlx::SqlitePool,
+    library_id: &str,
     base_paths: &[PathBuf],
     cache_base: &Path,
 ) -> Result<(), String> {
@@ -3670,8 +3417,9 @@ async fn rescan_video_library(
 
     // Get all DB entries
     let db_rows: Vec<(i64, String, Option<i64>, i64)> = sqlx::query_as(
-        "SELECT id, folder_path, parent_id, entry_type_id FROM media_entry_full",
+        "SELECT id, folder_path, parent_id, entry_type_id FROM media_entry_full WHERE library_id = ?",
     )
+    .bind(library_id)
     .fetch_all(pool)
     .await
     .map_err(|e| e.to_string())?;
@@ -3690,7 +3438,7 @@ async fn rescan_video_library(
     });
 
     for (id, rel_path) in &to_delete {
-        delete_cached_images_for_entry(pool, cache_base, rel_path).await?;
+        delete_cached_images_for_entry(pool, library_id, cache_base, rel_path).await?;
         sqlx::query("DELETE FROM media_entry WHERE id = ?")
             .bind(id)
             .execute(pool)
@@ -3735,9 +3483,10 @@ async fn rescan_video_library(
                 None
             } else {
                 let row: Option<(i64,)> = sqlx::query_as(
-                    "SELECT id FROM media_entry_full WHERE folder_path = ?",
+                    "SELECT id FROM media_entry_full WHERE folder_path = ? AND library_id = ?",
                 )
                 .bind(parent_path)
+                .bind(library_id)
                 .fetch_optional(pool)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -3760,15 +3509,17 @@ async fn rescan_video_library(
         });
 
         let max_order: Option<(i32,)> = if let Some(pid) = parent_id {
-            sqlx::query_as("SELECT COALESCE(MAX(sort_order), -1) FROM media_entry_full WHERE parent_id = ?")
+            sqlx::query_as("SELECT COALESCE(MAX(sort_order), -1) FROM media_entry_full WHERE parent_id = ? AND library_id = ?")
                 .bind(pid)
+                .bind(library_id)
                 .fetch_optional(pool)
                 .await
                 .map_err(|e| e.to_string())?
         } else {
             sqlx::query_as(
-                "SELECT COALESCE(MAX(sort_order), -1) FROM media_entry_full WHERE parent_id IS NULL",
+                "SELECT COALESCE(MAX(sort_order), -1) FROM media_entry_full WHERE parent_id IS NULL AND library_id = ?",
             )
+            .bind(library_id)
             .fetch_optional(pool)
             .await
             .map_err(|e| e.to_string())?
@@ -3778,8 +3529,9 @@ async fn rescan_video_library(
         if has_season && parent_id.is_none() {
             // TV show (only at root level)
             let result = sqlx::query(
-                "INSERT INTO media_entry (parent_id, entry_type_id) VALUES (NULL, ?)",
+                "INSERT INTO media_entry (library_id, parent_id, entry_type_id) VALUES (?, NULL, ?)",
             )
+            .bind(library_id)
             .bind(show_type_id.0)
             .execute(pool)
             .await
@@ -3796,7 +3548,7 @@ async fn rescan_video_library(
                 .await
                 .map_err(|e| e.to_string())?;
 
-            cache_entry_images(pool, cache_base, base_path, rel_path)
+            cache_entry_images(pool, library_id, cache_base, base_path, rel_path)
                 .await
                 .map_err(|e| e.to_string())?;
 
@@ -3804,8 +3556,9 @@ async fn rescan_video_library(
         } else if !subdirs.is_empty() {
             // Collection
             let result = sqlx::query(
-                "INSERT INTO media_entry (parent_id, entry_type_id) VALUES (?, ?)",
+                "INSERT INTO media_entry (library_id, parent_id, entry_type_id) VALUES (?, ?, ?)",
             )
+            .bind(library_id)
             .bind(parent_id)
             .bind(collection_type_id.0)
             .execute(pool)
@@ -3813,7 +3566,7 @@ async fn rescan_video_library(
             .map_err(|e| e.to_string())?;
 
             let entry_id = result.last_insert_rowid();
-            sqlx::query("INSERT INTO collection (id, title, folder_path, sort_title, sort_order) VALUES (?, ?, ?, ?, ?)")
+            sqlx::query("INSERT INTO media_collection (id, title, folder_path, sort_title, sort_order) VALUES (?, ?, ?, ?, ?)")
                 .bind(entry_id)
                 .bind(&title)
                 .bind(rel_path)
@@ -3823,7 +3576,7 @@ async fn rescan_video_library(
                 .await
                 .map_err(|e| e.to_string())?;
 
-            cache_entry_images(pool, cache_base, base_path, rel_path)
+            cache_entry_images(pool, library_id, cache_base, base_path, rel_path)
                 .await
                 .map_err(|e| e.to_string())?;
         } else {
@@ -3834,8 +3587,9 @@ async fn rescan_video_library(
             if has_video {
                 // Movie (leaf with video files)
                 let result = sqlx::query(
-                    "INSERT INTO media_entry (parent_id, entry_type_id) VALUES (?, ?)",
+                    "INSERT INTO media_entry (library_id, parent_id, entry_type_id) VALUES (?, ?, ?)",
                 )
+                .bind(library_id)
                 .bind(parent_id)
                 .bind(movie_type_id.0)
                 .execute(pool)
@@ -3854,14 +3608,15 @@ async fn rescan_video_library(
                     .await
                     .map_err(|e| e.to_string())?;
 
-                cache_entry_images(pool, cache_base, base_path, rel_path)
+                cache_entry_images(pool, library_id, cache_base, base_path, rel_path)
                     .await
                     .map_err(|e| e.to_string())?;
             } else {
                 // Empty folder → collection
                 let result = sqlx::query(
-                    "INSERT INTO media_entry (parent_id, entry_type_id) VALUES (?, ?)",
+                    "INSERT INTO media_entry (library_id, parent_id, entry_type_id) VALUES (?, ?, ?)",
                 )
+                .bind(library_id)
                 .bind(parent_id)
                 .bind(collection_type_id.0)
                 .execute(pool)
@@ -3869,7 +3624,7 @@ async fn rescan_video_library(
                 .map_err(|e| e.to_string())?;
 
                 let entry_id = result.last_insert_rowid();
-                sqlx::query("INSERT INTO collection (id, title, folder_path, sort_title, sort_order) VALUES (?, ?, ?, ?, ?)")
+                sqlx::query("INSERT INTO media_collection (id, title, folder_path, sort_title, sort_order) VALUES (?, ?, ?, ?, ?)")
                     .bind(entry_id)
                     .bind(&title)
                     .bind(rel_path)
@@ -3879,7 +3634,7 @@ async fn rescan_video_library(
                     .await
                     .map_err(|e| e.to_string())?;
 
-                cache_entry_images(pool, cache_base, base_path, rel_path)
+                cache_entry_images(pool, library_id, cache_base, base_path, rel_path)
                     .await
                     .map_err(|e| e.to_string())?;
             }
@@ -3894,14 +3649,15 @@ async fn rescan_video_library(
         .collect();
     for rel_path in &existing_paths {
         if let Some(base) = path_to_base.get(rel_path) {
-            sync_entry_images(pool, cache_base, base, rel_path).await?;
+            sync_entry_images(pool, library_id, cache_base, base, rel_path).await?;
         }
     }
 
     // Rescan seasons/episodes for all shows
     let all_shows: Vec<(i64, String)> = sqlx::query_as(
-        "SELECT id, folder_path FROM show",
+        "SELECT s.id, s.folder_path FROM show s JOIN media_entry me ON s.id = me.id WHERE me.library_id = ?",
     )
+    .bind(library_id)
     .fetch_all(pool)
     .await
     .map_err(|e| e.to_string())?;
@@ -4062,38 +3818,120 @@ async fn rescan_video_library(
 async fn rescan_music_library(
     app: &tauri::AppHandle,
     pool: &sqlx::SqlitePool,
+    library_id: &str,
     base_paths: &[PathBuf],
     cache_base: &Path,
 ) -> Result<(), String> {
     use std::collections::{HashSet, HashMap};
 
-    // Level 1: Artists — collect from all bases
-    let mut disk_artists: HashSet<String> = HashSet::new();
-    let mut artist_to_base: HashMap<String, PathBuf> = HashMap::new();
+    let artist_type_id: (i64,) =
+        sqlx::query_as("SELECT id FROM media_entry_type WHERE name = 'artist'")
+            .fetch_one(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    let album_type_id: (i64,) =
+        sqlx::query_as("SELECT id FROM media_entry_type WHERE name = 'album'")
+            .fetch_one(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    let track_type_id: (i64,) =
+        sqlx::query_as("SELECT id FROM media_entry_type WHERE name = 'track'")
+            .fetch_one(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+
+    // Collect all disk paths from all bases
+    // For music: artist dirs, album dirs, and track files
+    let mut disk_artist_paths: HashSet<String> = HashSet::new();
+    let mut disk_album_paths: HashSet<String> = HashSet::new();
+    let mut disk_track_paths: HashSet<String> = HashSet::new();
+    let mut path_to_base: HashMap<String, PathBuf> = HashMap::new();
+
     for base_path in base_paths {
-        for entry in std::fs::read_dir(base_path).map_err(|e| e.to_string())? {
-            let entry = entry.map_err(|e| e.to_string())?;
-            if is_scannable_dir(&entry) {
-                let rel = entry.path()
+        let artist_dirs = std::fs::read_dir(base_path)
+            .map_err(|e| e.to_string())?
+            .filter_map(|e| e.ok())
+            .filter(|e| is_scannable_dir(e));
+
+        for artist_entry in artist_dirs {
+            let artist_path = artist_entry.path();
+            let artist_rel = artist_path
+                .strip_prefix(base_path)
+                .unwrap_or(&artist_path)
+                .to_string_lossy()
+                .to_string();
+            disk_artist_paths.insert(artist_rel.clone());
+            path_to_base.insert(artist_rel, base_path.clone());
+
+            let album_dirs = std::fs::read_dir(&artist_path)
+                .map_err(|e| e.to_string())?
+                .filter_map(|e| e.ok())
+                .filter(|e| is_scannable_dir(e));
+
+            for album_entry in album_dirs {
+                let album_path = album_entry.path();
+                let album_rel = album_path
                     .strip_prefix(base_path)
-                    .unwrap_or(&entry.path())
+                    .unwrap_or(&album_path)
                     .to_string_lossy()
                     .to_string();
-                artist_to_base.insert(rel.clone(), base_path.clone());
-                disk_artists.insert(rel);
+                disk_album_paths.insert(album_rel.clone());
+                path_to_base.insert(album_rel, base_path.clone());
+
+                let track_files = std::fs::read_dir(&album_path)
+                    .map_err(|e| e.to_string())?
+                    .filter_map(|e| e.ok())
+                    .filter(|e| is_media_file(&e.path(), AUDIO_EXTENSIONS));
+
+                for track_entry in track_files {
+                    let track_rel = track_entry
+                        .path()
+                        .strip_prefix(base_path)
+                        .unwrap_or(&track_entry.path())
+                        .to_string_lossy()
+                        .to_string();
+                    disk_track_paths.insert(track_rel.clone());
+                    path_to_base.insert(track_rel, base_path.clone());
+                }
             }
         }
     }
 
-    let db_artists: Vec<(i64, String)> = sqlx::query_as("SELECT id, folder_path FROM artist")
-        .fetch_all(pool)
-        .await
-        .map_err(|e| e.to_string())?;
+    // Get all DB entries for this library
+    let db_rows: Vec<(i64, String, String, Option<i64>)> = sqlx::query_as(
+        "SELECT mef.id, COALESCE(mef.folder_path, ''), mef.entry_type, mef.parent_id FROM media_entry_full mef WHERE mef.library_id = ?",
+    )
+    .bind(library_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
 
-    for (id, path) in &db_artists {
-        if !disk_artists.contains(path) {
-            delete_cached_images_for_entry(pool, cache_base, path).await?;
-            sqlx::query("DELETE FROM artist WHERE id = ?")
+    // Also get track file_paths
+    let db_tracks: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT me.id, t.file_path FROM media_entry me JOIN track t ON me.id = t.id WHERE me.library_id = ?",
+    )
+    .bind(library_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let db_track_paths: HashMap<String, i64> = db_tracks.into_iter().map(|(id, p)| (p, id)).collect();
+
+    // Separate DB entries by type
+    let mut db_artist_map: HashMap<String, i64> = HashMap::new();
+    let mut db_album_map: HashMap<String, i64> = HashMap::new();
+    for (id, folder_path, entry_type, _parent_id) in &db_rows {
+        match entry_type.as_str() {
+            "artist" => { db_artist_map.insert(folder_path.clone(), *id); }
+            "album" => { db_album_map.insert(folder_path.clone(), *id); }
+            _ => {}
+        }
+    }
+
+    // Delete removed tracks
+    for (path, id) in &db_track_paths {
+        if !disk_track_paths.contains(path) {
+            sqlx::query("DELETE FROM media_entry WHERE id = ?")
                 .bind(id)
                 .execute(pool)
                 .await
@@ -4101,214 +3939,209 @@ async fn rescan_music_library(
         }
     }
 
-    let existing_artist_paths: HashSet<String> = db_artists.iter().map(|(_, p)| p.clone()).collect();
-
-    for rel_path in &disk_artists {
-        if existing_artist_paths.contains(rel_path) {
-            continue;
-        }
-        let base_path = artist_to_base.get(rel_path).unwrap();
-        let full_path = base_path.join(rel_path);
-        let name = full_path.file_name().unwrap_or_default().to_string_lossy().to_string();
-        let _ = app.emit("scan-progress", &name);
-        let sort_name = generate_sort_title(&name, "en");
-
-        let max_order: Option<(i32,)> =
-            sqlx::query_as("SELECT COALESCE(MAX(sort_order), -1) FROM artist")
-                .fetch_optional(pool)
+    // Delete removed albums
+    for (path, id) in &db_album_map {
+        if !disk_album_paths.contains(path) {
+            delete_cached_images_for_entry(pool, library_id, cache_base, path).await?;
+            sqlx::query("DELETE FROM media_entry WHERE id = ?")
+                .bind(id)
+                .execute(pool)
                 .await
                 .map_err(|e| e.to_string())?;
-        let sort_order = max_order.map(|(v,)| v + 1).unwrap_or(0);
+        }
+    }
 
-        sqlx::query(
-            "INSERT INTO artist (name, folder_path, sort_order, sort_name) VALUES (?, ?, ?, ?)",
+    // Delete removed artists
+    for (path, id) in &db_artist_map {
+        if !disk_artist_paths.contains(path) {
+            delete_cached_images_for_entry(pool, library_id, cache_base, path).await?;
+            sqlx::query("DELETE FROM media_entry WHERE id = ?")
+                .bind(id)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
+    // Add new artists
+    for artist_rel in &disk_artist_paths {
+        if db_artist_map.contains_key(artist_rel) {
+            continue;
+        }
+        let base_path = path_to_base.get(artist_rel).unwrap();
+        let full_path = base_path.join(artist_rel);
+        let artist_name = full_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let sort_title = generate_sort_title(&artist_name, "en");
+
+        let _ = app.emit("scan-progress", &artist_name);
+
+        let max_order: (i32,) = sqlx::query_as(
+            "SELECT COALESCE(MAX(mef.sort_order), -1) FROM media_entry_full mef WHERE mef.library_id = ? AND mef.entry_type = 'artist'",
         )
-        .bind(&name)
-        .bind(rel_path)
-        .bind(sort_order)
-        .bind(&sort_name)
+        .bind(library_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        let result = sqlx::query(
+            "INSERT INTO media_entry (library_id, parent_id, entry_type_id) VALUES (?, NULL, ?)",
+        )
+        .bind(library_id)
+        .bind(artist_type_id.0)
         .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
 
-        cache_entry_images(pool, cache_base, base_path, rel_path)
-            .await
-            .map_err(|e| e.to_string())?;
-    }
-
-    // Sync cached images for existing artists
-    for rel_path in &existing_artist_paths {
-        if disk_artists.contains(rel_path) {
-            if let Some(base) = artist_to_base.get(rel_path).or_else(|| {
-                base_paths.iter().find(|b| b.join(rel_path).exists())
-            }) {
-                sync_entry_images(pool, cache_base, base, rel_path).await?;
-            }
-        }
-    }
-
-    // Level 2 & 3: Albums and songs for each artist
-    let all_artists: Vec<(i64, String)> = sqlx::query_as("SELECT id, folder_path FROM artist")
-        .fetch_all(pool)
+        let entry_id = result.last_insert_rowid();
+        sqlx::query(
+            "INSERT INTO artist (id, title, sort_title, folder_path, sort_order) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(entry_id)
+        .bind(&artist_name)
+        .bind(&sort_title)
+        .bind(artist_rel)
+        .bind(max_order.0 + 1)
+        .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
 
-    for (artist_id, artist_rel) in &all_artists {
-        let artist_base = artist_to_base.get(artist_rel)
-            .or_else(|| base_paths.iter().find(|b| b.join(artist_rel).exists()))
-            .ok_or_else(|| format!("Cannot resolve base path for artist: {}", artist_rel))?;
-        let artist_path = artist_base.join(artist_rel);
-
-        let disk_albums: HashSet<String> = std::fs::read_dir(&artist_path)
-            .map_err(|e| e.to_string())?
-            .filter_map(|e| e.ok())
-            .filter(|e| is_scannable_dir(e))
-            .map(|e| {
-                e.path()
-                    .strip_prefix(artist_base)
-                    .unwrap_or(&e.path())
-                    .to_string_lossy()
-                    .to_string()
-            })
-            .collect();
-
-        let db_albums: Vec<(i64, String)> =
-            sqlx::query_as("SELECT id, folder_path FROM album WHERE artist_id = ?")
-                .bind(artist_id)
-                .fetch_all(pool)
-                .await
-                .map_err(|e| e.to_string())?;
-
-        for (id, path) in &db_albums {
-            if !disk_albums.contains(path) {
-                delete_cached_images_for_entry(pool, cache_base, path).await?;
-                sqlx::query("DELETE FROM album WHERE id = ?")
-                    .bind(id)
-                    .execute(pool)
-                    .await
-                    .map_err(|e| e.to_string())?;
-            }
-        }
-
-        let existing_album_paths: HashSet<String> = db_albums.iter().map(|(_, p)| p.clone()).collect();
-
-        for rel_path in &disk_albums {
-            if existing_album_paths.contains(rel_path) {
-                continue;
-            }
-            let full_path = artist_base.join(rel_path);
-            let name = full_path.file_name().unwrap_or_default().to_string_lossy().to_string();
-            let (album_title, album_year) = parse_folder_name(&name);
-            let album_sort_title = generate_sort_title(&album_title, "en");
-
-            let max_order: Option<(i32,)> =
-                sqlx::query_as("SELECT COALESCE(MAX(sort_order), -1) FROM album WHERE artist_id = ?")
-                    .bind(artist_id)
-                    .fetch_optional(pool)
-                    .await
-                    .map_err(|e| e.to_string())?;
-            let sort_order = max_order.map(|(v,)| v + 1).unwrap_or(0);
-
-            sqlx::query(
-                "INSERT INTO album (artist_id, title, release_date, folder_path, sort_order, sort_title) VALUES (?, ?, ?, ?, ?, ?)",
-            )
-            .bind(artist_id)
-            .bind(&album_title)
-            .bind(&album_year)
-            .bind(rel_path)
-            .bind(sort_order)
-            .bind(&album_sort_title)
-            .execute(pool)
+        cache_entry_images(pool, library_id, cache_base, base_path, artist_rel)
             .await
             .map_err(|e| e.to_string())?;
 
-            cache_entry_images(pool, cache_base, artist_base, rel_path)
-                .await
-                .map_err(|e| e.to_string())?;
+        db_artist_map.insert(artist_rel.clone(), entry_id);
+    }
+
+    // Add new albums
+    for album_rel in &disk_album_paths {
+        if db_album_map.contains_key(album_rel) {
+            continue;
         }
+        let base_path = path_to_base.get(album_rel).unwrap();
+        let full_path = base_path.join(album_rel);
+        let album_name = full_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let (album_title, album_year) = parse_folder_name(&album_name);
+        let album_sort_title = generate_sort_title(&album_title, "en");
 
-        // Sync cached images for existing albums
-        for rel_path in &existing_album_paths {
-            if disk_albums.contains(rel_path) {
-                sync_entry_images(pool, cache_base, artist_base, rel_path).await?;
-            }
+        // Find parent artist
+        let parent_rel = full_path
+            .parent()
+            .and_then(|p| p.strip_prefix(base_path).ok())
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        let parent_id = db_artist_map.get(&parent_rel).copied();
+
+        let max_order: (i32,) = if let Some(pid) = parent_id {
+            sqlx::query_as(
+                "SELECT COALESCE(MAX(mef.sort_order), -1) FROM media_entry_full mef WHERE mef.parent_id = ?",
+            )
+            .bind(pid)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| e.to_string())?
+        } else {
+            (-1,)
+        };
+
+        let result = sqlx::query(
+            "INSERT INTO media_entry (library_id, parent_id, entry_type_id) VALUES (?, ?, ?)",
+        )
+        .bind(library_id)
+        .bind(parent_id)
+        .bind(album_type_id.0)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        let entry_id = result.last_insert_rowid();
+        sqlx::query(
+            "INSERT INTO album (id, title, sort_title, folder_path, sort_order, release_date) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(entry_id)
+        .bind(&album_title)
+        .bind(&album_sort_title)
+        .bind(album_rel)
+        .bind(max_order.0 + 1)
+        .bind(&album_year)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        cache_entry_images(pool, library_id, cache_base, base_path, album_rel)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        db_album_map.insert(album_rel.clone(), entry_id);
+    }
+
+    // Add new tracks
+    for track_rel in &disk_track_paths {
+        if db_track_paths.contains_key(track_rel) {
+            continue;
         }
+        let base_path = path_to_base.get(track_rel).unwrap();
+        let full_path = base_path.join(track_rel);
+        let track_name = full_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let (track_title, track_number) = parse_song_filename(&track_name);
+        let track_sort_title = generate_sort_title(&track_title, "en");
 
-        // Songs for each album
-        let all_albums: Vec<(i64, String)> =
-            sqlx::query_as("SELECT id, folder_path FROM album WHERE artist_id = ?")
-                .bind(artist_id)
-                .fetch_all(pool)
-                .await
-                .map_err(|e| e.to_string())?;
+        // Find parent album
+        let parent_rel = full_path
+            .parent()
+            .and_then(|p| p.strip_prefix(base_path).ok())
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
 
-        for (album_id, album_rel) in &all_albums {
-            let album_path = artist_base.join(album_rel);
+        let parent_id = db_album_map.get(&parent_rel).copied();
 
-            let disk_songs: HashSet<String> = std::fs::read_dir(&album_path)
-                .map_err(|e| e.to_string())?
-                .filter_map(|e| e.ok())
-                .filter(|e| is_media_file(&e.path(), AUDIO_EXTENSIONS))
-                .map(|e| {
-                    e.path()
-                        .strip_prefix(artist_base)
-                        .unwrap_or(&e.path())
-                        .to_string_lossy()
-                        .to_string()
-                })
-                .collect();
+        let max_order: (i32,) = if let Some(pid) = parent_id {
+            sqlx::query_as(
+                "SELECT COALESCE(MAX(t.sort_order), -1) FROM track t JOIN media_entry me ON t.id = me.id WHERE me.parent_id = ?",
+            )
+            .bind(pid)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| e.to_string())?
+        } else {
+            (-1,)
+        };
 
-            let db_songs: Vec<(i64, String)> =
-                sqlx::query_as("SELECT id, file_path FROM song WHERE album_id = ?")
-                    .bind(album_id)
-                    .fetch_all(pool)
-                    .await
-                    .map_err(|e| e.to_string())?;
+        let result = sqlx::query(
+            "INSERT INTO media_entry (library_id, parent_id, entry_type_id) VALUES (?, ?, ?)",
+        )
+        .bind(library_id)
+        .bind(parent_id)
+        .bind(track_type_id.0)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
 
-            for (id, path) in &db_songs {
-                if !disk_songs.contains(path) {
-                    sqlx::query("DELETE FROM song WHERE id = ?")
-                        .bind(id)
-                        .execute(pool)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                }
-            }
-
-            let existing_song_paths: HashSet<String> = db_songs.iter().map(|(_, p)| p.clone()).collect();
-
-            for rel_path in &disk_songs {
-                if existing_song_paths.contains(rel_path) {
-                    continue;
-                }
-                let file_name = std::path::Path::new(rel_path)
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
-                let (song_title, track_number) = parse_song_filename(&file_name);
-
-                let max_order: Option<(i32,)> =
-                    sqlx::query_as("SELECT COALESCE(MAX(sort_order), -1) FROM song WHERE album_id = ?")
-                        .bind(album_id)
-                        .fetch_optional(pool)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                let sort_order = max_order.map(|(v,)| v + 1).unwrap_or(0);
-
-                sqlx::query(
-                    "INSERT INTO song (album_id, title, track_number, file_path, sort_order) VALUES (?, ?, ?, ?, ?)",
-                )
-                .bind(album_id)
-                .bind(&song_title)
-                .bind(track_number)
-                .bind(rel_path)
-                .bind(sort_order)
-                .execute(pool)
-                .await
-                .map_err(|e| e.to_string())?;
-            }
-        }
+        let entry_id = result.last_insert_rowid();
+        sqlx::query(
+            "INSERT INTO track (id, title, sort_title, file_path, sort_order, track_number) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(entry_id)
+        .bind(&track_title)
+        .bind(&track_sort_title)
+        .bind(track_rel)
+        .bind(max_order.0 + 1)
+        .bind(track_number)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
     }
 
     Ok(())
@@ -4393,14 +4226,16 @@ fn cache_images_for_entry(
 
 async fn insert_cached_images(
     pool: &sqlx::SqlitePool,
+    library_id: &str,
     entry_folder_path: &str,
     image_type: &str, // "cover" or "background"
     images: &[(String, String)], // (source_filename, cached_path)
 ) -> Result<(), sqlx::Error> {
     for (filename, cached_path) in images {
         sqlx::query(
-            "INSERT OR REPLACE INTO cached_images (entry_folder_path, image_type, source_filename, cached_path) VALUES (?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO cached_images (library_id, entry_folder_path, image_type, source_filename, cached_path) VALUES (?, ?, ?, ?, ?)",
         )
+        .bind(library_id)
         .bind(entry_folder_path)
         .bind(image_type)
         .bind(filename)
@@ -4411,10 +4246,11 @@ async fn insert_cached_images(
     Ok(())
 }
 
-async fn get_all_cached_covers(pool: &sqlx::SqlitePool) -> Result<HashMap<String, Vec<String>>, sqlx::Error> {
+async fn get_all_cached_covers(pool: &sqlx::SqlitePool, library_id: &str) -> Result<HashMap<String, Vec<String>>, sqlx::Error> {
     let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT entry_folder_path, cached_path FROM cached_images WHERE image_type = 'cover' ORDER BY entry_folder_path, source_filename",
+        "SELECT entry_folder_path, cached_path FROM cached_images WHERE library_id = ? AND image_type = 'cover' ORDER BY entry_folder_path, source_filename",
     )
+    .bind(library_id)
     .fetch_all(pool)
     .await?;
 
@@ -4450,20 +4286,22 @@ fn delete_cache_for_library(app_data_dir: &Path, library_id: &str) {
 /// Cache both covers and backgrounds for an entry, inserting into DB
 async fn cache_entry_images(
     pool: &sqlx::SqlitePool,
+    library_id: &str,
     cache_base: &Path,
     library_base: &Path,
     entry_rel_path: &str,
 ) -> Result<(), sqlx::Error> {
     let covers = cache_images_for_entry(cache_base, library_base, entry_rel_path, "covers");
-    insert_cached_images(pool, entry_rel_path, "cover", &covers).await?;
+    insert_cached_images(pool, library_id, entry_rel_path, "cover", &covers).await?;
     let backgrounds = cache_images_for_entry(cache_base, library_base, entry_rel_path, "backgrounds");
-    insert_cached_images(pool, entry_rel_path, "background", &backgrounds).await?;
+    insert_cached_images(pool, library_id, entry_rel_path, "background", &backgrounds).await?;
     Ok(())
 }
 
 /// Diff-aware sync for rescan: add new images, remove deleted ones, skip unchanged
 async fn sync_cached_images_for_entry(
     pool: &sqlx::SqlitePool,
+    library_id: &str,
     cache_base: &Path,
     library_base: &Path,
     entry_rel_path: &str,
@@ -4487,8 +4325,9 @@ async fn sync_cached_images_for_entry(
 
     // Get cached files from DB
     let db_rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT source_filename, cached_path FROM cached_images WHERE entry_folder_path = ? AND image_type = ?",
+        "SELECT source_filename, cached_path FROM cached_images WHERE library_id = ? AND entry_folder_path = ? AND image_type = ?",
     )
+    .bind(library_id)
     .bind(entry_rel_path)
     .bind(image_type_db)
     .fetch_all(pool)
@@ -4502,8 +4341,9 @@ async fn sync_cached_images_for_entry(
         if !disk_files.contains(filename) {
             let _ = std::fs::remove_file(cached_path);
             sqlx::query(
-                "DELETE FROM cached_images WHERE entry_folder_path = ? AND image_type = ? AND source_filename = ?",
+                "DELETE FROM cached_images WHERE library_id = ? AND entry_folder_path = ? AND image_type = ? AND source_filename = ?",
             )
+            .bind(library_id)
             .bind(entry_rel_path)
             .bind(image_type_db)
             .bind(filename)
@@ -4521,8 +4361,9 @@ async fn sync_cached_images_for_entry(
             let cached = cache_dir.join(filename);
             if std::fs::copy(&source, &cached).is_ok() {
                 sqlx::query(
-                    "INSERT OR REPLACE INTO cached_images (entry_folder_path, image_type, source_filename, cached_path) VALUES (?, ?, ?, ?)",
+                    "INSERT OR REPLACE INTO cached_images (library_id, entry_folder_path, image_type, source_filename, cached_path) VALUES (?, ?, ?, ?, ?)",
                 )
+                .bind(library_id)
                 .bind(entry_rel_path)
                 .bind(image_type_db)
                 .bind(filename)
@@ -4540,22 +4381,25 @@ async fn sync_cached_images_for_entry(
 /// Sync both covers and backgrounds for an entry during rescan
 async fn sync_entry_images(
     pool: &sqlx::SqlitePool,
+    library_id: &str,
     cache_base: &Path,
     library_base: &Path,
     entry_rel_path: &str,
 ) -> Result<(), String> {
-    sync_cached_images_for_entry(pool, cache_base, library_base, entry_rel_path, "covers", "cover").await?;
-    sync_cached_images_for_entry(pool, cache_base, library_base, entry_rel_path, "backgrounds", "background").await?;
+    sync_cached_images_for_entry(pool, library_id, cache_base, library_base, entry_rel_path, "covers", "cover").await?;
+    sync_cached_images_for_entry(pool, library_id, cache_base, library_base, entry_rel_path, "backgrounds", "background").await?;
     Ok(())
 }
 
 /// Delete cached images for a specific entry
 async fn delete_cached_images_for_entry(
     pool: &sqlx::SqlitePool,
+    library_id: &str,
     cache_base: &Path,
     entry_rel_path: &str,
 ) -> Result<(), String> {
-    sqlx::query("DELETE FROM cached_images WHERE entry_folder_path = ?")
+    sqlx::query("DELETE FROM cached_images WHERE library_id = ? AND entry_folder_path = ?")
+        .bind(library_id)
         .bind(entry_rel_path)
         .execute(pool)
         .await
@@ -4570,11 +4414,24 @@ async fn delete_cached_images_for_entry(
 async fn scan_music_library(
     app: &tauri::AppHandle,
     pool: &sqlx::SqlitePool,
+    library_id: &str,
     base_path: &PathBuf,
     cache_base: &Path,
     cancel: &AtomicBool,
 ) -> Result<(), sqlx::Error> {
-    // Level 1: Artists
+    let artist_type_id: (i64,) =
+        sqlx::query_as("SELECT id FROM media_entry_type WHERE name = 'artist'")
+            .fetch_one(pool)
+            .await?;
+    let album_type_id: (i64,) =
+        sqlx::query_as("SELECT id FROM media_entry_type WHERE name = 'album'")
+            .fetch_one(pool)
+            .await?;
+    let track_type_id: (i64,) =
+        sqlx::query_as("SELECT id FROM media_entry_type WHERE name = 'track'")
+            .fetch_one(pool)
+            .await?;
+
     let mut artist_dirs: Vec<_> = std::fs::read_dir(base_path)
         .map_err(|e| sqlx::Error::Protocol(e.to_string()))?
         .filter_map(|e| e.ok())
@@ -4590,26 +4447,37 @@ async fn scan_music_library(
         let artist_name = artist_entry.file_name().to_string_lossy().to_string();
         let _ = app.emit("scan-progress", &artist_name);
 
-        let sort_name = generate_sort_title(&artist_name, "en");
+        let sort_title = generate_sort_title(&artist_name, "en");
         let rel_path = artist_path
             .strip_prefix(base_path)
             .unwrap_or(&artist_path)
             .to_string_lossy()
             .to_string();
 
+        // Insert media_entry for artist
         let result = sqlx::query(
-            "INSERT INTO artist (name, folder_path, sort_order, sort_name) VALUES (?, ?, ?, ?)",
+            "INSERT INTO media_entry (library_id, parent_id, entry_type_id) VALUES (?, NULL, ?)",
         )
-        .bind(&artist_name)
-        .bind(&rel_path)
-        .bind(i as i32)
-        .bind(&sort_name)
+        .bind(library_id)
+        .bind(artist_type_id.0)
         .execute(pool)
         .await?;
 
-        let artist_id = result.last_insert_rowid();
+        let artist_entry_id = result.last_insert_rowid();
 
-        cache_entry_images(pool, cache_base, base_path, &rel_path).await?;
+        // Insert artist detail
+        sqlx::query(
+            "INSERT INTO artist (id, title, sort_title, folder_path, sort_order) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(artist_entry_id)
+        .bind(&artist_name)
+        .bind(&sort_title)
+        .bind(&rel_path)
+        .bind(i as i32)
+        .execute(pool)
+        .await?;
+
+        cache_entry_images(pool, library_id, cache_base, base_path, &rel_path).await?;
 
         // Level 2: Albums
         let mut album_dirs: Vec<_> = std::fs::read_dir(&artist_path)
@@ -4630,30 +4498,41 @@ async fn scan_music_library(
                 .to_string_lossy()
                 .to_string();
 
+            // Insert media_entry for album (parent = artist)
             let result = sqlx::query(
-                "INSERT INTO album (artist_id, title, release_date, folder_path, sort_order, sort_title) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO media_entry (library_id, parent_id, entry_type_id) VALUES (?, ?, ?)",
             )
-            .bind(artist_id)
-            .bind(&album_title)
-            .bind(&album_year)
-            .bind(&album_rel)
-            .bind(j as i32)
-            .bind(&album_sort_title)
+            .bind(library_id)
+            .bind(artist_entry_id)
+            .bind(album_type_id.0)
             .execute(pool)
             .await?;
 
-            let album_id = result.last_insert_rowid();
+            let album_entry_id = result.last_insert_rowid();
 
-            cache_entry_images(pool, cache_base, base_path, &album_rel).await?;
+            // Insert album detail
+            sqlx::query(
+                "INSERT INTO album (id, title, sort_title, folder_path, sort_order, release_date) VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(album_entry_id)
+            .bind(&album_title)
+            .bind(&album_sort_title)
+            .bind(&album_rel)
+            .bind(j as i32)
+            .bind(&album_year)
+            .execute(pool)
+            .await?;
 
-            // Level 3: Songs (files)
-            let mut song_files: Vec<_> = std::fs::read_dir(&album_path)
+            cache_entry_images(pool, library_id, cache_base, base_path, &album_rel).await?;
+
+            // Level 3: Tracks
+            let mut track_files: Vec<_> = std::fs::read_dir(&album_path)
                 .map_err(|e| sqlx::Error::Protocol(e.to_string()))?
                 .filter_map(|e| e.ok())
                 .filter(|e| is_media_file(&e.path(), AUDIO_EXTENSIONS))
                 .collect();
 
-            song_files.sort_by(|a, b| {
+            track_files.sort_by(|a, b| {
                 let (_, a_num) = parse_song_filename(&a.file_name().to_string_lossy());
                 let (_, b_num) = parse_song_filename(&b.file_name().to_string_lossy());
                 match (a_num, b_num) {
@@ -4662,24 +4541,39 @@ async fn scan_music_library(
                 }
             });
 
-            for (k, song_entry) in song_files.iter().enumerate() {
-                let song_name = song_entry.file_name().to_string_lossy().to_string();
-                let (song_title, track_number) = parse_song_filename(&song_name);
-                let song_rel = song_entry
+            for (k, track_entry) in track_files.iter().enumerate() {
+                let track_name = track_entry.file_name().to_string_lossy().to_string();
+                let (track_title, track_number) = parse_song_filename(&track_name);
+                let track_sort_title = generate_sort_title(&track_title, "en");
+                let track_rel = track_entry
                     .path()
                     .strip_prefix(base_path)
-                    .unwrap_or(&song_entry.path())
+                    .unwrap_or(&track_entry.path())
                     .to_string_lossy()
                     .to_string();
 
-                sqlx::query(
-                    "INSERT INTO song (album_id, title, track_number, file_path, sort_order) VALUES (?, ?, ?, ?, ?)",
+                // Insert media_entry for track (parent = album)
+                let result = sqlx::query(
+                    "INSERT INTO media_entry (library_id, parent_id, entry_type_id) VALUES (?, ?, ?)",
                 )
-                .bind(album_id)
-                .bind(&song_title)
-                .bind(track_number)
-                .bind(&song_rel)
+                .bind(library_id)
+                .bind(album_entry_id)
+                .bind(track_type_id.0)
+                .execute(pool)
+                .await?;
+
+                let track_entry_id = result.last_insert_rowid();
+
+                // Insert track detail
+                sqlx::query(
+                    "INSERT INTO track (id, title, sort_title, file_path, sort_order, track_number) VALUES (?, ?, ?, ?, ?, ?)",
+                )
+                .bind(track_entry_id)
+                .bind(&track_title)
+                .bind(&track_sort_title)
+                .bind(&track_rel)
                 .bind(k as i32)
+                .bind(track_number)
                 .execute(pool)
                 .await?;
             }
@@ -4692,6 +4586,7 @@ async fn scan_music_library(
 async fn scan_video_library(
     app: &tauri::AppHandle,
     pool: &sqlx::SqlitePool,
+    library_id: &str,
     base_path: &PathBuf,
     cache_base: &Path,
     cancel: &AtomicBool,
@@ -4747,8 +4642,9 @@ async fn scan_video_library(
         if has_season {
             // TV show
             let result = sqlx::query(
-                "INSERT INTO media_entry (parent_id, entry_type_id) VALUES (NULL, ?)",
+                "INSERT INTO media_entry (library_id, parent_id, entry_type_id) VALUES (?, NULL, ?)",
             )
+            .bind(library_id)
             .bind(show_type_id.0)
             .execute(pool)
             .await?;
@@ -4763,7 +4659,7 @@ async fn scan_video_library(
                 .execute(pool)
                 .await?;
 
-            cache_entry_images(pool, cache_base, base_path, &rel_path).await?;
+            cache_entry_images(pool, library_id, cache_base, base_path, &rel_path).await?;
 
             // Scan seasons
             let mut season_dirs = subdirs;
@@ -4842,6 +4738,7 @@ async fn scan_video_library(
             scan_video_dir(
                 app,
                 pool,
+                library_id,
                 base_path,
                 &path,
                 None,
@@ -4862,6 +4759,7 @@ async fn scan_video_library(
 async fn scan_video_dir(
     app: &tauri::AppHandle,
     pool: &sqlx::SqlitePool,
+    library_id: &str,
     base_path: &PathBuf,
     dir: &PathBuf,
     parent_id: Option<i64>,
@@ -4903,8 +4801,9 @@ async fn scan_video_dir(
     if has_video_files {
         // Movie (leaf node with video files)
         let result = sqlx::query(
-            "INSERT INTO media_entry (parent_id, entry_type_id) VALUES (?, ?)",
+            "INSERT INTO media_entry (library_id, parent_id, entry_type_id) VALUES (?, ?, ?)",
         )
+        .bind(library_id)
         .bind(parent_id)
         .bind(movie_type_id)
         .execute(pool)
@@ -4921,19 +4820,20 @@ async fn scan_video_dir(
             .execute(pool)
             .await?;
 
-        cache_entry_images(pool, cache_base, base_path, &rel_path).await?;
+        cache_entry_images(pool, library_id, cache_base, base_path, &rel_path).await?;
     } else {
         // Collection (has subdirs, or empty folder)
         let result = sqlx::query(
-            "INSERT INTO media_entry (parent_id, entry_type_id) VALUES (?, ?)",
+            "INSERT INTO media_entry (library_id, parent_id, entry_type_id) VALUES (?, ?, ?)",
         )
+        .bind(library_id)
         .bind(parent_id)
         .bind(collection_type_id)
         .execute(pool)
         .await?;
 
         let entry_id = result.last_insert_rowid();
-        sqlx::query("INSERT INTO collection (id, title, folder_path, sort_title, sort_order) VALUES (?, ?, ?, ?, ?)")
+        sqlx::query("INSERT INTO media_collection (id, title, folder_path, sort_title, sort_order) VALUES (?, ?, ?, ?, ?)")
             .bind(entry_id)
             .bind(&title)
             .bind(&rel_path)
@@ -4942,7 +4842,7 @@ async fn scan_video_dir(
             .execute(pool)
             .await?;
 
-        cache_entry_images(pool, cache_base, base_path, &rel_path).await?;
+        cache_entry_images(pool, library_id, cache_base, base_path, &rel_path).await?;
 
         let mut child_dirs: Vec<_> = subdirs;
         child_dirs.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
@@ -4952,6 +4852,7 @@ async fn scan_video_dir(
             scan_video_dir(
                 app,
                 pool,
+                library_id,
                 base_path,
                 &child_path,
                 Some(entry_id),
@@ -5137,49 +5038,34 @@ pub struct EpisodeDetailLocal {
     pub crew: Vec<CrewInfo>,
 }
 
-/// Helper: open library pool from library_id
-async fn open_library_pool(
-    state: &AppState,
+async fn get_library_paths(
+    app_db: &SqlitePool,
     library_id: &str,
-) -> Result<(SqlitePool, Vec<String>), String> {
-    let row: Option<(String, i32, String)> = sqlx::query_as(
-        "SELECT paths, portable, db_filename FROM libraries WHERE id = ?",
+) -> Result<Vec<String>, String> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT paths FROM library WHERE id = ?",
     )
     .bind(library_id)
-    .fetch_optional(&state.app_db)
+    .fetch_optional(app_db)
     .await
     .map_err(|e| e.to_string())?;
-
-    let (paths_json, portable, db_filename) = row.ok_or("Library not found")?;
-    let paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
-
-    let db_path = if portable != 0 {
-        PathBuf::from(&paths[0]).join(".waverunner.db")
-    } else {
-        state.app_data_dir.join(&db_filename)
-    };
-
-    let pool = crate::db::connect_library_pool(&db_path)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    Ok((pool, paths))
+    let (paths_json,) = row.ok_or("Library not found")?;
+    Ok(serde_json::from_str(&paths_json).unwrap_or_default())
 }
 
 #[tauri::command]
 pub async fn get_show_detail(
     state: tauri::State<'_, AppState>,
-    library_id: String,
     show_id: i64,
 ) -> Result<ShowDetail, String> {
-    let (pool, _) = open_library_pool(&state, &library_id).await?;
+    // Uses shared app_db pool
 
     let show_row: Option<(Option<String>, Option<String>, Option<String>, Option<String>, Option<i64>)> =
         sqlx::query_as(
             "SELECT tmdb_id, imdb_id, plot, tagline, maturity_rating_id FROM show WHERE id = ?",
         )
         .bind(show_id)
-        .fetch_optional(&pool)
+        .fetch_optional(&state.app_db)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -5188,7 +5074,7 @@ pub async fn get_show_detail(
     let maturity_rating: Option<String> = if let Some(mid) = mr_id {
         sqlx::query_scalar("SELECT name FROM maturity_rating WHERE id = ?")
             .bind(mid)
-            .fetch_optional(&pool)
+            .fetch_optional(&state.app_db)
             .await
             .map_err(|e| e.to_string())?
     } else {
@@ -5200,7 +5086,7 @@ pub async fn get_show_detail(
         "SELECT g.name FROM show_genre sg JOIN genre g ON sg.genre_id = g.id WHERE sg.show_id = ? ORDER BY g.name",
     )
     .bind(show_id)
-    .fetch_all(&pool)
+    .fetch_all(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
     let genres: Vec<String> = genre_rows.into_iter().map(|(n,)| n).collect();
@@ -5210,7 +5096,7 @@ pub async fn get_show_detail(
         "SELECT p.id, p.name, p.image_path FROM show_creator sc JOIN person p ON sc.person_id = p.id WHERE sc.show_id = ? ORDER BY p.name",
     )
     .bind(show_id)
-    .fetch_all(&pool)
+    .fetch_all(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
     let creators: Vec<PersonInfo> = creator_rows.into_iter().map(|(id, name, image_path)| PersonInfo { id, name, image_path }).collect();
@@ -5220,7 +5106,7 @@ pub async fn get_show_detail(
         "SELECT p.id, p.name, p.image_path, sc.role FROM show_cast sc JOIN person p ON sc.person_id = p.id WHERE sc.show_id = ? ORDER BY sc.sort_order",
     )
     .bind(show_id)
-    .fetch_all(&pool)
+    .fetch_all(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
     let cast: Vec<CastInfo> = cast_rows.into_iter().map(|(id, name, image_path, role)| CastInfo { id, name, image_path, role }).collect();
@@ -5230,7 +5116,7 @@ pub async fn get_show_detail(
         "SELECT p.id, p.name, p.image_path, sc.job FROM show_crew sc JOIN person p ON sc.person_id = p.id WHERE sc.show_id = ? ORDER BY p.name",
     )
     .bind(show_id)
-    .fetch_all(&pool)
+    .fetch_all(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
     let crew: Vec<CrewInfo> = crew_rows.into_iter().map(|(id, name, image_path, job)| CrewInfo { id, name, image_path, job }).collect();
@@ -5240,7 +5126,7 @@ pub async fn get_show_detail(
         "SELECT p.id, p.name, p.image_path FROM show_producer sp JOIN person p ON sp.person_id = p.id WHERE sp.show_id = ? ORDER BY p.name",
     )
     .bind(show_id)
-    .fetch_all(&pool)
+    .fetch_all(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
     let producers: Vec<PersonInfo> = producer_rows.into_iter().map(|(id, name, image_path)| PersonInfo { id, name, image_path }).collect();
@@ -5250,7 +5136,7 @@ pub async fn get_show_detail(
         "SELECT s.name FROM show_studio ss JOIN studio s ON ss.studio_id = s.id WHERE ss.show_id = ? ORDER BY s.name",
     )
     .bind(show_id)
-    .fetch_all(&pool)
+    .fetch_all(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
     let studios: Vec<String> = studio_rows.into_iter().map(|(n,)| n).collect();
@@ -5260,12 +5146,11 @@ pub async fn get_show_detail(
         "SELECT k.name FROM show_keyword sk JOIN keyword k ON sk.keyword_id = k.id WHERE sk.show_id = ? ORDER BY k.name",
     )
     .bind(show_id)
-    .fetch_all(&pool)
+    .fetch_all(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
     let keywords: Vec<String> = keyword_rows.into_iter().map(|(n,)| n).collect();
 
-    pool.close().await;
 
     Ok(ShowDetail {
         id: show_id,
@@ -5287,16 +5172,15 @@ pub async fn get_show_detail(
 #[tauri::command]
 pub async fn get_season_detail_local(
     state: tauri::State<'_, AppState>,
-    library_id: String,
     season_id: i64,
 ) -> Result<SeasonDetailLocal, String> {
-    let (pool, _) = open_library_pool(&state, &library_id).await?;
+    // Uses shared app_db pool
 
     let row: Option<(String, Option<i64>, Option<String>)> = sqlx::query_as(
         "SELECT title, season_number, plot FROM season WHERE id = ?",
     )
     .bind(season_id)
-    .fetch_optional(&pool)
+    .fetch_optional(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
 
@@ -5306,7 +5190,7 @@ pub async fn get_season_detail_local(
         "SELECT p.id, p.name, p.image_path, sc.role FROM season_cast sc JOIN person p ON sc.person_id = p.id WHERE sc.season_id = ? ORDER BY sc.sort_order",
     )
     .bind(season_id)
-    .fetch_all(&pool)
+    .fetch_all(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
     let cast: Vec<CastInfo> = cast_rows.into_iter().map(|(id, name, image_path, role)| CastInfo { id, name, image_path, role }).collect();
@@ -5315,7 +5199,7 @@ pub async fn get_season_detail_local(
         "SELECT p.id, p.name, p.image_path, sc.job FROM season_crew sc JOIN person p ON sc.person_id = p.id WHERE sc.season_id = ? ORDER BY p.name",
     )
     .bind(season_id)
-    .fetch_all(&pool)
+    .fetch_all(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
     let crew: Vec<CrewInfo> = crew_rows.into_iter().map(|(id, name, image_path, job)| CrewInfo { id, name, image_path, job }).collect();
@@ -5324,7 +5208,7 @@ pub async fn get_season_detail_local(
         "SELECT p.id, p.name, p.image_path FROM season_director sd JOIN person p ON sd.person_id = p.id WHERE sd.season_id = ? ORDER BY p.name",
     )
     .bind(season_id)
-    .fetch_all(&pool)
+    .fetch_all(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
     let directors: Vec<PersonInfo> = director_rows.into_iter().map(|(id, name, image_path)| PersonInfo { id, name, image_path }).collect();
@@ -5333,12 +5217,11 @@ pub async fn get_season_detail_local(
         "SELECT p.id, p.name, p.image_path FROM season_producer sp JOIN person p ON sp.person_id = p.id WHERE sp.season_id = ? ORDER BY p.name",
     )
     .bind(season_id)
-    .fetch_all(&pool)
+    .fetch_all(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
     let producers: Vec<PersonInfo> = producer_rows.into_iter().map(|(id, name, image_path)| PersonInfo { id, name, image_path }).collect();
 
-    pool.close().await;
 
     Ok(SeasonDetailLocal {
         id: season_id,
@@ -5355,16 +5238,15 @@ pub async fn get_season_detail_local(
 #[tauri::command]
 pub async fn get_episode_detail_local(
     state: tauri::State<'_, AppState>,
-    library_id: String,
     episode_id: i64,
 ) -> Result<EpisodeDetailLocal, String> {
-    let (pool, _) = open_library_pool(&state, &library_id).await?;
+    // Uses shared app_db pool
 
     let row: Option<(String, Option<i64>, Option<String>, Option<String>, Option<i64>)> = sqlx::query_as(
         "SELECT title, episode_number, release_date, plot, runtime FROM episode WHERE id = ?",
     )
     .bind(episode_id)
-    .fetch_optional(&pool)
+    .fetch_optional(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
 
@@ -5374,7 +5256,7 @@ pub async fn get_episode_detail_local(
         "SELECT p.id, p.name, p.image_path, ec.role FROM episode_cast ec JOIN person p ON ec.person_id = p.id WHERE ec.episode_id = ? ORDER BY ec.sort_order",
     )
     .bind(episode_id)
-    .fetch_all(&pool)
+    .fetch_all(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
     let cast: Vec<CastInfo> = cast_rows.into_iter().map(|(id, name, image_path, role)| CastInfo { id, name, image_path, role }).collect();
@@ -5383,12 +5265,11 @@ pub async fn get_episode_detail_local(
         "SELECT p.id, p.name, p.image_path, ec.job FROM episode_crew ec JOIN person p ON ec.person_id = p.id WHERE ec.episode_id = ? ORDER BY p.name",
     )
     .bind(episode_id)
-    .fetch_all(&pool)
+    .fetch_all(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
     let crew: Vec<CrewInfo> = crew_rows.into_iter().map(|(id, name, image_path, job)| CrewInfo { id, name, image_path, job }).collect();
 
-    pool.close().await;
 
     Ok(EpisodeDetailLocal {
         id: episode_id,
@@ -5490,108 +5371,106 @@ pub struct TmdbShowFieldSelection {
 #[tauri::command]
 pub async fn apply_tmdb_show_metadata(
     state: tauri::State<'_, AppState>,
-    library_id: String,
     show_id: i64,
     fields: TmdbShowFieldSelection,
 ) -> Result<(), String> {
-    let (pool, _) = open_library_pool(&state, &library_id).await?;
+    // Uses shared app_db pool
 
     // Scalar fields on show table
     if let Some(ref tmdb_id) = fields.tmdb_id {
         sqlx::query("UPDATE show SET tmdb_id = ? WHERE id = ?")
-            .bind(tmdb_id).bind(show_id).execute(&pool).await.map_err(|e| e.to_string())?;
+            .bind(tmdb_id).bind(show_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
     }
     if let Some(ref imdb_id) = fields.imdb_id {
         sqlx::query("UPDATE show SET imdb_id = ? WHERE id = ?")
-            .bind(imdb_id).bind(show_id).execute(&pool).await.map_err(|e| e.to_string())?;
+            .bind(imdb_id).bind(show_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
     }
     if let Some(ref plot) = fields.plot {
         sqlx::query("UPDATE show SET plot = ? WHERE id = ?")
-            .bind(plot).bind(show_id).execute(&pool).await.map_err(|e| e.to_string())?;
+            .bind(plot).bind(show_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
     }
     if let Some(ref tagline) = fields.tagline {
         sqlx::query("UPDATE show SET tagline = ? WHERE id = ?")
-            .bind(tagline).bind(show_id).execute(&pool).await.map_err(|e| e.to_string())?;
+            .bind(tagline).bind(show_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
     }
 
     // Maturity rating
     if let Some(ref mr_name) = fields.maturity_rating {
         if mr_name.is_empty() {
             sqlx::query("UPDATE show SET maturity_rating_id = NULL WHERE id = ?")
-                .bind(show_id).execute(&pool).await.map_err(|e| e.to_string())?;
+                .bind(show_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         } else {
             sqlx::query("INSERT OR IGNORE INTO maturity_rating (name) VALUES (?)")
-                .bind(mr_name).execute(&pool).await.map_err(|e| e.to_string())?;
+                .bind(mr_name).execute(&state.app_db).await.map_err(|e| e.to_string())?;
             sqlx::query("UPDATE show SET maturity_rating_id = (SELECT id FROM maturity_rating WHERE name = ?) WHERE id = ?")
-                .bind(mr_name).bind(show_id).execute(&pool).await.map_err(|e| e.to_string())?;
+                .bind(mr_name).bind(show_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         }
     }
 
     // Junction tables
     if let Some(ref genres) = fields.genres {
-        sqlx::query("DELETE FROM show_genre WHERE show_id = ?").bind(show_id).execute(&pool).await.map_err(|e| e.to_string())?;
+        sqlx::query("DELETE FROM show_genre WHERE show_id = ?").bind(show_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         for name in genres {
-            sqlx::query("INSERT OR IGNORE INTO genre (name) VALUES (?)").bind(name).execute(&pool).await.map_err(|e| e.to_string())?;
+            sqlx::query("INSERT OR IGNORE INTO genre (name) VALUES (?)").bind(name).execute(&state.app_db).await.map_err(|e| e.to_string())?;
             sqlx::query("INSERT INTO show_genre (show_id, genre_id) VALUES (?, (SELECT id FROM genre WHERE name = ?))")
-                .bind(show_id).bind(name).execute(&pool).await.map_err(|e| e.to_string())?;
+                .bind(show_id).bind(name).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         }
     }
 
     if let Some(ref creators) = fields.creators {
-        sqlx::query("DELETE FROM show_creator WHERE show_id = ?").bind(show_id).execute(&pool).await.map_err(|e| e.to_string())?;
+        sqlx::query("DELETE FROM show_creator WHERE show_id = ?").bind(show_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         for c in creators {
-            let person_id = ensure_person(&pool, &c.name, c.tmdb_id).await?;
+            let person_id = ensure_person(&state.app_db, &c.name, c.tmdb_id).await?;
             sqlx::query("INSERT INTO show_creator (show_id, person_id) VALUES (?, ?)")
-                .bind(show_id).bind(person_id).execute(&pool).await.map_err(|e| e.to_string())?;
+                .bind(show_id).bind(person_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         }
     }
 
     if let Some(ref cast) = fields.cast {
-        sqlx::query("DELETE FROM show_cast WHERE show_id = ?").bind(show_id).execute(&pool).await.map_err(|e| e.to_string())?;
+        sqlx::query("DELETE FROM show_cast WHERE show_id = ?").bind(show_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         for (i, c) in cast.iter().enumerate() {
-            let person_id = ensure_person(&pool, &c.name, c.tmdb_id).await?;
+            let person_id = ensure_person(&state.app_db, &c.name, c.tmdb_id).await?;
             sqlx::query("INSERT INTO show_cast (show_id, person_id, role, sort_order) VALUES (?, ?, ?, ?)")
-                .bind(show_id).bind(person_id).bind(&c.role).bind(i as i64).execute(&pool).await.map_err(|e| e.to_string())?;
+                .bind(show_id).bind(person_id).bind(&c.role).bind(i as i64).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         }
     }
 
     if let Some(ref crew) = fields.crew {
-        sqlx::query("DELETE FROM show_crew WHERE show_id = ?").bind(show_id).execute(&pool).await.map_err(|e| e.to_string())?;
+        sqlx::query("DELETE FROM show_crew WHERE show_id = ?").bind(show_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         for c in crew {
-            let person_id = ensure_person(&pool, &c.name, c.tmdb_id).await?;
+            let person_id = ensure_person(&state.app_db, &c.name, c.tmdb_id).await?;
             sqlx::query("INSERT INTO show_crew (show_id, person_id, job) VALUES (?, ?, ?)")
-                .bind(show_id).bind(person_id).bind(&c.job).execute(&pool).await.map_err(|e| e.to_string())?;
+                .bind(show_id).bind(person_id).bind(&c.job).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         }
     }
 
     if let Some(ref producers) = fields.producers {
-        sqlx::query("DELETE FROM show_producer WHERE show_id = ?").bind(show_id).execute(&pool).await.map_err(|e| e.to_string())?;
+        sqlx::query("DELETE FROM show_producer WHERE show_id = ?").bind(show_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         for p in producers {
-            let person_id = ensure_person(&pool, &p.name, p.tmdb_id).await?;
+            let person_id = ensure_person(&state.app_db, &p.name, p.tmdb_id).await?;
             sqlx::query("INSERT INTO show_producer (show_id, person_id) VALUES (?, ?)")
-                .bind(show_id).bind(person_id).execute(&pool).await.map_err(|e| e.to_string())?;
+                .bind(show_id).bind(person_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         }
     }
 
     if let Some(ref studios) = fields.studios {
-        sqlx::query("DELETE FROM show_studio WHERE show_id = ?").bind(show_id).execute(&pool).await.map_err(|e| e.to_string())?;
+        sqlx::query("DELETE FROM show_studio WHERE show_id = ?").bind(show_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         for name in studios {
-            sqlx::query("INSERT OR IGNORE INTO studio (name) VALUES (?)").bind(name).execute(&pool).await.map_err(|e| e.to_string())?;
+            sqlx::query("INSERT OR IGNORE INTO studio (name) VALUES (?)").bind(name).execute(&state.app_db).await.map_err(|e| e.to_string())?;
             sqlx::query("INSERT INTO show_studio (show_id, studio_id) VALUES (?, (SELECT id FROM studio WHERE name = ?))")
-                .bind(show_id).bind(name).execute(&pool).await.map_err(|e| e.to_string())?;
+                .bind(show_id).bind(name).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         }
     }
 
     if let Some(ref keywords) = fields.keywords {
-        sqlx::query("DELETE FROM show_keyword WHERE show_id = ?").bind(show_id).execute(&pool).await.map_err(|e| e.to_string())?;
+        sqlx::query("DELETE FROM show_keyword WHERE show_id = ?").bind(show_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         for name in keywords {
-            sqlx::query("INSERT OR IGNORE INTO keyword (name) VALUES (?)").bind(name).execute(&pool).await.map_err(|e| e.to_string())?;
+            sqlx::query("INSERT OR IGNORE INTO keyword (name) VALUES (?)").bind(name).execute(&state.app_db).await.map_err(|e| e.to_string())?;
             sqlx::query("INSERT INTO show_keyword (show_id, keyword_id) VALUES (?, (SELECT id FROM keyword WHERE name = ?))")
-                .bind(show_id).bind(name).execute(&pool).await.map_err(|e| e.to_string())?;
+                .bind(show_id).bind(name).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         }
     }
 
-    pool.close().await;
     Ok(())
 }
 
@@ -5609,54 +5488,52 @@ pub struct TmdbSeasonFieldSelection {
 #[tauri::command]
 pub async fn apply_tmdb_season_metadata(
     state: tauri::State<'_, AppState>,
-    library_id: String,
     season_id: i64,
     fields: TmdbSeasonFieldSelection,
 ) -> Result<(), String> {
-    let (pool, _) = open_library_pool(&state, &library_id).await?;
+    // Uses shared app_db pool
 
     if let Some(ref plot) = fields.plot {
         sqlx::query("UPDATE season SET plot = ? WHERE id = ?")
-            .bind(plot).bind(season_id).execute(&pool).await.map_err(|e| e.to_string())?;
+            .bind(plot).bind(season_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
     }
 
     if let Some(ref cast) = fields.cast {
-        sqlx::query("DELETE FROM season_cast WHERE season_id = ?").bind(season_id).execute(&pool).await.map_err(|e| e.to_string())?;
+        sqlx::query("DELETE FROM season_cast WHERE season_id = ?").bind(season_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         for (i, c) in cast.iter().enumerate() {
-            let person_id = ensure_person(&pool, &c.name, c.tmdb_id).await?;
+            let person_id = ensure_person(&state.app_db, &c.name, c.tmdb_id).await?;
             sqlx::query("INSERT INTO season_cast (season_id, person_id, role, sort_order) VALUES (?, ?, ?, ?)")
-                .bind(season_id).bind(person_id).bind(&c.role).bind(i as i64).execute(&pool).await.map_err(|e| e.to_string())?;
+                .bind(season_id).bind(person_id).bind(&c.role).bind(i as i64).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         }
     }
 
     if let Some(ref crew) = fields.crew {
-        sqlx::query("DELETE FROM season_crew WHERE season_id = ?").bind(season_id).execute(&pool).await.map_err(|e| e.to_string())?;
+        sqlx::query("DELETE FROM season_crew WHERE season_id = ?").bind(season_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         for c in crew {
-            let person_id = ensure_person(&pool, &c.name, c.tmdb_id).await?;
+            let person_id = ensure_person(&state.app_db, &c.name, c.tmdb_id).await?;
             sqlx::query("INSERT INTO season_crew (season_id, person_id, job) VALUES (?, ?, ?)")
-                .bind(season_id).bind(person_id).bind(&c.job).execute(&pool).await.map_err(|e| e.to_string())?;
+                .bind(season_id).bind(person_id).bind(&c.job).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         }
     }
 
     if let Some(ref directors) = fields.directors {
-        sqlx::query("DELETE FROM season_director WHERE season_id = ?").bind(season_id).execute(&pool).await.map_err(|e| e.to_string())?;
+        sqlx::query("DELETE FROM season_director WHERE season_id = ?").bind(season_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         for d in directors {
-            let person_id = ensure_person(&pool, &d.name, d.tmdb_id).await?;
+            let person_id = ensure_person(&state.app_db, &d.name, d.tmdb_id).await?;
             sqlx::query("INSERT INTO season_director (season_id, person_id) VALUES (?, ?)")
-                .bind(season_id).bind(person_id).execute(&pool).await.map_err(|e| e.to_string())?;
+                .bind(season_id).bind(person_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         }
     }
 
     if let Some(ref producers) = fields.producers {
-        sqlx::query("DELETE FROM season_producer WHERE season_id = ?").bind(season_id).execute(&pool).await.map_err(|e| e.to_string())?;
+        sqlx::query("DELETE FROM season_producer WHERE season_id = ?").bind(season_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         for p in producers {
-            let person_id = ensure_person(&pool, &p.name, p.tmdb_id).await?;
+            let person_id = ensure_person(&state.app_db, &p.name, p.tmdb_id).await?;
             sqlx::query("INSERT INTO season_producer (season_id, person_id) VALUES (?, ?)")
-                .bind(season_id).bind(person_id).execute(&pool).await.map_err(|e| e.to_string())?;
+                .bind(season_id).bind(person_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         }
     }
 
-    pool.close().await;
     Ok(())
 }
 
@@ -5674,44 +5551,42 @@ pub struct TmdbEpisodeFieldSelection {
 #[tauri::command]
 pub async fn apply_tmdb_episode_metadata(
     state: tauri::State<'_, AppState>,
-    library_id: String,
     episode_id: i64,
     fields: TmdbEpisodeFieldSelection,
 ) -> Result<(), String> {
-    let (pool, _) = open_library_pool(&state, &library_id).await?;
+    // Uses shared app_db pool
 
     if let Some(ref plot) = fields.plot {
         sqlx::query("UPDATE episode SET plot = ? WHERE id = ?")
-            .bind(plot).bind(episode_id).execute(&pool).await.map_err(|e| e.to_string())?;
+            .bind(plot).bind(episode_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
     }
     if let Some(runtime) = fields.runtime {
         sqlx::query("UPDATE episode SET runtime = ? WHERE id = ?")
-            .bind(runtime).bind(episode_id).execute(&pool).await.map_err(|e| e.to_string())?;
+            .bind(runtime).bind(episode_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
     }
     if let Some(ref release_date) = fields.release_date {
         sqlx::query("UPDATE episode SET release_date = ? WHERE id = ?")
-            .bind(release_date).bind(episode_id).execute(&pool).await.map_err(|e| e.to_string())?;
+            .bind(release_date).bind(episode_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
     }
 
     if let Some(ref cast) = fields.cast {
-        sqlx::query("DELETE FROM episode_cast WHERE episode_id = ?").bind(episode_id).execute(&pool).await.map_err(|e| e.to_string())?;
+        sqlx::query("DELETE FROM episode_cast WHERE episode_id = ?").bind(episode_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         for (i, c) in cast.iter().enumerate() {
-            let person_id = ensure_person(&pool, &c.name, c.tmdb_id).await?;
+            let person_id = ensure_person(&state.app_db, &c.name, c.tmdb_id).await?;
             sqlx::query("INSERT INTO episode_cast (episode_id, person_id, role, sort_order) VALUES (?, ?, ?, ?)")
-                .bind(episode_id).bind(person_id).bind(&c.role).bind(i as i64).execute(&pool).await.map_err(|e| e.to_string())?;
+                .bind(episode_id).bind(person_id).bind(&c.role).bind(i as i64).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         }
     }
 
     if let Some(ref crew) = fields.crew {
-        sqlx::query("DELETE FROM episode_crew WHERE episode_id = ?").bind(episode_id).execute(&pool).await.map_err(|e| e.to_string())?;
+        sqlx::query("DELETE FROM episode_crew WHERE episode_id = ?").bind(episode_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         for c in crew {
-            let person_id = ensure_person(&pool, &c.name, c.tmdb_id).await?;
+            let person_id = ensure_person(&state.app_db, &c.name, c.tmdb_id).await?;
             sqlx::query("INSERT INTO episode_crew (episode_id, person_id, job) VALUES (?, ?, ?)")
-                .bind(episode_id).bind(person_id).bind(&c.job).execute(&pool).await.map_err(|e| e.to_string())?;
+                .bind(episode_id).bind(person_id).bind(&c.job).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         }
     }
 
-    pool.close().await;
     Ok(())
 }
 
@@ -5720,7 +5595,6 @@ pub async fn apply_tmdb_episode_metadata(
 #[tauri::command]
 pub async fn apply_tmdb_season_episodes(
     state: tauri::State<'_, AppState>,
-    library_id: String,
     season_id: i64,
     tmdb_id: i64,
     season_number: i64,
@@ -5731,14 +5605,14 @@ pub async fn apply_tmdb_season_episodes(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "No TMDB API token configured. Add one in settings.".to_string())?;
 
-    let (pool, _) = open_library_pool(&state, &library_id).await?;
+    // Uses shared app_db pool
 
     // Get local episodes for this season
     let local_episodes: Vec<(i64, Option<i64>)> = sqlx::query_as(
         "SELECT id, episode_number FROM episode WHERE season_id = ? ORDER BY episode_number",
     )
     .bind(season_id)
-    .fetch_all(&pool)
+    .fetch_all(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
 
@@ -5765,17 +5639,17 @@ pub async fn apply_tmdb_season_episodes(
         if let Some(ref overview) = tmdb_ep.overview {
             if !overview.is_empty() {
                 sqlx::query("UPDATE episode SET plot = COALESCE(plot, ?) WHERE id = ? AND plot IS NULL")
-                    .bind(overview).bind(local_id).execute(&pool).await.map_err(|e| e.to_string())?;
+                    .bind(overview).bind(local_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
             }
         }
         if let Some(runtime) = tmdb_ep.runtime {
             sqlx::query("UPDATE episode SET runtime = COALESCE(runtime, ?) WHERE id = ? AND runtime IS NULL")
-                .bind(runtime).bind(local_id).execute(&pool).await.map_err(|e| e.to_string())?;
+                .bind(runtime).bind(local_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         }
         if let Some(ref air_date) = tmdb_ep.air_date {
             if !air_date.is_empty() {
                 sqlx::query("UPDATE episode SET release_date = COALESCE(release_date, ?) WHERE id = ? AND release_date IS NULL")
-                    .bind(air_date).bind(local_id).execute(&pool).await.map_err(|e| e.to_string())?;
+                    .bind(air_date).bind(local_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
             }
         }
 
@@ -5783,13 +5657,13 @@ pub async fn apply_tmdb_season_episodes(
         if !tmdb_ep.guest_stars.is_empty() {
             // Only populate if episode has no cast yet
             let existing: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM episode_cast WHERE episode_id = ?")
-                .bind(local_id).fetch_one(&pool).await.map_err(|e| e.to_string())?;
+                .bind(local_id).fetch_one(&state.app_db).await.map_err(|e| e.to_string())?;
             if existing.0 == 0 {
                 for (i, gs) in tmdb_ep.guest_stars.iter().enumerate() {
-                    let person_id = ensure_person(&pool, &gs.name, Some(gs.id)).await?;
+                    let person_id = ensure_person(&state.app_db, &gs.name, Some(gs.id)).await?;
                     sqlx::query("INSERT INTO episode_cast (episode_id, person_id, role, sort_order) VALUES (?, ?, ?, ?)")
                         .bind(local_id).bind(person_id).bind(&gs.character).bind(i as i64)
-                        .execute(&pool).await.map_err(|e| e.to_string())?;
+                        .execute(&state.app_db).await.map_err(|e| e.to_string())?;
                 }
             }
         }
@@ -5797,13 +5671,13 @@ pub async fn apply_tmdb_season_episodes(
         // Episode crew
         if !tmdb_ep.crew.is_empty() {
             let existing: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM episode_crew WHERE episode_id = ?")
-                .bind(local_id).fetch_one(&pool).await.map_err(|e| e.to_string())?;
+                .bind(local_id).fetch_one(&state.app_db).await.map_err(|e| e.to_string())?;
             if existing.0 == 0 {
                 for c in &tmdb_ep.crew {
-                    let person_id = ensure_person(&pool, &c.name, Some(c.id)).await?;
+                    let person_id = ensure_person(&state.app_db, &c.name, Some(c.id)).await?;
                     sqlx::query("INSERT INTO episode_crew (episode_id, person_id, job) VALUES (?, ?, ?)")
                         .bind(local_id).bind(person_id).bind(&c.job)
-                        .execute(&pool).await.map_err(|e| e.to_string())?;
+                        .execute(&state.app_db).await.map_err(|e| e.to_string())?;
                 }
             }
         }
@@ -5811,6 +5685,5 @@ pub async fn apply_tmdb_season_episodes(
         applied_count += 1;
     }
 
-    pool.close().await;
     Ok(applied_count)
 }

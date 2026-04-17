@@ -10,12 +10,18 @@ import { Toaster } from "@/components/ui/sonner";
 import { toast } from "sonner";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { Library, MediaEntry, EntriesResponse, BreadcrumbItem } from "@/types";
+import { Library, MediaEntry, EntriesResponse, BreadcrumbItem, ViewSpec, PersonSummary, PlaylistSummary } from "@/types";
+import { viewCacheKey } from "@/lib/complications";
 
 function App() {
   const [libraries, setLibraries] = useState<Library[]>([]);
-  const [selectedLibrary, setSelectedLibrary] = useState<Library | null>(null);
+  const [activeView, setActiveView] = useState<ViewSpec | null>(null);
+  const selectedLibrary = activeView
+    ? libraries.find((l) => l.id === activeView.libraryId) ?? null
+    : null;
   const [entries, setEntries] = useState<MediaEntry[]>([]);
+  const [people, setPeople] = useState<PersonSummary[] | null>(null);
+  const [playlists, setPlaylists] = useState<PlaylistSummary[] | null>(null);
   const [breadcrumbs, setBreadcrumbs] = useState<BreadcrumbItem[]>([]);
   const [forwardStack, setForwardStack] = useState<BreadcrumbItem[]>([]);
   const [sortMode, setSortMode] = useState("alpha");
@@ -58,8 +64,14 @@ function App() {
     }
   }, [playerState.isActive]);
 
-  // Cache: "libraryId:parentId" -> { entries, sortMode }
+  // Cache: "libraryId:parentId" -> { entries, sortMode } (library-root view only)
   const entryCacheRef = useRef<Map<string, { entries: MediaEntry[]; sort_mode: string }>>(new Map());
+  // Cache: viewCacheKey(view) -> entries (non-root MediaEntry views: movies-only / shows-only / person-detail)
+  const viewEntriesCacheRef = useRef<Map<string, { entries: MediaEntry[]; sort_mode: string }>>(new Map());
+  // Cache: viewCacheKey(view) -> people (people-list views)
+  const peopleCacheRef = useRef<Map<string, PersonSummary[]>>(new Map());
+  // Cache: viewCacheKey(view) -> playlists
+  const playlistsCacheRef = useRef<Map<string, PlaylistSummary[]>>(new Map());
   // Scroll position cache: "libraryId:parentId" -> scrollTop
   const scrollCacheRef = useRef<Map<string, number>>(new Map());
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
@@ -198,49 +210,168 @@ function App() {
     }
   }, []);
 
-  const loadEntries = useCallback(
-    async (library: Library, parentId: number | null, breadcrumb: BreadcrumbItem[]) => {
-      const cacheKey = `${library.id}:${parentId}`;
-      const cached = entryCacheRef.current.get(cacheKey);
+  const loadView = useCallback(
+    async (view: ViewSpec, parentId: number | null, breadcrumb: BreadcrumbItem[]) => {
+      // people-list and playlists produce their own result types; everything else lands as MediaEntry[].
+      if (view.kind === "people-list") {
+        const key = viewCacheKey(view);
+        const cached = peopleCacheRef.current.get(key);
+        setEntries([]);
+        setPlaylists(null);
+        if (cached) {
+          setPeople(cached);
+          setBreadcrumbs(breadcrumb);
+          return;
+        }
+        setLoading(true);
+        try {
+          const res = await invoke<PersonSummary[]>("get_people_in_library", {
+            libraryId: view.libraryId,
+            role: view.role,
+          });
+          peopleCacheRef.current.set(key, res);
+          setPeople(res);
+          setBreadcrumbs(breadcrumb);
+        } catch (e) {
+          console.error("Failed to load people:", e);
+        } finally {
+          setLoading(false);
+        }
+        return;
+      }
 
+      if (view.kind === "playlists") {
+        const key = viewCacheKey(view);
+        const cached = playlistsCacheRef.current.get(key);
+        setEntries([]);
+        setPeople(null);
+        if (cached) {
+          setPlaylists(cached);
+          setBreadcrumbs(breadcrumb);
+          return;
+        }
+        setLoading(true);
+        try {
+          const res = await invoke<PlaylistSummary[]>("get_playlists", {
+            libraryId: view.libraryId,
+          });
+          playlistsCacheRef.current.set(key, res);
+          setPlaylists(res);
+          setBreadcrumbs(breadcrumb);
+        } catch (e) {
+          console.error("Failed to load playlists:", e);
+        } finally {
+          setLoading(false);
+        }
+        return;
+      }
+
+      // All remaining views populate `entries`.
+      setPeople(null);
+      setPlaylists(null);
+
+      // library-root keeps the legacy parent-keyed cache so existing invalidate/update calls still work.
+      const useRootCache = view.kind === "library-root";
+      const cacheKey = useRootCache
+        ? `${view.libraryId}:${parentId}`
+        : viewCacheKey(view);
+      const cache = useRootCache ? entryCacheRef.current : viewEntriesCacheRef.current;
+
+      const cached = cache.get(cacheKey);
       if (cached) {
         setEntries(cached.entries);
         setSortMode(cached.sort_mode);
         setBreadcrumbs(breadcrumb);
-        restoreScrollPosition(library.id, parentId);
+        if (useRootCache) restoreScrollPosition(view.libraryId, parentId);
         return;
       }
 
       setLoading(true);
       try {
-        const res = await invoke<EntriesResponse>("get_entries", {
-          libraryId: library.id,
-          parentId,
-        });
-        await preloadCovers(res.entries);
-        entryCacheRef.current.set(cacheKey, { entries: res.entries, sort_mode: res.sort_mode });
-        setEntries(res.entries);
-        setSortMode(res.sort_mode);
+        let entries: MediaEntry[];
+        let sort_mode: string;
+        switch (view.kind) {
+          case "library-root": {
+            const res = await invoke<EntriesResponse>("get_entries", {
+              libraryId: view.libraryId,
+              parentId,
+            });
+            entries = res.entries;
+            sort_mode = res.sort_mode;
+            break;
+          }
+          case "movies-only":
+          case "shows-only": {
+            const res = await invoke<EntriesResponse>("get_entries", {
+              libraryId: view.libraryId,
+              parentId: null,
+              entryTypeFilter: view.kind === "movies-only" ? "movie" : "show",
+            });
+            entries = res.entries;
+            sort_mode = res.sort_mode;
+            break;
+          }
+          case "person-detail": {
+            entries = await invoke<MediaEntry[]>("get_entries_for_person", {
+              libraryId: view.libraryId,
+              personId: view.personId,
+              role: view.role,
+            });
+            sort_mode = "alpha";
+            break;
+          }
+        }
+        await preloadCovers(entries);
+        cache.set(cacheKey, { entries, sort_mode });
+        setEntries(entries);
+        setSortMode(sort_mode);
         setBreadcrumbs(breadcrumb);
-        restoreScrollPosition(library.id, parentId);
+        if (useRootCache) restoreScrollPosition(view.libraryId, parentId);
       } catch (e) {
-        console.error("Failed to load entries:", e);
+        console.error("Failed to load view:", e);
       } finally {
         setLoading(false);
       }
     },
-    [restoreScrollPosition]
+    [restoreScrollPosition, preloadCovers]
+  );
+
+  // Thin wrapper for the existing call sites that drive library-root navigation by (library, parentId).
+  const loadEntries = useCallback(
+    (library: Library, parentId: number | null, breadcrumb: BreadcrumbItem[]) =>
+      loadView({ kind: "library-root", libraryId: library.id }, parentId, breadcrumb),
+    [loadView]
   );
 
   const selectLibrary = useCallback(
     (library: Library) => {
       saveScrollPosition();
-      setSelectedLibrary(library);
+      setActiveView({ kind: "library-root", libraryId: library.id });
       setSelectedEntry(null);
       setSearch("");
       loadEntries(library, null, [{ id: null, title: library.name }]);
     },
     [loadEntries, saveScrollPosition]
+  );
+
+  const selectView = useCallback(
+    (view: ViewSpec) => {
+      saveScrollPosition();
+      setActiveView(view);
+      setSelectedEntry(null);
+      setSearch("");
+      const lib = libraries.find((l) => l.id === view.libraryId);
+      const libLabel = lib?.name ?? "Library";
+      const viewLabel: string =
+        view.kind === "library-root" ? libLabel
+        : view.kind === "movies-only" ? `${libLabel} — Movies`
+        : view.kind === "shows-only" ? `${libLabel} — Shows`
+        : view.kind === "playlists" ? `${libLabel} — Playlists`
+        : view.kind === "people-list" ? `${libLabel} — ${view.role}`
+        : `${libLabel} — Person`;
+      loadView(view, null, [{ id: null, title: viewLabel }]);
+    },
+    [libraries, loadView, saveScrollPosition]
   );
 
   const navigateTo = useCallback(
@@ -310,12 +441,25 @@ function App() {
     if (libraryId != null && parentId !== undefined) {
       entryCacheRef.current.delete(`${libraryId}:${parentId}`);
     } else if (libraryId != null) {
-      // Invalidate all entries for this library
+      // Invalidate everything for this library across all view caches.
+      const prefix = `${libraryId}:`;
       for (const key of entryCacheRef.current.keys()) {
-        if (key.startsWith(`${libraryId}:`)) entryCacheRef.current.delete(key);
+        if (key.startsWith(prefix)) entryCacheRef.current.delete(key);
+      }
+      for (const key of viewEntriesCacheRef.current.keys()) {
+        if (key.startsWith(prefix)) viewEntriesCacheRef.current.delete(key);
+      }
+      for (const key of peopleCacheRef.current.keys()) {
+        if (key.startsWith(prefix)) peopleCacheRef.current.delete(key);
+      }
+      for (const key of playlistsCacheRef.current.keys()) {
+        if (key.startsWith(prefix)) playlistsCacheRef.current.delete(key);
       }
     } else {
       entryCacheRef.current.clear();
+      viewEntriesCacheRef.current.clear();
+      peopleCacheRef.current.clear();
+      playlistsCacheRef.current.clear();
     }
   }, []);
 
@@ -668,13 +812,17 @@ function App() {
         <Sidebar
           libraries={libraries}
           selectedLibrary={selectedLibrary}
+          activeView={activeView}
           onSelectLibrary={selectLibrary}
+          onSelectView={selectView}
           onLibraryCreated={loadLibraries}
           onLibraryDeleted={() => {
             loadLibraries();
             invalidateCache();
-            setSelectedLibrary(null);
+            setActiveView(null);
             setEntries([]);
+            setPeople(null);
+            setPlaylists(null);
             setBreadcrumbs([]);
           }}
           onLibraryRescanned={() => {
@@ -689,6 +837,9 @@ function App() {
         />
         <MainContent
           entries={entries}
+          people={people}
+          playlists={playlists}
+          activeView={activeView}
           searchResults={searchResults}
           selectedEntry={selectedEntry}
           loading={loading}

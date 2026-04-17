@@ -4,7 +4,6 @@ export interface Library {
   paths: string[];
   format: string;
   portable: boolean;
-  db_filename: string;
   default_sort_mode: string;
   managed: boolean;
 }
@@ -34,6 +33,44 @@ export interface MediaEntry {
 export interface BreadcrumbItem {
   id: number | null;
   title: string;
+}
+
+// ---------- Sidebar complications ----------
+
+export type PersonRole = "actor" | "director_producer" | "composer";
+
+// "Where the user is" — drives what MainContent renders. Sidebar selection
+// always corresponds to a ViewSpec, and so do drill-downs that originate
+// from the main content (e.g. clicking a person on a people-list view).
+export type ViewSpec =
+  | { kind: "library-root";       libraryId: string }
+  | { kind: "movies-only";        libraryId: string }
+  | { kind: "shows-only";         libraryId: string }
+  | { kind: "people-list";        libraryId: string; role: PersonRole }
+  | { kind: "person-detail";      libraryId: string; personId: number; role: PersonRole }
+  | { kind: "playlists";           libraryId: string };
+
+// One node in the static complication tree shown for a library.
+export interface ComplicationNode {
+  id: string;
+  label: string;
+  iconName: string;
+  view: ViewSpec | null;
+  children?: ComplicationNode[];
+}
+
+// Returned by get_people_in_library.
+export interface PersonSummary {
+  id: number;
+  name: string;
+  image_path: string | null;
+  work_count: number;
+}
+
+export interface PlaylistSummary {
+  id: number;
+  title: string;
+  selected_cover: string | null;
 }
 
 export interface PersonInfo {

@@ -91,7 +91,7 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
-import { Library, MediaEntry, BreadcrumbItem, MovieDetail, MovieDetailUpdate, SeasonInfo, EpisodeInfo, ShowDetail, SeasonDetailLocal, EpisodeDetailLocal, TmdbSeasonDetail, TmdbEpisodeDetail, TmdbShowFieldSelection, TmdbSeasonFieldSelection, TmdbEpisodeFieldSelection, CastUpdateInfo, CrewUpdateInfo } from "@/types";
+import { Library, MediaEntry, BreadcrumbItem, MovieDetail, MovieDetailUpdate, SeasonInfo, EpisodeInfo, ShowDetail, SeasonDetailLocal, EpisodeDetailLocal, TmdbSeasonDetail, TmdbEpisodeDetail, TmdbShowFieldSelection, TmdbSeasonFieldSelection, TmdbEpisodeFieldSelection, CastUpdateInfo, CrewUpdateInfo, ViewSpec, PersonSummary, PlaylistSummary } from "@/types";
 import { TmdbMatchDialog } from "@/components/TmdbMatchDialog";
 import { TmdbShowMatchDialog } from "@/components/TmdbShowMatchDialog";
 import { TmdbImageBrowserDialog } from "@/components/TmdbImageBrowserDialog";
@@ -119,6 +119,9 @@ function formatReleaseDate(date: string | null | undefined): string | null {
 
 interface MainContentProps {
   entries: MediaEntry[];
+  people: PersonSummary[] | null;
+  playlists: PlaylistSummary[] | null;
+  activeView: ViewSpec | null;
   searchResults: MediaEntry[] | null;
   selectedEntry: MediaEntry | null;
   loading: boolean;
@@ -153,6 +156,9 @@ interface MainContentProps {
 
 export function MainContent({
   entries,
+  people,
+  playlists,
+  activeView,
   searchResults,
   selectedEntry,
   loading,
@@ -201,7 +207,6 @@ export function MainContent({
     try {
       const cmd = entry.entry_type === "show" ? "get_show_detail" : "get_movie_detail";
       const detail = await invoke<{ tmdb_id: string | null }>(cmd, {
-        libraryId: selectedLibrary.id,
         entryId: entry.id,
       });
       if (!detail.tmdb_id) {
@@ -301,6 +306,57 @@ export function MainContent({
   }, []);
 
   const isInsideCollection = breadcrumbs.length > 1;
+
+  // People-list placeholder. Real people-grid component is a follow-up plan;
+  // for now we just prove the data flows by listing names + work counts.
+  if (activeView?.kind === "people-list") {
+    return (
+      <main className="flex flex-1 flex-col overflow-hidden bg-background">
+        <div className="border-b border-border px-4 py-2 text-xs font-medium text-muted-foreground">
+          {selectedLibrary?.name} — {activeView.role}
+        </div>
+        <div ref={scrollContainerRef} className="flex-1 overflow-y-auto p-4">
+          {loading && <p className="text-sm text-muted-foreground">Loading…</p>}
+          {!loading && people && people.length === 0 && (
+            <p className="text-sm text-muted-foreground">No people found.</p>
+          )}
+          {!loading && people && people.length > 0 && (
+            <ul className="space-y-1 text-sm">
+              {people.map((p) => (
+                <li key={p.id}>
+                  {p.name}{" "}
+                  <span className="text-muted-foreground">({p.work_count})</span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </main>
+    );
+  }
+
+  if (activeView?.kind === "playlists") {
+    return (
+      <main className="flex flex-1 flex-col overflow-hidden bg-background">
+        <div className="border-b border-border px-4 py-2 text-xs font-medium text-muted-foreground">
+          {selectedLibrary?.name} — Playlists
+        </div>
+        <div ref={scrollContainerRef} className="flex-1 overflow-y-auto p-4">
+          {loading && <p className="text-sm text-muted-foreground">Loading…</p>}
+          {!loading && playlists && playlists.length === 0 && (
+            <p className="text-sm text-muted-foreground">No playlists yet.</p>
+          )}
+          {!loading && playlists && playlists.length > 0 && (
+            <ul className="space-y-1 text-sm">
+              {playlists.map((pl) => (
+                <li key={pl.id}>{pl.title}</li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </main>
+    );
+  }
 
   return (
     <main className="flex flex-1 flex-col overflow-hidden bg-background">
@@ -1122,14 +1178,13 @@ function EntryDetailPage({
   const loadDetail = useCallback(async () => {
     try {
       const d = await invoke<MovieDetail>("get_movie_detail", {
-        libraryId: selectedLibrary.id,
         entryId: entry.id,
       });
       setDetail(d);
     } catch (e) {
       console.error("Failed to load movie detail:", e);
     }
-  }, [selectedLibrary.id, entry.id]);
+  }, [entry.id]);
 
   useEffect(() => {
     loadDetail();
@@ -1161,7 +1216,6 @@ function EntryDetailPage({
     setSaving(true);
     try {
       await invoke("update_movie_detail", {
-        libraryId: selectedLibrary.id,
         entryId: entry.id,
         detail: draft,
       });
@@ -1335,7 +1389,6 @@ function EntryDetailPage({
       <TmdbMatchDialog
         open={tmdbDialogOpen}
         onOpenChange={setTmdbDialogOpen}
-        libraryId={selectedLibrary.id}
         entryId={entry.id}
         entryTitle={entry.title}
         entryYear={entry.year}
@@ -1428,45 +1481,41 @@ function ShowDetailPage({
   const loadDetail = useCallback(async () => {
     try {
       const d = await invoke<ShowDetail>("get_show_detail", {
-        libraryId: selectedLibrary.id,
         showId: entry.id,
       });
       setDetail(d);
     } catch (e) {
       console.error("Failed to load show detail:", e);
     }
-  }, [selectedLibrary.id, entry.id]);
+  }, [entry.id]);
 
   const loadSeasonDetail = useCallback(async (seasonId: number) => {
     try {
       const d = await invoke<SeasonDetailLocal>("get_season_detail_local", {
-        libraryId: selectedLibrary.id,
         seasonId,
       });
       setSeasonDetail(d);
     } catch (e) {
       console.error("Failed to load season detail:", e);
     }
-  }, [selectedLibrary.id]);
+  }, []);
 
   const loadEpisodeDetail = useCallback(async (episodeId: number) => {
     try {
       const d = await invoke<EpisodeDetailLocal>("get_episode_detail_local", {
-        libraryId: selectedLibrary.id,
         episodeId,
       });
       setEpisodeDetails((prev) => new Map(prev).set(episodeId, d));
     } catch (e) {
       console.error("Failed to load episode detail:", e);
     }
-  }, [selectedLibrary.id]);
+  }, []);
 
   useEffect(() => {
     loadDetail();
     (async () => {
       try {
         const s = await invoke<SeasonInfo[]>("get_show_seasons", {
-          libraryId: selectedLibrary.id,
           showId: entry.id,
         });
         setSeasons(s);
@@ -1477,7 +1526,7 @@ function ShowDetailPage({
         console.error("Failed to load seasons:", e);
       }
     })();
-  }, [selectedLibrary.id, entry.id, loadDetail]);
+  }, [entry.id, loadDetail]);
 
   useEffect(() => {
     if (selectedSeasonId == null) return;
@@ -1488,7 +1537,6 @@ function ShowDetailPage({
     (async () => {
       try {
         const eps = await invoke<EpisodeInfo[]>("get_season_episodes", {
-          libraryId: selectedLibrary.id,
           seasonId: selectedSeasonId,
         });
         setEpisodes(eps);
@@ -1496,7 +1544,7 @@ function ShowDetailPage({
         console.error("Failed to load episodes:", e);
       }
     })();
-  }, [selectedLibrary.id, selectedSeasonId, loadSeasonDetail]);
+  }, [selectedSeasonId, loadSeasonDetail]);
 
   const handleSeasonTmdb = useCallback(async () => {
     if (!detail?.tmdb_id || !selectedSeason || selectedSeason.season_number == null) return;
@@ -1529,7 +1577,6 @@ function ShowDetailPage({
           .map((c) => ({ name: c.name, job: c.job ?? null, tmdb_id: c.id }));
       }
       await invoke("apply_tmdb_season_metadata", {
-        libraryId: selectedLibrary.id,
         seasonId: selectedSeason.id,
         fields,
       });
@@ -1540,7 +1587,7 @@ function ShowDetailPage({
     } finally {
       setSeasonTmdbLoading(false);
     }
-  }, [detail, selectedSeason, selectedLibrary.id, loadSeasonDetail]);
+  }, [detail, selectedSeason, loadSeasonDetail]);
 
   const handleBulkEpisodes = useCallback(async () => {
     if (!detail?.tmdb_id || !selectedSeason || selectedSeason.season_number == null) return;
@@ -1548,7 +1595,6 @@ function ShowDetailPage({
     setBulkEpisodesLoading(true);
     try {
       const count = await invoke<number>("apply_tmdb_season_episodes", {
-        libraryId: selectedLibrary.id,
         seasonId: selectedSeason.id,
         tmdbId: Number(detail.tmdb_id),
         seasonNumber: selectedSeason.season_number,
@@ -1593,7 +1639,6 @@ function ShowDetailPage({
         }));
       }
       await invoke("apply_tmdb_episode_metadata", {
-        libraryId: selectedLibrary.id,
         episodeId: ep.id,
         fields,
       });
@@ -1605,7 +1650,7 @@ function ShowDetailPage({
     } finally {
       setEpisodeTmdbLoading(null);
     }
-  }, [detail, selectedSeason, selectedLibrary.id, loadEpisodeDetail, onEntryChanged]);
+  }, [detail, selectedSeason, loadEpisodeDetail, onEntryChanged]);
 
   const startEditShow = useCallback(() => {
     if (!detail) return;
@@ -1630,7 +1675,6 @@ function ShowDetailPage({
     setShowSaving(true);
     try {
       await invoke("apply_tmdb_show_metadata", {
-        libraryId: selectedLibrary.id,
         showId: entry.id,
         fields: showDraft,
       });
@@ -1663,7 +1707,6 @@ function ShowDetailPage({
     setSeasonSaving(true);
     try {
       await invoke("apply_tmdb_season_metadata", {
-        libraryId: selectedLibrary.id,
         seasonId: selectedSeason.id,
         fields: seasonDraft,
       });
@@ -1695,7 +1738,6 @@ function ShowDetailPage({
     setEpisodeSaving(true);
     try {
       await invoke("apply_tmdb_episode_metadata", {
-        libraryId: selectedLibrary.id,
         episodeId: editingEpisodeId,
         fields: episodeDraft,
       });
@@ -2048,7 +2090,6 @@ function ShowDetailPage({
       <TmdbShowMatchDialog
         open={tmdbDialogOpen}
         onOpenChange={setTmdbDialogOpen}
-        libraryId={selectedLibrary.id}
         entryId={entry.id}
         entryTitle={entry.title}
         entryYear={entry.year}

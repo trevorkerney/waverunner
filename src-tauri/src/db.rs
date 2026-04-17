@@ -5,17 +5,26 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                sqlx::query("PRAGMA foreign_keys = ON")
+                    .execute(&mut *conn)
+                    .await?;
+                Ok(())
+            })
+        })
         .connect(&db_url)
         .await?;
 
+    // ── App-level tables ──────────────────────────────────────────────
+
     sqlx::query(
-        "CREATE TABLE IF NOT EXISTS libraries (
+        "CREATE TABLE IF NOT EXISTS library (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
             paths TEXT NOT NULL,
             format TEXT NOT NULL,
             portable INTEGER NOT NULL DEFAULT 0,
-            db_filename TEXT NOT NULL,
             default_sort_mode TEXT NOT NULL DEFAULT 'alpha',
             managed INTEGER NOT NULL DEFAULT 0,
             player_path TEXT,
@@ -35,93 +44,57 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .execute(&pool)
     .await?;
 
-    Ok(pool)
-}
+    // ── Entry type lookup ─────────────────────────────────────────────
 
-pub async fn connect_library_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
-    let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
-    SqlitePoolOptions::new()
-        .max_connections(5)
-        .connect(&db_url)
-        .await
-}
-
-pub async fn create_library_pool(db_path: &Path, format: &str) -> Result<SqlitePool, sqlx::Error> {
-    let pool = connect_library_pool(db_path).await?;
-
-    match format {
-        "video" => create_video_tables(&pool).await?,
-        "music" => create_music_tables(&pool).await?,
-        _ => {
-            return Err(sqlx::Error::Configuration(
-                format!("Unsupported library format: {}", format).into(),
-            ));
-        }
-    }
-
-    // Cached images table — all formats
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS cached_images (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            entry_folder_path TEXT NOT NULL,
-            image_type TEXT NOT NULL,
-            source_filename TEXT NOT NULL,
-            cached_path TEXT NOT NULL,
-            UNIQUE(entry_folder_path, image_type, source_filename)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_cached_images_entry
-            ON cached_images(entry_folder_path, image_type)",
-    )
-    .execute(&pool)
-    .await?;
-
-    Ok(pool)
-}
-
-async fn create_video_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    // Entry type lookup
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS media_entry_type (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL UNIQUE
         )",
     )
-    .execute(pool)
+    .execute(&pool)
     .await?;
 
     sqlx::query(
         "INSERT OR IGNORE INTO media_entry_type (name)
-            VALUES ('movie'), ('show'), ('collection')",
+            VALUES ('movie'), ('show'), ('collection'), ('artist'), ('album'), ('track')",
     )
-    .execute(pool)
+    .execute(&pool)
     .await?;
 
-    // Core entry hierarchy (thin pointer — display data lives on detail tables)
+    // ── Core entry hierarchy ──────────────────────────────────────────
+
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS media_entry (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            library_id TEXT NOT NULL,
             parent_id INTEGER,
             entry_type_id INTEGER NOT NULL,
+            FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE,
             FOREIGN KEY (parent_id) REFERENCES media_entry(id) ON DELETE CASCADE,
             FOREIGN KEY (entry_type_id) REFERENCES media_entry_type(id)
         )",
     )
-    .execute(pool)
+    .execute(&pool)
     .await?;
 
-    // Lookup tables
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_media_entry_library ON media_entry(library_id)")
+        .execute(&pool)
+        .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_media_entry_parent ON media_entry(parent_id)")
+        .execute(&pool)
+        .await?;
+
+    // ── Shared lookup tables ──────────────────────────────────────────
+
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS genre (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL UNIQUE
         )",
     )
-    .execute(pool)
+    .execute(&pool)
     .await?;
 
     sqlx::query(
@@ -130,7 +103,7 @@ async fn create_video_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             name TEXT NOT NULL UNIQUE
         )",
     )
-    .execute(pool)
+    .execute(&pool)
     .await?;
 
     sqlx::query(
@@ -141,7 +114,7 @@ async fn create_video_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             tmdb_id INTEGER
         )",
     )
-    .execute(pool)
+    .execute(&pool)
     .await?;
 
     sqlx::query(
@@ -150,7 +123,7 @@ async fn create_video_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             name TEXT NOT NULL UNIQUE
         )",
     )
-    .execute(pool)
+    .execute(&pool)
     .await?;
 
     sqlx::query(
@@ -159,10 +132,11 @@ async fn create_video_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             name TEXT NOT NULL UNIQUE
         )",
     )
-    .execute(pool)
+    .execute(&pool)
     .await?;
 
-    // Movie (1:1 with media_entry)
+    // ── Video detail tables ───────────────────────────────────────────
+
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS movie (
             id INTEGER PRIMARY KEY,
@@ -183,10 +157,9 @@ async fn create_video_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             FOREIGN KEY (maturity_rating_id) REFERENCES maturity_rating(id)
         )",
     )
-    .execute(pool)
+    .execute(&pool)
     .await?;
 
-    // Movie junction tables
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS movie_genre (
             movie_id INTEGER NOT NULL,
@@ -196,7 +169,7 @@ async fn create_video_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             FOREIGN KEY (genre_id) REFERENCES genre(id) ON DELETE CASCADE
         )",
     )
-    .execute(pool)
+    .execute(&pool)
     .await?;
 
     sqlx::query(
@@ -208,7 +181,7 @@ async fn create_video_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
         )",
     )
-    .execute(pool)
+    .execute(&pool)
     .await?;
 
     sqlx::query(
@@ -222,7 +195,7 @@ async fn create_video_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
         )",
     )
-    .execute(pool)
+    .execute(&pool)
     .await?;
 
     sqlx::query(
@@ -235,7 +208,7 @@ async fn create_video_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
         )",
     )
-    .execute(pool)
+    .execute(&pool)
     .await?;
 
     sqlx::query(
@@ -247,7 +220,7 @@ async fn create_video_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
         )",
     )
-    .execute(pool)
+    .execute(&pool)
     .await?;
 
     sqlx::query(
@@ -259,7 +232,7 @@ async fn create_video_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             FOREIGN KEY (studio_id) REFERENCES studio(id) ON DELETE CASCADE
         )",
     )
-    .execute(pool)
+    .execute(&pool)
     .await?;
 
     sqlx::query(
@@ -271,10 +244,9 @@ async fn create_video_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             FOREIGN KEY (keyword_id) REFERENCES keyword(id) ON DELETE CASCADE
         )",
     )
-    .execute(pool)
+    .execute(&pool)
     .await?;
 
-    // Show (1:1 with media_entry)
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS show (
             id INTEGER PRIMARY KEY,
@@ -292,10 +264,9 @@ async fn create_video_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             FOREIGN KEY (maturity_rating_id) REFERENCES maturity_rating(id)
         )",
     )
-    .execute(pool)
+    .execute(&pool)
     .await?;
 
-    // Show junction tables
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS show_genre (
             show_id INTEGER NOT NULL,
@@ -305,7 +276,7 @@ async fn create_video_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             FOREIGN KEY (genre_id) REFERENCES genre(id) ON DELETE CASCADE
         )",
     )
-    .execute(pool)
+    .execute(&pool)
     .await?;
 
     sqlx::query(
@@ -317,7 +288,7 @@ async fn create_video_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
         )",
     )
-    .execute(pool)
+    .execute(&pool)
     .await?;
 
     sqlx::query(
@@ -331,7 +302,7 @@ async fn create_video_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
         )",
     )
-    .execute(pool)
+    .execute(&pool)
     .await?;
 
     sqlx::query(
@@ -344,7 +315,7 @@ async fn create_video_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
         )",
     )
-    .execute(pool)
+    .execute(&pool)
     .await?;
 
     sqlx::query(
@@ -356,7 +327,7 @@ async fn create_video_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
         )",
     )
-    .execute(pool)
+    .execute(&pool)
     .await?;
 
     sqlx::query(
@@ -368,7 +339,7 @@ async fn create_video_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             FOREIGN KEY (studio_id) REFERENCES studio(id) ON DELETE CASCADE
         )",
     )
-    .execute(pool)
+    .execute(&pool)
     .await?;
 
     sqlx::query(
@@ -380,10 +351,9 @@ async fn create_video_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             FOREIGN KEY (keyword_id) REFERENCES keyword(id) ON DELETE CASCADE
         )",
     )
-    .execute(pool)
+    .execute(&pool)
     .await?;
 
-    // Seasons
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS season (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -397,10 +367,9 @@ async fn create_video_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             UNIQUE(show_id, season_number)
         )",
     )
-    .execute(pool)
+    .execute(&pool)
     .await?;
 
-    // Episodes
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS episode (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -416,10 +385,9 @@ async fn create_video_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             UNIQUE(season_id, episode_number)
         )",
     )
-    .execute(pool)
+    .execute(&pool)
     .await?;
 
-    // Season junction tables
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS season_cast (
             season_id INTEGER NOT NULL,
@@ -431,7 +399,7 @@ async fn create_video_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
         )",
     )
-    .execute(pool)
+    .execute(&pool)
     .await?;
 
     sqlx::query(
@@ -444,7 +412,7 @@ async fn create_video_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
         )",
     )
-    .execute(pool)
+    .execute(&pool)
     .await?;
 
     sqlx::query(
@@ -456,7 +424,7 @@ async fn create_video_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
         )",
     )
-    .execute(pool)
+    .execute(&pool)
     .await?;
 
     sqlx::query(
@@ -468,10 +436,9 @@ async fn create_video_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
         )",
     )
-    .execute(pool)
+    .execute(&pool)
     .await?;
 
-    // Episode junction tables
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS episode_cast (
             episode_id INTEGER NOT NULL,
@@ -483,7 +450,7 @@ async fn create_video_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
         )",
     )
-    .execute(pool)
+    .execute(&pool)
     .await?;
 
     sqlx::query(
@@ -496,12 +463,11 @@ async fn create_video_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
         )",
     )
-    .execute(pool)
+    .execute(&pool)
     .await?;
 
-    // Collection (1:1 with media_entry)
     sqlx::query(
-        "CREATE TABLE IF NOT EXISTS collection (
+        "CREATE TABLE IF NOT EXISTS media_collection (
             id INTEGER PRIMARY KEY,
             title TEXT NOT NULL DEFAULT '',
             folder_path TEXT NOT NULL DEFAULT '',
@@ -512,75 +478,201 @@ async fn create_video_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             FOREIGN KEY (id) REFERENCES media_entry(id) ON DELETE CASCADE
         )",
     )
-    .execute(pool)
+    .execute(&pool)
     .await?;
 
-    // Convenience view: flattens media_entry + detail tables into one queryable surface
-    sqlx::query(
-        "CREATE VIEW IF NOT EXISTS media_entry_full AS
-         SELECT me.id, me.parent_id, me.entry_type_id, met.name as entry_type,
-             COALESCE(m.title, s.title, c.title) as title,
-             COALESCE(m.folder_path, s.folder_path, c.folder_path) as folder_path,
-             COALESCE(m.sort_title, s.sort_title, c.sort_title) as sort_title,
-             COALESCE(m.sort_order, s.sort_order, c.sort_order) as sort_order,
-             m.release_date,
-             COALESCE(m.selected_cover, s.selected_cover, c.selected_cover) as selected_cover
-         FROM media_entry me
-         JOIN media_entry_type met ON me.entry_type_id = met.id
-         LEFT JOIN movie m ON me.id = m.id
-         LEFT JOIN show s ON me.id = s.id
-         LEFT JOIN collection c ON me.id = c.id",
-    )
-    .execute(pool)
-    .await?;
+    // ── Music detail tables ───────────────────────────────────────────
 
-    Ok(())
-}
-
-async fn create_music_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS artist (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            folder_path TEXT NOT NULL,
+            id INTEGER PRIMARY KEY,
+            title TEXT NOT NULL DEFAULT '',
+            sort_title TEXT NOT NULL DEFAULT '',
+            folder_path TEXT NOT NULL DEFAULT '',
             sort_order INTEGER NOT NULL DEFAULT 0,
-            sort_name TEXT NOT NULL DEFAULT '',
-            selected_cover TEXT
+            selected_cover TEXT,
+            biography TEXT,
+            musicbrainz_id TEXT,
+            FOREIGN KEY (id) REFERENCES media_entry(id) ON DELETE CASCADE
         )",
     )
-    .execute(pool)
+    .execute(&pool)
     .await?;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS album (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            artist_id INTEGER NOT NULL,
-            title TEXT NOT NULL,
-            release_date TEXT,
-            folder_path TEXT NOT NULL,
-            sort_order INTEGER NOT NULL DEFAULT 0,
+            id INTEGER PRIMARY KEY,
+            title TEXT NOT NULL DEFAULT '',
             sort_title TEXT NOT NULL DEFAULT '',
+            folder_path TEXT NOT NULL DEFAULT '',
+            sort_order INTEGER NOT NULL DEFAULT 0,
             selected_cover TEXT,
-            release_type TEXT NOT NULL DEFAULT 'album',
-            FOREIGN KEY (artist_id) REFERENCES artist(id) ON DELETE CASCADE
+            release_date TEXT,
+            album_type TEXT NOT NULL DEFAULT 'album',
+            disc_count INTEGER,
+            FOREIGN KEY (id) REFERENCES media_entry(id) ON DELETE CASCADE
         )",
     )
-    .execute(pool)
+    .execute(&pool)
     .await?;
 
     sqlx::query(
-        "CREATE TABLE IF NOT EXISTS song (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            album_id INTEGER NOT NULL,
-            title TEXT NOT NULL,
-            track_number INTEGER,
-            file_path TEXT NOT NULL,
+        "CREATE TABLE IF NOT EXISTS track (
+            id INTEGER PRIMARY KEY,
+            title TEXT NOT NULL DEFAULT '',
+            sort_title TEXT NOT NULL DEFAULT '',
+            file_path TEXT NOT NULL DEFAULT '',
             sort_order INTEGER NOT NULL DEFAULT 0,
-            FOREIGN KEY (album_id) REFERENCES album(id) ON DELETE CASCADE
+            track_number INTEGER,
+            disc_number INTEGER,
+            runtime INTEGER,
+            FOREIGN KEY (id) REFERENCES media_entry(id) ON DELETE CASCADE
         )",
     )
-    .execute(pool)
+    .execute(&pool)
     .await?;
 
-    Ok(())
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS artist_genre (
+            artist_id INTEGER NOT NULL,
+            genre_id INTEGER NOT NULL,
+            PRIMARY KEY (artist_id, genre_id),
+            FOREIGN KEY (artist_id) REFERENCES artist(id) ON DELETE CASCADE,
+            FOREIGN KEY (genre_id) REFERENCES genre(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS album_genre (
+            album_id INTEGER NOT NULL,
+            genre_id INTEGER NOT NULL,
+            PRIMARY KEY (album_id, genre_id),
+            FOREIGN KEY (album_id) REFERENCES album(id) ON DELETE CASCADE,
+            FOREIGN KEY (genre_id) REFERENCES genre(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS track_artist (
+            track_id INTEGER NOT NULL,
+            person_id INTEGER NOT NULL,
+            role TEXT NOT NULL DEFAULT 'primary',
+            PRIMARY KEY (track_id, person_id, role),
+            FOREIGN KEY (track_id) REFERENCES track(id) ON DELETE CASCADE,
+            FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // ── Playlist tables ───────────────────────────────────────────────
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS media_playlist (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            library_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            sort_title TEXT NOT NULL DEFAULT '',
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            selected_cover TEXT,
+            FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS media_playlist_collection (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            sort_title TEXT NOT NULL DEFAULT '',
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            selected_cover TEXT,
+            parent_playlist_id INTEGER,
+            parent_collection_id INTEGER,
+            FOREIGN KEY (parent_playlist_id) REFERENCES media_playlist(id) ON DELETE CASCADE,
+            FOREIGN KEY (parent_collection_id) REFERENCES media_playlist_collection(id) ON DELETE CASCADE,
+            CHECK (
+                (parent_playlist_id IS NOT NULL AND parent_collection_id IS NULL)
+                OR (parent_playlist_id IS NULL AND parent_collection_id IS NOT NULL)
+            )
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS media_link (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            target_entry_id INTEGER NOT NULL,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            parent_playlist_id INTEGER,
+            parent_collection_id INTEGER,
+            FOREIGN KEY (target_entry_id) REFERENCES media_entry(id) ON DELETE CASCADE,
+            FOREIGN KEY (parent_playlist_id) REFERENCES media_playlist(id) ON DELETE CASCADE,
+            FOREIGN KEY (parent_collection_id) REFERENCES media_playlist_collection(id) ON DELETE CASCADE,
+            CHECK (
+                (parent_playlist_id IS NOT NULL AND parent_collection_id IS NULL)
+                OR (parent_playlist_id IS NULL AND parent_collection_id IS NOT NULL)
+            )
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // ── Cached images ─────────────────────────────────────────────────
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS cached_images (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            library_id TEXT NOT NULL,
+            entry_folder_path TEXT NOT NULL,
+            image_type TEXT NOT NULL,
+            source_filename TEXT NOT NULL,
+            cached_path TEXT NOT NULL,
+            FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE,
+            UNIQUE(library_id, entry_folder_path, image_type, source_filename)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_cached_images_entry
+            ON cached_images(library_id, entry_folder_path, image_type)",
+    )
+    .execute(&pool)
+    .await?;
+
+    // ── Convenience view ──────────────────────────────────────────────
+
+    sqlx::query(
+        "CREATE VIEW IF NOT EXISTS media_entry_full AS
+         SELECT me.id, me.library_id, me.parent_id, me.entry_type_id, met.name as entry_type,
+             COALESCE(m.title, s.title, c.title, ar.title, al.title, t.title) as title,
+             COALESCE(m.folder_path, s.folder_path, c.folder_path, ar.folder_path, al.folder_path) as folder_path,
+             COALESCE(m.sort_title, s.sort_title, c.sort_title, ar.sort_title, al.sort_title, t.sort_title) as sort_title,
+             COALESCE(m.sort_order, s.sort_order, c.sort_order, ar.sort_order, al.sort_order, t.sort_order) as sort_order,
+             COALESCE(m.release_date, al.release_date) as release_date,
+             COALESCE(m.selected_cover, s.selected_cover, c.selected_cover, ar.selected_cover, al.selected_cover) as selected_cover,
+             t.file_path as track_file_path,
+             t.track_number,
+             t.disc_number
+         FROM media_entry me
+         JOIN media_entry_type met ON me.entry_type_id = met.id
+         LEFT JOIN movie m ON me.id = m.id
+         LEFT JOIN show s ON me.id = s.id
+         LEFT JOIN media_collection c ON me.id = c.id
+         LEFT JOIN artist ar ON me.id = ar.id
+         LEFT JOIN album al ON me.id = al.id
+         LEFT JOIN track t ON me.id = t.id",
+    )
+    .execute(&pool)
+    .await?;
+
+    Ok(pool)
 }

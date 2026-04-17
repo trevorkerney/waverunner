@@ -237,7 +237,6 @@ export function usePlayer(): [PlayerState, PlayerActions] {
   const playEpisode = useCallback(async (args: PlayEpisodeArgs) => {
     const { libraryId, showId, showTitle, startEpisodeId } = args;
     const flat = await invoke<ShowEpisodeFlat[]>("get_show_episodes", {
-      libraryId,
       showId,
     });
     const episodes: EpisodeRef[] = flat.map((f) => ({

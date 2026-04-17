@@ -21,7 +21,7 @@ import { Button } from "@/components/ui/button";
 import { CreateLibraryDialog } from "@/components/CreateLibraryDialog";
 import { PlayerDock } from "@/components/player/PlayerDock";
 import { PlayerState, PlayerActions } from "@/hooks/usePlayer";
-import { Library } from "@/types";
+import { Library, ViewSpec } from "@/types";
 
 const MIN_WIDTH = 180;
 const MAX_WIDTH = 480;
@@ -30,7 +30,11 @@ const DEFAULT_WIDTH = 256;
 interface SidebarProps {
   libraries: Library[];
   selectedLibrary: Library | null;
+  // The currently active view (library-root, movies-only, people-list, etc).
+  // Threaded through for the upcoming complication-tree UI; not yet rendered.
+  activeView: ViewSpec | null;
   onSelectLibrary: (library: Library) => void;
+  onSelectView: (view: ViewSpec) => void;
   onLibraryCreated: () => void;
   onLibraryDeleted: () => void;
   onLibraryRescanned: () => void;
@@ -41,7 +45,9 @@ interface SidebarProps {
 export function Sidebar({
   libraries,
   selectedLibrary,
+  activeView: _activeView,
   onSelectLibrary,
+  onSelectView: _onSelectView,
   onLibraryCreated,
   onLibraryDeleted,
   onLibraryRescanned,

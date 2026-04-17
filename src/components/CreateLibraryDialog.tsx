@@ -48,7 +48,6 @@ export function CreateLibraryDialog({
   const [name, setName] = useState("");
   const [paths, setPaths] = useState<string[]>([""]);
   const [format, setFormat] = useState("video");
-  const [portable, setPortable] = useState(false);
   const [creating, setCreating] = useState(creatingGlobal);
   const [scanProgress, setScanProgress] = useState("");
   const toastIdRef = useRef<string | number | null>(null);
@@ -116,7 +115,7 @@ export function CreateLibraryDialog({
     creatingGlobal = true;
     setScanProgress("");
     try {
-      await invoke("create_library", { name, paths: validPaths, format, portable, managed });
+      await invoke("create_library", { name, paths: validPaths, format, portable: false, managed });
       if (toastIdRef.current != null) {
         toast.success(`Library "${name}" created`, { id: toastIdRef.current, duration: 4000, action: undefined });
         toastIdRef.current = null;
@@ -127,7 +126,7 @@ export function CreateLibraryDialog({
       setName("");
       setPaths([""]);
       setFormat("video");
-      setPortable(false);
+
     } catch (e) {
       const msg = String(e);
       if (msg.includes("cancelled")) {
@@ -140,7 +139,7 @@ export function CreateLibraryDialog({
         setName("");
         setPaths([""]);
         setFormat("video");
-        setPortable(false);
+  
       } else if (toastIdRef.current != null) {
         toast.error(msg, { id: toastIdRef.current, duration: 4000, action: undefined });
         toastIdRef.current = null;
@@ -247,15 +246,15 @@ export function CreateLibraryDialog({
           <div className="flex items-center justify-center gap-2">
             <Switch
               id="portable"
-              checked={portable}
-              onCheckedChange={setPortable}
+              checked={false}
+              disabled
             />
-            <span className="text-xs font-normal tracking-wide">Portable</span>
+            <span className="text-xs font-normal tracking-wide text-muted-foreground">Portable</span>
             <TooltipProvider>
               <Tooltip>
                 <TooltipTrigger render={<CircleHelp size={13} className="text-muted-foreground cursor-help" />} />
                 <TooltipContent>
-                  Store the library index alongside your media files so it travels with them and can be imported on other devices without re-scanning. Ideal for portable, external drives. When the library is located on a slower drive than the one where waverunner is installed, keep this setting off to store the index locally for better performance.
+                  Coming soon. Will allow storing the library index alongside your media files for portable/external drives.
                 </TooltipContent>
               </Tooltip>
             </TooltipProvider>

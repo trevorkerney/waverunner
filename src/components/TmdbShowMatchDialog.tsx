@@ -37,7 +37,6 @@ const NOTABLE_CREW_JOBS = [
 interface TmdbShowMatchDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  libraryId: string;
   entryId: number;
   entryTitle: string;
   entryYear: string | null;
@@ -230,7 +229,6 @@ function buildReviewFields(
 export function TmdbShowMatchDialog({
   open,
   onOpenChange,
-  libraryId,
   entryId,
   entryTitle,
   entryYear,
@@ -352,7 +350,6 @@ export function TmdbShowMatchDialog({
       }
 
       await invoke("apply_tmdb_show_metadata", {
-        libraryId,
         showId: entryId,
         fields: sel,
       });
@@ -369,7 +366,6 @@ export function TmdbShowMatchDialog({
     selectedTmdb,
     currentDetail,
     fieldChecks,
-    libraryId,
     entryId,
     onApplied,
     onOpenChange,
