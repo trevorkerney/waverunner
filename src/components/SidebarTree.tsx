@@ -85,6 +85,13 @@ function TreeNode({ node, activeView, onSelectView, depth }: TreeNodeProps) {
     <li>
       <button
         onClick={handleClick}
+        onContextMenu={(e) => {
+          // No per-node context menu yet — block both the browser default and propagation
+          // to the sidebar's outer "Create library" menu. When individual tree nodes need
+          // their own menus, wrap them in a ContextMenu here instead of this handler.
+          e.preventDefault();
+          e.stopPropagation();
+        }}
         style={{ paddingLeft: 4 + depth * 12 }}
         className={`flex w-full items-center gap-1.5 rounded-sm py-1 pr-2 text-left text-sm ${
           isActive
