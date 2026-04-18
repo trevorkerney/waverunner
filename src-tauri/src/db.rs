@@ -220,11 +220,10 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .await?;
 
     sqlx::query(
-        "CREATE TABLE IF NOT EXISTS movie_crew (
+        "CREATE TABLE IF NOT EXISTS movie_composer (
             movie_id INTEGER NOT NULL,
             person_id INTEGER NOT NULL,
-            job TEXT,
-            PRIMARY KEY (movie_id, person_id, job),
+            PRIMARY KEY (movie_id, person_id),
             FOREIGN KEY (movie_id) REFERENCES movie(id) ON DELETE CASCADE,
             FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
         )",
@@ -232,17 +231,9 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .execute(&pool)
     .await?;
 
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS movie_producer (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            movie_id INTEGER NOT NULL,
-            person_id INTEGER NOT NULL,
-            FOREIGN KEY (movie_id) REFERENCES movie(id) ON DELETE CASCADE,
-            FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
-        )",
-    )
-    .execute(&pool)
-    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_movie_composer_person ON movie_composer(person_id)")
+        .execute(&pool)
+        .await?;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS movie_studio (
@@ -327,11 +318,10 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .await?;
 
     sqlx::query(
-        "CREATE TABLE IF NOT EXISTS show_crew (
+        "CREATE TABLE IF NOT EXISTS show_composer (
             show_id INTEGER NOT NULL,
             person_id INTEGER NOT NULL,
-            job TEXT,
-            PRIMARY KEY (show_id, person_id, job),
+            PRIMARY KEY (show_id, person_id),
             FOREIGN KEY (show_id) REFERENCES show(id) ON DELETE CASCADE,
             FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
         )",
@@ -339,17 +329,9 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .execute(&pool)
     .await?;
 
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS show_producer (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            show_id INTEGER NOT NULL,
-            person_id INTEGER NOT NULL,
-            FOREIGN KEY (show_id) REFERENCES show(id) ON DELETE CASCADE,
-            FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
-        )",
-    )
-    .execute(&pool)
-    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_show_composer_person ON show_composer(person_id)")
+        .execute(&pool)
+        .await?;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS show_studio (
@@ -424,43 +406,6 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .await?;
 
     sqlx::query(
-        "CREATE TABLE IF NOT EXISTS season_crew (
-            season_id INTEGER NOT NULL,
-            person_id INTEGER NOT NULL,
-            job TEXT,
-            PRIMARY KEY (season_id, person_id, job),
-            FOREIGN KEY (season_id) REFERENCES season(id) ON DELETE CASCADE,
-            FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS season_director (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            season_id INTEGER NOT NULL,
-            person_id INTEGER NOT NULL,
-            FOREIGN KEY (season_id) REFERENCES season(id) ON DELETE CASCADE,
-            FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS season_producer (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            season_id INTEGER NOT NULL,
-            person_id INTEGER NOT NULL,
-            FOREIGN KEY (season_id) REFERENCES season(id) ON DELETE CASCADE,
-            FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    sqlx::query(
         "CREATE TABLE IF NOT EXISTS episode_cast (
             episode_id INTEGER NOT NULL,
             person_id INTEGER NOT NULL,
@@ -475,17 +420,36 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .await?;
 
     sqlx::query(
-        "CREATE TABLE IF NOT EXISTS episode_crew (
+        "CREATE TABLE IF NOT EXISTS episode_director (
             episode_id INTEGER NOT NULL,
             person_id INTEGER NOT NULL,
-            job TEXT,
-            PRIMARY KEY (episode_id, person_id, job),
+            PRIMARY KEY (episode_id, person_id),
             FOREIGN KEY (episode_id) REFERENCES episode(id) ON DELETE CASCADE,
             FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
         )",
     )
     .execute(&pool)
     .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_episode_director_person ON episode_director(person_id)")
+        .execute(&pool)
+        .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS episode_composer (
+            episode_id INTEGER NOT NULL,
+            person_id INTEGER NOT NULL,
+            PRIMARY KEY (episode_id, person_id),
+            FOREIGN KEY (episode_id) REFERENCES episode(id) ON DELETE CASCADE,
+            FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_episode_composer_person ON episode_composer(person_id)")
+        .execute(&pool)
+        .await?;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS media_collection (

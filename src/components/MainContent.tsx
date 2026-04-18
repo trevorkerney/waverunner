@@ -87,14 +87,16 @@ import {
   RefreshCw,
   ChevronDown,
   ChevronRight,
+  User as UserIcon,
 } from "lucide-react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
-import { Library, MediaEntry, BreadcrumbItem, MovieDetail, MovieDetailUpdate, SeasonInfo, EpisodeInfo, ShowDetail, SeasonDetailLocal, EpisodeDetailLocal, TmdbSeasonDetail, TmdbEpisodeDetail, TmdbShowFieldSelection, TmdbSeasonFieldSelection, TmdbEpisodeFieldSelection, CastUpdateInfo, CrewUpdateInfo, ViewSpec, PersonSummary, PlaylistSummary } from "@/types";
+import { Library, MediaEntry, BreadcrumbItem, MovieDetail, MovieDetailUpdate, SeasonInfo, EpisodeInfo, ShowDetail, SeasonDetailLocal, EpisodeDetailLocal, TmdbSeasonDetail, TmdbEpisodeDetail, TmdbShowFieldSelection, TmdbSeasonFieldSelection, TmdbEpisodeFieldSelection, CastUpdateInfo, ViewSpec, PersonSummary, PersonRole, PlaylistSummary } from "@/types";
 import { TmdbMatchDialog } from "@/components/TmdbMatchDialog";
 import { TmdbShowMatchDialog } from "@/components/TmdbShowMatchDialog";
 import { TmdbImageBrowserDialog } from "@/components/TmdbImageBrowserDialog";
+import { PeopleGrid } from "@/components/PeopleGrid";
 
 function getDisplayCover(entry: MediaEntry): string | null {
   if (entry.selected_cover && entry.covers.includes(entry.selected_cover)) {
@@ -131,6 +133,7 @@ interface MainContentProps {
   search: string;
   onSearchChange: (search: string) => void;
   onNavigate: (entry: MediaEntry) => void;
+  onNavigateToPerson: (person: PersonSummary, role: PersonRole) => void;
   onBreadcrumbClick: (index: number) => void;
   selectedLibrary: Library | null;
   hasLibraries: boolean;
@@ -168,6 +171,7 @@ export function MainContent({
   search,
   onSearchChange,
   onNavigate,
+  onNavigateToPerson,
   onBreadcrumbClick,
   selectedLibrary,
   hasLibraries,
@@ -307,28 +311,40 @@ export function MainContent({
 
   const isInsideCollection = breadcrumbs.length > 1;
 
-  // People-list placeholder. Real people-grid component is a follow-up plan;
-  // for now we just prove the data flows by listing names + work counts.
-  if (activeView?.kind === "people-list") {
+  const breadcrumbBar = (
+    <Breadcrumb className="border-b border-border">
+      <BreadcrumbList className="!flex-nowrap overflow-x-auto px-4 py-2 pr-8 text-xs font-medium">
+        {breadcrumbs.map((crumb, i) => (
+          <BreadcrumbUIItem key={i} className="whitespace-nowrap">
+            {i > 0 && <BreadcrumbSeparator />}
+            {i === breadcrumbs.length - 1 ? (
+              <BreadcrumbPage>{crumb.title}</BreadcrumbPage>
+            ) : (
+              <BreadcrumbLink render={<button onClick={() => onBreadcrumbClick(i)} />}>
+                {crumb.title}
+              </BreadcrumbLink>
+            )}
+          </BreadcrumbUIItem>
+        ))}
+      </BreadcrumbList>
+    </Breadcrumb>
+  );
+
+  if (activeView?.kind === "people-list" || activeView?.kind === "people-all") {
+    const role: PersonRole = activeView.kind === "people-all" ? "all" : activeView.role;
     return (
       <main className="flex flex-1 flex-col overflow-hidden bg-background">
-        <div className="border-b border-border px-4 py-2 text-xs font-medium text-muted-foreground">
-          {selectedLibrary?.name} — {activeView.role}
-        </div>
-        <div ref={scrollContainerRef} className="flex-1 overflow-y-auto p-4">
-          {loading && <p className="text-sm text-muted-foreground">Loading…</p>}
+        {breadcrumbBar}
+        <div ref={scrollContainerRef} className="flex-1 overflow-y-auto">
+          {loading && <p className="p-4 text-sm text-muted-foreground">Loading…</p>}
           {!loading && people && people.length === 0 && (
-            <p className="text-sm text-muted-foreground">No people found.</p>
+            <p className="p-4 text-sm text-muted-foreground">No people found.</p>
           )}
           {!loading && people && people.length > 0 && (
-            <ul className="space-y-1 text-sm">
-              {people.map((p) => (
-                <li key={p.id}>
-                  {p.name}{" "}
-                  <span className="text-muted-foreground">({p.work_count})</span>
-                </li>
-              ))}
-            </ul>
+            <PeopleGrid
+              people={people}
+              onSelectPerson={(p) => onNavigateToPerson(p, role)}
+            />
           )}
         </div>
       </main>
@@ -338,9 +354,7 @@ export function MainContent({
   if (activeView?.kind === "playlists") {
     return (
       <main className="flex flex-1 flex-col overflow-hidden bg-background">
-        <div className="border-b border-border px-4 py-2 text-xs font-medium text-muted-foreground">
-          {selectedLibrary?.name} — Playlists
-        </div>
+        {breadcrumbBar}
         <div ref={scrollContainerRef} className="flex-1 overflow-y-auto p-4">
           {loading && <p className="text-sm text-muted-foreground">Loading…</p>}
           {!loading && playlists && playlists.length === 0 && (
@@ -362,25 +376,17 @@ export function MainContent({
     <main className="flex flex-1 flex-col overflow-hidden bg-background">
       {selectedLibrary && (
         <>
-          {/* Breadcrumbs */}
-          <Breadcrumb className="border-b border-border">
-            <BreadcrumbList className="!flex-nowrap overflow-x-auto px-4 py-2 pr-8 text-xs font-medium">
-              {breadcrumbs.map((crumb, i) => (
-                <BreadcrumbUIItem key={i} className="whitespace-nowrap">
-                  {i > 0 && <BreadcrumbSeparator />}
-                  {i === breadcrumbs.length - 1 ? (
-                    <BreadcrumbPage>{crumb.title}</BreadcrumbPage>
-                  ) : (
-                    <BreadcrumbLink
-                      render={<button onClick={() => onBreadcrumbClick(i)} />}
-                    >
-                      {crumb.title}
-                    </BreadcrumbLink>
-                  )}
-                </BreadcrumbUIItem>
-              ))}
-            </BreadcrumbList>
-          </Breadcrumb>
+          {breadcrumbBar}
+
+          {/* Person-detail header */}
+          {activeView?.kind === "person-detail" && !selectedEntry && (
+            <PersonDetailHeader
+              name={activeView.personName}
+              imagePath={activeView.personImage}
+              role={activeView.role}
+              workCount={entries.length}
+            />
+          )}
 
           {/* Search + Sort + Size Slider */}
           {!selectedEntry && <div className="flex items-center gap-3 border-b border-border px-4 py-2">
@@ -1203,9 +1209,8 @@ function EntryDetailPage({
       maturity_rating: detail?.maturity_rating ?? null,
       genres: detail?.genres ?? [],
       directors: detail?.directors.map((d: { name: string }) => d.name) ?? [],
-      cast: detail?.cast.map((c: { name: string; role: string | null }) => ({ name: c.name, role: c.role, tmdb_id: null })) ?? [],
-      crew: detail?.crew.map((c: { name: string; job: string | null }) => ({ name: c.name, job: c.job, tmdb_id: null })) ?? [],
-      producers: detail?.producers.map((p: { name: string }) => p.name) ?? [],
+      cast: detail?.cast.map((c: { name: string; role: string | null }) => ({ name: c.name, role: c.role, tmdb_id: null, profile_path: null })) ?? [],
+      composers: detail?.composers.map((p: { name: string }) => p.name) ?? [],
       studios: detail?.studios ?? [],
       keywords: detail?.keywords ?? [],
     });
@@ -1344,10 +1349,7 @@ function EntryDetailPage({
             {detail.cast.length > 0 && (
               <p><span className="font-medium">Cast:</span> {detail.cast.map((c: { name: string; role: string | null }) => c.role ? `${c.name} (${c.role})` : c.name).join(", ")}</p>
             )}
-            {detail.crew.length > 0 && (
-              <p><span className="font-medium">Crew:</span> {detail.crew.map((c: { name: string; job: string | null }) => c.job ? `${c.name} (${c.job})` : c.name).join(", ")}</p>
-            )}
-            {detail.producers.length > 0 && <p><span className="font-medium">Producers:</span> {detail.producers.map((p: { name: string }) => p.name).join(", ")}</p>}
+            {detail.composers.length > 0 && <p><span className="font-medium">Composers:</span> {detail.composers.map((p: { name: string }) => p.name).join(", ")}</p>}
             {detail.studios.length > 0 && <p><span className="font-medium">Studios:</span> {detail.studios.join(", ")}</p>}
             {detail.keywords.length > 0 && <p><span className="font-medium">Keywords:</span> {detail.keywords.join(", ")}</p>}
             {detail.tmdb_id && <p><span className="font-medium">TMDB:</span> {detail.tmdb_id}</p>}
@@ -1364,14 +1366,13 @@ function EntryDetailPage({
             <EditField label="Maturity Rating" value={draft.maturity_rating ?? ""} onChange={(v) => updateDraft("maturity_rating", v || null)} />
             <EditField label="Genres (comma-separated)" value={(draft.genres ?? []).join(", ")} onChange={(v) => updateListField("genres", v)} />
             <EditField label="Directors (comma-separated)" value={(draft.directors ?? []).join(", ")} onChange={(v) => updateListField("directors", v)} />
-            <EditField label="Producers (comma-separated)" value={(draft.producers ?? []).join(", ")} onChange={(v) => updateListField("producers", v)} />
+            <EditField label="Composers (comma-separated)" value={(draft.composers ?? []).join(", ")} onChange={(v) => updateListField("composers", v)} />
             <EditField label="Studios (comma-separated)" value={(draft.studios ?? []).join(", ")} onChange={(v) => updateListField("studios", v)} />
             <EditField label="Keywords (comma-separated)" value={(draft.keywords ?? []).join(", ")} onChange={(v) => updateListField("keywords", v)} />
             <EditField label="TMDB ID" value={draft.tmdb_id ?? ""} onChange={(v) => updateDraft("tmdb_id", v || null)} />
             <EditField label="IMDB ID" value={draft.imdb_id ?? ""} onChange={(v) => updateDraft("imdb_id", v || null)} />
             <EditField label="Rotten Tomatoes ID" value={draft.rotten_tomatoes_id ?? ""} onChange={(v) => updateDraft("rotten_tomatoes_id", v || null)} />
             <PeopleListEdit label="Cast" items={draft.cast ?? []} onChange={(items) => updateDraft("cast", items)} secondaryField="role" secondaryLabel="Role" />
-            <PeopleListEdit label="Crew" items={draft.crew ?? []} onChange={(items) => updateDraft("crew", items)} secondaryField="job" secondaryLabel="Job" />
           </div>
         )}
         </ContextMenuTrigger>
@@ -1561,20 +1562,15 @@ function ShowDetailPage({
           name: c.name,
           role: c.character ?? null,
           tmdb_id: c.id,
+          profile_path: c.profile_path,
         }));
       }
+      // Any season-level director gets fanned out to every episode in the season by the backend.
       if (tmdbSeason.credits?.crew) {
-        const crew = tmdbSeason.credits.crew;
-        fields.directors = crew
+        const directors = tmdbSeason.credits.crew
           .filter((c) => c.job === "Director")
-          .map((c) => ({ name: c.name, tmdb_id: c.id }));
-        fields.producers = crew
-          .filter((c) => c.department === "Production")
-          .map((c) => ({ name: c.name, tmdb_id: c.id }));
-        fields.crew = crew
-          .filter((c) => c.job !== "Director" && c.department !== "Production")
-          .filter((c) => ["Writer", "Screenplay", "Story", "Composer", "Original Music Composer", "Director of Photography", "Cinematographer", "Editor"].includes(c.job ?? ""))
-          .map((c) => ({ name: c.name, job: c.job ?? null, tmdb_id: c.id }));
+          .map((c) => ({ name: c.name, tmdb_id: c.id, profile_path: c.profile_path }));
+        if (directors.length > 0) fields.season_director = directors;
       }
       await invoke("apply_tmdb_season_metadata", {
         seasonId: selectedSeason.id,
@@ -1629,14 +1625,18 @@ function ShowDetailPage({
           name: c.name,
           role: c.character ?? null,
           tmdb_id: c.id,
+          profile_path: c.profile_path,
         }));
       }
       if (tmdbEp.crew && tmdbEp.crew.length > 0) {
-        fields.crew = tmdbEp.crew.map((c) => ({
-          name: c.name,
-          job: c.job ?? null,
-          tmdb_id: c.id,
-        }));
+        const directors = tmdbEp.crew
+          .filter((c) => c.job === "Director")
+          .map((c) => ({ name: c.name, tmdb_id: c.id, profile_path: c.profile_path }));
+        const composers = tmdbEp.crew
+          .filter((c) => c.job === "Composer" || c.job === "Original Music Composer")
+          .map((c) => ({ name: c.name, tmdb_id: c.id, profile_path: c.profile_path }));
+        if (directors.length > 0) fields.director = directors;
+        if (composers.length > 0) fields.composer = composers;
       }
       await invoke("apply_tmdb_episode_metadata", {
         episodeId: ep.id,
@@ -1661,10 +1661,9 @@ function ShowDetailPage({
       tagline: detail.tagline ?? "",
       maturity_rating: detail.maturity_rating ?? "",
       genres: [...detail.genres],
-      creators: detail.creators.map((p) => ({ name: p.name, tmdb_id: null })),
-      cast: detail.cast.map((c) => ({ name: c.name, role: c.role, tmdb_id: null })),
-      crew: detail.crew.map((c) => ({ name: c.name, job: c.job, tmdb_id: null })),
-      producers: detail.producers.map((p) => ({ name: p.name, tmdb_id: null })),
+      creators: detail.creators.map((p) => ({ name: p.name, tmdb_id: null, profile_path: null })),
+      cast: detail.cast.map((c) => ({ name: c.name, role: c.role, tmdb_id: null, profile_path: null })),
+      composers: detail.composers.map((p) => ({ name: p.name, tmdb_id: null, profile_path: null })),
       studios: [...detail.studios],
       keywords: [...detail.keywords],
     });
@@ -1694,10 +1693,7 @@ function ShowDetailPage({
     setEditingEpisodeId(null);
     setSeasonDraft({
       plot: seasonDetail.plot ?? "",
-      cast: seasonDetail.cast.map((c) => ({ name: c.name, role: c.role, tmdb_id: null })),
-      crew: seasonDetail.crew.map((c) => ({ name: c.name, job: c.job, tmdb_id: null })),
-      directors: seasonDetail.directors.map((p) => ({ name: p.name, tmdb_id: null })),
-      producers: seasonDetail.producers.map((p) => ({ name: p.name, tmdb_id: null })),
+      cast: seasonDetail.cast.map((c) => ({ name: c.name, role: c.role, tmdb_id: null, profile_path: null })),
     });
     setSeasonEditing(true);
   }, [seasonDetail]);
@@ -1727,8 +1723,9 @@ function ShowDetailPage({
       plot: d?.plot ?? "",
       runtime: d?.runtime ?? undefined,
       release_date: d?.release_date ?? "",
-      cast: d?.cast.map((c) => ({ name: c.name, role: c.role, tmdb_id: null })) ?? [],
-      crew: d?.crew.map((c) => ({ name: c.name, job: c.job, tmdb_id: null })) ?? [],
+      cast: d?.cast.map((c) => ({ name: c.name, role: c.role, tmdb_id: null, profile_path: null })) ?? [],
+      director: d?.directors.map((p) => ({ name: p.name, tmdb_id: null, profile_path: null })) ?? [],
+      composer: d?.composers.map((p) => ({ name: p.name, tmdb_id: null, profile_path: null })) ?? [],
     });
     setEditingEpisodeId(ep.id);
   }, [episodeDetails]);
@@ -1844,8 +1841,7 @@ function ShowDetailPage({
             </div>
             <TruncatedList label="Cast" items={detail.cast.map((c) => c.role ? `${c.name} (${c.role})` : c.name)} />
             <TruncatedList label="Created By" items={detail.creators.map((c) => c.name)} />
-            <TruncatedList label="Crew" items={detail.crew.map((c) => c.job ? `${c.name} (${c.job})` : c.name)} />
-            <TruncatedList label="Producers" items={detail.producers.map((p) => p.name)} />
+            <TruncatedList label="Composers" items={detail.composers.map((c) => c.name)} />
             {detail.keywords.length > 0 && (
               <div className="text-sm">
                 <span className="text-muted-foreground">Keywords: </span>
@@ -1865,10 +1861,9 @@ function ShowDetailPage({
             <EditField label="Plot" value={showDraft.plot ?? ""} onChange={(v) => setShowDraft((p) => ({ ...p, plot: v }))} multiline />
             <EditField label="Maturity Rating" value={showDraft.maturity_rating ?? ""} onChange={(v) => setShowDraft((p) => ({ ...p, maturity_rating: v }))} />
             <EditField label="Genres (comma-separated)" value={(showDraft.genres ?? []).join(", ")} onChange={(v) => setShowDraft((p) => ({ ...p, genres: v.split(",").map((s) => s.trim()).filter(Boolean) }))} />
-            <EditField label="Creators (comma-separated)" value={(showDraft.creators ?? []).map((c) => c.name).join(", ")} onChange={(v) => setShowDraft((p) => ({ ...p, creators: v.split(",").map((s) => s.trim()).filter(Boolean).map((name) => ({ name, tmdb_id: null })) }))} />
-            <EditField label="Producers (comma-separated)" value={(showDraft.producers ?? []).map((c) => c.name).join(", ")} onChange={(v) => setShowDraft((p) => ({ ...p, producers: v.split(",").map((s) => s.trim()).filter(Boolean).map((name) => ({ name, tmdb_id: null })) }))} />
+            <EditField label="Creators (comma-separated)" value={(showDraft.creators ?? []).map((c) => c.name).join(", ")} onChange={(v) => setShowDraft((p) => ({ ...p, creators: v.split(",").map((s) => s.trim()).filter(Boolean).map((name) => ({ name, tmdb_id: null, profile_path: null })) }))} />
+            <EditField label="Composers (comma-separated)" value={(showDraft.composers ?? []).map((c) => c.name).join(", ")} onChange={(v) => setShowDraft((p) => ({ ...p, composers: v.split(",").map((s) => s.trim()).filter(Boolean).map((name) => ({ name, tmdb_id: null, profile_path: null })) }))} />
             <PeopleListEdit label="Cast" items={showDraft.cast ?? []} onChange={(items) => setShowDraft((p) => ({ ...p, cast: items }))} secondaryField="role" secondaryLabel="Role" />
-            <PeopleListEdit label="Crew" items={showDraft.crew ?? []} onChange={(items) => setShowDraft((p) => ({ ...p, crew: items }))} secondaryField="job" secondaryLabel="Job" />
             <EditField label="Studios (comma-separated)" value={(showDraft.studios ?? []).join(", ")} onChange={(v) => setShowDraft((p) => ({ ...p, studios: v.split(",").map((s) => s.trim()).filter(Boolean) }))} />
             <EditField label="Keywords (comma-separated)" value={(showDraft.keywords ?? []).join(", ")} onChange={(v) => setShowDraft((p) => ({ ...p, keywords: v.split(",").map((s) => s.trim()).filter(Boolean) }))} />
             <div className="flex gap-2">
@@ -1901,7 +1896,7 @@ function ShowDetailPage({
 
             {/* Season metadata */}
             {selectedSeason && !seasonEditing && (() => {
-              const hasMeta = seasonDetail && (seasonDetail.plot || seasonDetail.cast.length > 0 || seasonDetail.directors.length > 0 || seasonDetail.crew.length > 0 || seasonDetail.producers.length > 0);
+              const hasMeta = seasonDetail && (seasonDetail.plot || seasonDetail.cast.length > 0);
               const episodesNumbered = episodes.length > 0 && episodes.every((e) => e.episode_number != null);
               return (
                 <ContextMenu>
@@ -1914,9 +1909,6 @@ function ShowDetailPage({
                       <>
                         {seasonDetail.plot && <p className="text-sm">{seasonDetail.plot}</p>}
                         <TruncatedList label="Cast" items={seasonDetail.cast.map((c) => c.role ? `${c.name} (${c.role})` : c.name)} />
-                        <TruncatedList label="Directors" items={seasonDetail.directors.map((d) => d.name)} />
-                        <TruncatedList label="Crew" items={seasonDetail.crew.map((c) => c.job ? `${c.name} (${c.job})` : c.name)} />
-                        <TruncatedList label="Producers" items={seasonDetail.producers.map((p) => p.name)} />
                       </>
                     )}
                   </ContextMenuTrigger>
@@ -1941,10 +1933,8 @@ function ShowDetailPage({
             {selectedSeason && seasonEditing && (
               <div className="flex flex-col gap-3 rounded-md border p-3 text-sm">
                 <EditField label="Plot" value={seasonDraft.plot ?? ""} onChange={(v) => setSeasonDraft((p) => ({ ...p, plot: v }))} multiline />
-                <EditField label="Directors (comma-separated)" value={(seasonDraft.directors ?? []).map((c) => c.name).join(", ")} onChange={(v) => setSeasonDraft((p) => ({ ...p, directors: v.split(",").map((s) => s.trim()).filter(Boolean).map((name) => ({ name, tmdb_id: null })) }))} />
-                <EditField label="Producers (comma-separated)" value={(seasonDraft.producers ?? []).map((c) => c.name).join(", ")} onChange={(v) => setSeasonDraft((p) => ({ ...p, producers: v.split(",").map((s) => s.trim()).filter(Boolean).map((name) => ({ name, tmdb_id: null })) }))} />
+                <EditField label="Season-wide Director (comma-separated — applied to every episode)" value={(seasonDraft.season_director ?? []).map((c) => c.name).join(", ")} onChange={(v) => setSeasonDraft((p) => ({ ...p, season_director: v.split(",").map((s) => s.trim()).filter(Boolean).map((name) => ({ name, tmdb_id: null, profile_path: null })) }))} />
                 <PeopleListEdit label="Cast" items={seasonDraft.cast ?? []} onChange={(items) => setSeasonDraft((p) => ({ ...p, cast: items }))} secondaryField="role" secondaryLabel="Role" />
-                <PeopleListEdit label="Crew" items={seasonDraft.crew ?? []} onChange={(items) => setSeasonDraft((p) => ({ ...p, crew: items }))} secondaryField="job" secondaryLabel="Job" />
                 <div className="flex gap-2">
                   <Button size="sm" variant="outline" onClick={() => setSeasonEditing(false)} disabled={seasonSaving}>Cancel</Button>
                   <Button size="sm" onClick={saveSeason} disabled={seasonSaving}>{seasonSaving ? "Saving..." : "Save"}</Button>
@@ -1957,7 +1947,7 @@ function ShowDetailPage({
               {episodes.map((ep) => {
                 const isExpanded = expandedEpisodeId === ep.id;
                 const epDetail = episodeDetails.get(ep.id);
-                const hasDetail = epDetail && (epDetail.release_date || epDetail.plot || epDetail.runtime || epDetail.cast.length > 0 || epDetail.crew.length > 0);
+                const hasDetail = epDetail && (epDetail.release_date || epDetail.plot || epDetail.runtime || epDetail.cast.length > 0 || epDetail.directors.length > 0 || epDetail.composers.length > 0);
                 return (
                   <div key={ep.id} className="flex flex-col">
                     <ContextMenu>
@@ -2029,7 +2019,8 @@ function ShowDetailPage({
                                 <p>{epDetail.plot}</p>
                               )}
                               <TruncatedList label="Guest Stars" items={epDetail.cast.map((c) => c.role ? `${c.name} (${c.role})` : c.name)} />
-                              <TruncatedList label="Crew" items={epDetail.crew.map((c) => c.job ? `${c.name} (${c.job})` : c.name)} />
+                              <TruncatedList label="Directors" items={epDetail.directors.map((d) => d.name)} />
+                              <TruncatedList label="Composers" items={epDetail.composers.map((c) => c.name)} />
                             </>
                           )}
                         </ContextMenuTrigger>
@@ -2054,7 +2045,8 @@ function ShowDetailPage({
                         <EditField label="Runtime (min)" value={episodeDraft.runtime != null ? String(episodeDraft.runtime) : ""} onChange={(v) => setEpisodeDraft((p) => ({ ...p, runtime: v ? Number(v) : undefined }))} />
                         <EditField label="Plot" value={episodeDraft.plot ?? ""} onChange={(v) => setEpisodeDraft((p) => ({ ...p, plot: v }))} multiline />
                         <PeopleListEdit label="Guest Stars" items={episodeDraft.cast ?? []} onChange={(items) => setEpisodeDraft((p) => ({ ...p, cast: items }))} secondaryField="role" secondaryLabel="Role" />
-                        <PeopleListEdit label="Crew" items={episodeDraft.crew ?? []} onChange={(items) => setEpisodeDraft((p) => ({ ...p, crew: items }))} secondaryField="job" secondaryLabel="Job" />
+                        <EditField label="Director (comma-separated)" value={(episodeDraft.director ?? []).map((d) => d.name).join(", ")} onChange={(v) => setEpisodeDraft((p) => ({ ...p, director: v.split(",").map((s) => s.trim()).filter(Boolean).map((name) => ({ name, tmdb_id: null, profile_path: null })) }))} />
+                        <EditField label="Composer (comma-separated)" value={(episodeDraft.composer ?? []).map((c) => c.name).join(", ")} onChange={(v) => setEpisodeDraft((p) => ({ ...p, composer: v.split(",").map((s) => s.trim()).filter(Boolean).map((name) => ({ name, tmdb_id: null, profile_path: null })) }))} />
                         <div className="flex gap-2">
                           <Button size="sm" variant="outline" onClick={() => setEditingEpisodeId(null)} disabled={episodeSaving}>Cancel</Button>
                           <Button size="sm" onClick={saveEpisode} disabled={episodeSaving}>{episodeSaving ? "Saving..." : "Save"}</Button>
@@ -2128,7 +2120,7 @@ function ShowDetailPage({
   );
 }
 
-function PeopleListEdit<T extends CastUpdateInfo | CrewUpdateInfo>({
+function PeopleListEdit<T extends CastUpdateInfo>({
   label,
   items,
   onChange,
@@ -2138,7 +2130,7 @@ function PeopleListEdit<T extends CastUpdateInfo | CrewUpdateInfo>({
   label: string;
   items: T[];
   onChange: (items: T[]) => void;
-  secondaryField: "role" | "job";
+  secondaryField: "role";
   secondaryLabel: string;
 }) {
   const update = (i: number, patch: Partial<T>) => {
@@ -2207,6 +2199,42 @@ function EditField({
           className="rounded border border-input bg-transparent px-2 py-1 text-sm outline-none"
         />
       )}
+    </div>
+  );
+}
+
+function PersonDetailHeader({
+  name,
+  imagePath,
+  role,
+  workCount,
+}: {
+  name: string;
+  imagePath: string | null;
+  role: PersonRole;
+  workCount: number;
+}) {
+  const imageSrc = imagePath ? convertFileSrc(imagePath) : null;
+  const roleLabel =
+    role === "actor" ? "Actor"
+    : role === "director_creator" ? "Director / Creator"
+    : role === "composer" ? "Composer"
+    : "Credits";
+  return (
+    <div className="flex items-center gap-4 border-b border-border px-4 py-4">
+      <div className="flex h-24 w-24 flex-shrink-0 items-center justify-center overflow-hidden rounded-full bg-muted">
+        {imageSrc ? (
+          <img src={imageSrc} alt={name} className="h-full w-full object-cover" draggable={false} />
+        ) : (
+          <UserIcon className="h-10 w-10 text-muted-foreground" />
+        )}
+      </div>
+      <div className="flex min-w-0 flex-col">
+        <h1 className="truncate text-2xl font-bold">{name}</h1>
+        <p className="text-sm text-muted-foreground">
+          {roleLabel} · {workCount === 1 ? "1 work" : `${workCount} works`}
+        </p>
+      </div>
     </div>
   );
 }

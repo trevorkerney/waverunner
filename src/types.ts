@@ -30,14 +30,19 @@ export interface MediaEntry {
   tmdb_id: string | null;
 }
 
+// Each step in the navigation chain. `view` is set when this breadcrumb corresponds to a
+// distinct view switch (sidebar node click, drill into person-detail) — clicking or popping
+// to this crumb restores that view. When absent, this crumb is a drill-in within the current
+// view (e.g. a nested collection in library-root) and navigation uses parent-id semantics.
 export interface BreadcrumbItem {
   id: number | null;
   title: string;
+  view?: ViewSpec;
 }
 
 // ---------- Sidebar complications ----------
 
-export type PersonRole = "actor" | "director_producer" | "composer";
+export type PersonRole = "actor" | "director_creator" | "composer" | "all";
 
 // "Where the user is" — drives what MainContent renders. Sidebar selection
 // always corresponds to a ViewSpec, and so do drill-downs that originate
@@ -46,8 +51,9 @@ export type ViewSpec =
   | { kind: "library-root";       libraryId: string }
   | { kind: "movies-only";        libraryId: string }
   | { kind: "shows-only";         libraryId: string }
+  | { kind: "people-all";         libraryId: string }
   | { kind: "people-list";        libraryId: string; role: PersonRole }
-  | { kind: "person-detail";      libraryId: string; personId: number; role: PersonRole }
+  | { kind: "person-detail";      libraryId: string; personId: number; role: PersonRole; personName: string; personImage: string | null }
   | { kind: "playlists";           libraryId: string };
 
 // One node in the static complication tree shown for a library.
@@ -83,10 +89,6 @@ export interface CastInfo extends PersonInfo {
   role: string | null;
 }
 
-export interface CrewInfo extends PersonInfo {
-  job: string | null;
-}
-
 export interface MovieDetail {
   id: number;
   tmdb_id: string | null;
@@ -100,8 +102,7 @@ export interface MovieDetail {
   genres: string[];
   directors: PersonInfo[];
   cast: CastInfo[];
-  crew: CrewInfo[];
-  producers: PersonInfo[];
+  composers: PersonInfo[];
   studios: string[];
   keywords: string[];
 }
@@ -110,17 +111,13 @@ export interface CastUpdateInfo {
   name: string;
   role: string | null;
   tmdb_id: number | null;
-}
-
-export interface CrewUpdateInfo {
-  name: string;
-  job: string | null;
-  tmdb_id: number | null;
+  profile_path: string | null;
 }
 
 export interface PersonUpdateInfo {
   name: string;
   tmdb_id: number | null;
+  profile_path: string | null;
 }
 
 export interface SeasonInfo {
@@ -219,8 +216,7 @@ export interface TmdbFieldSelection {
   genres?: string[];
   directors?: PersonUpdateInfo[];
   cast?: CastUpdateInfo[];
-  crew?: CrewUpdateInfo[];
-  producers?: PersonUpdateInfo[];
+  composers?: PersonUpdateInfo[];
   studios?: string[];
   keywords?: string[];
 }
@@ -238,8 +234,7 @@ export interface MovieDetailUpdate {
   genres?: string[];
   directors?: string[];
   cast?: CastUpdateInfo[];
-  crew?: CrewUpdateInfo[];
-  producers?: string[];
+  composers?: string[];
   studios?: string[];
   keywords?: string[];
 }
@@ -256,8 +251,7 @@ export interface ShowDetail {
   genres: string[];
   creators: PersonInfo[];
   cast: CastInfo[];
-  crew: CrewInfo[];
-  producers: PersonInfo[];
+  composers: PersonInfo[];
   studios: string[];
   keywords: string[];
 }
@@ -268,9 +262,6 @@ export interface SeasonDetailLocal {
   season_number: number | null;
   plot: string | null;
   cast: CastInfo[];
-  crew: CrewInfo[];
-  directors: PersonInfo[];
-  producers: PersonInfo[];
 }
 
 export interface EpisodeDetailLocal {
@@ -281,7 +272,8 @@ export interface EpisodeDetailLocal {
   plot: string | null;
   runtime: number | null;
   cast: CastInfo[];
-  crew: CrewInfo[];
+  directors: PersonInfo[];
+  composers: PersonInfo[];
 }
 
 // ---------- TMDB TV types ----------
@@ -361,8 +353,7 @@ export interface TmdbShowFieldSelection {
   genres?: string[];
   creators?: PersonUpdateInfo[];
   cast?: CastUpdateInfo[];
-  crew?: CrewUpdateInfo[];
-  producers?: PersonUpdateInfo[];
+  composers?: PersonUpdateInfo[];
   studios?: string[];
   keywords?: string[];
 }
@@ -370,9 +361,7 @@ export interface TmdbShowFieldSelection {
 export interface TmdbSeasonFieldSelection {
   plot?: string;
   cast?: CastUpdateInfo[];
-  crew?: CrewUpdateInfo[];
-  directors?: PersonUpdateInfo[];
-  producers?: PersonUpdateInfo[];
+  season_director?: PersonUpdateInfo[];
 }
 
 export interface TmdbEpisodeFieldSelection {
@@ -380,7 +369,8 @@ export interface TmdbEpisodeFieldSelection {
   runtime?: number;
   release_date?: string;
   cast?: CastUpdateInfo[];
-  crew?: CrewUpdateInfo[];
+  director?: PersonUpdateInfo[];
+  composer?: PersonUpdateInfo[];
 }
 
 export interface ShowEpisodeFlat {

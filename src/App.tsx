@@ -10,7 +10,7 @@ import { Toaster } from "@/components/ui/sonner";
 import { toast } from "sonner";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { Library, MediaEntry, EntriesResponse, BreadcrumbItem, ViewSpec, PersonSummary, PlaylistSummary } from "@/types";
+import { Library, MediaEntry, EntriesResponse, BreadcrumbItem, ViewSpec, PersonSummary, PersonRole, PlaylistSummary } from "@/types";
 import { viewCacheKey } from "@/lib/complications";
 
 function App() {
@@ -233,8 +233,8 @@ function App() {
 
   const loadView = useCallback(
     async (view: ViewSpec, parentId: number | null, breadcrumb: BreadcrumbItem[], restoreScroll: boolean = true) => {
-      // people-list and playlists produce their own result types; everything else lands as MediaEntry[].
-      if (view.kind === "people-list") {
+      // people-list / people-all and playlists produce their own result types; everything else lands as MediaEntry[].
+      if (view.kind === "people-list" || view.kind === "people-all") {
         const key = viewCacheKey(view);
         const cached = peopleCacheRef.current.get(key);
         setEntries([]);
@@ -246,9 +246,10 @@ function App() {
         }
         setLoading(true);
         try {
+          const role = view.kind === "people-all" ? "all" : view.role;
           const res = await invoke<PersonSummary[]>("get_people_in_library", {
             libraryId: view.libraryId,
-            role: view.role,
+            role,
           });
           peopleCacheRef.current.set(key, res);
           setPeople(res);
@@ -423,7 +424,7 @@ function App() {
       setSelectedEntry(null);
       setSearch("");
       setForwardStack([]);
-      loadView(view, null, [{ id: null, title: library.name }], false);
+      loadView(view, null, [{ id: null, title: library.name, view }], false);
     },
     [loadView]
   );
@@ -439,16 +440,68 @@ function App() {
       setForwardStack([]);
       const lib = libraries.find((l) => l.id === view.libraryId);
       const libLabel = lib?.name ?? "Library";
-      const viewLabel: string =
-        view.kind === "library-root" ? libLabel
-        : view.kind === "movies-only" ? `${libLabel} — Movies`
-        : view.kind === "shows-only" ? `${libLabel} — TV`
-        : view.kind === "playlists" ? `${libLabel} — Playlists`
-        : view.kind === "people-list" ? `${libLabel} — ${view.role}`
-        : `${libLabel} — Person`;
-      loadView(view, null, [{ id: null, title: viewLabel }], false);
+
+      // Build the breadcrumb chain that should anchor this view. People subcategories
+      // are always nested under the "People" parent so drilling preserves that context
+      // and clicking "People" in the crumbs returns to the unioned list.
+      let chain: BreadcrumbItem[];
+      if (view.kind === "people-all") {
+        chain = [{ id: null, title: "People", view }];
+      } else if (view.kind === "people-list") {
+        const peopleAll: ViewSpec = { kind: "people-all", libraryId: view.libraryId };
+        const roleLabel =
+          view.role === "actor" ? "Actors"
+          : view.role === "director_creator" ? "Directors & Creators"
+          : view.role === "composer" ? "Composers"
+          : "People";
+        chain = [
+          { id: null, title: "People", view: peopleAll },
+          { id: null, title: roleLabel, view },
+        ];
+      } else if (view.kind === "person-detail") {
+        // Sidebar doesn't click person-detail directly; this branch is a safety net
+        // for programmatic selectView() calls with person-detail. Use navigateToPerson for drilling.
+        chain = [{ id: null, title: view.personName, view }];
+      } else {
+        const label =
+          view.kind === "library-root" ? libLabel
+          : view.kind === "movies-only" ? "Movies"
+          : view.kind === "shows-only" ? "TV"
+          : view.kind === "playlists" ? "Playlists"
+          : libLabel;
+        chain = [{ id: null, title: label, view }];
+      }
+
+      loadView(view, null, chain, false);
     },
     [libraries, loadView]
+  );
+
+  // Drill into a person-detail view while preserving the current breadcrumb chain.
+  // Called from PeopleGrid — click on a card anywhere (Actors, People-all, Composers etc.)
+  // appends this step so "People > Actors > Clark Gregg" is preserved on subsequent navigation.
+  const navigateToPerson = useCallback(
+    (person: PersonSummary, role: PersonRole) => {
+      if (!selectedLibrary) return;
+      const view: ViewSpec = {
+        kind: "person-detail",
+        libraryId: selectedLibrary.id,
+        personId: person.id,
+        role,
+        personName: person.name,
+        personImage: person.image_path,
+      };
+      const newBreadcrumbs: BreadcrumbItem[] = [
+        ...breadcrumbs,
+        { id: person.id, title: person.name, view },
+      ];
+      setActiveView(view);
+      setSelectedEntry(null);
+      setSearch("");
+      setForwardStack([]);
+      loadView(view, null, newBreadcrumbs, false);
+    },
+    [selectedLibrary, breadcrumbs, loadView]
   );
 
   const navigateTo = useCallback(
@@ -475,10 +528,17 @@ function App() {
       setSelectedEntry(null);
       setForwardStack([]);
       const newBreadcrumbs = breadcrumbs.slice(0, index + 1);
-      const parentId = newBreadcrumbs[newBreadcrumbs.length - 1].id;
-      loadEntries(selectedLibrary, parentId, newBreadcrumbs);
+      const target = newBreadcrumbs[newBreadcrumbs.length - 1];
+      if (target.view) {
+        // Distinct view step — restore it.
+        setActiveView(target.view);
+        loadView(target.view, null, newBreadcrumbs, true);
+      } else {
+        // Drill-in within the current view (e.g. a collection chain in library-root).
+        loadEntries(selectedLibrary, target.id, newBreadcrumbs);
+      }
     },
-    [selectedLibrary, breadcrumbs, loadEntries, saveScrollPosition]
+    [selectedLibrary, breadcrumbs, loadView, loadEntries, saveScrollPosition]
   );
 
   const goBack = useCallback(() => {
@@ -487,15 +547,23 @@ function App() {
     const removed = breadcrumbs[breadcrumbs.length - 1];
     setForwardStack((prev) => [...prev, removed]);
     const newBreadcrumbs = breadcrumbs.slice(0, -1);
-    const parentId = newBreadcrumbs[newBreadcrumbs.length - 1].id;
-    if (selectedEntry) {
+    const newLast = newBreadcrumbs[newBreadcrumbs.length - 1];
+    if (newLast.view) {
+      // Popping to a distinct-view step (covers "back out of detail within a view"
+      // AND "back from person-detail to people-list" AND "back to sidebar root").
+      setSelectedEntry(null);
+      setActiveView(newLast.view);
+      loadView(newLast.view, null, newBreadcrumbs, true);
+    } else if (selectedEntry) {
+      // Popping out of a movie/show detail page within the current view's grid.
       setSelectedEntry(null);
       setBreadcrumbs(newBreadcrumbs);
-      restoreScrollPosition(selectedLibrary.id, activeView?.kind ?? "library-root", parentId);
+      restoreScrollPosition(selectedLibrary.id, activeView?.kind ?? "library-root", newLast.id);
     } else {
-      loadEntries(selectedLibrary, parentId, newBreadcrumbs);
+      // Popping to a shallower drill-in (collection chain) within the current view.
+      loadEntries(selectedLibrary, newLast.id, newBreadcrumbs);
     }
-  }, [selectedLibrary, breadcrumbs, selectedEntry, loadEntries, saveScrollPosition, restoreScrollPosition, activeView]);
+  }, [selectedLibrary, breadcrumbs, selectedEntry, loadView, loadEntries, saveScrollPosition, restoreScrollPosition, activeView]);
 
   const goForward = useCallback(() => {
     if (!selectedLibrary || forwardStack.length === 0) return;
@@ -503,25 +571,39 @@ function App() {
     const next = forwardStack[forwardStack.length - 1];
     setForwardStack((prev) => prev.slice(0, -1));
     const newBreadcrumbs = [...breadcrumbs, next];
-    // Check if the forward entry is a non-collection (movie/show detail page)
-    const forwardEntry = entries.find((e) => e.id === next.id);
-    if (forwardEntry && forwardEntry.entry_type !== "collection") {
-      setSelectedEntry(forwardEntry);
-      setBreadcrumbs(newBreadcrumbs);
-    } else {
+    if (next.view) {
       setSelectedEntry(null);
-      loadEntries(selectedLibrary, next.id, newBreadcrumbs);
+      setActiveView(next.view);
+      loadView(next.view, null, newBreadcrumbs, true);
+    } else {
+      // Non-view crumb — either a collection drill-in or a movie/show detail page.
+      const forwardEntry = entries.find((e) => e.id === next.id);
+      if (forwardEntry && forwardEntry.entry_type !== "collection") {
+        setSelectedEntry(forwardEntry);
+        setBreadcrumbs(newBreadcrumbs);
+      } else {
+        setSelectedEntry(null);
+        loadEntries(selectedLibrary, next.id, newBreadcrumbs);
+      }
     }
-  }, [selectedLibrary, forwardStack, breadcrumbs, entries, loadEntries, saveScrollPosition]);
+  }, [selectedLibrary, forwardStack, breadcrumbs, entries, loadView, loadEntries, saveScrollPosition]);
 
   const invalidateCache = useCallback((libraryId?: string, parentId?: number | null) => {
     if (libraryId != null && parentId !== undefined) {
       entryCacheRef.current.delete(`${libraryId}:${parentId}`);
       // Filtered views (movies-only/shows-only/person-detail) flatten across the library,
       // so any parent-scoped mutation can leave them stale. Wipe them for this library.
+      // People and playlists caches likewise aggregate across all entries — a TMDB apply
+      // that adds new people should surface them in the sidebar people views without F5.
       const prefix = `${libraryId}:`;
       for (const key of viewEntriesCacheRef.current.keys()) {
         if (key.startsWith(prefix)) viewEntriesCacheRef.current.delete(key);
+      }
+      for (const key of peopleCacheRef.current.keys()) {
+        if (key.startsWith(prefix)) peopleCacheRef.current.delete(key);
+      }
+      for (const key of playlistsCacheRef.current.keys()) {
+        if (key.startsWith(prefix)) playlistsCacheRef.current.delete(key);
       }
     } else if (libraryId != null) {
       // Invalidate everything for this library across all view caches.
@@ -932,6 +1014,7 @@ function App() {
           search={search}
           onSearchChange={setSearch}
           onNavigate={navigateTo}
+          onNavigateToPerson={navigateToPerson}
           onBreadcrumbClick={navigateBreadcrumb}
           selectedLibrary={selectedLibrary}
           hasLibraries={libraries.length > 0}

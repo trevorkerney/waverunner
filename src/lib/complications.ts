@@ -18,10 +18,10 @@ function videoComplications(libraryId: string): ComplicationNode[] {
       id: "people",
       label: "People",
       iconName: "Users",
-      view: null,
+      view: { kind: "people-all", libraryId },
       children: [
         { id: "people.actors",    label: "Actors",                iconName: "User",         view: { kind: "people-list", libraryId, role: "actor" } },
-        { id: "people.directors", label: "Directors & Producers", iconName: "Clapperboard", view: { kind: "people-list", libraryId, role: "director_producer" } },
+        { id: "people.directors", label: "Directors & Creators", iconName: "Clapperboard", view: { kind: "people-list", libraryId, role: "director_creator" } },
         { id: "people.composers", label: "Composers",             iconName: "Music2",       view: { kind: "people-list", libraryId, role: "composer" } },
       ],
     },
@@ -37,6 +37,7 @@ export function viewCacheKey(view: ViewSpec): string {
     case "movies-only":        return `${view.libraryId}:movies`;
     case "shows-only":         return `${view.libraryId}:shows`;
     case "playlists":           return `${view.libraryId}:playlists`;
+    case "people-all":         return `${view.libraryId}:people:all`;
     case "people-list":        return `${view.libraryId}:people:${view.role}`;
     case "person-detail":      return `${view.libraryId}:person:${view.role}:${view.personId}`;
   }

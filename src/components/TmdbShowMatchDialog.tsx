@@ -19,20 +19,10 @@ import type {
   TmdbTvDetail,
   TmdbShowFieldSelection,
   CastUpdateInfo,
-  CrewUpdateInfo,
   PersonUpdateInfo,
 } from "@/types";
 
-const NOTABLE_CREW_JOBS = [
-  "Writer",
-  "Screenplay",
-  "Story",
-  "Composer",
-  "Original Music Composer",
-  "Director of Photography",
-  "Cinematographer",
-  "Editor",
-];
+const COMPOSER_JOBS = ["Composer", "Original Music Composer"];
 
 interface TmdbShowMatchDialogProps {
   open: boolean;
@@ -63,7 +53,7 @@ function getUSRating(tmdb: TmdbTvDetail): string {
 }
 
 function extractCreators(tmdb: TmdbTvDetail): PersonUpdateInfo[] {
-  return tmdb.created_by.map((c) => ({ name: c.name, tmdb_id: c.id }));
+  return tmdb.created_by.map((c) => ({ name: c.name, tmdb_id: c.id, profile_path: c.profile_path }));
 }
 
 function extractCast(tmdb: TmdbTvDetail, limit = 20): CastUpdateInfo[] {
@@ -72,32 +62,21 @@ function extractCast(tmdb: TmdbTvDetail, limit = 20): CastUpdateInfo[] {
     name: c.name,
     role: c.character ?? null,
     tmdb_id: c.id,
+    profile_path: c.profile_path,
   }));
 }
 
-function extractCrew(tmdb: TmdbTvDetail): CrewUpdateInfo[] {
-  if (!tmdb.credits?.crew) return [];
-  return tmdb.credits.crew
-    .filter((c) => c.job && NOTABLE_CREW_JOBS.includes(c.job) && c.job !== "Director")
-    .map((c) => ({ name: c.name, job: c.job ?? null, tmdb_id: c.id }));
-}
-
-function extractProducers(tmdb: TmdbTvDetail): PersonUpdateInfo[] {
+function extractComposers(tmdb: TmdbTvDetail): PersonUpdateInfo[] {
   if (!tmdb.credits?.crew) return [];
   const seen = new Set<number>();
   return tmdb.credits.crew
-    .filter(
-      (c) =>
-        c.job === "Producer" ||
-        c.job === "Executive Producer" ||
-        c.department === "Production"
-    )
+    .filter((c) => c.job && COMPOSER_JOBS.includes(c.job))
     .filter((c) => {
       if (seen.has(c.id)) return false;
       seen.add(c.id);
       return true;
     })
-    .map((c) => ({ name: c.name, tmdb_id: c.id }));
+    .map((c) => ({ name: c.name, tmdb_id: c.id, profile_path: c.profile_path }));
 }
 
 function extractStudios(tmdb: TmdbTvDetail): string[] {
@@ -119,13 +98,6 @@ function formatCast(items: CastUpdateInfo[]): string {
   if (items.length === 0) return "(empty)";
   return items
     .map((c) => (c.role ? `${c.name} (${c.role})` : c.name))
-    .join(", ");
-}
-
-function formatCrew(items: CrewUpdateInfo[]): string {
-  if (items.length === 0) return "(empty)";
-  return items
-    .map((c) => (c.job ? `${c.name} (${c.job})` : c.name))
     .join(", ");
 }
 
@@ -187,26 +159,17 @@ function buildReviewFields(
     key: "cast",
     label: "Cast",
     currentDisplay: formatCast(
-      current.cast.map((c) => ({ name: c.name, role: c.role ?? null, tmdb_id: null }))
+      current.cast.map((c) => ({ name: c.name, role: c.role ?? null, tmdb_id: null, profile_path: null }))
     ),
     tmdbDisplay: formatCast(extractCast(tmdb)),
     isEmpty: current.cast.length === 0,
   });
   fields.push({
-    key: "crew",
-    label: "Crew",
-    currentDisplay: formatCrew(
-      current.crew.map((c) => ({ name: c.name, job: c.job ?? null, tmdb_id: null }))
-    ),
-    tmdbDisplay: formatCrew(extractCrew(tmdb)),
-    isEmpty: current.crew.length === 0,
-  });
-  fields.push({
-    key: "producers",
-    label: "Producers",
-    currentDisplay: formatList(current.producers.map((p) => p.name)),
-    tmdbDisplay: formatList(extractProducers(tmdb).map((p) => p.name)),
-    isEmpty: current.producers.length === 0,
+    key: "composers",
+    label: "Composers",
+    currentDisplay: formatList(current.composers.map((c) => c.name)),
+    tmdbDisplay: formatList(extractComposers(tmdb).map((c) => c.name)),
+    isEmpty: current.composers.length === 0,
   });
   fields.push({
     key: "studios",
@@ -336,11 +299,8 @@ export function TmdbShowMatchDialog({
       if (isChecked("cast")) {
         sel.cast = extractCast(selectedTmdb);
       }
-      if (isChecked("crew")) {
-        sel.crew = extractCrew(selectedTmdb);
-      }
-      if (isChecked("producers")) {
-        sel.producers = extractProducers(selectedTmdb);
+      if (isChecked("composers")) {
+        sel.composers = extractComposers(selectedTmdb);
       }
       if (isChecked("studios")) {
         sel.studios = extractStudios(selectedTmdb);
