@@ -67,3 +67,29 @@ export function viewCacheKey(view: ViewSpec): string {
     case "playlist-detail":    return `${view.libraryId}:playlist:${view.playlistId}:${view.collectionId ?? "root"}`;
   }
 }
+
+// Scope key for saved sort presets. Mirrors the backend encoding in commands.rs so a single
+// preset table row maps to a single sortable location.
+//
+// `parentId` disambiguates library-root at the library's null parent vs inside a collection.
+// Returns null for non-sortable views (person-detail / people-list / people-all / search),
+// which the UI uses to gate the save-preset button.
+export function scopeKeyFor(view: ViewSpec, parentId: number | null): string | null {
+  switch (view.kind) {
+    case "library-root":
+      return parentId !== null
+        ? `lib-coll:${parentId}`
+        : `lib-root:${view.libraryId}`;
+    case "movies-only":      return `movies-only:${view.libraryId}`;
+    case "shows-only":       return `shows-only:${view.libraryId}`;
+    case "playlist-detail":
+      return view.collectionId !== null
+        ? `pl-coll:${view.collectionId}`
+        : `pl-root:${view.playlistId}`;
+    case "playlists":
+    case "people-all":
+    case "people-list":
+    case "person-detail":
+      return null;
+  }
+}

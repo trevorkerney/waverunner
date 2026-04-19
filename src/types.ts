@@ -12,6 +12,13 @@ export interface EntriesResponse {
   entries: MediaEntry[];
   sort_mode: string;
   format: string;
+  selected_preset_id: number | null;
+  presets: SortPreset[];
+}
+
+export interface SortPreset {
+  id: number;
+  name: string;
 }
 
 export interface MediaEntry {
@@ -91,6 +98,8 @@ export interface PlaylistContents {
   entries: MediaEntry[];
   sort_mode: string;
   playlist_name: string;
+  selected_preset_id: number | null;
+  presets: SortPreset[];
 }
 
 export interface PersonInfo {

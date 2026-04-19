@@ -10,8 +10,8 @@ import { Toaster } from "@/components/ui/sonner";
 import { toast } from "sonner";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { Library, MediaEntry, EntriesResponse, BreadcrumbItem, ViewSpec, PersonSummary, PersonRole, PlaylistSummary, PlaylistContents } from "@/types";
-import { viewCacheKey } from "@/lib/complications";
+import { Library, MediaEntry, EntriesResponse, BreadcrumbItem, ViewSpec, PersonSummary, PersonRole, PlaylistSummary, PlaylistContents, SortPreset } from "@/types";
+import { viewCacheKey, scopeKeyFor } from "@/lib/complications";
 
 function App() {
   const [libraries, setLibraries] = useState<Library[]>([]);
@@ -28,6 +28,8 @@ function App() {
   const [breadcrumbs, setBreadcrumbs] = useState<BreadcrumbItem[]>([]);
   const [forwardStack, setForwardStack] = useState<BreadcrumbItem[]>([]);
   const [sortMode, setSortMode] = useState("alpha");
+  const [selectedPresetId, setSelectedPresetId] = useState<number | null>(null);
+  const [presets, setPresets] = useState<SortPreset[]>([]);
   const [coverSize, setCoverSize] = useState(200);
   const [search, setSearch] = useState("");
   const [searchResults, setSearchResults] = useState<MediaEntry[] | null>(null);
@@ -68,9 +70,9 @@ function App() {
   }, [playerState.isActive]);
 
   // Cache: "libraryId:parentId" -> { entries, sortMode } (library-root view only)
-  const entryCacheRef = useRef<Map<string, { entries: MediaEntry[]; sort_mode: string }>>(new Map());
+  const entryCacheRef = useRef<Map<string, { entries: MediaEntry[]; sort_mode: string; selected_preset_id: number | null; presets: SortPreset[] }>>(new Map());
   // Cache: viewCacheKey(view) -> entries (non-root MediaEntry views: movies-only / shows-only / person-detail)
-  const viewEntriesCacheRef = useRef<Map<string, { entries: MediaEntry[]; sort_mode: string }>>(new Map());
+  const viewEntriesCacheRef = useRef<Map<string, { entries: MediaEntry[]; sort_mode: string; selected_preset_id: number | null; presets: SortPreset[] }>>(new Map());
   // Cache: viewCacheKey(view) -> people (people-list views)
   const peopleCacheRef = useRef<Map<string, PersonSummary[]>>(new Map());
   // Cache: viewCacheKey(view) -> playlists
@@ -252,7 +254,16 @@ function App() {
   }, []);
 
   const loadView = useCallback(
-    async (view: ViewSpec, parentId: number | null, breadcrumb: BreadcrumbItem[], restoreScroll: boolean = true) => {
+    async (
+      view: ViewSpec,
+      parentId: number | null,
+      breadcrumb: BreadcrumbItem[],
+      restoreScroll: boolean = true,
+      // When true, skip the pre-fetch "clear grid + show spinner" dance. Use for same-view
+      // refreshes (sort mode change, preset select/save/delete, in-place reorder refresh)
+      // so the user doesn't see an empty flash while the fetch runs.
+      inPlace: boolean = false,
+    ) => {
       // people-list / people-all and playlists produce their own result types; everything else lands as MediaEntry[].
       if (view.kind === "people-list" || view.kind === "people-all") {
         const key = viewCacheKey(view);
@@ -327,6 +338,8 @@ function App() {
       if (cached) {
         setEntries(cached.entries);
         setSortMode(cached.sort_mode);
+        setSelectedPresetId(cached.selected_preset_id);
+        setPresets(cached.presets);
         setBreadcrumbs(breadcrumb);
         if (restoreScroll && useRootCache) restoreScrollPosition(view.libraryId, view.kind, parentId);
         else if (!restoreScroll) resetScrollToTop();
@@ -335,12 +348,17 @@ function App() {
 
       // Update breadcrumb and clear the stale grid *before* awaiting the fetch, so the
       // spinner shows under the new breadcrumb instead of leaking the previous view's state.
-      setBreadcrumbs(breadcrumb);
-      setEntries([]);
-      setLoading(true);
+      // Skipped for `inPlace` refreshes so the current grid stays visible until the new data lands.
+      if (!inPlace) {
+        setBreadcrumbs(breadcrumb);
+        setEntries([]);
+        setLoading(true);
+      }
       try {
         let entries: MediaEntry[];
         let sort_mode: string;
+        let selected_preset_id: number | null = null;
+        let view_presets: SortPreset[] = [];
         switch (view.kind) {
           case "library-root": {
             const res = await invoke<EntriesResponse>("get_entries", {
@@ -349,6 +367,8 @@ function App() {
             });
             entries = res.entries;
             sort_mode = res.sort_mode;
+            selected_preset_id = res.selected_preset_id;
+            view_presets = res.presets;
             break;
           }
           case "movies-only":
@@ -360,6 +380,8 @@ function App() {
             });
             entries = res.entries;
             sort_mode = res.sort_mode;
+            selected_preset_id = res.selected_preset_id;
+            view_presets = res.presets;
             break;
           }
           case "person-detail": {
@@ -378,13 +400,17 @@ function App() {
             });
             entries = res.entries;
             sort_mode = res.sort_mode;
+            selected_preset_id = res.selected_preset_id;
+            view_presets = res.presets;
             break;
           }
         }
         await preloadCovers(entries);
-        cache.set(cacheKey, { entries, sort_mode });
+        cache.set(cacheKey, { entries, sort_mode, selected_preset_id, presets: view_presets });
         setEntries(entries);
         setSortMode(sort_mode);
+        setSelectedPresetId(selected_preset_id);
+        setPresets(view_presets);
         if (restoreScroll && useRootCache) restoreScrollPosition(view.libraryId, view.kind, parentId);
         else if (!restoreScroll) resetScrollToTop();
       } catch (e) {
@@ -416,6 +442,8 @@ function App() {
     try {
       let fresh: MediaEntry[] = [];
       let fresh_sort = sortMode;
+      let fresh_selected_preset_id: number | null = null;
+      let fresh_presets: SortPreset[] = [];
       if (view.kind === "library-root") {
         const res = await invoke<EntriesResponse>("get_entries", {
           libraryId: view.libraryId,
@@ -423,7 +451,12 @@ function App() {
         });
         fresh = res.entries;
         fresh_sort = res.sort_mode;
-        entryCacheRef.current.set(`${view.libraryId}:${gridParentId}`, { entries: fresh, sort_mode: fresh_sort });
+        fresh_selected_preset_id = res.selected_preset_id;
+        fresh_presets = res.presets;
+        entryCacheRef.current.set(`${view.libraryId}:${gridParentId}`, {
+          entries: fresh, sort_mode: fresh_sort,
+          selected_preset_id: fresh_selected_preset_id, presets: fresh_presets,
+        });
       } else if (view.kind === "movies-only" || view.kind === "shows-only") {
         const res = await invoke<EntriesResponse>("get_entries", {
           libraryId: view.libraryId,
@@ -432,7 +465,12 @@ function App() {
         });
         fresh = res.entries;
         fresh_sort = res.sort_mode;
-        viewEntriesCacheRef.current.set(viewCacheKey(view), { entries: fresh, sort_mode: fresh_sort });
+        fresh_selected_preset_id = res.selected_preset_id;
+        fresh_presets = res.presets;
+        viewEntriesCacheRef.current.set(viewCacheKey(view), {
+          entries: fresh, sort_mode: fresh_sort,
+          selected_preset_id: fresh_selected_preset_id, presets: fresh_presets,
+        });
       } else if (view.kind === "person-detail") {
         fresh = await invoke<MediaEntry[]>("get_entries_for_person", {
           libraryId: view.libraryId,
@@ -440,13 +478,18 @@ function App() {
           role: view.role,
         });
         fresh_sort = "alpha";
-        viewEntriesCacheRef.current.set(viewCacheKey(view), { entries: fresh, sort_mode: fresh_sort });
+        viewEntriesCacheRef.current.set(viewCacheKey(view), {
+          entries: fresh, sort_mode: fresh_sort,
+          selected_preset_id: null, presets: [],
+        });
       } else {
         return; // people-list / playlists don't render a media entry grid
       }
       await preloadCovers(fresh);
       setEntries(fresh);
       setSortMode(fresh_sort);
+      setSelectedPresetId(fresh_selected_preset_id);
+      setPresets(fresh_presets);
     } catch (e) {
       console.error("Failed to refresh grid:", e);
     }
@@ -726,7 +769,33 @@ function App() {
   }, []);
 
   const updateCache = useCallback((libraryId: string, parentId: number | null, entries: MediaEntry[], sort_mode: string) => {
-    entryCacheRef.current.set(`${libraryId}:${parentId}`, { entries, sort_mode });
+    // Merge with existing entry so preset metadata (selected_preset_id, presets) survives
+    // mutations that don't touch preset state (rename, cover change, etc).
+    const key = `${libraryId}:${parentId}`;
+    const prev = entryCacheRef.current.get(key);
+    entryCacheRef.current.set(key, {
+      entries,
+      sort_mode,
+      selected_preset_id: prev?.selected_preset_id ?? null,
+      presets: prev?.presets ?? [],
+    });
+  }, []);
+
+  // Cache put that carries preset metadata forward from any existing entry at the same key.
+  // Used by optimistic-update paths that don't know the fresh preset state.
+  const cacheSetMerging = useCallback((
+    cache: Map<string, { entries: MediaEntry[]; sort_mode: string; selected_preset_id: number | null; presets: SortPreset[] }>,
+    key: string,
+    entries: MediaEntry[],
+    sort_mode: string,
+  ) => {
+    const prev = cache.get(key);
+    cache.set(key, {
+      entries,
+      sort_mode,
+      selected_preset_id: prev?.selected_preset_id ?? null,
+      presets: prev?.presets ?? [],
+    });
   }, []);
 
   // Invoked after any playlist-scoped mutation (create/rename/delete/add-link/remove-link).
@@ -772,7 +841,7 @@ function App() {
           }
           setSortMode(mode);
           invalidateCache(selectedLibrary.id);
-          loadView(activeView, null, breadcrumbs, true);
+          loadView(activeView, null, breadcrumbs, true, true);
         } catch (e) {
           console.error("Failed to set playlist sort mode:", e);
         }
@@ -780,15 +849,24 @@ function App() {
       }
 
       const parentId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
+      // Disambiguate library-root / movies-only / shows-only when entry_id is null — all three
+      // currently share library.default_sort_mode + have their own *_sort_mode columns.
+      const scopeKind =
+        parentId !== null ? null
+        : activeView?.kind === "movies-only" ? "movies-only"
+        : activeView?.kind === "shows-only" ? "shows-only"
+        : "library-root";
       try {
         await invoke("set_sort_mode", {
           libraryId: selectedLibrary.id,
           entryId: parentId,
+          scopeKind,
           sortMode: mode,
         });
         setSortMode(mode);
         invalidateCache(selectedLibrary.id, parentId);
-        loadEntries(selectedLibrary, parentId, breadcrumbs);
+        // In-place refresh so the grid doesn't blank out during the sort_mode swap.
+        loadView(activeView ?? { kind: "library-root", libraryId: selectedLibrary.id }, parentId, breadcrumbs, true, true);
       } catch (e) {
         console.error("Failed to set sort mode:", e);
       }
@@ -805,14 +883,22 @@ function App() {
       // so the wire format differs from the library's flat entry_ids list.
       if (activeView?.kind === "playlist-detail") {
         const key = viewCacheKey(activeView);
-        viewEntriesCacheRef.current.set(key, { entries: reordered, sort_mode: sortMode });
+        cacheSetMerging(viewEntriesCacheRef.current, key, reordered, sortMode);
         const items = reordered.map((e) =>
           e.link_id != null
             ? { kind: "link", id: e.link_id }
             : { kind: "collection", id: e.id }
         );
         try {
-          await invoke("update_playlist_sort_order", { items });
+          await invoke("update_playlist_sort_order", {
+            playlistId: activeView.collectionId === null ? activeView.playlistId : null,
+            parentCollectionId: activeView.collectionId,
+            items,
+          });
+          // Mirror the backend's same-txn clear so the UI drops the preset selection immediately.
+          setSelectedPresetId(null);
+          const prev = viewEntriesCacheRef.current.get(key);
+          if (prev) viewEntriesCacheRef.current.set(key, { ...prev, selected_preset_id: null });
         } catch (e) {
           console.error("Failed to update playlist sort order:", e);
           viewEntriesCacheRef.current.delete(key);
@@ -822,19 +908,96 @@ function App() {
       }
 
       const parentId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
+      const scopeKind =
+        parentId !== null ? null
+        : activeView?.kind === "movies-only" ? "movies-only"
+        : activeView?.kind === "shows-only" ? "shows-only"
+        : "library-root";
       updateCache(selectedLibrary.id, parentId, reordered, sortMode);
       try {
         await invoke("update_sort_order", {
           libraryId: selectedLibrary.id,
+          entryId: parentId,
+          scopeKind,
           entryIds: reordered.map((e) => e.id),
         });
+        // Backend cleared selected_preset_id at this scope — mirror it in state + cache.
+        setSelectedPresetId(null);
+        const rootKey = `${selectedLibrary.id}:${parentId}`;
+        const rootPrev = entryCacheRef.current.get(rootKey);
+        if (rootPrev) entryCacheRef.current.set(rootKey, { ...rootPrev, selected_preset_id: null });
+        if (activeView?.kind === "movies-only" || activeView?.kind === "shows-only") {
+          const vk = viewCacheKey(activeView);
+          const vp = viewEntriesCacheRef.current.get(vk);
+          if (vp) viewEntriesCacheRef.current.set(vk, { ...vp, selected_preset_id: null });
+        }
       } catch (e) {
         console.error("Failed to update sort order:", e);
         invalidateCache(selectedLibrary.id, parentId);
         loadEntries(selectedLibrary, parentId, breadcrumbs);
       }
     },
-    [selectedLibrary, activeView, breadcrumbs, sortMode, loadEntries, loadView, invalidateCache, updateCache]
+    [selectedLibrary, activeView, breadcrumbs, sortMode, loadEntries, loadView, invalidateCache, updateCache, cacheSetMerging]
+  );
+
+  // ── Custom sort presets ────────────────────────────────────────────
+  // Every change goes through the backend which is scope-aware. Frontend refreshes from
+  // the response's `presets` + `selected_preset_id` fields (read by loadView).
+
+  const changePreset = useCallback(
+    async (presetId: number | null) => {
+      if (!activeView) return;
+      const parentId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
+      const scopeKey = scopeKeyFor(activeView, parentId);
+      if (!scopeKey) return;
+      try {
+        await invoke("set_selected_preset", { scopeKey, presetId });
+        invalidateCache(activeView.libraryId, parentId);
+        loadView(activeView, parentId, breadcrumbs, true, true);
+      } catch (e) {
+        console.error("Failed to set selected preset:", e);
+      }
+    },
+    [activeView, breadcrumbs, invalidateCache, loadView]
+  );
+
+  const savePreset = useCallback(
+    async (name: string, overwrite: boolean) => {
+      if (!activeView) return;
+      const parentId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
+      const scopeKey = scopeKeyFor(activeView, parentId);
+      if (!scopeKey) return;
+      // Shape the items list based on the scope: library scopes → {kind:"entry",id}; playlist
+      // scopes → {kind:"link",id} for media_link rows and {kind:"collection",id} for nested
+      // playlist_collection rows.
+      const items = activeView.kind === "playlist-detail"
+        ? entries.map((e) =>
+            e.link_id != null
+              ? { kind: "link", id: e.link_id }
+              : { kind: "collection", id: e.id }
+          )
+        : entries.map((e) => ({ kind: "entry", id: e.id }));
+      // Let "exists" bubble up so the caller (SortPresetSaveDialog) can prompt for overwrite.
+      await invoke("save_sort_preset", { scopeKey, name, items, overwrite });
+      invalidateCache(activeView.libraryId, parentId);
+      loadView(activeView, parentId, breadcrumbs, true, true);
+    },
+    [activeView, breadcrumbs, entries, invalidateCache, loadView]
+  );
+
+  const deletePreset = useCallback(
+    async (presetId: number) => {
+      if (!activeView) return;
+      const parentId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
+      try {
+        await invoke("delete_sort_preset", { presetId });
+        invalidateCache(activeView.libraryId, parentId);
+        loadView(activeView, parentId, breadcrumbs, true, true);
+      } catch (e) {
+        console.error("Failed to delete preset:", e);
+      }
+    },
+    [activeView, breadcrumbs, invalidateCache, loadView]
   );
 
   const applyTitleChange = useCallback((entryId: number, newTitle: string) => {
@@ -884,9 +1047,16 @@ function App() {
           parentId,
         });
         await preloadCovers(res.entries);
-        entryCacheRef.current.set(`${selectedLibrary.id}:${parentId}`, { entries: res.entries, sort_mode: res.sort_mode });
+        entryCacheRef.current.set(`${selectedLibrary.id}:${parentId}`, {
+          entries: res.entries,
+          sort_mode: res.sort_mode,
+          selected_preset_id: res.selected_preset_id,
+          presets: res.presets,
+        });
         setEntries(res.entries);
         setSortMode(res.sort_mode);
+        setSelectedPresetId(res.selected_preset_id);
+        setPresets(res.presets);
         // Restore scroll after React paints
         requestAnimationFrame(() => {
           requestAnimationFrame(() => {
@@ -968,7 +1138,7 @@ function App() {
               : e,
           );
           if (activeView?.kind === "playlist-detail") {
-            viewEntriesCacheRef.current.set(viewCacheKey(activeView), { entries: updated, sort_mode: sortMode });
+            cacheSetMerging(viewEntriesCacheRef.current, viewCacheKey(activeView), updated, sortMode);
           }
           return updated;
         });
@@ -993,7 +1163,7 @@ function App() {
         setEntries((prev) => {
           const updated = prev.map((e) => (e.link_id === linkId ? { ...e, selected_cover: coverPath } : e));
           if (activeView?.kind === "playlist-detail") {
-            viewEntriesCacheRef.current.set(viewCacheKey(activeView), { entries: updated, sort_mode: sortMode });
+            cacheSetMerging(viewEntriesCacheRef.current, viewCacheKey(activeView), updated, sortMode);
           }
           return updated;
         });
@@ -1061,7 +1231,7 @@ function App() {
                 : e,
             );
             if (activeView?.kind === "playlist-detail") {
-              viewEntriesCacheRef.current.set(viewCacheKey(activeView), { entries: updated, sort_mode: sortMode });
+              cacheSetMerging(viewEntriesCacheRef.current, viewCacheKey(activeView), updated, sortMode);
             }
             return updated;
           });
@@ -1124,7 +1294,7 @@ function App() {
                 : e,
             );
             if (activeView?.kind === "playlist-detail") {
-              viewEntriesCacheRef.current.set(viewCacheKey(activeView), { entries: updated, sort_mode: sortMode });
+              cacheSetMerging(viewEntriesCacheRef.current, viewCacheKey(activeView), updated, sortMode);
             }
             return updated;
           });
@@ -1309,6 +1479,11 @@ function App() {
           hasLibraries={libraries.length > 0}
           sortMode={sortMode}
           onSortModeChange={changeSortMode}
+          presets={presets}
+          selectedPresetId={selectedPresetId}
+          onChangePreset={changePreset}
+          onSavePreset={savePreset}
+          onDeletePreset={deletePreset}
           onSortOrderChange={updateSortOrder}
           onRenameEntry={renameEntry}
           onTitleChanged={applyTitleChange}

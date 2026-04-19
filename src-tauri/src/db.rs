@@ -25,7 +25,15 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             paths TEXT NOT NULL,
             format TEXT NOT NULL,
             portable INTEGER NOT NULL DEFAULT 0,
+            -- default_sort_mode: library-root sort for video libraries; artist-root sort for music libraries.
+            -- movies_sort_mode / shows_sort_mode: per-view sort_mode for the video filtered views, so
+            -- movies-only / shows-only / library-root are independent scopes for both the basic sort and presets.
             default_sort_mode TEXT NOT NULL DEFAULT 'alpha',
+            movies_sort_mode TEXT NOT NULL DEFAULT 'alpha',
+            shows_sort_mode TEXT NOT NULL DEFAULT 'alpha',
+            library_root_selected_preset_id INTEGER,
+            movies_only_selected_preset_id INTEGER,
+            shows_only_selected_preset_id INTEGER,
             managed INTEGER NOT NULL DEFAULT 0,
             player_path TEXT,
             player_args TEXT,
@@ -460,6 +468,7 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             sort_order INTEGER NOT NULL DEFAULT 0,
             selected_cover TEXT,
             sort_mode TEXT NOT NULL DEFAULT 'alpha',
+            selected_preset_id INTEGER,
             FOREIGN KEY (id) REFERENCES media_entry(id) ON DELETE CASCADE
         )",
     )
@@ -565,6 +574,7 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             sort_order INTEGER NOT NULL DEFAULT 0,
             sort_mode TEXT NOT NULL DEFAULT 'custom',
             selected_cover TEXT,
+            selected_preset_id INTEGER,
             FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE
         )",
     )
@@ -579,6 +589,7 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             sort_order INTEGER NOT NULL DEFAULT 0,
             sort_mode TEXT NOT NULL DEFAULT 'custom',
             selected_cover TEXT,
+            selected_preset_id INTEGER,
             parent_playlist_id INTEGER,
             parent_collection_id INTEGER,
             FOREIGN KEY (parent_playlist_id) REFERENCES media_playlist(id) ON DELETE CASCADE,
@@ -588,6 +599,29 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
                 OR (parent_playlist_id IS NULL AND parent_collection_id IS NOT NULL)
             )
         )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // ── Saved custom sort presets ─────────────────────────────────────
+    // scope_key identifies the sortable location (see sort_scope::scope_key_for on the frontend).
+    // items is a JSON array — shape depends on scope: library scopes carry {kind:"entry",id},
+    // playlist scopes carry {kind:"link",id} | {kind:"collection",id}.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS sort_preset (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scope_key TEXT NOT NULL,
+            name TEXT NOT NULL,
+            items TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE (scope_key, name)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_sort_preset_scope ON sort_preset(scope_key)",
     )
     .execute(&pool)
     .await?;

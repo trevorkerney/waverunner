@@ -35,6 +35,7 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuTrigger,
+  DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
 import {
   ContextMenu,
@@ -91,11 +92,14 @@ import {
   User as UserIcon,
   ListMusic,
   ListPlus,
+  Save,
 } from "lucide-react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
-import { Library, MediaEntry, BreadcrumbItem, MovieDetail, MovieDetailUpdate, SeasonInfo, EpisodeInfo, ShowDetail, SeasonDetailLocal, EpisodeDetailLocal, TmdbSeasonDetail, TmdbEpisodeDetail, TmdbShowFieldSelection, TmdbSeasonFieldSelection, TmdbEpisodeFieldSelection, CastUpdateInfo, ViewSpec, PersonSummary, PersonRole, PlaylistSummary } from "@/types";
+import { Library, MediaEntry, BreadcrumbItem, MovieDetail, MovieDetailUpdate, SeasonInfo, EpisodeInfo, ShowDetail, SeasonDetailLocal, EpisodeDetailLocal, TmdbSeasonDetail, TmdbEpisodeDetail, TmdbShowFieldSelection, TmdbSeasonFieldSelection, TmdbEpisodeFieldSelection, CastUpdateInfo, ViewSpec, PersonSummary, PersonRole, PlaylistSummary, SortPreset } from "@/types";
+import { scopeKeyFor } from "@/lib/complications";
+import { SortPresetSaveDialog } from "@/components/SortPresetSaveDialog";
 import { TmdbMatchDialog } from "@/components/TmdbMatchDialog";
 import { TmdbShowMatchDialog } from "@/components/TmdbShowMatchDialog";
 import { TmdbImageBrowserDialog } from "@/components/TmdbImageBrowserDialog";
@@ -161,6 +165,11 @@ interface MainContentProps {
   hasLibraries: boolean;
   sortMode: string;
   onSortModeChange: (mode: string) => void;
+  presets: SortPreset[];
+  selectedPresetId: number | null;
+  onChangePreset: (presetId: number | null) => Promise<void> | void;
+  onSavePreset: (name: string, overwrite: boolean) => Promise<void>;
+  onDeletePreset: (presetId: number) => Promise<void> | void;
   onSortOrderChange: (reordered: MediaEntry[]) => void;
   onRenameEntry: (entryId: number, newTitle: string) => Promise<string | null>;
   onTitleChanged: (entryId: number, newTitle: string) => void;
@@ -209,6 +218,11 @@ export function MainContent({
   hasLibraries,
   sortMode,
   onSortModeChange,
+  presets,
+  selectedPresetId,
+  onChangePreset,
+  onSavePreset,
+  onDeletePreset,
   onSortOrderChange,
   onRenameEntry,
   onTitleChanged,
@@ -230,6 +244,7 @@ export function MainContent({
     null
   );
   const [coverDialogMode, setCoverDialogMode] = useState<"select" | "delete">("select");
+  const [savePresetOpen, setSavePresetOpen] = useState(false);
 
   const openCoverDialog = useCallback((entry: MediaEntry, mode: "select" | "delete") => {
     setCoverDialogMode(mode);
@@ -537,14 +552,24 @@ export function MainContent({
                 className="h-8 pl-8 text-sm"
               />
             </div>
+            <div className="flex items-center gap-1.5">
             <DropdownMenu>
               <DropdownMenuTrigger className="flex h-8 items-center gap-1.5 rounded-md border border-input bg-background px-2.5 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground">
                 <ArrowUpDown size={12} />
-                {sortMode === "alpha"
-                  ? "A\u2013Z"
-                  : sortMode === "date" || sortMode === "year"
-                    ? "Date"
-                    : "Custom"}
+                {(() => {
+                  // When a preset is active the dropdown label shows the preset name — the
+                  // underlying sort_mode is still 'custom' but the user's mental model is
+                  // "I'm on the Chronological preset".
+                  if (selectedPresetId != null) {
+                    const p = presets.find((p) => p.id === selectedPresetId);
+                    if (p) return p.name;
+                  }
+                  return sortMode === "alpha"
+                    ? "A\u2013Z"
+                    : sortMode === "date" || sortMode === "year"
+                      ? "Date"
+                      : "Custom";
+                })()}
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
                 <DropdownMenuItem onClick={() => onSortModeChange("alpha")}>
@@ -558,11 +583,51 @@ export function MainContent({
                     Date
                   </DropdownMenuItem>
                 )}
-                <DropdownMenuItem onClick={() => onSortModeChange("custom")}>
+                <DropdownMenuItem onClick={() => { onSortModeChange("custom"); onChangePreset(null); }}>
                   Custom
                 </DropdownMenuItem>
+                {presets.length > 0 && <DropdownMenuSeparator />}
+                {presets.map((p) => (
+                  <DropdownMenuItem
+                    key={p.id}
+                    onClick={() => onChangePreset(p.id)}
+                    className="flex items-center justify-between gap-2"
+                  >
+                    <span className="truncate">{p.name}</span>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (window.confirm(`Delete preset "${p.name}"?`)) {
+                          onDeletePreset(p.id);
+                        }
+                      }}
+                      className="text-muted-foreground hover:text-destructive"
+                      aria-label={`Delete preset ${p.name}`}
+                    >
+                      <Trash2 size={12} />
+                    </button>
+                  </DropdownMenuItem>
+                ))}
               </DropdownMenuContent>
             </DropdownMenu>
+            {/* Save-preset button: visible only in pristine custom sort at a sortable scope
+                with items to save. Clicking opens the name dialog. */}
+            {sortMode === "custom"
+              && selectedPresetId === null
+              && activeView
+              && scopeKeyFor(activeView, breadcrumbs[breadcrumbs.length - 1]?.id ?? null) != null
+              && filteredEntries.length > 0
+              && (
+                <button
+                  onClick={() => setSavePresetOpen(true)}
+                  className="flex h-6 w-6 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+                  title="Save current order as a preset"
+                >
+                  <Save size={14} />
+                </button>
+              )
+            }
+            </div>
             <div className="flex w-32 items-center gap-2">
               <Slider
                 value={[coverSize]}
@@ -885,6 +950,12 @@ export function MainContent({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <SortPresetSaveDialog
+        open={savePresetOpen}
+        onOpenChange={setSavePresetOpen}
+        onSave={onSavePreset}
+      />
 
       {/* Cover Carousel Dialog */}
       {liveCoverDialogEntry && (

@@ -68,6 +68,11 @@ pub struct EntriesResponse {
     pub entries: Vec<MediaEntry>,
     pub sort_mode: String,
     pub format: String,
+    /// The active preset for this view's scope, or null. When non-null, the returned
+    /// `entries` are already in the preset's saved order (with stale/extra items appended).
+    pub selected_preset_id: Option<i64>,
+    /// All presets saved at this scope, alpha of creation.
+    pub presets: Vec<SortPresetSummary>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -687,6 +692,49 @@ pub async fn delete_library(
         })?;
     }
 
+    // Purge presets scoped to anything inside this library before the cascade deletes their
+    // owning rows. We scoop ids now since media_collection / media_playlist / etc. will be
+    // gone by the time we're done.
+    let library_collection_ids: Vec<(i64,)> = sqlx::query_as(
+        "SELECT id FROM media_entry WHERE library_id = ? AND entry_type_id = (SELECT id FROM media_entry_type WHERE name = 'collection')",
+    )
+    .bind(&library_id)
+    .fetch_all(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    let playlist_ids: Vec<(i64,)> = sqlx::query_as("SELECT id FROM media_playlist WHERE library_id = ?")
+        .bind(&library_id)
+        .fetch_all(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+    let pl_collection_ids: Vec<(i64,)> = sqlx::query_as(
+        "WITH RECURSIVE descendants(id) AS ( \
+           SELECT mpc.id FROM media_playlist_collection mpc \
+             JOIN media_playlist mp ON mpc.parent_playlist_id = mp.id \
+             WHERE mp.library_id = ? \
+           UNION ALL \
+           SELECT c.id FROM media_playlist_collection c JOIN descendants d ON c.parent_collection_id = d.id \
+         ) SELECT id FROM descendants",
+    )
+    .bind(&library_id)
+    .fetch_all(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    let mut scope_keys: Vec<String> = vec![
+        format!("lib-root:{}", library_id),
+        format!("movies-only:{}", library_id),
+        format!("shows-only:{}", library_id),
+    ];
+    scope_keys.extend(library_collection_ids.into_iter().map(|(id,)| format!("lib-coll:{id}")));
+    scope_keys.extend(playlist_ids.into_iter().map(|(id,)| format!("pl-root:{id}")));
+    scope_keys.extend(pl_collection_ids.into_iter().map(|(id,)| format!("pl-coll:{id}")));
+    for sk in scope_keys {
+        let _ = sqlx::query("DELETE FROM sort_preset WHERE scope_key = ?")
+            .bind(sk)
+            .execute(&state.app_db)
+            .await;
+    }
+
     sqlx::query("DELETE FROM library WHERE id = ?")
         .bind(&library_id)
         .execute(&state.app_db)
@@ -720,24 +768,69 @@ pub async fn get_entries(
 
     let result = match format.as_str() {
         "video" => {
-            // Type-filtered views are flat across the library, so they always use the library default sort.
-            // Otherwise the sort comes from the collection (when navigated into one) or the library default.
-            let sort_mode = if validated_type.is_some() {
-                default_sort_mode.clone()
-            } else {
-                match parent_id {
+            // Each sortable scope owns its own sort_mode and selected_preset_id:
+            //  - movies-only / shows-only → library.{movies,shows}_sort_mode / _preset_id
+            //  - library-root inside a collection → media_collection.sort_mode / selected_preset_id
+            //  - library-root at null parent → library.default_sort_mode / library_root_selected_preset_id
+            let (sort_mode, selected_preset_id, scope_key) = match validated_type {
+                Some("movie") => {
+                    let row: Option<(String, Option<i64>)> = sqlx::query_as(
+                        "SELECT movies_sort_mode, movies_only_selected_preset_id FROM library WHERE id = ?",
+                    )
+                    .bind(&library_id)
+                    .fetch_optional(&state.app_db)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                    let (m, p) = row.unwrap_or_else(|| (default_sort_mode.clone(), None));
+                    (m, p, format!("movies-only:{}", library_id))
+                }
+                Some("show") => {
+                    let row: Option<(String, Option<i64>)> = sqlx::query_as(
+                        "SELECT shows_sort_mode, shows_only_selected_preset_id FROM library WHERE id = ?",
+                    )
+                    .bind(&library_id)
+                    .fetch_optional(&state.app_db)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                    let (m, p) = row.unwrap_or_else(|| (default_sort_mode.clone(), None));
+                    (m, p, format!("shows-only:{}", library_id))
+                }
+                _ => match parent_id {
                     Some(pid) => {
-                        let row: Option<(String,)> = sqlx::query_as(
-                            "SELECT sort_mode FROM media_collection WHERE id = ?",
+                        let row: Option<(String, Option<i64>)> = sqlx::query_as(
+                            "SELECT sort_mode, selected_preset_id FROM media_collection WHERE id = ?",
                         )
                         .bind(pid)
                         .fetch_optional(&state.app_db)
                         .await
                         .map_err(|e| e.to_string())?;
-                        row.map(|(m,)| m).unwrap_or_else(|| default_sort_mode.clone())
+                        let (m, p) = row.unwrap_or_else(|| (default_sort_mode.clone(), None));
+                        (m, p, format!("lib-coll:{}", pid))
                     }
-                    None => default_sort_mode.clone(),
-                }
+                    None => {
+                        let row: Option<(Option<i64>,)> = sqlx::query_as(
+                            "SELECT library_root_selected_preset_id FROM library WHERE id = ?",
+                        )
+                        .bind(&library_id)
+                        .fetch_optional(&state.app_db)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                        let p = row.and_then(|(p,)| p);
+                        (default_sort_mode.clone(), p, format!("lib-root:{}", library_id))
+                    }
+                },
+            };
+
+            // Available presets for this scope (shown in the sort dropdown).
+            let presets: Vec<SortPresetSummary> = {
+                let rows: Vec<(i64, String)> = sqlx::query_as(
+                    "SELECT id, name FROM sort_preset WHERE scope_key = ? ORDER BY created_at ASC, id ASC",
+                )
+                .bind(&scope_key)
+                .fetch_all(&state.app_db)
+                .await
+                .map_err(|e| e.to_string())?;
+                rows.into_iter().map(|(id, name)| SortPresetSummary { id, name }).collect()
             };
 
             // Subquery: all years from a collection's descendants (movies + shows' episodes), recursing through nested collections
@@ -913,10 +1006,24 @@ pub async fn get_entries(
                 }
             }
 
+            // If a preset is active, reorder the entries to match its saved sequence.
+            // Items not in the preset stay at the end in their existing sort_order.
+            let entries = if sort_mode == "custom" {
+                if let Some(pid) = selected_preset_id {
+                    apply_library_preset_ordering(&state.app_db, pid, entries).await?
+                } else {
+                    entries
+                }
+            } else {
+                entries
+            };
+
             EntriesResponse {
                 entries,
                 sort_mode,
                 format,
+                selected_preset_id,
+                presets,
             }
         }
         "music" => {
@@ -966,6 +1073,8 @@ pub async fn get_entries(
                 entries,
                 sort_mode: default_sort_mode,
                 format,
+                selected_preset_id: None,
+                presets: Vec::new(),
             }
         }
         _ => {
@@ -2394,6 +2503,18 @@ pub async fn delete_playlist(
     .fetch_all(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
+    // Purge presets scoped to this playlist and its nested collections before the cascade.
+    let _ = sqlx::query("DELETE FROM sort_preset WHERE scope_key = ?")
+        .bind(format!("pl-root:{}", playlist_id))
+        .execute(&state.app_db)
+        .await;
+    for (cid,) in &descendant_ids {
+        let _ = sqlx::query("DELETE FROM sort_preset WHERE scope_key = ?")
+            .bind(format!("pl-coll:{}", cid))
+            .execute(&state.app_db)
+            .await;
+    }
+
     sqlx::query("DELETE FROM media_playlist WHERE id = ?")
         .bind(playlist_id)
         .execute(&state.app_db)
@@ -2456,6 +2577,13 @@ pub async fn delete_playlist_collection(
     .fetch_all(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
+    // Purge presets scoped to this collection and its descendants before the cascade.
+    for (cid,) in &descendant_ids {
+        let _ = sqlx::query("DELETE FROM sort_preset WHERE scope_key = ?")
+            .bind(format!("pl-coll:{}", cid))
+            .execute(&state.app_db)
+            .await;
+    }
     sqlx::query("DELETE FROM media_playlist_collection WHERE id = ?")
         .bind(collection_id)
         .execute(&state.app_db)
@@ -2747,7 +2875,7 @@ pub async fn set_playlist_sort_mode(
     if !matches!(mode.as_str(), "custom" | "alpha") {
         return Err(format!("Invalid playlist sort mode: {mode}"));
     }
-    sqlx::query("UPDATE media_playlist SET sort_mode = ? WHERE id = ?")
+    sqlx::query("UPDATE media_playlist SET sort_mode = ?, selected_preset_id = NULL WHERE id = ?")
         .bind(&mode)
         .bind(playlist_id)
         .execute(&state.app_db)
@@ -2765,7 +2893,7 @@ pub async fn set_playlist_collection_sort_mode(
     if !matches!(mode.as_str(), "custom" | "alpha") {
         return Err(format!("Invalid playlist-collection sort mode: {mode}"));
     }
-    sqlx::query("UPDATE media_playlist_collection SET sort_mode = ? WHERE id = ?")
+    sqlx::query("UPDATE media_playlist_collection SET sort_mode = ?, selected_preset_id = NULL WHERE id = ?")
         .bind(&mode)
         .bind(collection_id)
         .execute(&state.app_db)
@@ -2914,6 +3042,177 @@ pub struct PlaylistContents {
     pub entries: Vec<MediaEntry>,
     pub sort_mode: String,
     pub playlist_name: String,
+    pub selected_preset_id: Option<i64>,
+    pub presets: Vec<SortPresetSummary>,
+}
+
+// ── Sort presets ──────────────────────────────────────────────────────
+// Saved custom orderings per sortable location. See the sort_preset table in db.rs.
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SortPresetSummary {
+    pub id: i64,
+    pub name: String,
+}
+
+/// Route an UPDATE of `selected_preset_id` to the correct table/column given a scope key.
+/// The scope-key format is `<prefix>:<id>` where prefix is one of
+/// `lib-root` | `lib-coll` | `movies-only` | `shows-only` | `pl-root` | `pl-coll`. Library scopes
+/// carry a TEXT library id; all others carry an INTEGER id.
+async fn write_selected_preset_for_scope(
+    pool: &sqlx::SqlitePool,
+    scope_key: &str,
+    preset_id: Option<i64>,
+) -> Result<(), String> {
+    let (prefix, value) = scope_key.split_once(':').ok_or("Invalid scope_key")?;
+    match prefix {
+        "lib-root" => {
+            sqlx::query("UPDATE library SET library_root_selected_preset_id = ? WHERE id = ?")
+                .bind(preset_id).bind(value)
+                .execute(pool).await.map_err(|e| e.to_string())?;
+        }
+        "movies-only" => {
+            sqlx::query("UPDATE library SET movies_only_selected_preset_id = ? WHERE id = ?")
+                .bind(preset_id).bind(value)
+                .execute(pool).await.map_err(|e| e.to_string())?;
+        }
+        "shows-only" => {
+            sqlx::query("UPDATE library SET shows_only_selected_preset_id = ? WHERE id = ?")
+                .bind(preset_id).bind(value)
+                .execute(pool).await.map_err(|e| e.to_string())?;
+        }
+        "lib-coll" => {
+            let id: i64 = value.parse().map_err(|_| "Invalid collection id in scope_key")?;
+            sqlx::query("UPDATE media_collection SET selected_preset_id = ? WHERE id = ?")
+                .bind(preset_id).bind(id)
+                .execute(pool).await.map_err(|e| e.to_string())?;
+        }
+        "pl-root" => {
+            let id: i64 = value.parse().map_err(|_| "Invalid playlist id in scope_key")?;
+            sqlx::query("UPDATE media_playlist SET selected_preset_id = ? WHERE id = ?")
+                .bind(preset_id).bind(id)
+                .execute(pool).await.map_err(|e| e.to_string())?;
+        }
+        "pl-coll" => {
+            let id: i64 = value.parse().map_err(|_| "Invalid playlist-collection id in scope_key")?;
+            sqlx::query("UPDATE media_playlist_collection SET selected_preset_id = ? WHERE id = ?")
+                .bind(preset_id).bind(id)
+                .execute(pool).await.map_err(|e| e.to_string())?;
+        }
+        other => return Err(format!("Unknown scope_key prefix: {other}")),
+    }
+    Ok(())
+}
+
+/// Upsert a preset scoped to `scope_key`. Returns the preset id. Collisions on
+/// `(scope_key, name)` without `overwrite=true` are signalled by the literal error string "exists"
+/// so the frontend can swap the save dialog into "Overwrite?" confirm mode and retry.
+#[tauri::command]
+pub async fn save_sort_preset(
+    state: tauri::State<'_, AppState>,
+    scope_key: String,
+    name: String,
+    items: serde_json::Value,
+    overwrite: bool,
+) -> Result<i64, String> {
+    let items_json = serde_json::to_string(&items).map_err(|e| e.to_string())?;
+    let existing: Option<(i64,)> = sqlx::query_as(
+        "SELECT id FROM sort_preset WHERE scope_key = ? AND name = ?",
+    )
+    .bind(&scope_key)
+    .bind(&name)
+    .fetch_optional(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let id = match existing {
+        Some((id,)) => {
+            if !overwrite { return Err("exists".to_string()); }
+            sqlx::query("UPDATE sort_preset SET items = ? WHERE id = ?")
+                .bind(&items_json).bind(id)
+                .execute(&state.app_db).await.map_err(|e| e.to_string())?;
+            id
+        }
+        None => {
+            let res = sqlx::query(
+                "INSERT INTO sort_preset (scope_key, name, items) VALUES (?, ?, ?)",
+            )
+            .bind(&scope_key).bind(&name).bind(&items_json)
+            .execute(&state.app_db).await.map_err(|e| e.to_string())?;
+            res.last_insert_rowid()
+        }
+    };
+    write_selected_preset_for_scope(&state.app_db, &scope_key, Some(id)).await?;
+    Ok(id)
+}
+
+#[tauri::command]
+pub async fn get_sort_presets(
+    state: tauri::State<'_, AppState>,
+    scope_key: String,
+) -> Result<Vec<SortPresetSummary>, String> {
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT id, name FROM sort_preset WHERE scope_key = ? ORDER BY created_at ASC, id ASC",
+    )
+    .bind(&scope_key)
+    .fetch_all(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(rows.into_iter().map(|(id, name)| SortPresetSummary { id, name }).collect())
+}
+
+/// Delete a preset by id. Explicitly clears any `selected_preset_id` column that references it —
+/// we don't rely on SQLite FK ON DELETE SET NULL because foreign_keys pragma state isn't guaranteed
+/// and the selected_preset_id columns were added without the FK clause in some code paths.
+#[tauri::command]
+pub async fn delete_sort_preset(
+    state: tauri::State<'_, AppState>,
+    preset_id: i64,
+) -> Result<(), String> {
+    sqlx::query("DELETE FROM sort_preset WHERE id = ?")
+        .bind(preset_id)
+        .execute(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+    // Null out any pointers that referenced the deleted preset.
+    for sql in [
+        "UPDATE library SET library_root_selected_preset_id = NULL WHERE library_root_selected_preset_id = ?",
+        "UPDATE library SET movies_only_selected_preset_id = NULL WHERE movies_only_selected_preset_id = ?",
+        "UPDATE library SET shows_only_selected_preset_id = NULL WHERE shows_only_selected_preset_id = ?",
+        "UPDATE media_collection SET selected_preset_id = NULL WHERE selected_preset_id = ?",
+        "UPDATE media_playlist SET selected_preset_id = NULL WHERE selected_preset_id = ?",
+        "UPDATE media_playlist_collection SET selected_preset_id = NULL WHERE selected_preset_id = ?",
+    ] {
+        sqlx::query(sql).bind(preset_id)
+            .execute(&state.app_db).await.map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn set_selected_preset(
+    state: tauri::State<'_, AppState>,
+    scope_key: String,
+    preset_id: Option<i64>,
+) -> Result<(), String> {
+    // Validate the preset actually belongs to the given scope when selecting a non-null id —
+    // guards against the frontend sending a mismatched id by mistake.
+    if let Some(pid) = preset_id {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT scope_key FROM sort_preset WHERE id = ?",
+        )
+        .bind(pid)
+        .fetch_optional(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+        match row {
+            Some((sk,)) if sk == scope_key => {}
+            Some(_) => return Err("preset scope mismatch".to_string()),
+            None => return Err("preset not found".to_string()),
+        }
+    }
+    write_selected_preset_for_scope(&state.app_db, &scope_key, preset_id).await?;
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -2929,6 +3228,12 @@ pub enum PlaylistSortItem {
 #[tauri::command]
 pub async fn update_playlist_sort_order(
     state: tauri::State<'_, AppState>,
+    // Scope of the reorder — exactly one of these identifies the level that was reordered,
+    // so we can clear its selected_preset_id.
+    //   parent_collection_id: Some(id) → inside a nested playlist-collection
+    //   parent_collection_id: None + playlist_id: Some(id) → at the playlist root
+    playlist_id: Option<i64>,
+    parent_collection_id: Option<i64>,
     items: Vec<PlaylistSortItem>,
 ) -> Result<(), String> {
     for (i, item) in items.iter().enumerate() {
@@ -2951,6 +3256,19 @@ pub async fn update_playlist_sort_order(
             }
         }
     }
+    if let Some(cid) = parent_collection_id {
+        sqlx::query("UPDATE media_playlist_collection SET selected_preset_id = NULL WHERE id = ?")
+            .bind(cid)
+            .execute(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+    } else if let Some(pid) = playlist_id {
+        sqlx::query("UPDATE media_playlist SET selected_preset_id = NULL WHERE id = ?")
+            .bind(pid)
+            .execute(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -2960,29 +3278,43 @@ pub async fn get_playlist_contents(
     playlist_id: i64,
     parent_collection_id: Option<i64>,
 ) -> Result<PlaylistContents, String> {
-    // Look up the playlist's name (for breadcrumb labels) and its root sort_mode.
-    let playlist_row: Option<(String, String, String)> = sqlx::query_as(
-        "SELECT title, sort_mode, library_id FROM media_playlist WHERE id = ?",
+    // Look up the playlist's name (for breadcrumb labels) and its root sort_mode / selected preset.
+    let playlist_row: Option<(String, String, String, Option<i64>)> = sqlx::query_as(
+        "SELECT title, sort_mode, library_id, selected_preset_id FROM media_playlist WHERE id = ?",
     )
     .bind(playlist_id)
     .fetch_optional(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
-    let (playlist_name, playlist_sort_mode, library_id) = playlist_row.ok_or("Playlist not found")?;
+    let (playlist_name, playlist_sort_mode, library_id, playlist_preset_id) =
+        playlist_row.ok_or("Playlist not found")?;
 
-    // The sort mode at the current level depends on whether we're at the playlist root
-    // or inside a nested playlist-collection.
-    let sort_mode = if let Some(cid) = parent_collection_id {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT sort_mode FROM media_playlist_collection WHERE id = ?",
+    // The sort mode + selected preset at the current level depend on whether we're at the
+    // playlist root or inside a nested playlist-collection.
+    let (sort_mode, selected_preset_id, scope_key) = if let Some(cid) = parent_collection_id {
+        let row: Option<(String, Option<i64>)> = sqlx::query_as(
+            "SELECT sort_mode, selected_preset_id FROM media_playlist_collection WHERE id = ?",
         )
         .bind(cid)
         .fetch_optional(&state.app_db)
         .await
         .map_err(|e| e.to_string())?;
-        row.map(|(m,)| m).unwrap_or_else(|| "custom".to_string())
+        let (mode, pid) = row.unwrap_or_else(|| ("custom".to_string(), None));
+        (mode, pid, format!("pl-coll:{}", cid))
     } else {
-        playlist_sort_mode
+        (playlist_sort_mode, playlist_preset_id, format!("pl-root:{}", playlist_id))
+    };
+
+    // Available presets for this scope (shown in the sort dropdown).
+    let presets: Vec<SortPresetSummary> = {
+        let rows: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT id, name FROM sort_preset WHERE scope_key = ? ORDER BY created_at ASC, id ASC",
+        )
+        .bind(&scope_key)
+        .fetch_all(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+        rows.into_iter().map(|(id, name)| SortPresetSummary { id, name }).collect()
     };
 
     // Shared cached-covers lookup — used to populate `covers` on every returned entry.
@@ -3092,19 +3424,154 @@ pub async fn get_playlist_contents(
         items.push((sort_order, sort_title, entry));
     }
 
-    // Apply sort mode.
-    match sort_mode.as_str() {
-        "alpha" => items.sort_by(|a, b| a.1.cmp(&b.1)),
-        _ => items.sort_by_key(|t| t.0), // "custom" — sort_order
-    }
-
-    let entries: Vec<MediaEntry> = items.into_iter().map(|(_, _, e)| e).collect();
+    // Apply sort mode. Custom-sort with a selected preset overrides the normal sort_order
+    // with the preset's saved order (items not in the preset tail onto the end).
+    let entries: Vec<MediaEntry> = if sort_mode == "alpha" {
+        items.sort_by(|a, b| a.1.cmp(&b.1));
+        items.into_iter().map(|(_, _, e)| e).collect()
+    } else if let Some(pid) = selected_preset_id {
+        items.sort_by_key(|t| t.0);
+        apply_playlist_preset_ordering(&state.app_db, pid, items).await?
+    } else {
+        items.sort_by_key(|t| t.0);
+        items.into_iter().map(|(_, _, e)| e).collect()
+    };
 
     Ok(PlaylistContents {
         entries,
         sort_mode,
         playlist_name,
+        selected_preset_id,
+        presets,
     })
+}
+
+/// Library-scope preset ordering. Preset items are `{kind:"entry",id:N}` referencing media_entry.id.
+/// Stale ids are dropped; remaining entries trail in their current sort_order.
+async fn apply_library_preset_ordering(
+    pool: &sqlx::SqlitePool,
+    preset_id: i64,
+    entries: Vec<MediaEntry>,
+) -> Result<Vec<MediaEntry>, String> {
+    let row: Option<(String,)> = sqlx::query_as("SELECT items FROM sort_preset WHERE id = ?")
+        .bind(preset_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some((items_json,)) = row else { return Ok(entries); };
+
+    #[derive(serde::Deserialize)]
+    struct LibraryPresetItem {
+        #[serde(rename = "kind")]
+        _kind: String,
+        id: i64,
+    }
+    let preset_items: Vec<LibraryPresetItem> = serde_json::from_str(&items_json).unwrap_or_default();
+
+    // Preserve the caller's iteration order (sort_order) via a parallel `order` vec so
+    // remaining items keep their sort_order sequence after the preset prefix.
+    let mut by_id: std::collections::HashMap<i64, MediaEntry> = std::collections::HashMap::new();
+    let mut order: Vec<i64> = Vec::new();
+    for e in entries {
+        order.push(e.id);
+        by_id.insert(e.id, e);
+    }
+
+    let before = preset_items.len();
+    let mut out: Vec<MediaEntry> = Vec::new();
+    let mut kept_ids: Vec<i64> = Vec::new();
+    for pi in preset_items {
+        if let Some(entry) = by_id.remove(&pi.id) {
+            out.push(entry);
+            kept_ids.push(pi.id);
+        }
+    }
+    for id in order {
+        if let Some(entry) = by_id.remove(&id) {
+            out.push(entry);
+        }
+    }
+
+    if kept_ids.len() != before {
+        let pruned: Vec<serde_json::Value> = kept_ids
+            .into_iter()
+            .map(|id| serde_json::json!({"kind":"entry","id":id}))
+            .collect();
+        if let Ok(new_json) = serde_json::to_string(&pruned) {
+            let _ = sqlx::query("UPDATE sort_preset SET items = ? WHERE id = ?")
+                .bind(&new_json).bind(preset_id)
+                .execute(pool).await;
+        }
+    }
+
+    Ok(out)
+}
+
+/// Reorder playlist items by a preset's saved sequence, dropping stale ids and appending
+/// remaining items in their current sort_order. Prunes stale entries from the preset row
+/// opportunistically so the JSON doesn't grow unbounded.
+async fn apply_playlist_preset_ordering(
+    pool: &sqlx::SqlitePool,
+    preset_id: i64,
+    items: Vec<(i64, String, MediaEntry)>,
+) -> Result<Vec<MediaEntry>, String> {
+    let row: Option<(String,)> = sqlx::query_as("SELECT items FROM sort_preset WHERE id = ?")
+        .bind(preset_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some((items_json,)) = row else {
+        return Ok(items.into_iter().map(|(_, _, e)| e).collect());
+    };
+    let preset_items: Vec<PlaylistSortItem> = serde_json::from_str(&items_json).unwrap_or_default();
+
+    // Index live entries by (kind, id). Kind "link" → link_id; kind "collection" → id for playlist_collection.
+    // `order` preserves the caller's iteration order (already sort_order-ordered).
+    let mut by_key: std::collections::HashMap<(String, i64), MediaEntry> =
+        std::collections::HashMap::new();
+    let mut order: Vec<(String, i64)> = Vec::new();
+    for (_, _, e) in items {
+        let key = if let Some(lid) = e.link_id {
+            ("link".to_string(), lid)
+        } else {
+            ("collection".to_string(), e.id)
+        };
+        order.push(key.clone());
+        by_key.insert(key, e);
+    }
+
+    let before = preset_items.len();
+    let mut out: Vec<MediaEntry> = Vec::new();
+    let mut kept: Vec<PlaylistSortItem> = Vec::new();
+    for pi in preset_items {
+        let key = match &pi {
+            PlaylistSortItem::Link { id } => ("link".to_string(), *id),
+            PlaylistSortItem::Collection { id } => ("collection".to_string(), *id),
+        };
+        if let Some(entry) = by_key.remove(&key) {
+            out.push(entry);
+            kept.push(pi);
+        }
+    }
+    for key in order {
+        if let Some(entry) = by_key.remove(&key) {
+            out.push(entry);
+        }
+    }
+
+    // Opportunistic prune: if some preset items were stale, rewrite the preset JSON without them.
+    if kept.len() != before {
+        if let Ok(new_json) = serde_json::to_string(&kept.iter().map(|pi| match pi {
+            PlaylistSortItem::Link { id } => serde_json::json!({"kind":"link","id":id}),
+            PlaylistSortItem::Collection { id } => serde_json::json!({"kind":"collection","id":id}),
+        }).collect::<Vec<_>>()) {
+            let _ = sqlx::query("UPDATE sort_preset SET items = ? WHERE id = ?")
+                .bind(&new_json).bind(preset_id)
+                .execute(pool).await;
+        }
+    }
+
+    Ok(out)
 }
 
 #[tauri::command]
@@ -3185,6 +3652,9 @@ pub async fn set_sort_mode(
     state: tauri::State<'_, AppState>,
     library_id: String,
     entry_id: Option<i64>,
+    // Disambiguates library-root / movies-only / shows-only when entry_id is None.
+    // Valid values: "library-root" | "movies-only" | "shows-only". Omit for music libraries.
+    scope_kind: Option<String>,
     sort_mode: String,
 ) -> Result<(), String> {
     if !["alpha", "date", "custom"].contains(&sort_mode.as_str()) {
@@ -3204,7 +3674,7 @@ pub async fn set_sort_mode(
     match entry_id {
         Some(eid) if format == "video" => {
             // Set sort_mode on a collection entry (video)
-            sqlx::query("UPDATE media_collection SET sort_mode = ? WHERE id = ?")
+            sqlx::query("UPDATE media_collection SET sort_mode = ?, selected_preset_id = NULL WHERE id = ?")
                 .bind(&sort_mode)
                 .bind(eid)
                 .execute(&state.app_db)
@@ -3214,8 +3684,27 @@ pub async fn set_sort_mode(
         Some(_) if format != "video" && format != "music" => {
             return Err(format!("Unsupported library format: {}", format));
         }
+        _ if format == "video" => {
+            // Video library: route to the correct per-view column based on scope_kind.
+            let kind = scope_kind.as_deref().unwrap_or("library-root");
+            let (mode_col, preset_col) = match kind {
+                "movies-only" => ("movies_sort_mode", "movies_only_selected_preset_id"),
+                "shows-only" => ("shows_sort_mode", "shows_only_selected_preset_id"),
+                "library-root" => ("default_sort_mode", "library_root_selected_preset_id"),
+                other => return Err(format!("Invalid scope_kind: {other}")),
+            };
+            let sql = format!(
+                "UPDATE library SET {mode_col} = ?, {preset_col} = NULL WHERE id = ?"
+            );
+            sqlx::query(&sql)
+                .bind(&sort_mode)
+                .bind(&library_id)
+                .execute(&state.app_db)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
         _ => {
-            // Set default_sort_mode on the library (root-level default, or music)
+            // Music library: single default_sort_mode, no presets yet.
             sqlx::query("UPDATE library SET default_sort_mode = ? WHERE id = ?")
                 .bind(&sort_mode)
                 .bind(&library_id)
@@ -3232,6 +3721,14 @@ pub async fn set_sort_mode(
 pub async fn update_sort_order(
     state: tauri::State<'_, AppState>,
     library_id: String,
+    // Scope of the reorder — tells us which selected_preset_id to clear. Same-transaction semantics
+    // make "reorder clears preset" atomic: if the sort_order writes succeed, so does the clear.
+    //   entry_id: Some(collection_id) → library-root at that collection → clear media_collection.selected_preset_id
+    //   entry_id: None + scope_kind "library-root" → clear library.library_root_selected_preset_id
+    //   entry_id: None + scope_kind "movies-only" → clear library.movies_only_selected_preset_id
+    //   entry_id: None + scope_kind "shows-only"  → clear library.shows_only_selected_preset_id
+    entry_id: Option<i64>,
+    scope_kind: Option<String>,
     entry_ids: Vec<i64>,
 ) -> Result<(), String> {
     let (format, _paths, _default_sort_mode) = get_library_meta(&state.app_db, &library_id).await?;
@@ -3246,6 +3743,28 @@ pub async fn update_sort_order(
                     .bind(i as i32).bind(id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
                 sqlx::query("UPDATE media_collection SET sort_order = ? WHERE id = ?")
                     .bind(i as i32).bind(id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
+            }
+            match entry_id {
+                Some(eid) => {
+                    sqlx::query("UPDATE media_collection SET selected_preset_id = NULL WHERE id = ?")
+                        .bind(eid)
+                        .execute(&state.app_db)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+                None => {
+                    let preset_col = match scope_kind.as_deref() {
+                        Some("movies-only") => "movies_only_selected_preset_id",
+                        Some("shows-only") => "shows_only_selected_preset_id",
+                        _ => "library_root_selected_preset_id",
+                    };
+                    let sql = format!("UPDATE library SET {preset_col} = NULL WHERE id = ?");
+                    sqlx::query(&sql)
+                        .bind(&library_id)
+                        .execute(&state.app_db)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
             }
         }
         "music" => {
@@ -4103,6 +4622,28 @@ pub async fn delete_entry(
         .execute(&state.app_db)
         .await
         .map_err(|e| e.to_string())?;
+
+    // Purge presets scoped to this entry or any descendant collection. We collect collection
+    // descendants before the cascade removes them from media_entry.
+    let descendant_collections: Vec<(i64,)> = sqlx::query_as(
+        "WITH RECURSIVE descendants(id) AS ( \
+           SELECT id FROM media_entry WHERE id = ? \
+           UNION ALL \
+           SELECT me.id FROM media_entry me JOIN descendants d ON me.parent_id = d.id \
+         ) \
+         SELECT id FROM descendants \
+         WHERE id IN (SELECT id FROM media_collection)",
+    )
+    .bind(entry_id)
+    .fetch_all(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    for (cid,) in descendant_collections {
+        let _ = sqlx::query("DELETE FROM sort_preset WHERE scope_key = ?")
+            .bind(format!("lib-coll:{}", cid))
+            .execute(&state.app_db)
+            .await;
+    }
 
     // Delete from DB (CASCADE handles children, movie, collection, show tables)
     sqlx::query("DELETE FROM media_entry WHERE id = ?")
