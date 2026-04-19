@@ -3,6 +3,8 @@ mod db;
 mod mpv;
 mod player;
 mod tmdb;
+#[cfg(windows)]
+mod win_maximize_fix;
 
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -53,6 +55,9 @@ pub fn run() {
                     let _ = window.set_title("waverunner_dev");
                 }
             }
+
+            #[cfg(windows)]
+            win_maximize_fix::install(app);
 
             Ok(())
         })
