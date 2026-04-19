@@ -10,11 +10,14 @@ import { Toaster } from "@/components/ui/sonner";
 import { toast } from "sonner";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { Library, MediaEntry, EntriesResponse, BreadcrumbItem, ViewSpec, PersonSummary, PersonRole, PlaylistSummary } from "@/types";
+import { Library, MediaEntry, EntriesResponse, BreadcrumbItem, ViewSpec, PersonSummary, PersonRole, PlaylistSummary, PlaylistContents } from "@/types";
 import { viewCacheKey } from "@/lib/complications";
 
 function App() {
   const [libraries, setLibraries] = useState<Library[]>([]);
+  // Playlists per-library for the sidebar tree (each library's "Playlists" node shows its
+  // playlists as children). Refreshed on libraries change + any onPlaylistChanged.
+  const [sidebarPlaylists, setSidebarPlaylists] = useState<Record<string, PlaylistSummary[]>>({});
   const [activeView, setActiveView] = useState<ViewSpec | null>(null);
   const selectedLibrary = activeView
     ? libraries.find((l) => l.id === activeView.libraryId) ?? null
@@ -134,6 +137,23 @@ function App() {
     loadLibraries();
   }, [loadLibraries]);
 
+  // Populate sidebar playlist children whenever the libraries list changes. Failures per
+  // library are silently ignored — the Playlists sidebar node just won't show children.
+  useEffect(() => {
+    let cancelled = false;
+    libraries.forEach(async (lib) => {
+      try {
+        const pls = await invoke<PlaylistSummary[]>("get_playlists", { libraryId: lib.id });
+        if (!cancelled) {
+          setSidebarPlaylists((prev) => ({ ...prev, [lib.id]: pls }));
+        }
+      } catch {
+        // swallow — sidebar just renders with no playlist children for that library
+      }
+    });
+    return () => { cancelled = true; };
+  }, [libraries]);
+
   // Auto-update on launch
   useEffect(() => {
     const endpoint =
@@ -244,6 +264,10 @@ function App() {
           setBreadcrumbs(breadcrumb);
           return;
         }
+        // Update breadcrumb and clear the stale people list *before* awaiting the fetch,
+        // so the loading spinner appears under the new breadcrumb instead of the previous view's.
+        setBreadcrumbs(breadcrumb);
+        setPeople(null);
         setLoading(true);
         try {
           const role = view.kind === "people-all" ? "all" : view.role;
@@ -253,7 +277,6 @@ function App() {
           });
           peopleCacheRef.current.set(key, res);
           setPeople(res);
-          setBreadcrumbs(breadcrumb);
         } catch (e) {
           console.error("Failed to load people:", e);
         } finally {
@@ -272,6 +295,8 @@ function App() {
           setBreadcrumbs(breadcrumb);
           return;
         }
+        setBreadcrumbs(breadcrumb);
+        setPlaylists(null);
         setLoading(true);
         try {
           const res = await invoke<PlaylistSummary[]>("get_playlists", {
@@ -279,7 +304,6 @@ function App() {
           });
           playlistsCacheRef.current.set(key, res);
           setPlaylists(res);
-          setBreadcrumbs(breadcrumb);
         } catch (e) {
           console.error("Failed to load playlists:", e);
         } finally {
@@ -309,6 +333,10 @@ function App() {
         return;
       }
 
+      // Update breadcrumb and clear the stale grid *before* awaiting the fetch, so the
+      // spinner shows under the new breadcrumb instead of leaking the previous view's state.
+      setBreadcrumbs(breadcrumb);
+      setEntries([]);
       setLoading(true);
       try {
         let entries: MediaEntry[];
@@ -343,12 +371,20 @@ function App() {
             sort_mode = "alpha";
             break;
           }
+          case "playlist-detail": {
+            const res = await invoke<PlaylistContents>("get_playlist_contents", {
+              playlistId: view.playlistId,
+              parentCollectionId: view.collectionId,
+            });
+            entries = res.entries;
+            sort_mode = res.sort_mode;
+            break;
+          }
         }
         await preloadCovers(entries);
         cache.set(cacheKey, { entries, sort_mode });
         setEntries(entries);
         setSortMode(sort_mode);
-        setBreadcrumbs(breadcrumb);
         if (restoreScroll && useRootCache) restoreScrollPosition(view.libraryId, view.kind, parentId);
         else if (!restoreScroll) resetScrollToTop();
       } catch (e) {
@@ -462,6 +498,15 @@ function App() {
         // Sidebar doesn't click person-detail directly; this branch is a safety net
         // for programmatic selectView() calls with person-detail. Use navigateToPerson for drilling.
         chain = [{ id: null, title: view.personName, view }];
+      } else if (view.kind === "playlist-detail") {
+        // Sidebar may now click a playlist directly (it appears as a child of the
+        // Playlists node). Build a two-step chain so the breadcrumb reads
+        // "Playlists > <PlaylistName>".
+        const playlistsRoot: ViewSpec = { kind: "playlists", libraryId: view.libraryId };
+        chain = [
+          { id: null, title: "Playlists", view: playlistsRoot },
+          { id: view.playlistId, title: view.playlistName, view },
+        ];
       } else {
         const label =
           view.kind === "library-root" ? libLabel
@@ -504,11 +549,58 @@ function App() {
     [selectedLibrary, breadcrumbs, loadView]
   );
 
+  // Drill into a playlist from the Playlists grid. Appends to the current breadcrumb chain
+  // so clicking "Playlists" crumb returns to the list.
+  const navigateToPlaylist = useCallback(
+    (playlist: PlaylistSummary) => {
+      if (!selectedLibrary) return;
+      const view: ViewSpec = {
+        kind: "playlist-detail",
+        libraryId: selectedLibrary.id,
+        playlistId: playlist.id,
+        playlistName: playlist.title,
+        collectionId: null,
+      };
+      const newBreadcrumbs: BreadcrumbItem[] = [
+        ...breadcrumbs,
+        { id: playlist.id, title: playlist.title, view },
+      ];
+      setActiveView(view);
+      setSelectedEntry(null);
+      setSearch("");
+      setForwardStack([]);
+      loadView(view, null, newBreadcrumbs, false);
+    },
+    [selectedLibrary, breadcrumbs, loadView]
+  );
+
+
   const navigateTo = useCallback(
     (entry: MediaEntry) => {
       if (!selectedLibrary) return;
       saveScrollPosition();
       setForwardStack([]);
+
+      // Playlist-collection nodes live inside a playlist view — drill within it by updating
+      // the view's collectionId, so the breadcrumb chain reads "Playlists > PL > Star Wars".
+      if (entry.entry_type === "playlist_collection" && activeView?.kind === "playlist-detail") {
+        const newView: ViewSpec = {
+          kind: "playlist-detail",
+          libraryId: activeView.libraryId,
+          playlistId: activeView.playlistId,
+          playlistName: activeView.playlistName,
+          collectionId: entry.id,
+        };
+        const newBreadcrumbs = [
+          ...breadcrumbs,
+          { id: entry.id, title: entry.title, view: newView },
+        ];
+        setActiveView(newView);
+        setSelectedEntry(null);
+        loadView(newView, null, newBreadcrumbs, false);
+        return;
+      }
+
       const newBreadcrumbs = [...breadcrumbs, { id: entry.id, title: entry.title }];
       if (entry.entry_type === "movie" || entry.entry_type === "show") {
         setSelectedEntry(entry);
@@ -518,7 +610,7 @@ function App() {
         loadEntries(selectedLibrary, entry.id, newBreadcrumbs);
       }
     },
-    [selectedLibrary, breadcrumbs, loadEntries, saveScrollPosition]
+    [selectedLibrary, breadcrumbs, activeView, loadEntries, loadView, saveScrollPosition]
   );
 
   const navigateBreadcrumb = useCallback(
@@ -632,9 +724,56 @@ function App() {
     entryCacheRef.current.set(`${libraryId}:${parentId}`, { entries, sort_mode });
   }, []);
 
+  // Invoked after any playlist-scoped mutation (create/rename/delete/add-link/remove-link).
+  // Wipes caches, re-fetches the active view if it's a playlist-* view in this library,
+  // and refreshes the sidebar's per-library playlist children.
+  const handlePlaylistChanged = useCallback((libraryId: string) => {
+    invalidateCache(libraryId);
+    (async () => {
+      try {
+        const pls = await invoke<PlaylistSummary[]>("get_playlists", { libraryId });
+        setSidebarPlaylists((prev) => ({ ...prev, [libraryId]: pls }));
+      } catch {
+        // swallow
+      }
+    })();
+    if (
+      activeView &&
+      activeView.libraryId === libraryId &&
+      (activeView.kind === "playlists" || activeView.kind === "playlist-detail")
+    ) {
+      loadView(activeView, null, breadcrumbs, true);
+    }
+  }, [activeView, breadcrumbs, invalidateCache, loadView]);
+
   const changeSortMode = useCallback(
     async (mode: string) => {
       if (!selectedLibrary) return;
+
+      // Playlist-detail has its own per-level sort_mode storage (playlist root vs nested collection)
+      // and a limited vocabulary ("custom" | "alpha"). Route there instead of set_sort_mode.
+      if (activeView?.kind === "playlist-detail") {
+        try {
+          if (activeView.collectionId !== null) {
+            await invoke("set_playlist_collection_sort_mode", {
+              collectionId: activeView.collectionId,
+              mode,
+            });
+          } else {
+            await invoke("set_playlist_sort_mode", {
+              playlistId: activeView.playlistId,
+              mode,
+            });
+          }
+          setSortMode(mode);
+          invalidateCache(selectedLibrary.id);
+          loadView(activeView, null, breadcrumbs, true);
+        } catch (e) {
+          console.error("Failed to set playlist sort mode:", e);
+        }
+        return;
+      }
+
       const parentId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
       try {
         await invoke("set_sort_mode", {
@@ -649,13 +788,34 @@ function App() {
         console.error("Failed to set sort mode:", e);
       }
     },
-    [selectedLibrary, breadcrumbs, loadEntries, invalidateCache]
+    [selectedLibrary, activeView, breadcrumbs, loadEntries, loadView, invalidateCache]
   );
 
   const updateSortOrder = useCallback(
     async (reordered: MediaEntry[]) => {
       if (!selectedLibrary) return;
       setEntries(reordered);
+
+      // Playlist views carry a mix of media_link and media_playlist_collection items,
+      // so the wire format differs from the library's flat entry_ids list.
+      if (activeView?.kind === "playlist-detail") {
+        const key = viewCacheKey(activeView);
+        viewEntriesCacheRef.current.set(key, { entries: reordered, sort_mode: sortMode });
+        const items = reordered.map((e) =>
+          e.link_id != null
+            ? { kind: "link", id: e.link_id }
+            : { kind: "collection", id: e.id }
+        );
+        try {
+          await invoke("update_playlist_sort_order", { items });
+        } catch (e) {
+          console.error("Failed to update playlist sort order:", e);
+          viewEntriesCacheRef.current.delete(key);
+          loadView(activeView, null, breadcrumbs, true);
+        }
+        return;
+      }
+
       const parentId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
       updateCache(selectedLibrary.id, parentId, reordered, sortMode);
       try {
@@ -669,7 +829,7 @@ function App() {
         loadEntries(selectedLibrary, parentId, breadcrumbs);
       }
     },
-    [selectedLibrary, breadcrumbs, sortMode, loadEntries, invalidateCache, updateCache]
+    [selectedLibrary, activeView, breadcrumbs, sortMode, loadEntries, loadView, invalidateCache, updateCache]
   );
 
   const applyTitleChange = useCallback((entryId: number, newTitle: string) => {
@@ -750,12 +910,20 @@ function App() {
           basePath: basePath ?? null,
         });
         invalidateCache(selectedLibrary.id, parentId);
+        // Preserve current scroll across the reload. Without this the restore
+        // falls through to a stale (or zero) saved value, and any side-effect
+        // scroll (focus return from the dialog, dnd-kit mount re-layout, etc.)
+        // can land the viewport wherever the new entry happens to sit in the
+        // DOM — which in the user's case was at the ASCII-sorted tail when the
+        // name was lowercase. Keeping the current scroll numerically stable
+        // makes it case-insensitive by construction.
+        saveScrollPosition();
         await loadEntries(selectedLibrary, parentId, breadcrumbs);
       } catch (e) {
         toast.error(String(e));
       }
     },
-    [selectedLibrary, breadcrumbs, invalidateCache, loadEntries]
+    [selectedLibrary, breadcrumbs, invalidateCache, loadEntries, saveScrollPosition]
   );
 
   const deleteEntry = useCallback(
@@ -777,8 +945,65 @@ function App() {
   );
 
   const setCover = useCallback(
-    async (entryId: number, coverPath: string | null) => {
+    async (
+      entryId: number,
+      coverPath: string | null,
+      opts?: { linkId?: number | null; playlistCollection?: boolean },
+    ) => {
+      const linkId = opts?.linkId ?? null;
+      const isPlaylistCollection = opts?.playlistCollection === true;
+
+      // Playlist-collection cover: the id here is a media_playlist_collection.id. We patch
+      // the matching card in the current playlist view and invoke the collection-scoped command.
+      if (isPlaylistCollection) {
+        setEntries((prev) => {
+          const updated = prev.map((e) =>
+            e.id === entryId && e.entry_type === "playlist_collection"
+              ? { ...e, selected_cover: coverPath }
+              : e,
+          );
+          if (activeView?.kind === "playlist-detail") {
+            viewEntriesCacheRef.current.set(viewCacheKey(activeView), { entries: updated, sort_mode: sortMode });
+          }
+          return updated;
+        });
+        try {
+          await invoke("set_playlist_collection_cover", { collectionId: entryId, coverPath });
+        } catch (e) {
+          console.error("Failed to set playlist-collection cover:", e);
+          if (activeView?.kind === "playlist-detail") {
+            viewEntriesCacheRef.current.delete(viewCacheKey(activeView));
+            loadView(activeView, null, breadcrumbs, true);
+          }
+        }
+        return;
+      }
+
       if (!selectedLibrary) return;
+
+      // Playlist-link cover override: only mutates the specific media_link row, never the
+      // target entry. Optimistically patch the matching link in the current playlist view
+      // and its cached entries so other copies of the same media stay on their own covers.
+      if (linkId != null) {
+        setEntries((prev) => {
+          const updated = prev.map((e) => (e.link_id === linkId ? { ...e, selected_cover: coverPath } : e));
+          if (activeView?.kind === "playlist-detail") {
+            viewEntriesCacheRef.current.set(viewCacheKey(activeView), { entries: updated, sort_mode: sortMode });
+          }
+          return updated;
+        });
+        try {
+          await invoke("set_link_cover", { linkId, coverPath });
+        } catch (e) {
+          console.error("Failed to set link cover:", e);
+          if (activeView?.kind === "playlist-detail") {
+            viewEntriesCacheRef.current.delete(viewCacheKey(activeView));
+            loadView(activeView, null, breadcrumbs, true);
+          }
+        }
+        return;
+      }
+
       const last = breadcrumbs[breadcrumbs.length - 1];
       const parentId = last?.id === entryId
         ? (breadcrumbs[breadcrumbs.length - 2]?.id ?? null)
@@ -803,21 +1028,47 @@ function App() {
         loadEntries(selectedLibrary, parentId, breadcrumbs);
       }
     },
-    [selectedLibrary, breadcrumbs, sortMode, loadEntries, invalidateCache, updateCache]
+    [selectedLibrary, activeView, breadcrumbs, sortMode, loadEntries, loadView, invalidateCache, updateCache]
   );
 
   const addCover = useCallback(
-    async (entryId: number) => {
-      if (!selectedLibrary) return;
+    async (entryId: number, opts?: { playlistCollection?: boolean }) => {
+      const isPlaylistCollection = opts?.playlistCollection === true;
+      if (!isPlaylistCollection && !selectedLibrary) return;
+
       const selected = await openDialog({
         multiple: false,
         directory: false,
         filters: [{ name: "Image", extensions: ["jpg", "jpeg", "png", "webp", "bmp", "gif"] }],
       });
       if (!selected || typeof selected !== "string") return;
+
+      if (isPlaylistCollection) {
+        try {
+          const newCoverPath = await invoke<string>("add_playlist_collection_cover", {
+            collectionId: entryId,
+            sourcePath: selected,
+          });
+          setEntries((prev) => {
+            const updated = prev.map((e) =>
+              e.id === entryId && e.entry_type === "playlist_collection"
+                ? { ...e, covers: [...e.covers, newCoverPath], selected_cover: newCoverPath }
+                : e,
+            );
+            if (activeView?.kind === "playlist-detail") {
+              viewEntriesCacheRef.current.set(viewCacheKey(activeView), { entries: updated, sort_mode: sortMode });
+            }
+            return updated;
+          });
+        } catch (e) {
+          toast.error(String(e));
+        }
+        return;
+      }
+
       try {
         const newCoverPath = await invoke<string>("add_cover", {
-          libraryId: selectedLibrary.id,
+          libraryId: selectedLibrary!.id,
           entryId,
           sourcePath: selected,
         });
@@ -831,12 +1082,12 @@ function App() {
           : (last?.id ?? null);
         setEntries((prev) => {
           const updated = prev.map(updateEntry);
-          updateCache(selectedLibrary.id, parentId, updated, sortMode);
+          updateCache(selectedLibrary!.id, parentId, updated, sortMode);
           return updated;
         });
         setSelectedEntry((prev) => (prev && prev.id === entryId ? updateEntry(prev) : prev));
         await invoke("set_cover", {
-          libraryId: selectedLibrary.id,
+          libraryId: selectedLibrary!.id,
           entryId,
           coverPath: newCoverPath,
         });
@@ -844,11 +1095,40 @@ function App() {
         toast.error(String(e));
       }
     },
-    [selectedLibrary, breadcrumbs, sortMode, updateCache]
+    [selectedLibrary, activeView, breadcrumbs, sortMode, updateCache]
   );
 
   const deleteCover = useCallback(
-    async (entryId: number, coverPath: string) => {
+    async (entryId: number, coverPath: string, opts?: { playlistCollection?: boolean }) => {
+      const isPlaylistCollection = opts?.playlistCollection === true;
+
+      if (isPlaylistCollection) {
+        try {
+          const newSelected = await invoke<string | null>("delete_playlist_collection_cover", {
+            collectionId: entryId,
+            coverPath,
+          });
+          setEntries((prev) => {
+            const updated = prev.map((e) =>
+              e.id === entryId && e.entry_type === "playlist_collection"
+                ? {
+                    ...e,
+                    covers: e.covers.filter((c) => c !== coverPath),
+                    selected_cover: newSelected,
+                  }
+                : e,
+            );
+            if (activeView?.kind === "playlist-detail") {
+              viewEntriesCacheRef.current.set(viewCacheKey(activeView), { entries: updated, sort_mode: sortMode });
+            }
+            return updated;
+          });
+        } catch (e) {
+          toast.error(String(e));
+        }
+        return;
+      }
+
       if (!selectedLibrary) return;
       try {
         const newSelected = await invoke<string | null>("delete_cover", {
@@ -874,7 +1154,7 @@ function App() {
         toast.error(String(e));
       }
     },
-    [selectedLibrary, breadcrumbs, sortMode, updateCache]
+    [selectedLibrary, activeView, breadcrumbs, sortMode, updateCache]
   );
 
   useEffect(() => {
@@ -997,6 +1277,8 @@ function App() {
               loadEntries(selectedLibrary, parentId, breadcrumbs);
             }
           }}
+          onPlaylistChanged={handlePlaylistChanged}
+          sidebarPlaylists={sidebarPlaylists}
           playerState={playerState}
           playerActions={playerActions}
         />
@@ -1015,6 +1297,8 @@ function App() {
           onSearchChange={setSearch}
           onNavigate={navigateTo}
           onNavigateToPerson={navigateToPerson}
+          onNavigateToPlaylist={navigateToPlaylist}
+          onPlaylistChanged={handlePlaylistChanged}
           onBreadcrumbClick={navigateBreadcrumb}
           selectedLibrary={selectedLibrary}
           hasLibraries={libraries.length > 0}

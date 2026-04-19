@@ -58,6 +58,9 @@ pub struct MediaEntry {
     pub season_display: Option<String>,
     pub collection_display: Option<String>,
     pub tmdb_id: Option<String>,
+    /// Non-null only when this row represents a `media_link` inside a playlist view.
+    /// Frontend uses it to offer "Remove from playlist".
+    pub link_id: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -868,6 +871,7 @@ pub async fn get_entries(
                         season_display,
                         collection_display: None,
                         tmdb_id,
+                        link_id: None,
                     }
                 })
                 .collect();
@@ -953,6 +957,7 @@ pub async fn get_entries(
                         season_display: None,
                         collection_display: None,
                         tmdb_id: None,
+                        link_id: None,
                     }
                 })
                 .collect();
@@ -1081,7 +1086,7 @@ pub async fn search_entries(
             let mut entries: Vec<MediaEntry> = rows.into_iter()
                 .map(|(id, title, year, end_year, folder_path, parent_id, entry_type, selected_cover, tmdb_id, season_display)| {
                     let covers = covers_map.remove(&folder_path).unwrap_or_default();
-                    MediaEntry { id, title, year, end_year, folder_path, parent_id, entry_type, covers, selected_cover, child_count: 0, season_display, collection_display: None, tmdb_id }
+                    MediaEntry { id, title, year, end_year, folder_path, parent_id, entry_type, covers, selected_cover, child_count: 0, season_display, collection_display: None, tmdb_id, link_id: None }
                 })
                 .collect();
 
@@ -1139,7 +1144,7 @@ pub async fn search_entries(
             rows.into_iter()
                 .map(|(id, title, folder_path, selected_cover)| {
                     let covers = covers_map.remove(&folder_path).unwrap_or_default();
-                    MediaEntry { id, title, year: None, end_year: None, folder_path, parent_id: None, entry_type: "artist".to_string(), covers, selected_cover, child_count: 0, season_display: None, collection_display: None, tmdb_id: None }
+                    MediaEntry { id, title, year: None, end_year: None, folder_path, parent_id: None, entry_type: "artist".to_string(), covers, selected_cover, child_count: 0, season_display: None, collection_display: None, tmdb_id: None, link_id: None }
                 })
                 .collect()
         }
@@ -1944,6 +1949,15 @@ pub async fn delete_cover(
     )
     .await?;
 
+    // Cascade: any playlist links pinning this exact cover path must drop the pin so the
+    // UI falls back to the target's new selected_cover instead of rendering a stale path.
+    sqlx::query("UPDATE media_link SET selected_cover = NULL WHERE selected_cover = ? AND target_entry_id = ?")
+        .bind(&cover_path)
+        .bind(entry_id)
+        .execute(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+
     // Determine if the deleted cover was selected; if so pick a new one
     let current_selected: Option<String> = match format.as_str() {
         "video" => {
@@ -2297,6 +2311,7 @@ pub async fn get_entries_for_person(
                 season_display: None,
                 collection_display: None,
                 tmdb_id,
+                link_id: None,
             }
         })
         .collect();
@@ -2309,6 +2324,7 @@ pub struct PlaylistSummary {
     pub id: i64,
     pub title: String,
     pub selected_cover: Option<String>,
+    pub covers: Vec<String>,
 }
 
 #[tauri::command]
@@ -2325,7 +2341,11 @@ pub async fn get_playlists(
     .map_err(|e| e.to_string())?;
     let playlists = rows
         .into_iter()
-        .map(|(id, title, selected_cover)| PlaylistSummary { id, title, selected_cover })
+        .map(|(id, title, selected_cover)| {
+            let dir = playlist_covers_dir(&state.app_data_dir, "playlist", id);
+            let covers = list_playlist_covers(&dir);
+            PlaylistSummary { id, title, selected_cover, covers }
+        })
         .collect();
     Ok(playlists)
 }
@@ -2361,12 +2381,730 @@ pub async fn delete_playlist(
     state: tauri::State<'_, AppState>,
     playlist_id: i64,
 ) -> Result<(), String> {
+    // Collect every nested collection id before the cascade delete removes them, so we
+    // can also wipe their on-disk cover directories (the DB cascade doesn't touch disk).
+    let descendant_ids: Vec<(i64,)> = sqlx::query_as(
+        "WITH RECURSIVE descendants(id) AS ( \
+           SELECT id FROM media_playlist_collection WHERE parent_playlist_id = ? \
+           UNION ALL \
+           SELECT c.id FROM media_playlist_collection c JOIN descendants d ON c.parent_collection_id = d.id \
+         ) SELECT id FROM descendants",
+    )
+    .bind(playlist_id)
+    .fetch_all(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
     sqlx::query("DELETE FROM media_playlist WHERE id = ?")
         .bind(playlist_id)
         .execute(&state.app_db)
         .await
         .map_err(|e| e.to_string())?;
+    let pl_dir = playlist_covers_dir(&state.app_data_dir, "playlist", playlist_id);
+    if pl_dir.exists() { let _ = std::fs::remove_dir_all(&pl_dir); }
+    for (cid,) in descendant_ids {
+        let cdir = playlist_covers_dir(&state.app_data_dir, "collection", cid);
+        if cdir.exists() { let _ = std::fs::remove_dir_all(&cdir); }
+    }
     Ok(())
+}
+
+#[tauri::command]
+pub async fn rename_playlist(
+    state: tauri::State<'_, AppState>,
+    playlist_id: i64,
+    new_title: String,
+) -> Result<(), String> {
+    sqlx::query("UPDATE media_playlist SET title = ?, sort_title = LOWER(?) WHERE id = ?")
+        .bind(&new_title)
+        .bind(&new_title)
+        .bind(playlist_id)
+        .execute(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn rename_playlist_collection(
+    state: tauri::State<'_, AppState>,
+    collection_id: i64,
+    new_title: String,
+) -> Result<(), String> {
+    sqlx::query("UPDATE media_playlist_collection SET title = ?, sort_title = LOWER(?) WHERE id = ?")
+        .bind(&new_title)
+        .bind(&new_title)
+        .bind(collection_id)
+        .execute(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn delete_playlist_collection(
+    state: tauri::State<'_, AppState>,
+    collection_id: i64,
+) -> Result<(), String> {
+    let descendant_ids: Vec<(i64,)> = sqlx::query_as(
+        "WITH RECURSIVE descendants(id) AS ( \
+           SELECT id FROM media_playlist_collection WHERE id = ? \
+           UNION ALL \
+           SELECT c.id FROM media_playlist_collection c JOIN descendants d ON c.parent_collection_id = d.id \
+         ) SELECT id FROM descendants",
+    )
+    .bind(collection_id)
+    .fetch_all(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    sqlx::query("DELETE FROM media_playlist_collection WHERE id = ?")
+        .bind(collection_id)
+        .execute(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+    for (cid,) in descendant_ids {
+        let cdir = playlist_covers_dir(&state.app_data_dir, "collection", cid);
+        if cdir.exists() { let _ = std::fs::remove_dir_all(&cdir); }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn create_playlist_collection(
+    state: tauri::State<'_, AppState>,
+    title: String,
+    parent_playlist_id: Option<i64>,
+    parent_collection_id: Option<i64>,
+) -> Result<i64, String> {
+    // Exactly one parent must be set — matches the table's CHECK constraint.
+    if parent_playlist_id.is_some() == parent_collection_id.is_some() {
+        return Err("Exactly one of parent_playlist_id or parent_collection_id must be set".to_string());
+    }
+    let sort_title = title.to_lowercase();
+    let max_order: (i64,) = sqlx::query_as(
+        "SELECT COALESCE(MAX(sort_order), 0) FROM media_playlist_collection \
+         WHERE parent_playlist_id IS ? AND parent_collection_id IS ?",
+    )
+    .bind(parent_playlist_id)
+    .bind(parent_collection_id)
+    .fetch_one(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    let result = sqlx::query(
+        "INSERT INTO media_playlist_collection (title, sort_title, sort_order, parent_playlist_id, parent_collection_id) \
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(&title)
+    .bind(&sort_title)
+    .bind(max_order.0 + 1)
+    .bind(parent_playlist_id)
+    .bind(parent_collection_id)
+    .execute(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(result.last_insert_rowid())
+}
+
+#[tauri::command]
+pub async fn add_media_link(
+    state: tauri::State<'_, AppState>,
+    target_entry_id: i64,
+    parent_playlist_id: Option<i64>,
+    parent_collection_id: Option<i64>,
+) -> Result<i64, String> {
+    if parent_playlist_id.is_some() == parent_collection_id.is_some() {
+        return Err("Exactly one of parent_playlist_id or parent_collection_id must be set".to_string());
+    }
+
+    // Cross-library linking is rejected in v1: the target entry must live in the same library
+    // as the parent playlist. Resolve the playlist's library_id from whichever parent is set.
+    // Collections are also rejected — only leaf media (movie/show) can be linked into playlists.
+    let target_row: Option<(String, String)> = sqlx::query_as(
+        "SELECT library_id, entry_type FROM media_entry_full WHERE id = ?",
+    )
+    .bind(target_entry_id)
+    .fetch_optional(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    let (target_lib, target_type) = target_row.ok_or("Target media entry not found")?;
+    if target_type != "movie" && target_type != "show" {
+        return Err(format!("Cannot add {target_type} to a playlist — only movies and shows can be linked"));
+    }
+
+    let parent_lib: Option<(String,)> = if let Some(pid) = parent_playlist_id {
+        sqlx::query_as("SELECT library_id FROM media_playlist WHERE id = ?")
+            .bind(pid)
+            .fetch_optional(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?
+    } else if let Some(cid) = parent_collection_id {
+        // Walk up the collection chain until we hit a parent playlist, then take its library.
+        sqlx::query_as(
+            "WITH RECURSIVE up(pl_id, pc_id) AS ( \
+               SELECT parent_playlist_id, parent_collection_id FROM media_playlist_collection WHERE id = ? \
+               UNION ALL \
+               SELECT c.parent_playlist_id, c.parent_collection_id \
+                 FROM media_playlist_collection c JOIN up ON c.id = up.pc_id \
+             ) \
+             SELECT library_id FROM media_playlist WHERE id = (SELECT pl_id FROM up WHERE pl_id IS NOT NULL LIMIT 1)",
+        )
+        .bind(cid)
+        .fetch_optional(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?
+    } else {
+        None
+    };
+    let parent_lib = parent_lib.ok_or("Parent playlist not found")?.0;
+
+    if target_lib != parent_lib {
+        return Err("Cross-library linking is not supported in this version".to_string());
+    }
+
+    let max_order: (i64,) = sqlx::query_as(
+        "SELECT COALESCE(MAX(sort_order), 0) FROM media_link \
+         WHERE parent_playlist_id IS ? AND parent_collection_id IS ?",
+    )
+    .bind(parent_playlist_id)
+    .bind(parent_collection_id)
+    .fetch_one(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    // Seed the link's own selected_cover from the target entry's current cover so the
+    // initial render matches the library. After this the two covers are independent —
+    // cover changes in the library never touch `media_link.selected_cover`, and vice versa.
+    let target_cover: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT selected_cover FROM media_entry_full WHERE id = ?",
+    )
+    .bind(target_entry_id)
+    .fetch_optional(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    let initial_cover = target_cover.and_then(|(c,)| c);
+
+    let result = sqlx::query(
+        "INSERT INTO media_link (target_entry_id, sort_order, selected_cover, parent_playlist_id, parent_collection_id) \
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(target_entry_id)
+    .bind(max_order.0 + 1)
+    .bind(&initial_cover)
+    .bind(parent_playlist_id)
+    .bind(parent_collection_id)
+    .execute(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(result.last_insert_rowid())
+}
+
+/// Update the per-link cover override. Only applies to playlist links — the target
+/// entry's own `selected_cover` in the library is untouched.
+#[tauri::command]
+pub async fn set_link_cover(
+    state: tauri::State<'_, AppState>,
+    link_id: i64,
+    cover_path: Option<String>,
+) -> Result<(), String> {
+    sqlx::query("UPDATE media_link SET selected_cover = ? WHERE id = ?")
+        .bind(&cover_path)
+        .bind(link_id)
+        .execute(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn remove_media_link(
+    state: tauri::State<'_, AppState>,
+    link_id: i64,
+) -> Result<(), String> {
+    sqlx::query("DELETE FROM media_link WHERE id = ?")
+        .bind(link_id)
+        .execute(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Walk the playlist's full tree (root + every nested playlist_collection) and return
+/// true if any `media_link` anywhere inside it already targets `target_entry_id`.
+/// Used by the "Add to playlist" flow to decide whether to prompt for duplicate confirmation.
+#[tauri::command]
+pub async fn playlist_contains_target(
+    state: tauri::State<'_, AppState>,
+    playlist_id: i64,
+    target_entry_id: i64,
+) -> Result<bool, String> {
+    let row: Option<(i64,)> = sqlx::query_as(
+        "WITH RECURSIVE descendants(id) AS ( \
+            SELECT id FROM media_playlist_collection WHERE parent_playlist_id = ? \
+            UNION ALL \
+            SELECT c.id FROM media_playlist_collection c \
+              JOIN descendants d ON c.parent_collection_id = d.id \
+         ) \
+         SELECT 1 FROM media_link \
+          WHERE target_entry_id = ? \
+            AND (parent_playlist_id = ? OR parent_collection_id IN (SELECT id FROM descendants)) \
+          LIMIT 1",
+    )
+    .bind(playlist_id)
+    .bind(target_entry_id)
+    .bind(playlist_id)
+    .fetch_optional(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(row.is_some())
+}
+
+/// Re-parent an existing media_link inside the same playlist. Exactly one of the two
+/// parent IDs must be set (mirrors the table's CHECK constraint). The link's sort_order
+/// is reset to (max + 1) in the new parent — equivalent to "move to the end".
+#[tauri::command]
+pub async fn move_media_link(
+    state: tauri::State<'_, AppState>,
+    link_id: i64,
+    parent_playlist_id: Option<i64>,
+    parent_collection_id: Option<i64>,
+) -> Result<(), String> {
+    if parent_playlist_id.is_some() == parent_collection_id.is_some() {
+        return Err("Exactly one of parent_playlist_id or parent_collection_id must be set".to_string());
+    }
+    let max_order: (i64,) = sqlx::query_as(
+        "SELECT COALESCE(MAX(sort_order), 0) FROM media_link \
+         WHERE parent_playlist_id IS ? AND parent_collection_id IS ?",
+    )
+    .bind(parent_playlist_id)
+    .bind(parent_collection_id)
+    .fetch_one(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    sqlx::query(
+        "UPDATE media_link \
+         SET parent_playlist_id = ?, parent_collection_id = ?, sort_order = ? \
+         WHERE id = ?",
+    )
+    .bind(parent_playlist_id)
+    .bind(parent_collection_id)
+    .bind(max_order.0 + 1)
+    .bind(link_id)
+    .execute(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Re-parent a nested media_playlist_collection inside the same playlist. Same
+/// exactly-one-parent rule as creation/move for media_link. The collection's children
+/// (further nested collections and links) ride along via the unchanged FK cascade —
+/// only this row's parent_* columns are updated.
+#[tauri::command]
+pub async fn move_playlist_collection(
+    state: tauri::State<'_, AppState>,
+    collection_id: i64,
+    parent_playlist_id: Option<i64>,
+    parent_collection_id: Option<i64>,
+) -> Result<(), String> {
+    if parent_playlist_id.is_some() == parent_collection_id.is_some() {
+        return Err("Exactly one of parent_playlist_id or parent_collection_id must be set".to_string());
+    }
+    // Guard against the obvious self-loop (moving a collection into itself). Deeper
+    // cycle detection (moving into a descendant) would require walking the chain;
+    // skipped for v1 — UI drops don't let the user target a descendant since they
+    // can only see siblings and descendants aren't rendered at the current level.
+    if parent_collection_id == Some(collection_id) {
+        return Err("Cannot move a collection into itself".to_string());
+    }
+    let max_order: (i64,) = sqlx::query_as(
+        "SELECT COALESCE(MAX(sort_order), 0) FROM media_playlist_collection \
+         WHERE parent_playlist_id IS ? AND parent_collection_id IS ?",
+    )
+    .bind(parent_playlist_id)
+    .bind(parent_collection_id)
+    .fetch_one(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    sqlx::query(
+        "UPDATE media_playlist_collection \
+         SET parent_playlist_id = ?, parent_collection_id = ?, sort_order = ? \
+         WHERE id = ?",
+    )
+    .bind(parent_playlist_id)
+    .bind(parent_collection_id)
+    .bind(max_order.0 + 1)
+    .bind(collection_id)
+    .execute(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn set_playlist_sort_mode(
+    state: tauri::State<'_, AppState>,
+    playlist_id: i64,
+    mode: String,
+) -> Result<(), String> {
+    if !matches!(mode.as_str(), "custom" | "alpha") {
+        return Err(format!("Invalid playlist sort mode: {mode}"));
+    }
+    sqlx::query("UPDATE media_playlist SET sort_mode = ? WHERE id = ?")
+        .bind(&mode)
+        .bind(playlist_id)
+        .execute(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn set_playlist_collection_sort_mode(
+    state: tauri::State<'_, AppState>,
+    collection_id: i64,
+    mode: String,
+) -> Result<(), String> {
+    if !matches!(mode.as_str(), "custom" | "alpha") {
+        return Err(format!("Invalid playlist-collection sort mode: {mode}"));
+    }
+    sqlx::query("UPDATE media_playlist_collection SET sort_mode = ? WHERE id = ?")
+        .bind(&mode)
+        .bind(collection_id)
+        .execute(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// ── Playlist / playlist_collection custom covers ──────────────────────────────
+
+#[tauri::command]
+pub async fn add_playlist_cover(
+    state: tauri::State<'_, AppState>,
+    playlist_id: i64,
+    source_path: String,
+) -> Result<String, String> {
+    let dir = playlist_covers_dir(&state.app_data_dir, "playlist", playlist_id);
+    let added = copy_cover_into_dir(&source_path, &dir)?;
+    // Auto-select the first cover added so the UI updates immediately.
+    let current: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT selected_cover FROM media_playlist WHERE id = ?",
+    )
+    .bind(playlist_id)
+    .fetch_optional(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    if current.and_then(|(c,)| c).is_none() {
+        sqlx::query("UPDATE media_playlist SET selected_cover = ? WHERE id = ?")
+            .bind(&added).bind(playlist_id)
+            .execute(&state.app_db).await.map_err(|e| e.to_string())?;
+    }
+    Ok(added)
+}
+
+#[tauri::command]
+pub async fn add_playlist_collection_cover(
+    state: tauri::State<'_, AppState>,
+    collection_id: i64,
+    source_path: String,
+) -> Result<String, String> {
+    let dir = playlist_covers_dir(&state.app_data_dir, "collection", collection_id);
+    let added = copy_cover_into_dir(&source_path, &dir)?;
+    let current: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT selected_cover FROM media_playlist_collection WHERE id = ?",
+    )
+    .bind(collection_id)
+    .fetch_optional(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    if current.and_then(|(c,)| c).is_none() {
+        sqlx::query("UPDATE media_playlist_collection SET selected_cover = ? WHERE id = ?")
+            .bind(&added).bind(collection_id)
+            .execute(&state.app_db).await.map_err(|e| e.to_string())?;
+    }
+    Ok(added)
+}
+
+#[tauri::command]
+pub async fn delete_playlist_cover(
+    state: tauri::State<'_, AppState>,
+    playlist_id: i64,
+    cover_path: String,
+) -> Result<Option<String>, String> {
+    let p = PathBuf::from(&cover_path);
+    if p.exists() {
+        std::fs::remove_file(&p).map_err(|e| format!("Failed to delete cover: {e}"))?;
+    }
+    let current: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT selected_cover FROM media_playlist WHERE id = ?",
+    )
+    .bind(playlist_id)
+    .fetch_optional(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    let current = current.and_then(|(c,)| c);
+    let new_selected = if current.as_deref() == Some(cover_path.as_str()) {
+        let dir = playlist_covers_dir(&state.app_data_dir, "playlist", playlist_id);
+        let new_val = list_playlist_covers(&dir).into_iter().next();
+        sqlx::query("UPDATE media_playlist SET selected_cover = ? WHERE id = ?")
+            .bind(&new_val).bind(playlist_id)
+            .execute(&state.app_db).await.map_err(|e| e.to_string())?;
+        new_val
+    } else {
+        current
+    };
+    Ok(new_selected)
+}
+
+#[tauri::command]
+pub async fn delete_playlist_collection_cover(
+    state: tauri::State<'_, AppState>,
+    collection_id: i64,
+    cover_path: String,
+) -> Result<Option<String>, String> {
+    let p = PathBuf::from(&cover_path);
+    if p.exists() {
+        std::fs::remove_file(&p).map_err(|e| format!("Failed to delete cover: {e}"))?;
+    }
+    let current: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT selected_cover FROM media_playlist_collection WHERE id = ?",
+    )
+    .bind(collection_id)
+    .fetch_optional(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    let current = current.and_then(|(c,)| c);
+    let new_selected = if current.as_deref() == Some(cover_path.as_str()) {
+        let dir = playlist_covers_dir(&state.app_data_dir, "collection", collection_id);
+        let new_val = list_playlist_covers(&dir).into_iter().next();
+        sqlx::query("UPDATE media_playlist_collection SET selected_cover = ? WHERE id = ?")
+            .bind(&new_val).bind(collection_id)
+            .execute(&state.app_db).await.map_err(|e| e.to_string())?;
+        new_val
+    } else {
+        current
+    };
+    Ok(new_selected)
+}
+
+#[tauri::command]
+pub async fn set_playlist_cover(
+    state: tauri::State<'_, AppState>,
+    playlist_id: i64,
+    cover_path: Option<String>,
+) -> Result<(), String> {
+    sqlx::query("UPDATE media_playlist SET selected_cover = ? WHERE id = ?")
+        .bind(&cover_path).bind(playlist_id)
+        .execute(&state.app_db).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn set_playlist_collection_cover(
+    state: tauri::State<'_, AppState>,
+    collection_id: i64,
+    cover_path: Option<String>,
+) -> Result<(), String> {
+    sqlx::query("UPDATE media_playlist_collection SET selected_cover = ? WHERE id = ?")
+        .bind(&cover_path).bind(collection_id)
+        .execute(&state.app_db).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PlaylistContents {
+    pub entries: Vec<MediaEntry>,
+    pub sort_mode: String,
+    pub playlist_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum PlaylistSortItem {
+    Link { id: i64 },
+    Collection { id: i64 },
+}
+
+/// Rewrite sort_order across both media_link and media_playlist_collection so the
+/// merged display list matches the provided order. Caller supplies every item at
+/// the current level (root or nested) in its new position.
+#[tauri::command]
+pub async fn update_playlist_sort_order(
+    state: tauri::State<'_, AppState>,
+    items: Vec<PlaylistSortItem>,
+) -> Result<(), String> {
+    for (i, item) in items.iter().enumerate() {
+        match item {
+            PlaylistSortItem::Link { id } => {
+                sqlx::query("UPDATE media_link SET sort_order = ? WHERE id = ?")
+                    .bind(i as i32)
+                    .bind(id)
+                    .execute(&state.app_db)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            PlaylistSortItem::Collection { id } => {
+                sqlx::query("UPDATE media_playlist_collection SET sort_order = ? WHERE id = ?")
+                    .bind(i as i32)
+                    .bind(id)
+                    .execute(&state.app_db)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_playlist_contents(
+    state: tauri::State<'_, AppState>,
+    playlist_id: i64,
+    parent_collection_id: Option<i64>,
+) -> Result<PlaylistContents, String> {
+    // Look up the playlist's name (for breadcrumb labels) and its root sort_mode.
+    let playlist_row: Option<(String, String, String)> = sqlx::query_as(
+        "SELECT title, sort_mode, library_id FROM media_playlist WHERE id = ?",
+    )
+    .bind(playlist_id)
+    .fetch_optional(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    let (playlist_name, playlist_sort_mode, library_id) = playlist_row.ok_or("Playlist not found")?;
+
+    // The sort mode at the current level depends on whether we're at the playlist root
+    // or inside a nested playlist-collection.
+    let sort_mode = if let Some(cid) = parent_collection_id {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT sort_mode FROM media_playlist_collection WHERE id = ?",
+        )
+        .bind(cid)
+        .fetch_optional(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+        row.map(|(m,)| m).unwrap_or_else(|| "custom".to_string())
+    } else {
+        playlist_sort_mode
+    };
+
+    // Shared cached-covers lookup — used to populate `covers` on every returned entry.
+    // Use `.get().cloned()` (not `.remove()`) so duplicate links to the same media_entry
+    // each get their covers hydrated instead of the first consuming them.
+    let covers_map = get_all_cached_covers(&state.app_db, &library_id)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // ── Links at this level ──
+    // Columns mirror `media_entry_full` so we can hydrate a MediaEntry for each target.
+    // The `?` placeholders are bound twice each (the OR/IS-NULL pattern handles "playlist root" vs "nested collection").
+    let link_rows: Vec<(
+        i64, // link_id
+        i64, // sort_order
+        i64, // target id
+        String, Option<String>, Option<String>, String, Option<i64>, String, Option<String>, Option<String>,
+    )> = sqlx::query_as(
+        // COALESCE(link.selected_cover, target.selected_cover) — the link's own override wins;
+        // when it's NULL (never set, or null-out'd by a library-side cover delete) we fall back
+        // to whatever the target entry currently shows.
+        "SELECT ml.id, ml.sort_order, \
+                mef.id, mef.title, \
+                CASE WHEN mef.entry_type = 'movie' THEN SUBSTR(mef.release_date, 1, 4) ELSE NULL END as year, \
+                NULL as end_year, \
+                mef.folder_path, mef.parent_id, mef.entry_type, \
+                COALESCE(ml.selected_cover, mef.selected_cover) as selected_cover, \
+                mef.sort_title \
+         FROM media_link ml \
+         JOIN media_entry_full mef ON mef.id = ml.target_entry_id \
+         WHERE (ml.parent_playlist_id IS ? AND ml.parent_collection_id IS ?)",
+    )
+    .bind(if parent_collection_id.is_none() { Some(playlist_id) } else { None })
+    .bind(parent_collection_id)
+    .fetch_all(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // ── Nested playlist-collections at this level ──
+    let collection_rows: Vec<(i64, String, Option<String>, i64, String)> = sqlx::query_as(
+        "SELECT id, title, selected_cover, sort_order, sort_title FROM media_playlist_collection \
+         WHERE (parent_playlist_id IS ? AND parent_collection_id IS ?)",
+    )
+    .bind(if parent_collection_id.is_none() { Some(playlist_id) } else { None })
+    .bind(parent_collection_id)
+    .fetch_all(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // Build the merged list. Each playlist-collection becomes an entry with entry_type="playlist_collection".
+    // Each link is hydrated from its target entry's row. We carry (sort_order, sort_title) alongside
+    // each item to apply the current sort mode uniformly after merging.
+    let mut items: Vec<(i64, String, MediaEntry)> = Vec::new();
+
+    for (link_id, sort_order, id, title, year, end_year, folder_path, parent_id, entry_type, selected_cover, sort_title) in link_rows {
+        let covers = covers_map.get(&folder_path).cloned().unwrap_or_default();
+        let entry = MediaEntry {
+            id,
+            title,
+            year,
+            end_year,
+            folder_path,
+            parent_id,
+            entry_type,
+            covers,
+            selected_cover,
+            child_count: 0,
+            season_display: None,
+            collection_display: None,
+            tmdb_id: None,
+            link_id: Some(link_id),
+        };
+        items.push((sort_order, sort_title.unwrap_or_default(), entry));
+    }
+
+    for (id, title, selected_cover, sort_order, sort_title) in collection_rows {
+        // Count children (links + sub-collections) for display.
+        let child_count: (i64,) = sqlx::query_as(
+            "SELECT \
+                (SELECT COUNT(*) FROM media_link WHERE parent_collection_id = ?) \
+              + (SELECT COUNT(*) FROM media_playlist_collection WHERE parent_collection_id = ?)",
+        )
+        .bind(id)
+        .bind(id)
+        .fetch_one(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        let cover_dir = playlist_covers_dir(&state.app_data_dir, "collection", id);
+        let collection_covers = list_playlist_covers(&cover_dir);
+        let entry = MediaEntry {
+            id,
+            title,
+            year: None,
+            end_year: None,
+            folder_path: String::new(),
+            parent_id: None,
+            entry_type: "playlist_collection".to_string(),
+            covers: collection_covers,
+            selected_cover,
+            child_count: child_count.0,
+            season_display: None,
+            collection_display: None,
+            tmdb_id: None,
+            link_id: None,
+        };
+        items.push((sort_order, sort_title, entry));
+    }
+
+    // Apply sort mode.
+    match sort_mode.as_str() {
+        "alpha" => items.sort_by(|a, b| a.1.cmp(&b.1)),
+        _ => items.sort_by_key(|t| t.0), // "custom" — sort_order
+    }
+
+    let entries: Vec<MediaEntry> = items.into_iter().map(|(_, _, e)| e).collect();
+
+    Ok(PlaylistContents {
+        entries,
+        sort_mode,
+        playlist_name,
+    })
 }
 
 #[tauri::command]
@@ -4232,6 +4970,47 @@ fn is_image_file(path: &Path) -> bool {
         .and_then(|e| e.to_str())
         .map(|e| IMAGE_EXTENSIONS.contains(&e.to_lowercase().as_str()))
         .unwrap_or(false)
+}
+
+/// Playlists and nested playlist_collections don't live in a media-library folder, so
+/// their custom covers are stored under `<app_data_dir>/playlist_covers/{kind}-{id}/`.
+/// `kind` is either "playlist" or "collection".
+fn playlist_covers_dir(app_data_dir: &Path, kind: &str, id: i64) -> PathBuf {
+    app_data_dir.join("playlist_covers").join(format!("{kind}-{id}"))
+}
+
+fn list_playlist_covers(dir: &Path) -> Vec<String> {
+    if !dir.exists() { return Vec::new(); }
+    let Ok(read) = std::fs::read_dir(dir) else { return Vec::new(); };
+    let mut out: Vec<String> = read
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| is_image_file(p))
+        .filter_map(|p| p.to_str().map(|s| s.to_string()))
+        .collect();
+    out.sort();
+    out
+}
+
+/// Copy a user-picked image into `target_dir`, deduplicating the filename. Returns the
+/// absolute path of the new file.
+fn copy_cover_into_dir(source_path: &str, target_dir: &Path) -> Result<String, String> {
+    let src = PathBuf::from(source_path);
+    if !src.exists() { return Err("Source file does not exist".into()); }
+    if !is_image_file(&src) { return Err("File is not a supported image".into()); }
+    std::fs::create_dir_all(target_dir).map_err(|e| format!("Failed to create covers dir: {e}"))?;
+    let stem = src.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "cover".into());
+    let ext = src.extension().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "jpg".into());
+    let mut name = format!("{stem}.{ext}");
+    let mut target = target_dir.join(&name);
+    let mut n = 1;
+    while target.exists() {
+        name = format!("{stem}_{n}.{ext}");
+        target = target_dir.join(&name);
+        n += 1;
+    }
+    std::fs::copy(&src, &target).map_err(|e| format!("Failed to copy cover: {e}"))?;
+    target.to_str().map(|s| s.to_string()).ok_or_else(|| "Invalid target path".into())
 }
 
 /// Copy images from source_dir/{image_type_dir}/ to cache_base/{entry_rel_path}/{image_type_dir}/

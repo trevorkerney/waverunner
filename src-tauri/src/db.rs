@@ -563,6 +563,7 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             title TEXT NOT NULL,
             sort_title TEXT NOT NULL DEFAULT '',
             sort_order INTEGER NOT NULL DEFAULT 0,
+            sort_mode TEXT NOT NULL DEFAULT 'custom',
             selected_cover TEXT,
             FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE
         )",
@@ -576,6 +577,7 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             title TEXT NOT NULL,
             sort_title TEXT NOT NULL DEFAULT '',
             sort_order INTEGER NOT NULL DEFAULT 0,
+            sort_mode TEXT NOT NULL DEFAULT 'custom',
             selected_cover TEXT,
             parent_playlist_id INTEGER,
             parent_collection_id INTEGER,
@@ -595,6 +597,7 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             target_entry_id INTEGER NOT NULL,
             sort_order INTEGER NOT NULL DEFAULT 0,
+            selected_cover TEXT,
             parent_playlist_id INTEGER,
             parent_collection_id INTEGER,
             FOREIGN KEY (target_entry_id) REFERENCES media_entry(id) ON DELETE CASCADE,

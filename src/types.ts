@@ -28,6 +28,9 @@ export interface MediaEntry {
   season_display: string | null;
   collection_display: string | null;
   tmdb_id: string | null;
+  /** Non-null only when this row represents a `media_link` inside a playlist view.
+   *  Used to offer "Remove from playlist" from the context menu. */
+  link_id: number | null;
 }
 
 // Each step in the navigation chain. `view` is set when this breadcrumb corresponds to a
@@ -54,7 +57,8 @@ export type ViewSpec =
   | { kind: "people-all";         libraryId: string }
   | { kind: "people-list";        libraryId: string; role: PersonRole }
   | { kind: "person-detail";      libraryId: string; personId: number; role: PersonRole; personName: string; personImage: string | null }
-  | { kind: "playlists";           libraryId: string };
+  | { kind: "playlists";           libraryId: string }
+  | { kind: "playlist-detail";    libraryId: string; playlistId: number; playlistName: string; collectionId: number | null };
 
 // One node in the static complication tree shown for a library.
 export interface ComplicationNode {
@@ -77,6 +81,16 @@ export interface PlaylistSummary {
   id: number;
   title: string;
   selected_cover: string | null;
+  covers: string[];
+}
+
+// Result of `get_playlist_contents`. Entries are a mix of linked media
+// (with `link_id` populated, `entry_type` = target's type) and nested
+// playlist-collection groups (`entry_type` = "playlist_collection").
+export interface PlaylistContents {
+  entries: MediaEntry[];
+  sort_mode: string;
+  playlist_name: string;
 }
 
 export interface PersonInfo {

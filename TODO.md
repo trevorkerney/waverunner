@@ -24,7 +24,7 @@ custom collections / playlists / whatever you want to call it - user should be a
 
 save cover sets. users should be able to save a set of media covers so that they can easily switch all media covers in a library to the saved set. 
 
-save custom sort sets. users should be able to create and name custom sorting sets and easily switch to them (i.e. named sorting sets based on things not in metadata like 'chronological')
+
 
 sidebar complications (complications like a watch)
   - movies/tv
@@ -42,12 +42,18 @@ settings system where changes are all set at once on save button click, instead 
 
 add warning when playing entire seasons without episode numbers (they will likely play out of order)
 
-weird bugs when changing and viewing media covers, specifically when looking at the hobbit collection media and john wick 3. only pattern i see here is media inside collections, idk tho. basically it is just not displaying covers in the change cover and delete cover menus, which messes up their ui pretty bad. also when this happens the cover doesnt show up in detail view sometimes
+POSSIBLY FIXED: weird bugs when changing and viewing media covers, specifically when looking at the hobbit collection media and john wick 3. only pattern i see here is media inside collections, idk tho. basically it is just not displaying covers in the change cover and delete cover menus, which messes up their ui pretty bad. also when this happens the cover doesnt show up in detail view sometimes
 
 adding year to media should add it to movie/show folder name
 
 
 ## BIG STUFF NOW
+
+remember size slider better maybe
+
+save custom sort sets. users should be able to create and name custom sorting sets and easily switch to them (i.e. named sorting sets based on things not in metadata like 'chronological')
+
+need to consider some sort of ability to queue up things for the player. TV show autoplay should probably take this system into heavy consideration. Users should be able to queue playlists. Users should be able to queue up individual movies in context menus at their whim. On the player and maybe not on the player, the user should be able to view the queue and manipulate it in a dialog or sidebar or something
 
 need some kind of resume where left off functionality
 

@@ -19,10 +19,12 @@ import {
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { CreateLibraryDialog } from "@/components/CreateLibraryDialog";
+import { CreatePlaylistDialog } from "@/components/CreatePlaylistDialog";
 import { PlayerDock } from "@/components/player/PlayerDock";
 import { PlayerState, PlayerActions } from "@/hooks/usePlayer";
 import { SidebarTree } from "@/components/SidebarTree";
 import { getComplicationsForLibrary } from "@/lib/complications";
+import type { ComplicationNode, PlaylistSummary } from "@/types";
 import { Library, ViewSpec } from "@/types";
 
 const MIN_WIDTH = 180;
@@ -40,6 +42,10 @@ interface SidebarProps {
   onLibraryCreated: () => void;
   onLibraryDeleted: () => void;
   onLibraryRescanned: () => void;
+  /** Called after a playlist is created via the sidebar so App.tsx can invalidate caches. */
+  onPlaylistChanged: (libraryId: string) => void;
+  /** Per-library playlists to show as children of the "Playlists" sidebar node. */
+  sidebarPlaylists: Record<string, PlaylistSummary[]>;
   playerState: PlayerState;
   playerActions: PlayerActions;
 }
@@ -53,6 +59,8 @@ export function Sidebar({
   onLibraryCreated,
   onLibraryDeleted,
   onLibraryRescanned,
+  onPlaylistChanged,
+  sidebarPlaylists,
   playerState,
   playerActions,
 }: SidebarProps) {
@@ -60,9 +68,24 @@ export function Sidebar({
   const [dragging, setDragging] = useState(false);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Library | null>(null);
+  // Which library to create a playlist inside, or null when the dialog is closed.
+  const [createPlaylistFor, setCreatePlaylistFor] = useState<string | null>(null);
   // Track libraries the user has explicitly collapsed; default is expanded.
   const [collapsedLibs, setCollapsedLibs] = useState<Set<string>>(new Set());
   const isResizing = useRef(false);
+
+  const renderNodeMenu = useCallback((node: ComplicationNode) => {
+    if (node.id === "playlists" && node.view?.kind === "playlists") {
+      const libId = node.view.libraryId;
+      return (
+        <ContextMenuItem onClick={() => setCreatePlaylistFor(libId)}>
+          <FolderPlus size={14} />
+          Create playlist
+        </ContextMenuItem>
+      );
+    }
+    return null;
+  }, []);
 
   const toggleLibExpand = useCallback((libId: string) => {
     setCollapsedLibs((prev) => {
@@ -137,7 +160,7 @@ export function Sidebar({
                           }}
                         />
                       }
-                      className={`flex w-full items-center gap-1 rounded-sm truncate py-1.5 pr-2 pl-1 text-left text-sm ${
+                      className={`flex w-full items-start gap-1 rounded-sm py-1.5 pr-2 pl-1 text-left text-sm ${
                         isSelected
                           ? "bg-sidebar-accent text-sidebar-accent-foreground"
                           : "text-sidebar-foreground hover:bg-sidebar-accent/50"
@@ -148,14 +171,14 @@ export function Sidebar({
                           e.stopPropagation();
                           toggleLibExpand(lib.id);
                         }}
-                        className="flex h-4 w-4 flex-shrink-0 items-center justify-center"
+                        className="flex h-5 w-4 flex-shrink-0 items-center justify-center"
                       >
                         <ChevronRight
                           size={12}
                           className={`transition-transform ${expanded ? "rotate-90" : ""}`}
                         />
                       </span>
-                      <span className="truncate">{lib.name}</span>
+                      <span className="min-w-0 flex-1 break-words">{lib.name}</span>
                     </ContextMenuTrigger>
                     <ContextMenuContent>
                       <ContextMenuItem
@@ -189,11 +212,12 @@ export function Sidebar({
                   </ContextMenu>
                   {expanded && (
                     <SidebarTree
-                      nodes={getComplicationsForLibrary(lib)}
+                      nodes={getComplicationsForLibrary(lib, sidebarPlaylists[lib.id] ?? [])}
                       activeView={isSelected ? activeView : null}
                       onSelectView={(view) => {
                         onSelectView(view);
                       }}
+                      renderNodeMenu={renderNodeMenu}
                       depth={1}
                     />
                   )}
@@ -224,6 +248,14 @@ export function Sidebar({
         open={dialogOpen}
         onOpenChange={setDialogOpen}
         onCreated={onLibraryCreated}
+      />
+      <CreatePlaylistDialog
+        libraryId={createPlaylistFor}
+        open={createPlaylistFor !== null}
+        onOpenChange={(o) => { if (!o) setCreatePlaylistFor(null); }}
+        onCreated={() => {
+          if (createPlaylistFor) onPlaylistChanged(createPlaylistFor);
+        }}
       />
       <Dialog open={deleteTarget !== null} onOpenChange={(open) => { if (!open) setDeleteTarget(null); }}>
         <DialogContent className="sm:max-w-sm">

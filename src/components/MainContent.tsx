@@ -18,6 +18,7 @@ import {
   useSortable,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { Slider } from "@/components/ui/slider";
@@ -88,6 +89,8 @@ import {
   ChevronDown,
   ChevronRight,
   User as UserIcon,
+  ListMusic,
+  ListPlus,
 } from "lucide-react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -97,12 +100,29 @@ import { TmdbMatchDialog } from "@/components/TmdbMatchDialog";
 import { TmdbShowMatchDialog } from "@/components/TmdbShowMatchDialog";
 import { TmdbImageBrowserDialog } from "@/components/TmdbImageBrowserDialog";
 import { PeopleGrid } from "@/components/PeopleGrid";
+import { CreatePlaylistDialog } from "@/components/CreatePlaylistDialog";
+import { CreatePlaylistCollectionDialog } from "@/components/CreatePlaylistCollectionDialog";
+import { AddToPlaylistDialog } from "@/components/AddToPlaylistDialog";
+import { RenameDialog } from "@/components/RenameDialog";
 
 function getDisplayCover(entry: MediaEntry): string | null {
   if (entry.selected_cover && entry.covers.includes(entry.selected_cover)) {
     return entry.selected_cover;
   }
   return entry.covers[0] || null;
+}
+
+/** Stable, collision-free sortable id for a grid entry.
+ *  - Playlist links use their `link_id` (distinct across playlists).
+ *  - Nested playlist_collections use `pc-<id>` so they don't collide with real
+ *    media_entry ids (both id spaces AUTOINCREMENT from 1).
+ *  - Everything else (movies, shows, media_collections, artists) keeps its numeric
+ *    media_entry id so existing library drag-and-drop, key-by-id, and
+ *    update_sort_order flows keep working unchanged. */
+function sortableIdFor(entry: MediaEntry): string | number {
+  if (entry.link_id != null) return `link-${entry.link_id}`;
+  if (entry.entry_type === "playlist_collection") return `pc-${entry.id}`;
+  return entry.id;
 }
 
 function formatReleaseDate(date: string | null | undefined): string | null {
@@ -134,6 +154,8 @@ interface MainContentProps {
   onSearchChange: (search: string) => void;
   onNavigate: (entry: MediaEntry) => void;
   onNavigateToPerson: (person: PersonSummary, role: PersonRole) => void;
+  onNavigateToPlaylist: (playlist: PlaylistSummary) => void;
+  onPlaylistChanged: (libraryId: string) => void;
   onBreadcrumbClick: (index: number) => void;
   selectedLibrary: Library | null;
   hasLibraries: boolean;
@@ -142,9 +164,17 @@ interface MainContentProps {
   onSortOrderChange: (reordered: MediaEntry[]) => void;
   onRenameEntry: (entryId: number, newTitle: string) => Promise<string | null>;
   onTitleChanged: (entryId: number, newTitle: string) => void;
-  onSetCover: (entryId: number, coverPath: string | null) => void;
-  onAddCover: (entryId: number) => Promise<void>;
-  onDeleteCover: (entryId: number, coverPath: string) => Promise<void>;
+  onSetCover: (
+    entryId: number,
+    coverPath: string | null,
+    opts?: { linkId?: number | null; playlistCollection?: boolean },
+  ) => void;
+  onAddCover: (entryId: number, opts?: { playlistCollection?: boolean }) => Promise<void>;
+  onDeleteCover: (
+    entryId: number,
+    coverPath: string,
+    opts?: { playlistCollection?: boolean },
+  ) => Promise<void>;
   onMoveEntry: (entryId: number, newParentId: number | null, insertBeforeId: number | null) => Promise<void>;
   onCreateCollection: (name: string, basePath?: string) => Promise<void>;
   onDeleteEntry: (entryId: number, deleteFromDisk: boolean) => Promise<void>;
@@ -172,6 +202,8 @@ export function MainContent({
   onSearchChange,
   onNavigate,
   onNavigateToPerson,
+  onNavigateToPlaylist,
+  onPlaylistChanged,
   onBreadcrumbClick,
   selectedLibrary,
   hasLibraries,
@@ -233,7 +265,7 @@ export function MainContent({
   const isSearching = searchResults != null;
   const filteredEntries = isSearching ? searchResults : entries;
 
-  const [dragId, setDragId] = useState<number | null>(null);
+  const [dragId, setDragId] = useState<string | number | null>(null);
   const [newCollectionOpen, setNewCollectionOpen] = useState(false);
   const [newCollectionName, setNewCollectionName] = useState("");
   const [newCollectionPath, setNewCollectionPath] = useState("");
@@ -242,6 +274,11 @@ export function MainContent({
   const [deleteConfirmText, setDeleteConfirmText] = useState("");
   const [deleteFilesWarning, setDeleteFilesWarning] = useState<MediaEntry | null>(null);
   const [deletingId, setDeletingId] = useState<number | null>(null);
+
+  // Playlist-related dialog state
+  const [addToPlaylistFor, setAddToPlaylistFor] = useState<MediaEntry | null>(null);
+  const [createCollectionOpen, setCreateCollectionOpen] = useState(false);
+  const [renameCollectionFor, setRenameCollectionFor] = useState<MediaEntry | null>(null);
 
   const handleDelete = useCallback(async (entryId: number, deleteFromDisk: boolean) => {
     setDeletingId(entryId);
@@ -257,7 +294,7 @@ export function MainContent({
   );
 
   const handleDragStart = useCallback((event: DragStartEvent) => {
-    setDragId(event.active.id as number);
+    setDragId(event.active.id as string | number);
   }, []);
 
   const handleDragEnd = useCallback(
@@ -265,9 +302,102 @@ export function MainContent({
       setDragId(null);
       const { active, over } = event;
       if (!over || active.id === over.id) return;
-      const entryId = active.id as number;
       const overId = String(over.id);
 
+      // Resolve the active card back to the underlying entry so we know whether
+      // it's a library media_entry, a playlist link, or a nested playlist_collection.
+      const activeEntry = filteredEntries.find((e) => sortableIdFor(e) === active.id);
+      if (!activeEntry) return;
+
+      const inPlaylist = activeView?.kind === "playlist-detail";
+
+      // ── Playlist moves ────────────────────────────────────────────
+      if (inPlaylist && activeView.kind === "playlist-detail") {
+        // Dropping onto a nested playlist_collection card.
+        if (overId.startsWith("pc-drop-")) {
+          const targetPcId = Number(overId.slice("pc-drop-".length));
+          if (activeEntry.entry_type === "playlist_collection" && activeEntry.id === targetPcId) return;
+          try {
+            if (activeEntry.link_id != null) {
+              await invoke("move_media_link", {
+                linkId: activeEntry.link_id,
+                parentPlaylistId: null,
+                parentCollectionId: targetPcId,
+              });
+            } else if (activeEntry.entry_type === "playlist_collection") {
+              await invoke("move_playlist_collection", {
+                collectionId: activeEntry.id,
+                parentPlaylistId: null,
+                parentCollectionId: targetPcId,
+              });
+            } else {
+              return;
+            }
+            if (selectedLibrary) onPlaylistChanged(selectedLibrary.id);
+          } catch (e) {
+            toast.error(String(e));
+          }
+          return;
+        }
+
+        // Dropping onto the move-up zone — re-parent to whatever is one level above us.
+        if (overId === "move-up-zone" && activeView.collectionId !== null) {
+          // The parent of the current nested collection: find its row in the DB via
+          // the second-to-last view-carrying breadcrumb. That breadcrumb's view is
+          // either the root playlist (collectionId === null) or another collection.
+          const parentCrumb = breadcrumbs[breadcrumbs.length - 2];
+          const parentView = parentCrumb?.view;
+          let parentPlaylistId: number | null = null;
+          let parentCollectionId: number | null = null;
+          if (parentView && parentView.kind === "playlist-detail") {
+            if (parentView.collectionId === null) {
+              parentPlaylistId = parentView.playlistId;
+            } else {
+              parentCollectionId = parentView.collectionId;
+            }
+          } else {
+            // No clean parent breadcrumb — fall back to the root of the current playlist.
+            parentPlaylistId = activeView.playlistId;
+          }
+          try {
+            if (activeEntry.link_id != null) {
+              await invoke("move_media_link", {
+                linkId: activeEntry.link_id,
+                parentPlaylistId,
+                parentCollectionId,
+              });
+            } else if (activeEntry.entry_type === "playlist_collection") {
+              await invoke("move_playlist_collection", {
+                collectionId: activeEntry.id,
+                parentPlaylistId,
+                parentCollectionId,
+              });
+            } else {
+              return;
+            }
+            if (selectedLibrary) onPlaylistChanged(selectedLibrary.id);
+          } catch (e) {
+            toast.error(String(e));
+          }
+          return;
+        }
+
+        // In-level sortable reorder inside a playlist. over.id is another item's
+        // sortable id ("link-N" or "pc-N"); onSortOrderChange routes to
+        // update_playlist_sort_order in App.tsx because activeView is playlist-detail.
+        if (sortMode !== "custom") return;
+        const oldIndex = filteredEntries.findIndex((e) => sortableIdFor(e) === active.id);
+        const newIndex = filteredEntries.findIndex((e) => sortableIdFor(e) === over.id);
+        if (oldIndex === -1 || newIndex === -1) return;
+        const reordered = [...filteredEntries];
+        const [moved] = reordered.splice(oldIndex, 1);
+        reordered.splice(newIndex, 0, moved);
+        onSortOrderChange(reordered);
+        return;
+      }
+
+      // ── Library moves (unchanged) ─────────────────────────────────
+      const entryId = Number(active.id);
       if (overId === "move-up-zone") {
         const currentParentId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
         const grandparentId = breadcrumbs.length >= 3 ? breadcrumbs[breadcrumbs.length - 2].id : null;
@@ -290,11 +420,11 @@ export function MainContent({
         onSortOrderChange(reordered);
       }
     },
-    [breadcrumbs, onMoveEntry, sortMode, filteredEntries, onSortOrderChange]
+    [breadcrumbs, onMoveEntry, sortMode, filteredEntries, onSortOrderChange, activeView, selectedLibrary, onPlaylistChanged]
   );
 
   const dragEntry = dragId != null
-    ? filteredEntries.find((e) => e.id === dragId) ?? null
+    ? filteredEntries.find((e) => sortableIdFor(e) === dragId) ?? null
     : null;
 
   // Prefer collection/move-up droppables (pointerWithin), fall back to closestCenter for sort
@@ -303,13 +433,24 @@ export function MainContent({
     // Filter for our special droppables (collection-* and move-up-zone)
     const specialCollisions = pointerCollisions.filter((c) => {
       const id = String(c.id);
-      return id === "move-up-zone" || id.startsWith("collection-");
+      return (
+        id === "move-up-zone" ||
+        id.startsWith("collection-") ||
+        id.startsWith("pc-drop-")
+      );
     });
     if (specialCollisions.length > 0) return specialCollisions;
     return closestCenter(args);
   }, []);
 
-  const isInsideCollection = breadcrumbs.length > 1;
+  // Show the move-up droppable whenever dragging something up one level is meaningful.
+  // Library-root nests via collection breadcrumbs (breadcrumbs.length > 1).
+  // Playlist-detail is "inside" only when the active view points at a nested
+  // playlist_collection — at the playlist root there's nothing above us.
+  const isInsideCollection =
+    activeView?.kind === "playlist-detail"
+      ? activeView.collectionId !== null
+      : breadcrumbs.length > 1;
 
   const breadcrumbBar = (
     <Breadcrumb className="border-b border-border">
@@ -353,22 +494,16 @@ export function MainContent({
 
   if (activeView?.kind === "playlists") {
     return (
-      <main className="flex flex-1 flex-col overflow-hidden bg-background">
-        {breadcrumbBar}
-        <div ref={scrollContainerRef} className="flex-1 overflow-y-auto p-4">
-          {loading && <p className="text-sm text-muted-foreground">Loading…</p>}
-          {!loading && playlists && playlists.length === 0 && (
-            <p className="text-sm text-muted-foreground">No playlists yet.</p>
-          )}
-          {!loading && playlists && playlists.length > 0 && (
-            <ul className="space-y-1 text-sm">
-              {playlists.map((pl) => (
-                <li key={pl.id}>{pl.title}</li>
-              ))}
-            </ul>
-          )}
-        </div>
-      </main>
+      <PlaylistsView
+        libraryId={activeView.libraryId}
+        playlists={playlists}
+        loading={loading}
+        breadcrumbBar={breadcrumbBar}
+        scrollContainerRef={scrollContainerRef}
+        onNavigateToPlaylist={onNavigateToPlaylist}
+        onPlaylistChanged={onPlaylistChanged}
+        getFullCoverUrl={getFullCoverUrl}
+      />
     );
   }
 
@@ -415,9 +550,14 @@ export function MainContent({
                 <DropdownMenuItem onClick={() => onSortModeChange("alpha")}>
                   Alphabetical
                 </DropdownMenuItem>
-                <DropdownMenuItem onClick={() => onSortModeChange("date")}>
-                  Date
-                </DropdownMenuItem>
+                {/* Date sort is only meaningful for library-scoped grids — playlists have
+                    no uniform release-date semantics, and the user's intent is usually
+                    custom chronological ordering via the Custom option. */}
+                {activeView?.kind !== "playlist-detail" && (
+                  <DropdownMenuItem onClick={() => onSortModeChange("date")}>
+                    Date
+                  </DropdownMenuItem>
+                )}
                 <DropdownMenuItem onClick={() => onSortModeChange("custom")}>
                   Custom
                 </DropdownMenuItem>
@@ -485,7 +625,7 @@ export function MainContent({
           >
             {isInsideCollection && <MoveUpDropZone isActive={dragId != null} />}
             <SortableContext
-              items={filteredEntries.map((e) => e.id)}
+              items={filteredEntries.map(sortableIdFor)}
               strategy={rectSortingStrategy}
             >
               <div
@@ -498,13 +638,16 @@ export function MainContent({
               >
                 {filteredEntries.map((entry) => (
                   <SortableCoverCard
-                    key={entry.id}
+                    key={sortableIdFor(entry)}
+                    sortableId={sortableIdFor(entry)}
                     entry={entry}
                     size={coverSize}
                     onNavigate={onNavigate}
                     onRename={onRenameEntry}
                     onChangeCover={() => openCoverDialog(entry, "select")}
-                    onAddCover={() => onAddCover(entry.id)}
+                    onAddCover={() => onAddCover(entry.id, {
+                      playlistCollection: entry.entry_type === "playlist_collection",
+                    })}
                     onAddCoverFromTmdb={() => openTmdbImages(entry)}
                     onDeleteCover={() => openCoverDialog(entry, "delete")}
                     onDelete={async (entry) => {
@@ -530,6 +673,25 @@ export function MainContent({
                     getCoverUrl={getCoverUrl}
                     isDragActive={dragId != null}
                     sortMode={sortMode}
+                    onAddToPlaylist={selectedLibrary ? (e) => setAddToPlaylistFor(e) : undefined}
+                    onRemoveLink={activeView?.kind === "playlist-detail" ? async (linkId) => {
+                      try {
+                        await invoke("remove_media_link", { linkId });
+                        if (selectedLibrary) onPlaylistChanged(selectedLibrary.id);
+                      } catch (err) {
+                        toast.error(String(err));
+                      }
+                    } : undefined}
+                    onRenamePlaylistCollection={activeView?.kind === "playlist-detail" ? (e) => setRenameCollectionFor(e) : undefined}
+                    onDeletePlaylistCollection={activeView?.kind === "playlist-detail" ? async (e) => {
+                      if (!window.confirm(`Delete collection "${e.title}"? Its links and nested collections will be removed from the playlist.`)) return;
+                      try {
+                        await invoke("delete_playlist_collection", { collectionId: e.id });
+                        if (selectedLibrary) onPlaylistChanged(selectedLibrary.id);
+                      } catch (err) {
+                        toast.error(String(err));
+                      }
+                    } : undefined}
                   />
                 ))}
               </div>
@@ -543,31 +705,39 @@ export function MainContent({
         )}
         </ContextMenuTrigger>
           <ContextMenuContent>
-            {selectedLibrary?.format === "video" && (
+            {activeView?.kind === "playlist-detail" && (
+              <ContextMenuItem onClick={() => setCreateCollectionOpen(true)}>
+                <FolderPlus size={14} />
+                Create collection here
+              </ContextMenuItem>
+            )}
+            {activeView?.kind === "library-root" && selectedLibrary?.format === "video" && (
               <ContextMenuItem onClick={() => { setNewCollectionName(""); setNewCollectionPath(selectedLibrary?.paths[0] ?? ""); setNewCollectionOpen(true); }}>
                 <FolderPlus size={14} />
                 New Collection
               </ContextMenuItem>
             )}
-            <ContextMenuItem onClick={async () => {
-              if (!selectedLibrary) return;
-              const toastId = toast.loading("Rescanning...");
-              const unlisten = await listen<string>("scan-progress", (event) => {
-                toast.loading(event.payload, { id: toastId });
-              });
-              try {
-                await invoke("rescan_library", { libraryId: selectedLibrary.id });
-                toast.success("Rescan complete", { id: toastId });
-                onRescan();
-              } catch (err) {
-                toast.error(String(err), { id: toastId });
-              } finally {
-                unlisten();
-              }
-            }}>
-              <RefreshCw size={14} />
-              Rescan
-            </ContextMenuItem>
+            {activeView?.kind !== "playlist-detail" && (
+              <ContextMenuItem onClick={async () => {
+                if (!selectedLibrary) return;
+                const toastId = toast.loading("Rescanning...");
+                const unlisten = await listen<string>("scan-progress", (event) => {
+                  toast.loading(event.payload, { id: toastId });
+                });
+                try {
+                  await invoke("rescan_library", { libraryId: selectedLibrary.id });
+                  toast.success("Rescan complete", { id: toastId });
+                  onRescan();
+                } catch (err) {
+                  toast.error(String(err), { id: toastId });
+                } finally {
+                  unlisten();
+                }
+              }}>
+                <RefreshCw size={14} />
+                Rescan
+              </ContextMenuItem>
+            )}
           </ContextMenuContent>
       </ContextMenu>
       )}
@@ -726,12 +896,17 @@ export function MainContent({
             if (!open) setCoverDialogEntry(null);
           }}
           onSelect={(coverPath) => {
-            onSetCover(liveCoverDialogEntry.id, coverPath);
+            onSetCover(liveCoverDialogEntry.id, coverPath, {
+              linkId: liveCoverDialogEntry.link_id,
+              playlistCollection: liveCoverDialogEntry.entry_type === "playlist_collection",
+            });
             setCoverDialogEntry(null);
           }}
           onDelete={async (coverPath) => {
             const wasLast = liveCoverDialogEntry.covers.length <= 1;
-            await onDeleteCover(liveCoverDialogEntry.id, coverPath);
+            await onDeleteCover(liveCoverDialogEntry.id, coverPath, {
+              playlistCollection: liveCoverDialogEntry.entry_type === "playlist_collection",
+            });
             if (wasLast) setCoverDialogEntry(null);
           }}
           getCoverUrl={getFullCoverUrl}
@@ -748,6 +923,55 @@ export function MainContent({
           onDownloaded={() => { onEntryChanged(); }}
         />
       )}
+
+      {/* Add-to-playlist dialog (applies anywhere a media entry is right-clicked) */}
+      <AddToPlaylistDialog
+        open={addToPlaylistFor !== null}
+        onOpenChange={(o) => { if (!o) setAddToPlaylistFor(null); }}
+        libraryId={selectedLibrary?.id ?? null}
+        entryId={addToPlaylistFor?.id ?? null}
+        entryTitle={addToPlaylistFor?.title ?? null}
+        onAdded={() => {
+          if (selectedLibrary) onPlaylistChanged(selectedLibrary.id);
+        }}
+      />
+
+      {/* Create-collection-here dialog for right-click inside a playlist-detail view.
+          Parented to the playlist root when collectionId is null, else to the nested collection. */}
+      <CreatePlaylistCollectionDialog
+        open={createCollectionOpen}
+        onOpenChange={setCreateCollectionOpen}
+        parentPlaylistId={
+          activeView?.kind === "playlist-detail" && activeView.collectionId === null
+            ? activeView.playlistId : null
+        }
+        parentCollectionId={
+          activeView?.kind === "playlist-detail" ? activeView.collectionId : null
+        }
+        onCreated={() => {
+          if (selectedLibrary) onPlaylistChanged(selectedLibrary.id);
+        }}
+      />
+
+      {/* Rename-nested-playlist-collection dialog */}
+      <RenameDialog
+        open={renameCollectionFor !== null}
+        onOpenChange={(o) => { if (!o) setRenameCollectionFor(null); }}
+        title="Rename collection"
+        initialValue={renameCollectionFor?.title ?? ""}
+        onSubmit={async (newName) => {
+          if (!renameCollectionFor) return;
+          try {
+            await invoke("rename_playlist_collection", {
+              collectionId: renameCollectionFor.id,
+              newTitle: newName,
+            });
+            if (selectedLibrary) onPlaylistChanged(selectedLibrary.id);
+          } catch (e) {
+            toast.error(String(e));
+          }
+        }}
+      />
     </main>
   );
 }
@@ -762,6 +986,11 @@ function SortableCoverCard({
   onAddCoverFromTmdb,
   onDeleteCover,
   onDelete,
+  onAddToPlaylist,
+  onRemoveLink,
+  onRenamePlaylistCollection,
+  onDeletePlaylistCollection,
+  sortableId,
   getCoverUrl,
   isDragActive,
   sortMode,
@@ -776,6 +1005,14 @@ function SortableCoverCard({
   onAddCoverFromTmdb: () => void;
   onDeleteCover: () => void;
   onDelete: (entry: MediaEntry) => Promise<void>;
+  onAddToPlaylist?: (entry: MediaEntry) => void;
+  onRemoveLink?: (linkId: number) => void;
+  onRenamePlaylistCollection?: (entry: MediaEntry) => void;
+  onDeletePlaylistCollection?: (entry: MediaEntry) => void;
+  /** Overrides the useSortable id. Playlist views need string ids so links and
+   *  nested playlist_collections don't collide with each other or with real
+   *  media_entry ids. Library views can omit this and the card falls back to entry.id. */
+  sortableId?: string | number;
   getCoverUrl: (filePath: string) => string;
   isDragActive: boolean;
   sortMode: string;
@@ -788,21 +1025,26 @@ function SortableCoverCard({
     transform,
     transition,
     isDragging,
-  } = useSortable({ id: entry.id });
+  } = useSortable({ id: sortableId ?? entry.id });
 
   const isCollection = entry.entry_type === "collection";
-  // Collections get an extra droppable so we can detect "move into" vs "reorder"
+  const isPlaylistCollection = entry.entry_type === "playlist_collection";
+  const isDropTarget = isCollection || isPlaylistCollection;
+  // Different prefixes so the drag-end handler knows which backend to call.
+  const dropId = isPlaylistCollection
+    ? `pc-drop-${entry.id}`
+    : `collection-${entry.id}`;
   const { setNodeRef: setCollectionDropRef, isOver } = useDroppable({
-    id: `collection-${entry.id}`,
-    disabled: !isCollection || isDragging,
+    id: dropId,
+    disabled: !isDropTarget || isDragging,
   });
 
   const setRef = useCallback(
     (node: HTMLElement | null) => {
       setSortRef(node);
-      if (isCollection) setCollectionDropRef(node);
+      if (isDropTarget) setCollectionDropRef(node);
     },
-    [setSortRef, setCollectionDropRef, isCollection]
+    [setSortRef, setCollectionDropRef, isDropTarget]
   );
 
   // Only show sort shift animation in custom sort mode
@@ -935,31 +1177,91 @@ function SortableCoverCard({
         </div>
       </ContextMenuTrigger>
       <ContextMenuContent>
-        <ContextMenuItem onClick={startRename}>
-          <Pencil size={14} />
-          Rename
-        </ContextMenuItem>
-        <ContextMenuItem onClick={onAddCover}>
-          <ImageIcon size={14} />
-          Add local cover
-        </ContextMenuItem>
-        <ContextMenuItem onClick={onAddCoverFromTmdb} disabled={entry.entry_type === "collection" || !entry.tmdb_id}>
-          <ImageIcon size={14} />
-          Add cover from TMDB
-        </ContextMenuItem>
-        <ContextMenuItem onClick={onChangeCover} disabled={entry.covers.length <= 1}>
-          <ImageIcon size={14} />
-          Change cover
-        </ContextMenuItem>
-        <ContextMenuItem onClick={onDeleteCover} disabled={entry.covers.length < 1}>
-          <Trash2 size={14} />
-          Delete cover
-        </ContextMenuItem>
-        {!(entry.entry_type === "collection" && entry.child_count > 0) && (
-          <ContextMenuItem onClick={() => onDelete(entry)} className="text-destructive focus:text-destructive">
-            <Trash2 size={14} />
-            {entry.entry_type === "collection" ? "Delete collection" : "Delete media"}
-          </ContextMenuItem>
+        {entry.entry_type === "playlist_collection" ? (
+          <>
+            {onRenamePlaylistCollection && (
+              <ContextMenuItem onClick={() => onRenamePlaylistCollection(entry)}>
+                <Pencil size={14} />
+                Rename
+              </ContextMenuItem>
+            )}
+            <ContextMenuItem onClick={onAddCover}>
+              <ImageIcon size={14} />
+              Add local cover
+            </ContextMenuItem>
+            <ContextMenuItem onClick={onChangeCover} disabled={entry.covers.length <= 1}>
+              <ImageIcon size={14} />
+              Change cover
+            </ContextMenuItem>
+            <ContextMenuItem onClick={onDeleteCover} disabled={entry.covers.length < 1}>
+              <Trash2 size={14} />
+              Delete cover
+            </ContextMenuItem>
+            {onDeletePlaylistCollection && (
+              <ContextMenuItem
+                onClick={() => onDeletePlaylistCollection(entry)}
+                className="text-destructive focus:text-destructive"
+              >
+                <Trash2 size={14} />
+                Delete collection
+              </ContextMenuItem>
+            )}
+          </>
+        ) : (
+          <>
+            {entry.link_id == null && (
+              <ContextMenuItem onClick={startRename}>
+                <Pencil size={14} />
+                Rename
+              </ContextMenuItem>
+            )}
+            {/* Add/Delete cover mutate the target media_entry (shared with the library),
+                which we don't want from inside a playlist — only the per-link cover
+                override (Change cover) is offered there. */}
+            {entry.link_id == null && (
+              <>
+                <ContextMenuItem onClick={onAddCover}>
+                  <ImageIcon size={14} />
+                  Add local cover
+                </ContextMenuItem>
+                <ContextMenuItem onClick={onAddCoverFromTmdb} disabled={entry.entry_type === "collection" || !entry.tmdb_id}>
+                  <ImageIcon size={14} />
+                  Add cover from TMDB
+                </ContextMenuItem>
+              </>
+            )}
+            <ContextMenuItem onClick={onChangeCover} disabled={entry.covers.length <= 1}>
+              <ImageIcon size={14} />
+              Change cover
+            </ContextMenuItem>
+            {entry.link_id == null && (
+              <ContextMenuItem onClick={onDeleteCover} disabled={entry.covers.length < 1}>
+                <Trash2 size={14} />
+                Delete cover
+              </ContextMenuItem>
+            )}
+            {onAddToPlaylist && entry.link_id == null && (entry.entry_type === "movie" || entry.entry_type === "show") && (
+              <ContextMenuItem onClick={() => onAddToPlaylist(entry)}>
+                <ListPlus size={14} />
+                Add to playlist
+              </ContextMenuItem>
+            )}
+            {onRemoveLink && entry.link_id != null && (
+              <ContextMenuItem
+                onClick={() => onRemoveLink(entry.link_id!)}
+                className="text-destructive focus:text-destructive"
+              >
+                <Trash2 size={14} />
+                Remove from playlist
+              </ContextMenuItem>
+            )}
+            {entry.link_id == null && !(entry.entry_type === "collection" && entry.child_count > 0) && (
+              <ContextMenuItem onClick={() => onDelete(entry)} className="text-destructive focus:text-destructive">
+                <Trash2 size={14} />
+                {entry.entry_type === "collection" ? "Delete collection" : "Delete media"}
+              </ContextMenuItem>
+            )}
+          </>
         )}
       </ContextMenuContent>
     </ContextMenu>
@@ -2236,5 +2538,241 @@ function PersonDetailHeader({
         </p>
       </div>
     </div>
+  );
+}
+
+// ── Playlists grid view ─────────────────────────────────────────────
+// Shows the user's playlists as clickable cards. Right-click on a card offers
+// Rename / Delete / Create playlist (peer); right-click on the grid background
+// offers Create playlist. Uses the shared RenameDialog for name edits.
+
+function PlaylistsView({
+  libraryId,
+  playlists,
+  loading,
+  breadcrumbBar,
+  scrollContainerRef,
+  onNavigateToPlaylist,
+  onPlaylistChanged,
+  getFullCoverUrl,
+}: {
+  libraryId: string;
+  playlists: PlaylistSummary[] | null;
+  loading: boolean;
+  breadcrumbBar: React.ReactNode;
+  scrollContainerRef: RefObject<HTMLDivElement | null>;
+  onNavigateToPlaylist: (p: PlaylistSummary) => void;
+  onPlaylistChanged: (libraryId: string) => void;
+  getFullCoverUrl: (filePath: string) => string;
+}) {
+  const [createOpen, setCreateOpen] = useState(false);
+  const [renameTarget, setRenameTarget] = useState<PlaylistSummary | null>(null);
+  const [coverDialog, setCoverDialog] = useState<{ playlist: PlaylistSummary; mode: "select" | "delete" } | null>(null);
+
+  async function handleDelete(p: PlaylistSummary) {
+    if (!window.confirm(`Delete playlist "${p.title}"? The linked media will not be deleted.`)) return;
+    try {
+      await invoke("delete_playlist", { playlistId: p.id });
+      onPlaylistChanged(libraryId);
+    } catch (e) {
+      toast.error(String(e));
+    }
+  }
+
+  async function handleAddCover(p: PlaylistSummary) {
+    const selected = await openDialog({
+      multiple: false,
+      directory: false,
+      filters: [{ name: "Image", extensions: ["jpg", "jpeg", "png", "webp", "bmp", "gif"] }],
+    });
+    if (!selected || typeof selected !== "string") return;
+    try {
+      await invoke("add_playlist_cover", { playlistId: p.id, sourcePath: selected });
+      onPlaylistChanged(libraryId);
+    } catch (e) {
+      toast.error(String(e));
+    }
+  }
+
+  // Synthesized MediaEntry passed to CoverCarouselDialog — only the fields it reads
+  // (title, covers, selected_cover) need to be set.
+  const dialogEntry: MediaEntry | null = coverDialog
+    ? {
+        id: coverDialog.playlist.id,
+        title: coverDialog.playlist.title,
+        year: null,
+        end_year: null,
+        folder_path: "",
+        parent_id: null,
+        entry_type: "playlist",
+        covers: coverDialog.playlist.covers,
+        selected_cover: coverDialog.playlist.selected_cover,
+        child_count: 0,
+        season_display: null,
+        collection_display: null,
+        tmdb_id: null,
+        link_id: null,
+      }
+    : null;
+
+  return (
+    <main className="flex flex-1 flex-col overflow-hidden bg-background">
+      {breadcrumbBar}
+      <ContextMenu>
+        <ContextMenuTrigger render={<div ref={scrollContainerRef} className="flex-1 overflow-y-auto" />}>
+          {loading && <p className="p-4 text-sm text-muted-foreground">Loading…</p>}
+          {!loading && playlists && playlists.length === 0 && (
+            <p className="p-4 text-sm text-muted-foreground">No playlists yet. Right-click here to create one.</p>
+          )}
+          {!loading && playlists && playlists.length > 0 && (
+            <div
+              className="grid gap-4 p-4"
+              style={{ gridTemplateColumns: "repeat(auto-fill, minmax(160px, 1fr))" }}
+            >
+              {playlists.map((pl) => (
+                <PlaylistCard
+                  key={pl.id}
+                  playlist={pl}
+                  onClick={() => onNavigateToPlaylist(pl)}
+                  onRename={() => setRenameTarget(pl)}
+                  onDelete={() => handleDelete(pl)}
+                  onCreatePeer={() => setCreateOpen(true)}
+                  onAddCover={() => handleAddCover(pl)}
+                  onChangeCover={() => setCoverDialog({ playlist: pl, mode: "select" })}
+                  onDeleteCover={() => setCoverDialog({ playlist: pl, mode: "delete" })}
+                />
+              ))}
+            </div>
+          )}
+        </ContextMenuTrigger>
+        <ContextMenuContent>
+          <ContextMenuItem onClick={() => setCreateOpen(true)}>
+            <FolderPlus size={14} />
+            Create playlist
+          </ContextMenuItem>
+        </ContextMenuContent>
+      </ContextMenu>
+      <CreatePlaylistDialog
+        libraryId={libraryId}
+        open={createOpen}
+        onOpenChange={setCreateOpen}
+        onCreated={() => onPlaylistChanged(libraryId)}
+      />
+      <RenameDialog
+        open={renameTarget !== null}
+        onOpenChange={(o) => { if (!o) setRenameTarget(null); }}
+        title="Rename playlist"
+        initialValue={renameTarget?.title ?? ""}
+        onSubmit={async (newName) => {
+          if (!renameTarget) return;
+          try {
+            await invoke("rename_playlist", { playlistId: renameTarget.id, newTitle: newName });
+            onPlaylistChanged(libraryId);
+          } catch (e) {
+            toast.error(String(e));
+          }
+        }}
+      />
+      {dialogEntry && coverDialog && (
+        <CoverCarouselDialog
+          entry={dialogEntry}
+          mode={coverDialog.mode}
+          open={coverDialog !== null}
+          onOpenChange={(open) => { if (!open) setCoverDialog(null); }}
+          onSelect={async (coverPath) => {
+            try {
+              await invoke("set_playlist_cover", { playlistId: coverDialog.playlist.id, coverPath });
+              onPlaylistChanged(libraryId);
+            } catch (e) {
+              toast.error(String(e));
+            }
+            setCoverDialog(null);
+          }}
+          onDelete={async (coverPath) => {
+            const wasLast = coverDialog.playlist.covers.length <= 1;
+            try {
+              await invoke("delete_playlist_cover", { playlistId: coverDialog.playlist.id, coverPath });
+              onPlaylistChanged(libraryId);
+            } catch (e) {
+              toast.error(String(e));
+            }
+            if (wasLast) setCoverDialog(null);
+          }}
+          getCoverUrl={getFullCoverUrl}
+        />
+      )}
+    </main>
+  );
+}
+
+function PlaylistCard({
+  playlist,
+  onClick,
+  onRename,
+  onDelete,
+  onCreatePeer,
+  onAddCover,
+  onChangeCover,
+  onDeleteCover,
+}: {
+  playlist: PlaylistSummary;
+  onClick: () => void;
+  onRename: () => void;
+  onDelete: () => void;
+  onCreatePeer: () => void;
+  onAddCover: () => void;
+  onChangeCover: () => void;
+  onDeleteCover: () => void;
+}) {
+  const coverSrc = playlist.selected_cover ? convertFileSrc(playlist.selected_cover) : null;
+  return (
+    <ContextMenu>
+      <ContextMenuTrigger
+        render={
+          <button
+            onClick={onClick}
+            onContextMenu={(e) => e.stopPropagation()}
+            className="flex flex-col gap-2 rounded-md text-left transition-colors hover:bg-accent/40 focus:bg-accent/60 focus:outline-none"
+          />
+        }
+      >
+        <div className="relative aspect-[2/3] overflow-hidden rounded-md bg-muted">
+          {coverSrc ? (
+            <img src={coverSrc} alt={playlist.title} className="h-full w-full object-cover" draggable={false} />
+          ) : (
+            <div className="flex h-full w-full items-center justify-center text-muted-foreground">
+              <ListMusic size={36} />
+            </div>
+          )}
+        </div>
+        <p className="line-clamp-2 px-1 text-sm font-medium">{playlist.title}</p>
+      </ContextMenuTrigger>
+      <ContextMenuContent>
+        <ContextMenuItem onClick={onRename}>
+          <Pencil size={14} />
+          Rename
+        </ContextMenuItem>
+        <ContextMenuItem onClick={onAddCover}>
+          <ImageIcon size={14} />
+          Add local cover
+        </ContextMenuItem>
+        <ContextMenuItem onClick={onChangeCover} disabled={playlist.covers.length <= 1}>
+          <ImageIcon size={14} />
+          Change cover
+        </ContextMenuItem>
+        <ContextMenuItem onClick={onDeleteCover} disabled={playlist.covers.length < 1}>
+          <Trash2 size={14} />
+          Delete cover
+        </ContextMenuItem>
+        <ContextMenuItem onClick={onCreatePeer}>
+          <FolderPlus size={14} />
+          Create playlist
+        </ContextMenuItem>
+        <ContextMenuItem onClick={onDelete} className="text-destructive focus:text-destructive">
+          <Trash2 size={14} />
+          Delete
+        </ContextMenuItem>
+      </ContextMenuContent>
+    </ContextMenu>
   );
 }
