@@ -460,7 +460,12 @@ function App() {
       setSelectedEntry(null);
       setSearch("");
       setForwardStack([]);
-      loadView(view, null, [{ id: null, title: library.name, view }], false);
+      // Clicking the library header lands on library-root. The top-level breadcrumb
+      // always bakes the library name into its label so the user sees "<lib> - All".
+      const libRoot: ViewSpec = { kind: "library-root", libraryId: library.id };
+      loadView(view, null, [
+        { id: null, title: `${library.name} - All`, view: libRoot },
+      ], false);
     },
     [loadView]
   );
@@ -476,13 +481,22 @@ function App() {
       setForwardStack([]);
       const lib = libraries.find((l) => l.id === view.libraryId);
       const libLabel = lib?.name ?? "Library";
+      // Top-level sidebar views render as a single "<library> - <section>" crumb; deeper
+      // views keep their own sub-crumbs after. No standalone library button.
+      const rootLabel = (kind: ViewSpec["kind"]): string => {
+        const section =
+          kind === "library-root" ? "All"
+          : kind === "movies-only" ? "Movies"
+          : kind === "shows-only" ? "TV"
+          : kind === "people-all" || kind === "people-list" || kind === "person-detail" ? "People"
+          : kind === "playlists" || kind === "playlist-detail" ? "Playlists"
+          : "";
+        return section ? `${libLabel} - ${section}` : libLabel;
+      };
 
-      // Build the breadcrumb chain that should anchor this view. People subcategories
-      // are always nested under the "People" parent so drilling preserves that context
-      // and clicking "People" in the crumbs returns to the unioned list.
       let chain: BreadcrumbItem[];
       if (view.kind === "people-all") {
-        chain = [{ id: null, title: "People", view }];
+        chain = [{ id: null, title: rootLabel("people-all"), view }];
       } else if (view.kind === "people-list") {
         const peopleAll: ViewSpec = { kind: "people-all", libraryId: view.libraryId };
         const roleLabel =
@@ -491,7 +505,7 @@ function App() {
           : view.role === "composer" ? "Composers"
           : "People";
         chain = [
-          { id: null, title: "People", view: peopleAll },
+          { id: null, title: rootLabel("people-all"), view: peopleAll },
           { id: null, title: roleLabel, view },
         ];
       } else if (view.kind === "person-detail") {
@@ -499,22 +513,13 @@ function App() {
         // for programmatic selectView() calls with person-detail. Use navigateToPerson for drilling.
         chain = [{ id: null, title: view.personName, view }];
       } else if (view.kind === "playlist-detail") {
-        // Sidebar may now click a playlist directly (it appears as a child of the
-        // Playlists node). Build a two-step chain so the breadcrumb reads
-        // "Playlists > <PlaylistName>".
         const playlistsRoot: ViewSpec = { kind: "playlists", libraryId: view.libraryId };
         chain = [
-          { id: null, title: "Playlists", view: playlistsRoot },
+          { id: null, title: rootLabel("playlists"), view: playlistsRoot },
           { id: view.playlistId, title: view.playlistName, view },
         ];
       } else {
-        const label =
-          view.kind === "library-root" ? libLabel
-          : view.kind === "movies-only" ? "Movies"
-          : view.kind === "shows-only" ? "TV"
-          : view.kind === "playlists" ? "Playlists"
-          : libLabel;
-        chain = [{ id: null, title: label, view }];
+        chain = [{ id: null, title: rootLabel(view.kind), view }];
       }
 
       loadView(view, null, chain, false);
