@@ -33,6 +33,8 @@ POSSIBLY FIXED: weird bugs when changing and viewing media covers, specifically 
 
 ## BIG STUFF NOW
 
+RENAME TV SHOW FROM DETAIL VIEW
+
 going into collections and adding things to playlist makes app forget scroll location on prev menu sometimes MAYBE. Seems to be when I go back by clicking previous breadcrumbs after adding things to playlist
 
 adding year to media should add it to movie/show folder name

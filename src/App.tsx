@@ -1,9 +1,11 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import "./App.css";
 import { Titlebar } from "@/components/Titlebar";
 import { Sidebar } from "@/components/Sidebar";
 import { MainContent } from "@/components/MainContent";
+import { CoverUrlProvider } from "@/context/CoverUrlContext";
+import { LibraryProvider } from "@/context/LibraryContext";
 import { PlayerView } from "@/components/PlayerView";
 import { usePlayer } from "@/hooks/usePlayer";
 import { Toaster } from "@/components/ui/sonner";
@@ -152,6 +154,13 @@ function App() {
   const getFullCoverUrl = useCallback((filePath: string): string => {
     return convertFileSrc(filePath);
   }, []);
+
+  // Stable value object for CoverUrlProvider; memoized so context consumers don't re-render
+  // every time App re-renders with unrelated state changes.
+  const coverUrlValue = useMemo(
+    () => ({ getCoverUrl, getFullCoverUrl }),
+    [getCoverUrl, getFullCoverUrl],
+  );
 
   const loadLibraries = useCallback(async () => {
     try {
@@ -1522,6 +1531,8 @@ function App() {
           playerState={playerState}
           playerActions={playerActions}
         />
+        <CoverUrlProvider value={coverUrlValue}>
+        <LibraryProvider value={selectedLibrary}>
         <MainContent
           entries={entries}
           people={people}
@@ -1583,6 +1594,8 @@ function App() {
           onPlayFile={handlePlayFile}
           onPlayEpisode={handlePlayEpisode}
         />
+        </LibraryProvider>
+        </CoverUrlProvider>
       </div>
       <Toaster position="top-center" />
     </div>
