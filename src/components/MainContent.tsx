@@ -8,7 +8,6 @@ import {
   BreadcrumbSeparator,
 } from "@/components/ui/breadcrumb";
 import type {
-  Library,
   MediaEntry,
   BreadcrumbItem,
   ViewSpec,
@@ -41,8 +40,6 @@ interface MainContentProps {
   onNavigateToPlaylist: (playlist: PlaylistSummary) => void;
   onPlaylistChanged: (libraryId: string) => void;
   onBreadcrumbClick: (index: number) => void;
-  /** Still accepted for API stability — internal consumers now read from LibraryContext. */
-  selectedLibrary: Library | null;
   hasLibraries: boolean;
   sortMode: string;
   onSortModeChange: (mode: string) => void;
@@ -74,10 +71,6 @@ interface MainContentProps {
   onDeleteEntry: (entryId: number, deleteFromDisk: boolean) => Promise<void>;
   onRescan: () => void;
   onEntryChanged: () => void;
-  /** Accepted but unused — view components consume it from CoverUrlContext. */
-  getCoverUrl?: (filePath: string) => string;
-  /** Accepted but unused — view components consume it from CoverUrlContext. */
-  getFullCoverUrl?: (filePath: string) => string;
   scrollContainerRef: RefObject<HTMLDivElement | null>;
   onPlayFile?: (path: string, title: string) => void;
   onPlayEpisode?: (args: {

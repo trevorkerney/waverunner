@@ -1551,7 +1551,6 @@ function App() {
           onNavigateToPlaylist={navigateToPlaylist}
           onPlaylistChanged={handlePlaylistChanged}
           onBreadcrumbClick={navigateBreadcrumb}
-          selectedLibrary={selectedLibrary}
           hasLibraries={libraries.length > 0}
           sortMode={sortMode}
           onSortModeChange={changeSortMode}
@@ -1588,8 +1587,6 @@ function App() {
               loadEntries(selectedLibrary, parentId, breadcrumbs);
             }
           }}
-          getCoverUrl={getCoverUrl}
-          getFullCoverUrl={getFullCoverUrl}
           scrollContainerRef={scrollContainerRef}
           onPlayFile={handlePlayFile}
           onPlayEpisode={handlePlayEpisode}
