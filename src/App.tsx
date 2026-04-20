@@ -230,6 +230,15 @@ function App() {
     }
     const timer = setTimeout(async () => {
       try {
+        // Person-detail: search is client-side over the already-loaded person entries.
+        // The backend's search_entries is library-scoped (by parent_id), not person-scoped,
+        // so it would return unrelated results. Person result sets are small, substring
+        // match is fine.
+        if (activeView?.kind === "person-detail") {
+          const q = search.trim().toLowerCase();
+          setSearchResults(entries.filter((e) => e.title.toLowerCase().includes(q)));
+          return;
+        }
         const parentId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
         const results = await invoke<MediaEntry[]>("search_entries", {
           libraryId: selectedLibrary.id,
@@ -250,7 +259,7 @@ function App() {
       }
     }, 200);
     return () => clearTimeout(timer);
-  }, [search, selectedLibrary, breadcrumbs, activeView, preloadCovers]);
+  }, [search, selectedLibrary, breadcrumbs, activeView, entries, preloadCovers]);
 
   const saveScrollPosition = useCallback(() => {
     if (!selectedLibrary || !scrollContainerRef.current) return;

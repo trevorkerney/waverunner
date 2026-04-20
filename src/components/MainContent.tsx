@@ -103,52 +103,46 @@ export function MainContent(props: MainContentProps) {
     </Breadcrumb>
   );
 
-  // Pulled out so both library / playlist-detail / person-detail call sites share the
-  // same fat prop bag without repeating 30 lines.
-  const gridCommon = {
-    breadcrumbBar,
-    breadcrumbs,
-    entries: props.entries,
-    searchResults: props.searchResults,
-    selectedEntry: props.selectedEntry,
-    loading: props.loading,
-    hasLibraries: props.hasLibraries,
-    coverSize: props.coverSize,
-    onCoverSizeChange: props.onCoverSizeChange,
-    search: props.search,
-    onSearchChange: props.onSearchChange,
-    sortMode: props.sortMode,
-    onSortModeChange: props.onSortModeChange,
-    presets: props.presets,
-    selectedPresetId: props.selectedPresetId,
-    onChangePreset: props.onChangePreset,
-    onSavePreset: props.onSavePreset,
-    onDeletePreset: props.onDeletePreset,
-    onSortOrderChange: props.onSortOrderChange,
-    onNavigate: props.onNavigate,
-    onRenameEntry: props.onRenameEntry,
-    onTitleChanged: props.onTitleChanged,
-    onSetCover: props.onSetCover,
-    onAddCover: props.onAddCover,
-    onDeleteCover: props.onDeleteCover,
-    onMoveEntry: props.onMoveEntry,
-    onCreateCollection: props.onCreateCollection,
-    onDeleteEntry: props.onDeleteEntry,
-    onRescan: props.onRescan,
-    onEntryChanged: props.onEntryChanged,
-    onPlaylistChanged: props.onPlaylistChanged,
-    scrollContainerRef: props.scrollContainerRef,
-    onPlayFile: props.onPlayFile,
-    onPlayEpisode: props.onPlayEpisode,
-  };
-
   if (!activeView) {
-    // Render the library-root shell anyway so the empty-state UI (no libraries / no
-    // selection) shows up inside the normal main area.
+    // Empty state (no library selected, or no libraries yet) renders inside LibraryGridView's
+    // shell so the user sees the normal main area rather than a bare div.
     return (
       <LibraryGridView
         view={{ kind: "library-root", libraryId: "" }}
-        {...gridCommon}
+        breadcrumbBar={breadcrumbBar}
+        breadcrumbs={breadcrumbs}
+        entries={props.entries}
+        searchResults={props.searchResults}
+        selectedEntry={props.selectedEntry}
+        loading={props.loading}
+        hasLibraries={props.hasLibraries}
+        coverSize={props.coverSize}
+        onCoverSizeChange={props.onCoverSizeChange}
+        search={props.search}
+        onSearchChange={props.onSearchChange}
+        sortMode={props.sortMode}
+        onSortModeChange={props.onSortModeChange}
+        presets={props.presets}
+        selectedPresetId={props.selectedPresetId}
+        onChangePreset={props.onChangePreset}
+        onSavePreset={props.onSavePreset}
+        onDeletePreset={props.onDeletePreset}
+        onSortOrderChange={props.onSortOrderChange}
+        onNavigate={props.onNavigate}
+        onRenameEntry={props.onRenameEntry}
+        onTitleChanged={props.onTitleChanged}
+        onSetCover={props.onSetCover}
+        onAddCover={props.onAddCover}
+        onDeleteCover={props.onDeleteCover}
+        onMoveEntry={props.onMoveEntry}
+        onCreateCollection={props.onCreateCollection}
+        onDeleteEntry={props.onDeleteEntry}
+        onRescan={props.onRescan}
+        onEntryChanged={props.onEntryChanged}
+        onPlaylistChanged={props.onPlaylistChanged}
+        scrollContainerRef={props.scrollContainerRef}
+        onPlayFile={props.onPlayFile}
+        onPlayEpisode={props.onPlayEpisode}
       />
     );
   }
@@ -179,12 +173,110 @@ export function MainContent(props: MainContentProps) {
         />
       );
     case "playlist-detail":
-      return <PlaylistDetailView view={activeView} {...gridCommon} />;
+      return (
+        <PlaylistDetailView
+          view={activeView}
+          breadcrumbBar={breadcrumbBar}
+          breadcrumbs={breadcrumbs}
+          entries={props.entries}
+          searchResults={props.searchResults}
+          selectedEntry={props.selectedEntry}
+          loading={props.loading}
+          coverSize={props.coverSize}
+          onCoverSizeChange={props.onCoverSizeChange}
+          search={props.search}
+          onSearchChange={props.onSearchChange}
+          sortMode={props.sortMode}
+          onSortModeChange={props.onSortModeChange}
+          presets={props.presets}
+          selectedPresetId={props.selectedPresetId}
+          onChangePreset={props.onChangePreset}
+          onSavePreset={props.onSavePreset}
+          onDeletePreset={props.onDeletePreset}
+          onSortOrderChange={props.onSortOrderChange}
+          onNavigate={props.onNavigate}
+          onRenameEntry={props.onRenameEntry}
+          onTitleChanged={props.onTitleChanged}
+          onSetCover={props.onSetCover}
+          onAddCover={props.onAddCover}
+          onDeleteCover={props.onDeleteCover}
+          onDeleteEntry={props.onDeleteEntry}
+          onEntryChanged={props.onEntryChanged}
+          onPlaylistChanged={props.onPlaylistChanged}
+          scrollContainerRef={props.scrollContainerRef}
+          onPlayFile={props.onPlayFile}
+          onPlayEpisode={props.onPlayEpisode}
+        />
+      );
     case "person-detail":
-      return <PersonDetailView view={activeView} {...gridCommon} />;
+      return (
+        <PersonDetailView
+          view={activeView}
+          breadcrumbBar={breadcrumbBar}
+          entries={props.entries}
+          searchResults={props.searchResults}
+          selectedEntry={props.selectedEntry}
+          loading={props.loading}
+          coverSize={props.coverSize}
+          onCoverSizeChange={props.onCoverSizeChange}
+          search={props.search}
+          onSearchChange={props.onSearchChange}
+          sortMode={props.sortMode}
+          onSortModeChange={props.onSortModeChange}
+          onNavigate={props.onNavigate}
+          onRenameEntry={props.onRenameEntry}
+          onTitleChanged={props.onTitleChanged}
+          onSetCover={props.onSetCover}
+          onAddCover={props.onAddCover}
+          onDeleteCover={props.onDeleteCover}
+          onEntryChanged={props.onEntryChanged}
+          onPlaylistChanged={props.onPlaylistChanged}
+          scrollContainerRef={props.scrollContainerRef}
+          onPlayFile={props.onPlayFile}
+          onPlayEpisode={props.onPlayEpisode}
+        />
+      );
     case "library-root":
     case "movies-only":
     case "shows-only":
-      return <LibraryGridView view={activeView} {...gridCommon} />;
+      return (
+        <LibraryGridView
+          view={activeView}
+          breadcrumbBar={breadcrumbBar}
+          breadcrumbs={breadcrumbs}
+          entries={props.entries}
+          searchResults={props.searchResults}
+          selectedEntry={props.selectedEntry}
+          loading={props.loading}
+          hasLibraries={props.hasLibraries}
+          coverSize={props.coverSize}
+          onCoverSizeChange={props.onCoverSizeChange}
+          search={props.search}
+          onSearchChange={props.onSearchChange}
+          sortMode={props.sortMode}
+          onSortModeChange={props.onSortModeChange}
+          presets={props.presets}
+          selectedPresetId={props.selectedPresetId}
+          onChangePreset={props.onChangePreset}
+          onSavePreset={props.onSavePreset}
+          onDeletePreset={props.onDeletePreset}
+          onSortOrderChange={props.onSortOrderChange}
+          onNavigate={props.onNavigate}
+          onRenameEntry={props.onRenameEntry}
+          onTitleChanged={props.onTitleChanged}
+          onSetCover={props.onSetCover}
+          onAddCover={props.onAddCover}
+          onDeleteCover={props.onDeleteCover}
+          onMoveEntry={props.onMoveEntry}
+          onCreateCollection={props.onCreateCollection}
+          onDeleteEntry={props.onDeleteEntry}
+          onRescan={props.onRescan}
+          onEntryChanged={props.onEntryChanged}
+          onPlaylistChanged={props.onPlaylistChanged}
+          scrollContainerRef={props.scrollContainerRef}
+          onPlayFile={props.onPlayFile}
+          onPlayEpisode={props.onPlayEpisode}
+        />
+      );
   }
 }

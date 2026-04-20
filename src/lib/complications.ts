@@ -1,4 +1,14 @@
-import type { ComplicationNode, Library, PlaylistSummary, ViewSpec } from "@/types";
+import type { ComplicationNode, Library, MediaEntry, PlaylistSummary, ViewSpec } from "@/types";
+
+/** Stable, collision-free sortable id for a grid entry. Playlist links use their `link_id`
+ *  (distinct across playlists); nested playlist_collections use `pc-<id>` so they don't
+ *  collide with real media_entry ids. Everything else keeps its numeric media_entry id so
+ *  existing library drag-and-drop / update_sort_order flows keep working. */
+export function sortableIdFor(entry: MediaEntry): string | number {
+  if (entry.link_id != null) return `link-${entry.link_id}`;
+  if (entry.entry_type === "playlist_collection") return `pc-${entry.id}`;
+  return entry.id;
+}
 
 export function getComplicationsForLibrary(
   library: Library,
