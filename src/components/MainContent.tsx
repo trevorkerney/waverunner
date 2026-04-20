@@ -583,9 +583,13 @@ export function MainContent({
                     Date
                   </DropdownMenuItem>
                 )}
-                <DropdownMenuItem onClick={() => { onSortModeChange("custom"); onChangePreset(null); }}>
-                  Custom
-                </DropdownMenuItem>
+                {/* Person-detail spans multiple library parents — there's no per-person
+                    sort_order to persist — so hide Custom there. Alpha/Date are plenty. */}
+                {activeView?.kind !== "person-detail" && (
+                  <DropdownMenuItem onClick={() => { onSortModeChange("custom"); onChangePreset(null); }}>
+                    Custom
+                  </DropdownMenuItem>
+                )}
                 {presets.length > 0 && <DropdownMenuSeparator />}
                 {presets.map((p) => (
                   <DropdownMenuItem
@@ -650,6 +654,67 @@ export function MainContent({
         selectedEntry.entry_type === "show"
           ? <ShowDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getFullCoverUrl={getFullCoverUrl} onEntryChanged={onEntryChanged} onTitleChanged={onTitleChanged} onChangeCover={() => openCoverDialog(selectedEntry, "select")} onAddCover={() => onAddCover(selectedEntry.id)} onDeleteCover={() => openCoverDialog(selectedEntry, "delete")} onPlayEpisode={onPlayEpisode} />
           : <EntryDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getFullCoverUrl={getFullCoverUrl} onEntryChanged={onEntryChanged} onTitleChanged={onTitleChanged} onChangeCover={() => openCoverDialog(selectedEntry, "select")} onAddCover={() => onAddCover(selectedEntry.id)} onDeleteCover={() => openCoverDialog(selectedEntry, "delete")} onPlayFile={onPlayFile} />
+      ) : activeView?.kind === "person-detail" ? (
+        // Person-detail reuses the same grid rendering as library views but must not expose
+        // the library context menu (Rescan / New Collection) on the background. Render the
+        // same content inside a plain div, skipping the <ContextMenu> wrapper entirely.
+        <div className="flex min-h-full flex-col" onContextMenu={(e) => e.preventDefault()}>
+          {!selectedLibrary ? null : loading ? (
+            <div className="flex flex-1 items-center justify-center">
+              <Spinner className="size-6" />
+            </div>
+          ) : filteredEntries.length === 0 ? (
+            <p className="text-sm text-muted-foreground">
+              {search ? "No results" : "Empty"}
+            </p>
+          ) : (
+            <DndContext
+              sensors={sensors}
+              collisionDetection={collisionDetection}
+              onDragStart={handleDragStart}
+              onDragEnd={handleDragEnd}
+              onDragCancel={() => setDragId(null)}
+            >
+              <SortableContext items={filteredEntries.map(sortableIdFor)} strategy={rectSortingStrategy}>
+                <div
+                  className="grid gap-4"
+                  style={{
+                    gridTemplateColumns: `repeat(auto-fill, minmax(${coverSize}px, 1fr))`,
+                    alignItems: "center",
+                    justifyItems: "center",
+                  }}
+                >
+                  {filteredEntries.map((entry) => (
+                    <SortableCoverCard
+                      key={sortableIdFor(entry)}
+                      sortableId={sortableIdFor(entry)}
+                      entry={entry}
+                      size={coverSize}
+                      onNavigate={onNavigate}
+                      onRename={onRenameEntry}
+                      onChangeCover={() => openCoverDialog(entry, "select")}
+                      onAddCover={() => onAddCover(entry.id, { playlistCollection: entry.entry_type === "playlist_collection" })}
+                      onAddCoverFromTmdb={() => openTmdbImages(entry)}
+                      onDeleteCover={() => openCoverDialog(entry, "delete")}
+                      onDelete={async () => { /* no-op in person-detail, readOnly hides the item anyway */ }}
+                      deletingId={deletingId}
+                      getCoverUrl={getCoverUrl}
+                      isDragActive={dragId != null}
+                      sortMode={sortMode}
+                      onAddToPlaylist={selectedLibrary ? (e) => setAddToPlaylistFor(e) : undefined}
+                      readOnly
+                    />
+                  ))}
+                </div>
+              </SortableContext>
+              <DragOverlay>
+                {dragEntry && (
+                  <DragOverlayCard entry={dragEntry} size={coverSize} getCoverUrl={getCoverUrl} />
+                )}
+              </DragOverlay>
+            </DndContext>
+          )}
+        </div>
       ) : (
       <ContextMenu>
         <ContextMenuTrigger render={<div className="flex min-h-full flex-col" />}>
@@ -1066,6 +1131,7 @@ function SortableCoverCard({
   isDragActive,
   sortMode,
   deletingId,
+  readOnly,
 }: {
   entry: MediaEntry;
   size: number;
@@ -1088,6 +1154,10 @@ function SortableCoverCard({
   isDragActive: boolean;
   sortMode: string;
   deletingId: number | null;
+  /** Hides every mutating context-menu option on this card — used by person-detail where
+   *  library-level edits don't belong. "Add to playlist" is still available via its own
+   *  handler. */
+  readOnly?: boolean;
 }) {
   const {
     attributes,
@@ -1280,7 +1350,7 @@ function SortableCoverCard({
           </>
         ) : (
           <>
-            {entry.link_id == null && (
+            {!readOnly && entry.link_id == null && (
               <ContextMenuItem onClick={startRename}>
                 <Pencil size={14} />
                 Rename
@@ -1288,8 +1358,8 @@ function SortableCoverCard({
             )}
             {/* Add/Delete cover mutate the target media_entry (shared with the library),
                 which we don't want from inside a playlist — only the per-link cover
-                override (Change cover) is offered there. */}
-            {entry.link_id == null && (
+                override (Change cover) is offered there. person-detail hides them too. */}
+            {!readOnly && entry.link_id == null && (
               <>
                 <ContextMenuItem onClick={onAddCover}>
                   <ImageIcon size={14} />
@@ -1301,11 +1371,13 @@ function SortableCoverCard({
                 </ContextMenuItem>
               </>
             )}
-            <ContextMenuItem onClick={onChangeCover} disabled={entry.covers.length <= 1}>
-              <ImageIcon size={14} />
-              Change cover
-            </ContextMenuItem>
-            {entry.link_id == null && (
+            {!readOnly && (
+              <ContextMenuItem onClick={onChangeCover} disabled={entry.covers.length <= 1}>
+                <ImageIcon size={14} />
+                Change cover
+              </ContextMenuItem>
+            )}
+            {!readOnly && entry.link_id == null && (
               <ContextMenuItem onClick={onDeleteCover} disabled={entry.covers.length < 1}>
                 <Trash2 size={14} />
                 Delete cover
@@ -1326,7 +1398,7 @@ function SortableCoverCard({
                 Remove from playlist
               </ContextMenuItem>
             )}
-            {entry.link_id == null && !(entry.entry_type === "collection" && entry.child_count > 0) && (
+            {!readOnly && entry.link_id == null && !(entry.entry_type === "collection" && entry.child_count > 0) && (
               <ContextMenuItem onClick={() => onDelete(entry)} className="text-destructive focus:text-destructive">
                 <Trash2 size={14} />
                 {entry.entry_type === "collection" ? "Delete collection" : "Delete media"}

@@ -20,21 +20,7 @@ on the first time someone sets sort mode to custom OR creates a collection, show
 
 go through everything ensuring compatibility with MacOS and Linux
 
-custom collections / playlists / whatever you want to call it - user should be able to create custom collections
-
 save cover sets. users should be able to save a set of media covers so that they can easily switch all media covers in a library to the saved set. 
-
-
-
-sidebar complications (complications like a watch)
-  - movies/tv
-    - just movies
-    - just tv
-    - people
-      - actors
-      - directors/producers
-      - composers
-    - custom collections/playlists
 
 rotten tomatoes (audience especially) and imdb (maybe metacritic) ratings as well as personal ratings
 
@@ -44,14 +30,15 @@ add warning when playing entire seasons without episode numbers (they will likel
 
 POSSIBLY FIXED: weird bugs when changing and viewing media covers, specifically when looking at the hobbit collection media and john wick 3. only pattern i see here is media inside collections, idk tho. basically it is just not displaying covers in the change cover and delete cover menus, which messes up their ui pretty bad. also when this happens the cover doesnt show up in detail view sometimes
 
-adding year to media should add it to movie/show folder name
-
 
 ## BIG STUFF NOW
 
-remember size slider better maybe
+going into collections and adding things to playlist makes app forget scroll location on prev menu sometimes MAYBE. Seems to be when I go back by clicking previous breadcrumbs after adding things to playlist
 
-save custom sort sets. users should be able to create and name custom sorting sets and easily switch to them (i.e. named sorting sets based on things not in metadata like 'chronological')
+adding year to media should add it to movie/show folder name
+- add automatic TMDB matches for movies with title and release year
+
+remember size slider better maybe
 
 need to consider some sort of ability to queue up things for the player. TV show autoplay should probably take this system into heavy consideration. Users should be able to queue playlists. Users should be able to queue up individual movies in context menus at their whim. On the player and maybe not on the player, the user should be able to view the queue and manipulate it in a dialog or sidebar or something
 

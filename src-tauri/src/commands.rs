@@ -32,6 +32,77 @@ fn sanitize_filename(name: &str) -> String {
         .to_string()
 }
 
+/// Rename a file or directory. On Windows, if `std::fs::rename` fails (commonly with
+/// error 5 ACCESS_DENIED when an SMB share's client holds descendant oplocks from a
+/// recent transfer — a state that blocks `MoveFileEx`), fall back to the Windows
+/// Shell COM rename path that File Explorer uses, which handles locked descendants.
+fn rename_path(from: &Path, to: &Path) -> std::io::Result<()> {
+    match std::fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        #[cfg(windows)]
+        Err(e) => {
+            eprintln!(
+                "std::fs::rename({:?} -> {:?}) failed: {} (os error {:?}); trying shell rename",
+                from, to, e, e.raw_os_error()
+            );
+            shell_rename_windows(from, to)
+        }
+        #[cfg(not(windows))]
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(windows)]
+fn shell_rename_windows(from: &Path, to: &Path) -> std::io::Result<()> {
+    let parent = from
+        .parent()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no parent dir"))?;
+    let old_name = from
+        .file_name()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no source name"))?
+        .to_string_lossy();
+    let new_name = to
+        .file_name()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no dest name"))?
+        .to_string_lossy();
+
+    // PowerShell single-quote escapes apostrophes by doubling them.
+    let parent_esc = parent.to_string_lossy().replace('\'', "''");
+    let old_esc = old_name.replace('\'', "''");
+    let new_esc = new_name.replace('\'', "''");
+    let dest_esc = to.to_string_lossy().replace('\'', "''");
+
+    let script = format!(
+        "$shell = New-Object -ComObject Shell.Application; \
+         $f = $shell.NameSpace('{}'); \
+         $i = $f.ParseName('{}'); \
+         if ($null -eq $i) {{ exit 1 }}; \
+         $i.Name = '{}'; \
+         if (Test-Path '{}') {{ exit 0 }} else {{ exit 1 }}",
+        parent_esc, old_esc, new_esc, dest_esc
+    );
+
+    let output = std::process::Command::new("powershell")
+        .args(["-ExecutionPolicy", "Bypass", "-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to launch PowerShell: {}", e),
+            )
+        })?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("Shell rename failed: {}", stderr.trim()),
+        ))
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Library {
     pub id: String,
@@ -2402,28 +2473,35 @@ pub async fn get_entries_for_person(
             .await
             .map_err(|e| e.to_string())?;
 
-    let entries: Vec<MediaEntry> = rows
-        .into_iter()
-        .map(|(id, title, year, folder_path, parent_id, entry_type, selected_cover, tmdb_id)| {
-            let covers = covers_map.remove(&folder_path).unwrap_or_default();
-            MediaEntry {
-                id,
-                title,
-                year,
-                end_year: None,
-                folder_path,
-                parent_id,
-                entry_type,
-                covers,
-                selected_cover,
-                child_count: 0,
-                season_display: None,
-                collection_display: None,
-                tmdb_id,
-                link_id: None,
-            }
-        })
-        .collect();
+    // Hydrate derived fields (year range + season_display) for shows so person-detail
+    // cards match the library grid. Movies get their year inline from the SELECT above;
+    // collections don't appear in person-detail views in practice (people resolve to
+    // movies/shows), so no collection enrichment is needed here.
+    let mut entries: Vec<MediaEntry> = Vec::with_capacity(rows.len());
+    for (id, title, year, folder_path, parent_id, entry_type, selected_cover, tmdb_id) in rows {
+        let covers = covers_map.remove(&folder_path).unwrap_or_default();
+        let (final_year, final_end_year, season_display) = if entry_type == "show" {
+            enrich_show_fields(&state.app_db, id).await?
+        } else {
+            (year, None, None)
+        };
+        entries.push(MediaEntry {
+            id,
+            title,
+            year: final_year,
+            end_year: final_end_year,
+            folder_path,
+            parent_id,
+            entry_type,
+            covers,
+            selected_cover,
+            child_count: 0,
+            season_display,
+            collection_display: None,
+            tmdb_id,
+            link_id: None,
+        });
+    }
 
     Ok(entries)
 }
@@ -3371,18 +3449,27 @@ pub async fn get_playlist_contents(
 
     for (link_id, sort_order, id, title, year, end_year, folder_path, parent_id, entry_type, selected_cover, sort_title) in link_rows {
         let covers = covers_map.get(&folder_path).cloned().unwrap_or_default();
+        // Compute year range + season_display for show targets so playlist cards look the
+        // same as library cards. The library grid computes these in one big CASE expression
+        // in its query; here we do a small follow-up per show since the link_rows select
+        // is already complex and only a subset of entries need it.
+        let (final_year, final_end_year, season_display) = if entry_type == "show" {
+            enrich_show_fields(&state.app_db, id).await?
+        } else {
+            (year, end_year, None)
+        };
         let entry = MediaEntry {
             id,
             title,
-            year,
-            end_year,
+            year: final_year,
+            end_year: final_end_year,
             folder_path,
             parent_id,
             entry_type,
             covers,
             selected_cover,
             child_count: 0,
-            season_display: None,
+            season_display,
             collection_display: None,
             tmdb_id: None,
             link_id: Some(link_id),
@@ -3444,6 +3531,63 @@ pub async fn get_playlist_contents(
         selected_preset_id,
         presets,
     })
+}
+
+/// Compute year range + season_display for a show, matching what the library grid
+/// produces inline in its big CASE expression. Returns (year, end_year, season_display).
+/// Returns (None, None, None) when the show has no episodes / seasons.
+async fn enrich_show_fields(
+    pool: &sqlx::SqlitePool,
+    show_id: i64,
+) -> Result<(Option<String>, Option<String>, Option<String>), String> {
+    let year_row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT MIN(SUBSTR(e.release_date, 1, 4)), MAX(SUBSTR(e.release_date, 1, 4)) \
+         FROM episode e JOIN season s ON e.season_id = s.id \
+         WHERE s.show_id = ? AND e.release_date IS NOT NULL",
+    )
+    .bind(show_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let (year, end_year) = match year_row {
+        Some((lo, hi)) => {
+            // Mirror the library query's NULLIF(max, min) — single-year shows get None for end_year.
+            let end_year = if hi == lo { None } else { hi };
+            (lo, end_year)
+        }
+        None => (None, None),
+    };
+
+    let season_row: Option<(i64, Option<i64>, Option<i64>, i64)> = sqlx::query_as(
+        "SELECT COUNT(*), MIN(season_number), MAX(season_number), \
+                COUNT(season_number) \
+         FROM season WHERE show_id = ?",
+    )
+    .bind(show_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let season_display = season_row.and_then(|(total, min_n, max_n, numbered)| {
+        match total {
+            0 => None,
+            1 => match min_n {
+                Some(n) => Some(format!("season {n}")),
+                None => Some("1 season".to_string()),
+            },
+            _ => {
+                // Contiguous numbered-range check mirrors the library query.
+                if numbered == total && min_n.is_some() && max_n.is_some()
+                    && (max_n.unwrap() - min_n.unwrap() + 1) == total
+                {
+                    Some(format!("seasons {}\u{2013}{}", min_n.unwrap(), max_n.unwrap()))
+                } else {
+                    Some(format!("{total} seasons"))
+                }
+            }
+        }
+    });
+
+    Ok((year, end_year, season_display))
 }
 
 /// Library-scope preset ordering. Preset items are `{kind:"entry",id:N}` referencing media_entry.id.
@@ -3837,7 +3981,7 @@ pub async fn rename_entry(
                         return Err(format!("A folder named '{}' already exists", new_folder_name));
                     }
 
-                    std::fs::rename(&old_full_path, &new_full_path)
+                    rename_path(&old_full_path, &new_full_path)
                         .map_err(|e| format!("Failed to rename folder: {}", e))?;
 
                     let new_rel_path = new_full_path
@@ -3893,7 +4037,8 @@ pub async fn rename_entry(
                         .map_err(|e| e.to_string())?;
                     }
 
-                    // Update cached_images
+                    // Update cached_images — cache folder lives in our app_data so it's
+                    // always local, standard rename suffices (no Shell fallback needed).
                     let old_cache = cache_base.join(&folder_path);
                     let new_cache = cache_base.join(&new_rel_path);
                     if old_cache.exists() {
@@ -3945,7 +4090,7 @@ pub async fn rename_entry(
                         return Err(format!("A folder named '{}' already exists", safe_title));
                     }
 
-                    std::fs::rename(&old_full_path, &new_full_path)
+                    rename_path(&old_full_path, &new_full_path)
                         .map_err(|e| format!("Failed to rename folder: {}", e))?;
 
                     let new_rel_path = new_full_path
@@ -4069,12 +4214,13 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
 }
 
 /// Move a directory: try rename first (instant, same-drive only), fall back to copy + delete.
+/// Uses `rename_path` so SMB oplock descendants don't kill same-drive rename on Windows.
 fn move_dir(src: &Path, dst: &Path) -> Result<(), String> {
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create destination directory: {}", e))?;
     }
-    match std::fs::rename(src, dst) {
+    match rename_path(src, dst) {
         Ok(()) => Ok(()),
         Err(_) => {
             copy_dir_recursive(src, dst)

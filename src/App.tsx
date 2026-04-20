@@ -11,6 +11,28 @@ import { toast } from "sonner";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { Library, MediaEntry, EntriesResponse, BreadcrumbItem, ViewSpec, PersonSummary, PersonRole, PlaylistSummary, PlaylistContents, SortPreset } from "@/types";
+
+// Client-side sort for person-detail views (which have no backend-persisted sort state).
+// Only "alpha" and "date" are valid — person-detail has no sort_order concept, so the
+// dropdown hides "custom" there and the routing layer should never hand us anything else.
+function sortEntriesClientSide(entries: MediaEntry[], mode: "alpha" | "date"): MediaEntry[] {
+  const alpha = (a: MediaEntry, b: MediaEntry) =>
+    a.title.toLowerCase().localeCompare(b.title.toLowerCase());
+  const copy = [...entries];
+  if (mode === "date") {
+    copy.sort((a, b) => {
+      const ay = a.year ?? "";
+      const by = b.year ?? "";
+      if (ay === by) return alpha(a, b);
+      if (ay === "") return 1;
+      if (by === "") return -1;
+      return ay.localeCompare(by);
+    });
+  } else {
+    copy.sort(alpha);
+  }
+  return copy;
+}
 import { viewCacheKey, scopeKeyFor } from "@/lib/complications";
 
 function App() {
@@ -30,6 +52,11 @@ function App() {
   const [sortMode, setSortMode] = useState("alpha");
   const [selectedPresetId, setSelectedPresetId] = useState<number | null>(null);
   const [presets, setPresets] = useState<SortPreset[]>([]);
+  // Tracks the latest sortMode for closures that shouldn't recreate on every change
+  // (currently `loadView`, so its person-detail branch can sort client-side with the
+  // user's current selection without re-running all cached callbacks).
+  const sortModeRef = useRef(sortMode);
+  useEffect(() => { sortModeRef.current = sortMode; }, [sortMode]);
   const [coverSize, setCoverSize] = useState(200);
   const [search, setSearch] = useState("");
   const [searchResults, setSearchResults] = useState<MediaEntry[] | null>(null);
@@ -227,19 +254,29 @@ function App() {
   // restoreScrollPosition: apply the saved scroll for a (library, view-kind, parent) triple,
   // or reset to top when none is saved. Scroll keys include view kind so sidebar switches
   // don't leak scroll between views (library-root at parentId=null is distinct from movies-only at parentId=null).
+  //
+  // The scroll restore is scheduled after layout settles. When the grid content was just
+  // refreshed (e.g. after a TMDB apply from the detail page), the first rAF can fire before
+  // the grid has grown to its final height, which clamps scrollTop to 0. We re-apply the
+  // target value for ~300 ms, backing off once we observe scrollTop matching the saved value
+  // and the scroll container has enough content to hold it.
   const restoreScrollPosition = useCallback((libraryId: string, kind: string, parentId: number | null) => {
     const key = `${libraryId}:${kind}:${parentId}`;
     const saved = scrollCacheRef.current.get(key) ?? 0;
-    if (scrollContainerRef.current) {
-      // Double rAF: first waits for React commit, second waits for layout/paint
-      requestAnimationFrame(() => {
-        requestAnimationFrame(() => {
-          if (scrollContainerRef.current) {
-            scrollContainerRef.current.scrollTop = saved;
-          }
-        });
-      });
-    }
+    let attempts = 0;
+    const apply = () => {
+      attempts += 1;
+      const el = scrollContainerRef.current;
+      if (!el) return;
+      el.scrollTop = saved;
+      const maxScroll = Math.max(0, el.scrollHeight - el.clientHeight);
+      const effective = Math.min(saved, maxScroll);
+      // Give up once the applied value matches what we want, or we've tried enough times
+      // that content must be final. ~300 ms worth of frames is plenty for async cover layout.
+      if (el.scrollTop === effective || attempts >= 20) return;
+      requestAnimationFrame(apply);
+    };
+    requestAnimationFrame(() => requestAnimationFrame(apply));
   }, []);
 
   const resetScrollToTop = useCallback(() => {
@@ -390,7 +427,12 @@ function App() {
               personId: view.personId,
               role: view.role,
             });
-            sort_mode = "alpha";
+            // Person-detail has no backend sort_mode. Use whatever the user last picked in
+            // this session (or alpha on first load). Sort client-side since the backend
+            // always returns rows alpha-ordered.
+            const pd_mode: "alpha" | "date" = sortModeRef.current === "date" ? "date" : "alpha";
+            sort_mode = pd_mode;
+            entries = sortEntriesClientSide(entries, pd_mode);
             break;
           }
           case "playlist-detail": {
@@ -823,6 +865,29 @@ function App() {
   const changeSortMode = useCallback(
     async (mode: string) => {
       if (!selectedLibrary) return;
+
+      // Person-detail has no persistent sort state — it's a filtered read, not a table we can
+      // write sort_mode onto. Handle the mode swap entirely client-side: re-sort the in-memory
+      // entries and update the session sortMode. No backend call, no reload (which would trigger
+      // a flash back to alpha from the person-detail loadView branch).
+      if (activeView?.kind === "person-detail") {
+        if (mode !== "alpha" && mode !== "date") {
+          console.warn(`Unsupported sort mode for person-detail: ${mode}`);
+          return;
+        }
+        setSortMode(mode);
+        setEntries((prev) => sortEntriesClientSide(prev, mode));
+        const key = viewCacheKey(activeView);
+        const cached = viewEntriesCacheRef.current.get(key);
+        if (cached) {
+          viewEntriesCacheRef.current.set(key, {
+            ...cached,
+            entries: sortEntriesClientSide(cached.entries, mode),
+            sort_mode: mode,
+          });
+        }
+        return;
+      }
 
       // Playlist-detail has its own per-level sort_mode storage (playlist root vs nested collection)
       // and a limited vocabulary ("custom" | "alpha"). Route there instead of set_sort_mode.
