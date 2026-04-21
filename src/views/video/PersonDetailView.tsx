@@ -14,7 +14,7 @@ import { GridSearchInput } from "@/views/video/parts/GridSearchInput";
 import { SortDropdown, type SortOption } from "@/views/video/parts/SortDropdown";
 import { CoverSizeSlider } from "@/views/video/parts/CoverSizeSlider";
 import { useSelectedLibrary } from "@/context/LibraryContext";
-import { sortableIdFor } from "@/lib/complications";
+import { sortableIdFor } from "@/lib/utils";
 import type { MediaEntry, ViewSpec } from "@/types";
 
 export function PersonDetailView({

@@ -35,7 +35,7 @@ function sortEntriesClientSide(entries: MediaEntry[], mode: "alpha" | "date"): M
   }
   return copy;
 }
-import { viewCacheKey, scopeKeyFor } from "@/lib/complications";
+import { viewCacheKey, scopeKeyFor } from "@/lib/utils";
 
 function App() {
   const [libraries, setLibraries] = useState<Library[]>([]);
@@ -328,6 +328,8 @@ function App() {
         if (cached) {
           setPeople(cached);
           setBreadcrumbs(breadcrumb);
+          if (restoreScroll) restoreScrollPosition(view.libraryId, view.kind, null);
+          else resetScrollToTop();
           return;
         }
         // Update breadcrumb and clear the stale people list *before* awaiting the fetch,
@@ -343,6 +345,8 @@ function App() {
           });
           peopleCacheRef.current.set(key, res);
           setPeople(res);
+          if (restoreScroll) restoreScrollPosition(view.libraryId, view.kind, null);
+          else resetScrollToTop();
         } catch (e) {
           console.error("Failed to load people:", e);
         } finally {
@@ -636,6 +640,8 @@ function App() {
   const navigateToPerson = useCallback(
     (person: PersonSummary, role: PersonRole) => {
       if (!selectedLibrary) return;
+      // Save the people page's scroll before drilling in so going back lands where we left.
+      saveScrollPosition();
       const view: ViewSpec = {
         kind: "person-detail",
         libraryId: selectedLibrary.id,
@@ -654,7 +660,7 @@ function App() {
       setForwardStack([]);
       loadView(view, null, newBreadcrumbs, false);
     },
-    [selectedLibrary, breadcrumbs, loadView]
+    [selectedLibrary, breadcrumbs, loadView, saveScrollPosition]
   );
 
   // Drill into a playlist from the Playlists grid. Appends to the current breadcrumb chain

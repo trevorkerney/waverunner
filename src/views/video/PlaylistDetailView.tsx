@@ -27,7 +27,7 @@ import { SavePresetButton } from "@/views/video/parts/SavePresetButton";
 import { CoverSizeSlider } from "@/views/video/parts/CoverSizeSlider";
 import { SortableCoverGrid } from "@/views/video/parts/SortableCoverGrid";
 import { useSelectedLibrary } from "@/context/LibraryContext";
-import { scopeKeyFor, sortableIdFor } from "@/lib/complications";
+import { scopeKeyFor, sortableIdFor } from "@/lib/utils";
 import type { GridDndAdapter } from "@/hooks/useGridDnd";
 import type {
   BreadcrumbItem,

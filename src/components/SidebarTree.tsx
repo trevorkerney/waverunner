@@ -18,7 +18,7 @@ import {
   ContextMenuContent,
 } from "@/components/ui/context-menu";
 import type { ComplicationNode, ViewSpec } from "@/types";
-import { viewCacheKey } from "@/lib/complications";
+import { viewCacheKey } from "@/lib/utils";
 
 const ICON_MAP: Record<string, LucideIcon> = {
   Clapperboard,

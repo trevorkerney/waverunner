@@ -23,9 +23,63 @@ import { CreatePlaylistDialog } from "@/components/CreatePlaylistDialog";
 import { PlayerDock } from "@/components/player/PlayerDock";
 import { PlayerState, PlayerActions } from "@/hooks/usePlayer";
 import { SidebarTree } from "@/components/SidebarTree";
-import { getComplicationsForLibrary } from "@/lib/complications";
 import type { ComplicationNode, PlaylistSummary } from "@/types";
 import { Library, ViewSpec } from "@/types";
+
+/** Builds the sidebar tree for a single library. Currently dispatches by `library.format`;
+ *  music gets a sibling `musicComplications` builder when that lands. */
+function getComplicationsForLibrary(
+  library: Library,
+  playlists: PlaylistSummary[] = [],
+): ComplicationNode[] {
+  switch (library.format) {
+    case "video":
+      return videoComplications(library.id, playlists);
+    default:
+      return [];
+  }
+}
+
+function videoComplications(libraryId: string, playlists: PlaylistSummary[]): ComplicationNode[] {
+  // Each user-created playlist appears as a child of the "Playlists" node so users can
+  // jump directly into one from the sidebar. Collapsing "Playlists" hides them.
+  const playlistChildren: ComplicationNode[] = playlists.map((p) => ({
+    id: `playlist.${p.id}`,
+    label: p.title,
+    iconName: "ListMusic",
+    view: {
+      kind: "playlist-detail",
+      libraryId,
+      playlistId: p.id,
+      playlistName: p.title,
+      collectionId: null,
+    },
+  }));
+
+  return [
+    { id: "all",     label: "All",    iconName: "Library", view: { kind: "library-root", libraryId } },
+    { id: "movies",  label: "Movies", iconName: "Film",    view: { kind: "movies-only",  libraryId } },
+    { id: "shows",   label: "TV",     iconName: "Tv",      view: { kind: "shows-only",   libraryId } },
+    {
+      id: "people",
+      label: "People",
+      iconName: "Users",
+      view: { kind: "people-all", libraryId },
+      children: [
+        { id: "people.actors",    label: "Actors",                iconName: "User",         view: { kind: "people-list", libraryId, role: "actor" } },
+        { id: "people.directors", label: "Directors & Creators", iconName: "Clapperboard", view: { kind: "people-list", libraryId, role: "director_creator" } },
+        { id: "people.composers", label: "Composers",             iconName: "Music2",       view: { kind: "people-list", libraryId, role: "composer" } },
+      ],
+    },
+    {
+      id: "playlists",
+      label: "Playlists",
+      iconName: "ListMusic",
+      view: { kind: "playlists", libraryId },
+      children: playlistChildren,
+    },
+  ];
+}
 
 const MIN_WIDTH = 180;
 const MAX_WIDTH = 480;

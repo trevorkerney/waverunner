@@ -158,7 +158,11 @@ pub struct PersonSummary {
     pub id: i64,
     pub name: String,
     pub image_path: Option<String>,
-    pub work_count: i64,
+    /// Number of distinct movies this person has a credit on for the requested role.
+    pub movie_count: i64,
+    /// Number of distinct shows this person has a credit on for the requested role.
+    /// A show counts once regardless of how many seasons/episodes the person is in.
+    pub show_count: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -2380,6 +2384,255 @@ fn role_works_cte(role: &str) -> Result<&'static str, String> {
     }
 }
 
+/// Build the person-specific involvement label for a single (person, entry) pair.
+///
+/// Returns `Some(label)` describing what *this person* did in *this work* — e.g.
+/// `as Walter White`, `acted in`, `directed`, `created`, or anthology-specific variants
+/// like `as Lacie in "Nosedive"` or `acted in 3 episodes`. Returns `None` when no credit
+/// rows exist for the pair under the requested role (rare — `get_entries_for_person`
+/// only returns entries the person has credits on).
+///
+/// Role priority for `"all"`: cast → director/creator → composer. First match wins, so
+/// a person who acted *and* directed a work gets the cast label.
+///
+/// Spoiler guardrail: episode titles and counts only surface for shows where
+/// `show.is_anthology = 1`. Regular shows always fall back to generic `acted in` /
+/// `directed` so character arcs and deaths aren't revealed via the person page.
+async fn compute_person_entry_label(
+    pool: &SqlitePool,
+    person_id: i64,
+    entry_id: i64,
+    entry_type: &str,
+    role: &str,
+) -> Result<Option<String>, String> {
+    let roles_to_try: Vec<&str> = match role {
+        "all" => vec!["actor", "director_creator", "composer"],
+        other => vec![other],
+    };
+    for r in roles_to_try {
+        if let Some(label) = try_compute_label_for_role(pool, person_id, entry_id, entry_type, r).await? {
+            return Ok(Some(label));
+        }
+    }
+    Ok(None)
+}
+
+/// Computes the label for a specific role (single role, no fallback). Called by
+/// [compute_person_entry_label] once per candidate role.
+async fn try_compute_label_for_role(
+    pool: &SqlitePool,
+    person_id: i64,
+    entry_id: i64,
+    entry_type: &str,
+    role: &str,
+) -> Result<Option<String>, String> {
+    fn cast_label(role: Option<String>) -> String {
+        match role {
+            Some(s) if !s.trim().is_empty() => format!("as {}", s.trim()),
+            _ => "acted in".to_string(),
+        }
+    }
+
+    match (entry_type, role) {
+        ("movie", "actor") => {
+            let row: Option<(Option<String>,)> = sqlx::query_as(
+                "SELECT role FROM movie_cast WHERE movie_id = ? AND person_id = ? LIMIT 1",
+            )
+            .bind(entry_id)
+            .bind(person_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            Ok(row.map(|(r,)| cast_label(r)))
+        }
+        ("movie", "director_creator") => {
+            let row: Option<(i64,)> = sqlx::query_as(
+                "SELECT 1 FROM movie_director WHERE movie_id = ? AND person_id = ? LIMIT 1",
+            )
+            .bind(entry_id)
+            .bind(person_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            Ok(row.map(|_| "directed".to_string()))
+        }
+        ("movie", "composer") => {
+            let row: Option<(i64,)> = sqlx::query_as(
+                "SELECT 1 FROM movie_composer WHERE movie_id = ? AND person_id = ? LIMIT 1",
+            )
+            .bind(entry_id)
+            .bind(person_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            Ok(row.map(|_| "composed".to_string()))
+        }
+        ("show", "actor") => {
+            // Show-level cast first — if present, skip season/episode enrichment entirely
+            // (that's where spoiler-safe "acted in" / "as X" labels live).
+            let sc: Option<(Option<String>,)> = sqlx::query_as(
+                "SELECT role FROM show_cast WHERE show_id = ? AND person_id = ? LIMIT 1",
+            )
+            .bind(entry_id)
+            .bind(person_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            if let Some((r,)) = sc {
+                return Ok(Some(cast_label(r)));
+            }
+            // Fall back to season_cast — some shows only record cast at the season level.
+            let sec: Option<(Option<String>,)> = sqlx::query_as(
+                "SELECT sec.role FROM season_cast sec JOIN season s ON s.id = sec.season_id \
+                 WHERE s.show_id = ? AND sec.person_id = ? LIMIT 1",
+            )
+            .bind(entry_id)
+            .bind(person_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            if let Some((r,)) = sec {
+                return Ok(Some(cast_label(r)));
+            }
+            // Only episode_cast rows — apply anthology rules. Non-anthology shows get a
+            // generic "acted in" (spoiler guardrail).
+            let total: (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM episode_cast ec \
+                 JOIN episode e ON e.id = ec.episode_id \
+                 JOIN season s ON s.id = e.season_id \
+                 WHERE s.show_id = ? AND ec.person_id = ?",
+            )
+            .bind(entry_id)
+            .bind(person_id)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            let n = total.0;
+            if n == 0 {
+                return Ok(None);
+            }
+            let anthology_row: Option<(i64,)> = sqlx::query_as(
+                "SELECT is_anthology FROM show WHERE id = ?",
+            )
+            .bind(entry_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            let is_anthology = anthology_row.map(|(v,)| v != 0).unwrap_or(false);
+            if !is_anthology {
+                return Ok(Some("acted in".to_string()));
+            }
+            if n == 1 {
+                let row: Option<(Option<String>, String)> = sqlx::query_as(
+                    "SELECT ec.role, e.title FROM episode_cast ec \
+                     JOIN episode e ON e.id = ec.episode_id \
+                     JOIN season s ON s.id = e.season_id \
+                     WHERE s.show_id = ? AND ec.person_id = ? LIMIT 1",
+                )
+                .bind(entry_id)
+                .bind(person_id)
+                .fetch_optional(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+                if let Some((r, title)) = row {
+                    let label = match r {
+                        Some(s) if !s.trim().is_empty() => {
+                            format!("as {} in \"{}\"", s.trim(), title)
+                        }
+                        _ => format!("acted in \"{}\"", title),
+                    };
+                    return Ok(Some(label));
+                }
+                return Ok(Some("acted in".to_string()));
+            }
+            Ok(Some(format!("acted in {} episodes", n)))
+        }
+        ("show", "director_creator") => {
+            let sc: Option<(i64,)> = sqlx::query_as(
+                "SELECT 1 FROM show_creator WHERE show_id = ? AND person_id = ? LIMIT 1",
+            )
+            .bind(entry_id)
+            .bind(person_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            if sc.is_some() {
+                return Ok(Some("created".to_string()));
+            }
+            // Episode-director case. Same anthology rules.
+            let total: (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM episode_director ed \
+                 JOIN episode e ON e.id = ed.episode_id \
+                 JOIN season s ON s.id = e.season_id \
+                 WHERE s.show_id = ? AND ed.person_id = ?",
+            )
+            .bind(entry_id)
+            .bind(person_id)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            let n = total.0;
+            if n == 0 {
+                return Ok(None);
+            }
+            let anthology_row: Option<(i64,)> = sqlx::query_as(
+                "SELECT is_anthology FROM show WHERE id = ?",
+            )
+            .bind(entry_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            let is_anthology = anthology_row.map(|(v,)| v != 0).unwrap_or(false);
+            if !is_anthology {
+                return Ok(Some("directed".to_string()));
+            }
+            if n == 1 {
+                let row: Option<(String,)> = sqlx::query_as(
+                    "SELECT e.title FROM episode_director ed \
+                     JOIN episode e ON e.id = ed.episode_id \
+                     JOIN season s ON s.id = e.season_id \
+                     WHERE s.show_id = ? AND ed.person_id = ? LIMIT 1",
+                )
+                .bind(entry_id)
+                .bind(person_id)
+                .fetch_optional(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+                if let Some((title,)) = row {
+                    return Ok(Some(format!("directed \"{}\"", title)));
+                }
+            }
+            Ok(Some(format!("directed {} episodes", n)))
+        }
+        ("show", "composer") => {
+            let sc: Option<(i64,)> = sqlx::query_as(
+                "SELECT 1 FROM show_composer WHERE show_id = ? AND person_id = ? LIMIT 1",
+            )
+            .bind(entry_id)
+            .bind(person_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            if sc.is_some() {
+                return Ok(Some("composed".to_string()));
+            }
+            let ec: Option<(i64,)> = sqlx::query_as(
+                "SELECT 1 FROM episode_composer ec \
+                 JOIN episode e ON e.id = ec.episode_id \
+                 JOIN season s ON s.id = e.season_id \
+                 WHERE s.show_id = ? AND ec.person_id = ? LIMIT 1",
+            )
+            .bind(entry_id)
+            .bind(person_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            Ok(ec.map(|_| "composed".to_string()))
+        }
+        _ => Ok(None),
+    }
+}
+
 async fn get_library_meta(
     app_db: &SqlitePool,
     library_id: &str,
@@ -2408,27 +2661,34 @@ pub async fn get_people_in_library(
         return Err("People browsing is only supported for video libraries".to_string());
     }
 
+    // Split the total count into movie and show counts so the card can render format-
+    // specific labels like "2 movies & 4 shows". The role_works CTE uses UNION (not
+    // UNION ALL), so each (person, kind, entry) row is already distinct — a person
+    // credited at show-, season-, and episode-level on the same show still counts as 1.
     let query = format!(
         "{cte} \
-         SELECT p.id, p.name, p.image_path, COUNT(*) AS work_count \
+         SELECT p.id, p.name, p.image_path, \
+                SUM(CASE WHEN rw.kind = 'movie' THEN 1 ELSE 0 END) AS movie_count, \
+                SUM(CASE WHEN rw.kind = 'show'  THEN 1 ELSE 0 END) AS show_count \
          FROM person p \
          JOIN role_works rw ON rw.person_id = p.id \
          GROUP BY p.id \
          ORDER BY p.name COLLATE NOCASE ASC"
     );
 
-    let rows: Vec<(i64, String, Option<String>, i64)> = sqlx::query_as(&query)
+    let rows: Vec<(i64, String, Option<String>, i64, i64)> = sqlx::query_as(&query)
         .fetch_all(&state.app_db)
         .await
         .map_err(|e| e.to_string())?;
 
     Ok(rows
         .into_iter()
-        .map(|(id, name, image_path, work_count)| PersonSummary {
+        .map(|(id, name, image_path, movie_count, show_count)| PersonSummary {
             id,
             name,
             image_path,
-            work_count,
+            movie_count,
+            show_count,
         })
         .collect())
 }
@@ -2473,30 +2733,26 @@ pub async fn get_entries_for_person(
             .await
             .map_err(|e| e.to_string())?;
 
-    // Hydrate derived fields (year range + season_display) for shows so person-detail
-    // cards match the library grid. Movies get their year inline from the SELECT above;
-    // collections don't appear in person-detail views in practice (people resolve to
-    // movies/shows), so no collection enrichment is needed here.
+    // Person-detail cards display a person-specific involvement label ("as Walter White",
+    // "directed", etc.) instead of the library-centric year/season-range shown on other
+    // grids. The label is computed per (person, entry) pair from cast/director/composer
+    // junctions; year/end_year are nulled so the card renders *only* the label.
     let mut entries: Vec<MediaEntry> = Vec::with_capacity(rows.len());
-    for (id, title, year, folder_path, parent_id, entry_type, selected_cover, tmdb_id) in rows {
+    for (id, title, _year, folder_path, parent_id, entry_type, selected_cover, tmdb_id) in rows {
         let covers = covers_map.remove(&folder_path).unwrap_or_default();
-        let (final_year, final_end_year, season_display) = if entry_type == "show" {
-            enrich_show_fields(&state.app_db, id).await?
-        } else {
-            (year, None, None)
-        };
+        let label = compute_person_entry_label(&state.app_db, person_id, id, &entry_type, &role).await?;
         entries.push(MediaEntry {
             id,
             title,
-            year: final_year,
-            end_year: final_end_year,
+            year: None,
+            end_year: None,
             folder_path,
             parent_id,
             entry_type,
             covers,
             selected_cover,
             child_count: 0,
-            season_display,
+            season_display: label,
             collection_display: None,
             tmdb_id,
             link_id: None,
@@ -6532,6 +6788,10 @@ pub struct ShowDetail {
     pub composers: Vec<PersonInfo>,
     pub studios: Vec<String>,
     pub keywords: Vec<String>,
+    /// True for anthology shows (Black Mirror, True Detective, etc.) where seasons or
+    /// episodes are self-contained. When true, per-episode involvement labels on the
+    /// person-detail page can reveal episode titles without risking spoilers.
+    pub is_anthology: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -6578,16 +6838,17 @@ pub async fn get_show_detail(
 ) -> Result<ShowDetail, String> {
     // Uses shared app_db pool
 
-    let show_row: Option<(Option<String>, Option<String>, Option<String>, Option<String>, Option<i64>)> =
+    let show_row: Option<(Option<String>, Option<String>, Option<String>, Option<String>, Option<i64>, i64)> =
         sqlx::query_as(
-            "SELECT tmdb_id, imdb_id, plot, tagline, maturity_rating_id FROM show WHERE id = ?",
+            "SELECT tmdb_id, imdb_id, plot, tagline, maturity_rating_id, is_anthology FROM show WHERE id = ?",
         )
         .bind(show_id)
         .fetch_optional(&state.app_db)
         .await
         .map_err(|e| e.to_string())?;
 
-    let (tmdb_id, imdb_id, plot, tagline, mr_id) = show_row.ok_or("Show not found")?;
+    let (tmdb_id, imdb_id, plot, tagline, mr_id, is_anthology_int) = show_row.ok_or("Show not found")?;
+    let is_anthology = is_anthology_int != 0;
 
     let maturity_rating: Option<String> = if let Some(mid) = mr_id {
         sqlx::query_scalar("SELECT name FROM maturity_rating WHERE id = ?")
@@ -6673,6 +6934,7 @@ pub async fn get_show_detail(
         composers,
         studios,
         keywords,
+        is_anthology,
     })
 }
 
@@ -6850,6 +7112,13 @@ pub struct TmdbShowFieldSelection {
     pub composers: Option<Vec<PersonUpdateInfo>>,
     pub studios: Option<Vec<String>>,
     pub keywords: Option<Vec<String>>,
+    /// User-editable anthology flag. `None` = don't touch (keyword auto-detect may still
+    /// flip it during this apply); `Some(bool)` = user-provided explicit value, overrides
+    /// auto-detect.
+    pub is_anthology: Option<bool>,
+    /// User-editable display title. Writes to `show.title` + `show.sort_title`. Does NOT
+    /// rename the folder on disk — that's handled by the dedicated `rename_entry` flow.
+    pub title: Option<String>,
 }
 
 #[tauri::command]
@@ -6859,6 +7128,22 @@ pub async fn apply_tmdb_show_metadata(
     fields: TmdbShowFieldSelection,
 ) -> Result<(), String> {
     let mut new_people: Vec<(i64, i64, Option<String>)> = Vec::new();
+
+    // Display title — overwrites show.title + sort_title when non-empty. Folder on disk
+    // stays as-is (rename_entry is the path for folder renaming).
+    if let Some(ref title) = fields.title {
+        let trimmed = title.trim();
+        if !trimmed.is_empty() {
+            let sort_title = generate_sort_title(trimmed, "en");
+            sqlx::query("UPDATE show SET title = ?, sort_title = ? WHERE id = ?")
+                .bind(trimmed)
+                .bind(&sort_title)
+                .bind(show_id)
+                .execute(&state.app_db)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
 
     // Scalar fields on show table
     if let Some(ref tmdb_id) = fields.tmdb_id {
@@ -6949,6 +7234,35 @@ pub async fn apply_tmdb_show_metadata(
         }
     }
 
+    // Anthology flag — explicit user value wins; otherwise auto-detect from the imported
+    // keywords (match `anthology` case-insensitively in the keyword name). This covers
+    // Black Mirror, True Detective, American Horror Story, Fargo, etc. on TMDB without
+    // requiring the user to toggle manually.
+    if let Some(flag) = fields.is_anthology {
+        sqlx::query("UPDATE show SET is_anthology = ? WHERE id = ?")
+            .bind(if flag { 1_i64 } else { 0_i64 })
+            .bind(show_id)
+            .execute(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+    } else if fields.keywords.is_some() {
+        let auto: Option<(i64,)> = sqlx::query_as(
+            "SELECT 1 FROM show_keyword sk JOIN keyword k ON k.id = sk.keyword_id \
+             WHERE sk.show_id = ? AND LOWER(k.name) LIKE '%anthology%' LIMIT 1",
+        )
+        .bind(show_id)
+        .fetch_optional(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+        if auto.is_some() {
+            sqlx::query("UPDATE show SET is_anthology = 1 WHERE id = ?")
+                .bind(show_id)
+                .execute(&state.app_db)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
     process_person_images(&state.app_db, &state.app_data_dir, new_people).await;
     Ok(())
 }
@@ -6961,6 +7275,9 @@ pub struct TmdbSeasonFieldSelection {
     pub cast: Option<Vec<CastUpdateInfo>>,
     /// Director(s) of every episode in this season — fanned out to one episode_director row per episode on apply.
     pub season_director: Option<Vec<PersonUpdateInfo>>,
+    /// TMDB's season `name` or a user-edited title. Overwrites `season.title` when non-empty.
+    /// Only affects the display title; does not rename the folder on disk.
+    pub title: Option<String>,
 }
 
 #[tauri::command]
@@ -6970,6 +7287,19 @@ pub async fn apply_tmdb_season_metadata(
     fields: TmdbSeasonFieldSelection,
 ) -> Result<(), String> {
     let mut new_people: Vec<(i64, i64, Option<String>)> = Vec::new();
+
+    // Display title — only written when non-empty. The filename/folder is untouched;
+    // this is purely the DB-side display value shown in the UI.
+    if let Some(ref title) = fields.title {
+        if !title.trim().is_empty() {
+            sqlx::query("UPDATE season SET title = ? WHERE id = ?")
+                .bind(title.trim())
+                .bind(season_id)
+                .execute(&state.app_db)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
 
     if let Some(ref plot) = fields.plot {
         sqlx::query("UPDATE season SET plot = ? WHERE id = ?")
@@ -7022,6 +7352,9 @@ pub struct TmdbEpisodeFieldSelection {
     pub cast: Option<Vec<CastUpdateInfo>>,
     pub director: Option<Vec<PersonUpdateInfo>>,
     pub composer: Option<Vec<PersonUpdateInfo>>,
+    /// TMDB's episode `name` or a user-edited title. Overwrites `episode.title` when non-empty.
+    /// Only affects the display title; does not rename the file on disk.
+    pub title: Option<String>,
 }
 
 #[tauri::command]
@@ -7031,6 +7364,20 @@ pub async fn apply_tmdb_episode_metadata(
     fields: TmdbEpisodeFieldSelection,
 ) -> Result<(), String> {
     let mut new_people: Vec<(i64, i64, Option<String>)> = Vec::new();
+
+    // Display title — only written when non-empty. The file on disk is untouched; this
+    // is purely the DB-side display value used in the UI (detail page, person-detail
+    // anthology labels, etc.).
+    if let Some(ref title) = fields.title {
+        if !title.trim().is_empty() {
+            sqlx::query("UPDATE episode SET title = ? WHERE id = ?")
+                .bind(title.trim())
+                .bind(episode_id)
+                .execute(&state.app_db)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
 
     if let Some(ref plot) = fields.plot {
         sqlx::query("UPDATE episode SET plot = ? WHERE id = ?")
@@ -7109,6 +7456,19 @@ pub async fn apply_tmdb_season_episodes(
     let client = reqwest::Client::new();
     let season_detail = crate::tmdb::get_season_detail(&client, &token, tmdb_id, season_number).await?;
 
+    // Populate the season's own display title from TMDB when available. Only touches the
+    // DB value — folder on disk is left alone. Unconditional overwrite here because the
+    // existing value is almost always the filename-derived default; users who've manually
+    // renamed can avoid re-bulk-fetching.
+    if !season_detail.name.is_empty() {
+        sqlx::query("UPDATE season SET title = ? WHERE id = ?")
+            .bind(&season_detail.name)
+            .bind(season_id)
+            .execute(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
     let mut applied_count: i64 = 0;
 
     // Match by episode number
@@ -7123,6 +7483,16 @@ pub async fn apply_tmdb_season_episodes(
             Some(e) => e,
             None => continue,
         };
+
+        // Episode display title — unconditional overwrite (same reasoning as season).
+        if !tmdb_ep.name.is_empty() {
+            sqlx::query("UPDATE episode SET title = ? WHERE id = ?")
+                .bind(&tmdb_ep.name)
+                .bind(local_id)
+                .execute(&state.app_db)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
 
         // Apply plot + runtime
         if let Some(ref overview) = tmdb_ep.overview {

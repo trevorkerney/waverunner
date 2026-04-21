@@ -280,6 +280,7 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             plot TEXT,
             tagline TEXT,
             maturity_rating_id INTEGER,
+            is_anthology INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY (id) REFERENCES media_entry(id) ON DELETE CASCADE,
             FOREIGN KEY (maturity_rating_id) REFERENCES maturity_rating(id)
         )",
@@ -456,6 +457,28 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .await?;
 
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_episode_composer_person ON episode_composer(person_id)")
+        .execute(&pool)
+        .await?;
+
+    // Person-scoped lookup indexes on cast/director/creator junctions whose composite PKs
+    // lead with the entity id — without these, "find all credits for person X" table-scans.
+    // Used by get_entries_for_person and the per-entry involvement-label helper.
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_movie_cast_person ON movie_cast(person_id)")
+        .execute(&pool)
+        .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_show_cast_person ON show_cast(person_id)")
+        .execute(&pool)
+        .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_season_cast_person ON season_cast(person_id)")
+        .execute(&pool)
+        .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_episode_cast_person ON episode_cast(person_id)")
+        .execute(&pool)
+        .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_movie_director_person ON movie_director(person_id)")
+        .execute(&pool)
+        .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_show_creator_person ON show_creator(person_id)")
         .execute(&pool)
         .await?;
 

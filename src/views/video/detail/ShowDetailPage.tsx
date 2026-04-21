@@ -18,6 +18,7 @@ import {
   ContextMenuItem,
 } from "@/components/ui/context-menu";
 import { Button } from "@/components/ui/button";
+import { Switch } from "@/components/ui/switch";
 import {
   Dialog,
   DialogContent,
@@ -75,7 +76,7 @@ function formatReleaseDate(date: string | null | undefined): string | null {
 export function ShowDetailPage({
   entry,
   onEntryChanged,
-  onTitleChanged: _onTitleChanged,
+  onTitleChanged,
   onChangeCover,
   onAddCover,
   onDeleteCover,
@@ -158,22 +159,42 @@ export function ShowDetailPage({
     }
   }, []);
 
-  useEffect(() => {
-    loadDetail();
-    (async () => {
+  /** Re-fetch the season dropdown. Called on mount and after any apply/edit that may have
+   *  renamed seasons (TMDB apply, manual season title edit). */
+  const loadSeasons = useCallback(
+    async (opts?: { pickFirstIfNone?: boolean }) => {
       try {
         const s = await invoke<SeasonInfo[]>("get_show_seasons", {
           showId: entry.id,
         });
         setSeasons(s);
-        if (s.length > 0) {
-          setSelectedSeasonId(s[0].id);
+        if (opts?.pickFirstIfNone && s.length > 0) {
+          setSelectedSeasonId((current) => current ?? s[0].id);
         }
       } catch (e) {
         console.error("Failed to load seasons:", e);
       }
-    })();
-  }, [entry.id, loadDetail]);
+    },
+    [entry.id],
+  );
+
+  /** Re-fetch the selected season's episodes list. Called when selectedSeasonId changes
+   *  and after any apply/edit that may have renamed episodes. */
+  const loadEpisodes = useCallback(async (seasonId: number) => {
+    try {
+      const eps = await invoke<EpisodeInfo[]>("get_season_episodes", {
+        seasonId,
+      });
+      setEpisodes(eps);
+    } catch (e) {
+      console.error("Failed to load episodes:", e);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadDetail();
+    loadSeasons({ pickFirstIfNone: true });
+  }, [loadDetail, loadSeasons]);
 
   useEffect(() => {
     if (selectedSeasonId == null) return;
@@ -181,17 +202,8 @@ export function ShowDetailPage({
     setEpisodeDetails(new Map());
     setExpandedEpisodeId(null);
     loadSeasonDetail(selectedSeasonId);
-    (async () => {
-      try {
-        const eps = await invoke<EpisodeInfo[]>("get_season_episodes", {
-          seasonId: selectedSeasonId,
-        });
-        setEpisodes(eps);
-      } catch (e) {
-        console.error("Failed to load episodes:", e);
-      }
-    })();
-  }, [selectedSeasonId, loadSeasonDetail]);
+    loadEpisodes(selectedSeasonId);
+  }, [selectedSeasonId, loadSeasonDetail, loadEpisodes]);
 
   const handleSeasonTmdb = useCallback(async () => {
     if (!detail?.tmdb_id || !selectedSeason || selectedSeason.season_number == null) return;
@@ -202,6 +214,7 @@ export function ShowDetailPage({
         seasonNumber: selectedSeason.season_number,
       });
       const fields: TmdbSeasonFieldSelection = {};
+      if (tmdbSeason.name) fields.title = tmdbSeason.name;
       if (tmdbSeason.overview) fields.plot = tmdbSeason.overview;
       if (tmdbSeason.credits?.cast && tmdbSeason.credits.cast.length > 0) {
         fields.cast = tmdbSeason.credits.cast.slice(0, 20).map((c) => ({
@@ -222,13 +235,16 @@ export function ShowDetailPage({
         fields,
       });
       toast.success("Season metadata populated from TMDB");
+      // Refresh the season dropdown (title may have changed) and the current season's
+      // detail panel so the user sees changes without having to navigate away.
+      loadSeasons();
       loadSeasonDetail(selectedSeason.id);
     } catch (e) {
       toast.error(String(e));
     } finally {
       setSeasonTmdbLoading(false);
     }
-  }, [detail, selectedSeason, loadSeasonDetail]);
+  }, [detail, selectedSeason, loadSeasons, loadSeasonDetail]);
 
   const handleBulkEpisodes = useCallback(async () => {
     if (!detail?.tmdb_id || !selectedSeason || selectedSeason.season_number == null) return;
@@ -243,13 +259,17 @@ export function ShowDetailPage({
       toast.success(`Populated ${count} episode(s) from TMDB`);
       setEpisodeDetails(new Map());
       setExpandedEpisodeId(null);
+      // Season title AND every episode title may have been rewritten by the bulk apply.
+      // Refresh both lists so the user sees the new names live without re-navigating.
+      loadSeasons();
+      loadEpisodes(selectedSeason.id);
       onEntryChanged();
     } catch (e) {
       toast.error(String(e));
     } finally {
       setBulkEpisodesLoading(false);
     }
-  }, [detail, selectedSeason, onEntryChanged]);
+  }, [detail, selectedSeason, loadSeasons, loadEpisodes, onEntryChanged]);
 
   const handleEpisodeTmdb = useCallback(
     async (ep: EpisodeInfo) => {
@@ -268,6 +288,7 @@ export function ShowDetailPage({
           episodeNumber: ep.episode_number,
         });
         const fields: TmdbEpisodeFieldSelection = {};
+        if (tmdbEp.name) fields.title = tmdbEp.name;
         if (tmdbEp.overview) fields.plot = tmdbEp.overview;
         if (tmdbEp.runtime) fields.runtime = tmdbEp.runtime;
         if (tmdbEp.air_date) fields.release_date = tmdbEp.air_date;
@@ -294,6 +315,8 @@ export function ShowDetailPage({
           fields,
         });
         toast.success(`Episode ${ep.episode_number} metadata populated`);
+        // Title may have changed — refresh the episode list so the row name updates live.
+        if (selectedSeason) loadEpisodes(selectedSeason.id);
         loadEpisodeDetail(ep.id);
         onEntryChanged();
       } catch (e) {
@@ -302,7 +325,7 @@ export function ShowDetailPage({
         setEpisodeTmdbLoading(null);
       }
     },
-    [detail, selectedSeason, loadEpisodeDetail, onEntryChanged],
+    [detail, selectedSeason, loadEpisodes, loadEpisodeDetail, onEntryChanged],
   );
 
   const startEditShow = useCallback(() => {
@@ -310,6 +333,7 @@ export function ShowDetailPage({
     setSeasonEditing(false);
     setEditingEpisodeId(null);
     setShowDraft({
+      title: entry.title,
       plot: detail.plot ?? "",
       tagline: detail.tagline ?? "",
       maturity_rating: detail.maturity_rating ?? "",
@@ -332,9 +356,10 @@ export function ShowDetailPage({
       })),
       studios: [...detail.studios],
       keywords: [...detail.keywords],
+      is_anthology: detail.is_anthology,
     });
     setShowEditing(true);
-  }, [detail]);
+  }, [detail, entry.title]);
 
   const saveShow = useCallback(async () => {
     setShowSaving(true);
@@ -343,6 +368,13 @@ export function ShowDetailPage({
         showId: entry.id,
         fields: showDraft,
       });
+      // Propagate the title change to the parent's caches so the sidebar/library grid
+      // reflect it immediately. Folder on disk is deliberately NOT renamed — that's the
+      // library card's rename flow.
+      const newTitle = showDraft.title?.trim();
+      if (newTitle && newTitle !== entry.title) {
+        onTitleChanged(entry.id, newTitle);
+      }
       await loadDetail();
       onEntryChanged();
       setShowEditing(false);
@@ -351,13 +383,14 @@ export function ShowDetailPage({
     } finally {
       setShowSaving(false);
     }
-  }, [entry.id, showDraft, loadDetail, onEntryChanged]);
+  }, [entry.id, entry.title, showDraft, loadDetail, onEntryChanged, onTitleChanged]);
 
   const startEditSeason = useCallback(() => {
     if (!seasonDetail) return;
     setShowEditing(false);
     setEditingEpisodeId(null);
     setSeasonDraft({
+      title: seasonDetail.title,
       plot: seasonDetail.plot ?? "",
       cast: seasonDetail.cast.map((c) => ({
         name: c.name,
@@ -377,6 +410,8 @@ export function ShowDetailPage({
         seasonId: selectedSeason.id,
         fields: seasonDraft,
       });
+      // If the user edited the title, refresh the seasons dropdown so it reflects live.
+      if (seasonDraft.title !== undefined) loadSeasons();
       loadSeasonDetail(selectedSeason.id);
       setSeasonEditing(false);
     } catch (e) {
@@ -384,14 +419,18 @@ export function ShowDetailPage({
     } finally {
       setSeasonSaving(false);
     }
-  }, [selectedSeason, seasonDraft, loadSeasonDetail]);
+  }, [selectedSeason, seasonDraft, loadSeasons, loadSeasonDetail]);
 
   const startEditEpisode = useCallback(
     (ep: EpisodeInfo) => {
       setShowEditing(false);
       setSeasonEditing(false);
       const d = episodeDetails.get(ep.id);
+      // Title comes from the episode row (`ep.title`) — the per-episode detail fetch
+      // (`EpisodeDetailLocal`) would also have it, but when the user opens edit without
+      // having fetched detail first, we still need a reasonable initial value.
       setEpisodeDraft({
+        title: d?.title ?? ep.title,
         plot: d?.plot ?? "",
         runtime: d?.runtime ?? undefined,
         release_date: d?.release_date ?? "",
@@ -420,6 +459,10 @@ export function ShowDetailPage({
         episodeId: editingEpisodeId,
         fields: episodeDraft,
       });
+      // Title edit propagates to the episode list row live.
+      if (episodeDraft.title !== undefined && selectedSeason) {
+        loadEpisodes(selectedSeason.id);
+      }
       loadEpisodeDetail(editingEpisodeId);
       onEntryChanged();
       setEditingEpisodeId(null);
@@ -428,7 +471,7 @@ export function ShowDetailPage({
     } finally {
       setEpisodeSaving(false);
     }
-  }, [editingEpisodeId, episodeDraft, loadEpisodeDetail, onEntryChanged]);
+  }, [editingEpisodeId, episodeDraft, selectedSeason, loadEpisodes, loadEpisodeDetail, onEntryChanged]);
 
   const toggleEpisode = useCallback(
     (epId: number) => {
@@ -550,6 +593,11 @@ export function ShowDetailPage({
           {showEditing && (
             <div className="flex flex-col gap-3 text-sm">
               <EditField
+                label="Title"
+                value={showDraft.title ?? ""}
+                onChange={(v) => setShowDraft((p) => ({ ...p, title: v }))}
+              />
+              <EditField
                 label="Tagline"
                 value={showDraft.tagline ?? ""}
                 onChange={(v) => setShowDraft((p) => ({ ...p, tagline: v }))}
@@ -630,6 +678,19 @@ export function ShowDetailPage({
                   }))
                 }
               />
+              {/* Anthology flag — gates whether the person-detail page is allowed to show
+                   episode-level involvement (episode titles, counts) without risking spoilers.
+                   Auto-populated from TMDB's `anthology` keyword during apply; manually
+                   toggleable here when coverage misses. */}
+              <div className="flex items-center justify-between">
+                <label className="text-xs font-medium text-muted-foreground">Anthology series</label>
+                <Switch
+                  checked={showDraft.is_anthology ?? false}
+                  onCheckedChange={(checked) =>
+                    setShowDraft((p) => ({ ...p, is_anthology: checked }))
+                  }
+                />
+              </div>
               <div className="flex gap-2">
                 <Button size="sm" variant="outline" onClick={() => setShowEditing(false)} disabled={showSaving}>
                   Cancel
@@ -710,6 +771,11 @@ export function ShowDetailPage({
 
               {selectedSeason && seasonEditing && (
                 <div className="flex flex-col gap-3 rounded-md border p-3 text-sm">
+                  <EditField
+                    label="Title"
+                    value={seasonDraft.title ?? ""}
+                    onChange={(v) => setSeasonDraft((p) => ({ ...p, title: v }))}
+                  />
                   <EditField
                     label="Plot"
                     value={seasonDraft.plot ?? ""}
@@ -878,6 +944,11 @@ export function ShowDetailPage({
                       )}
                       {isExpanded && editingEpisodeId === ep.id && (
                         <div className="ml-14 mb-1 flex flex-col gap-3 rounded-md border p-3 text-sm">
+                          <EditField
+                            label="Title"
+                            value={episodeDraft.title ?? ""}
+                            onChange={(v) => setEpisodeDraft((p) => ({ ...p, title: v }))}
+                          />
                           <EditField
                             label="Air Date"
                             value={episodeDraft.release_date ?? ""}

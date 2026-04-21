@@ -81,7 +81,8 @@ export interface PersonSummary {
   id: number;
   name: string;
   image_path: string | null;
-  work_count: number;
+  movie_count: number;
+  show_count: number;
 }
 
 export interface PlaylistSummary {
@@ -277,6 +278,7 @@ export interface ShowDetail {
   composers: PersonInfo[];
   studios: string[];
   keywords: string[];
+  is_anthology: boolean;
 }
 
 export interface SeasonDetailLocal {
@@ -379,12 +381,15 @@ export interface TmdbShowFieldSelection {
   composers?: PersonUpdateInfo[];
   studios?: string[];
   keywords?: string[];
+  is_anthology?: boolean;
+  title?: string;
 }
 
 export interface TmdbSeasonFieldSelection {
   plot?: string;
   cast?: CastUpdateInfo[];
   season_director?: PersonUpdateInfo[];
+  title?: string;
 }
 
 export interface TmdbEpisodeFieldSelection {
@@ -394,6 +399,7 @@ export interface TmdbEpisodeFieldSelection {
   cast?: CastUpdateInfo[];
   director?: PersonUpdateInfo[];
   composer?: PersonUpdateInfo[];
+  title?: string;
 }
 
 export interface ShowEpisodeFlat {
