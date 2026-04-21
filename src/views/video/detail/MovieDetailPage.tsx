@@ -21,7 +21,7 @@ import { useCoverUrl } from "@/context/CoverUrlContext";
 import { useSelectedLibrary } from "@/context/LibraryContext";
 import { getDisplayCover } from "@/components/cards/SortableCoverCard";
 import { EditField } from "@/views/video/detail/parts/EditField";
-import { PeopleListEdit } from "@/views/video/detail/parts/PeopleListEdit";
+import { PersonPickerList } from "@/views/video/detail/parts/PersonPickerList";
 import type { MediaEntry, MovieDetail, MovieDetailUpdate } from "@/types";
 
 function formatReleaseDate(date: string | null | undefined): string | null {
@@ -97,15 +97,32 @@ export function MovieDetailPage({
       runtime: detail?.runtime ?? null,
       maturity_rating: detail?.maturity_rating ?? null,
       genres: detail?.genres ?? [],
-      directors: detail?.directors.map((d: { name: string }) => d.name) ?? [],
+      // Directors/composers: the backend now accepts PersonUpdateInfo (not plain
+       // strings) so tmdb_id and an explicit person_id hint can round-trip. We carry
+       // the existing DB id as `person_id` so editing this form doesn't orphan the
+       // person record via name-rewrite.
+      directors:
+        detail?.directors.map((d: { id: number; name: string }) => ({
+          person_id: d.id,
+          name: d.name,
+          tmdb_id: null,
+          profile_path: null,
+        })) ?? [],
       cast:
-        detail?.cast.map((c: { name: string; role: string | null }) => ({
+        detail?.cast.map((c: { id: number; name: string; role: string | null }) => ({
+          person_id: c.id,
           name: c.name,
           role: c.role,
           tmdb_id: null,
           profile_path: null,
         })) ?? [],
-      composers: detail?.composers.map((p: { name: string }) => p.name) ?? [],
+      composers:
+        detail?.composers.map((p: { id: number; name: string }) => ({
+          person_id: p.id,
+          name: p.name,
+          tmdb_id: null,
+          profile_path: null,
+        })) ?? [],
       studios: detail?.studios ?? [],
       keywords: detail?.keywords ?? [],
     });
@@ -344,15 +361,15 @@ export function MovieDetailPage({
                 value={(draft.genres ?? []).join(", ")}
                 onChange={(v) => updateListField("genres", v)}
               />
-              <EditField
-                label="Directors (comma-separated)"
-                value={(draft.directors ?? []).join(", ")}
-                onChange={(v) => updateListField("directors", v)}
+              <PersonPickerList
+                label="Directors"
+                items={draft.directors ?? []}
+                onChange={(items) => updateDraft("directors", items)}
               />
-              <EditField
-                label="Composers (comma-separated)"
-                value={(draft.composers ?? []).join(", ")}
-                onChange={(v) => updateListField("composers", v)}
+              <PersonPickerList
+                label="Composers"
+                items={draft.composers ?? []}
+                onChange={(items) => updateDraft("composers", items)}
               />
               <EditField
                 label="Studios (comma-separated)"
@@ -379,12 +396,12 @@ export function MovieDetailPage({
                 value={draft.rotten_tomatoes_id ?? ""}
                 onChange={(v) => updateDraft("rotten_tomatoes_id", v || null)}
               />
-              <PeopleListEdit
+              <PersonPickerList
                 label="Cast"
                 items={draft.cast ?? []}
                 onChange={(items) => updateDraft("cast", items)}
                 secondaryField="role"
-                secondaryLabel="Role"
+                secondaryLabel="Character"
               />
             </div>
           )}

@@ -43,11 +43,13 @@ export function SortableCoverCard({
   onRemoveLink,
   onRenamePlaylistCollection,
   onDeletePlaylistCollection,
+  onEditCharacterName,
   sortableId,
   isDragActive,
   sortMode,
   deletingId,
   readOnly,
+  hideYear,
 }: {
   entry: MediaEntry;
   size: number;
@@ -62,6 +64,10 @@ export function SortableCoverCard({
   onRemoveLink?: (linkId: number) => void;
   onRenamePlaylistCollection?: (entry: MediaEntry) => void;
   onDeletePlaylistCollection?: (entry: MediaEntry) => void;
+  /** Person-detail Actor section uses this. Allowed to render even when `readOnly` is
+   *  true — same exemption pattern as `onAddToPlaylist`. Director/Composer sections
+   *  simply omit the prop. */
+  onEditCharacterName?: (entry: MediaEntry) => void;
   /** Overrides the useSortable id. Playlist views need string ids so links and
    *  nested playlist_collections don't collide with each other or with real
    *  media_entry ids. Library views can omit this and the card falls back to entry.id. */
@@ -70,9 +76,13 @@ export function SortableCoverCard({
   sortMode: string;
   deletingId: number | null;
   /** Hides every mutating context-menu option on this card — used by person-detail where
-   *  library-level edits don't belong. "Add to playlist" is still available via its own
-   *  handler. */
+   *  library-level edits don't belong. `onAddToPlaylist` and `onEditCharacterName` are
+   *  the documented exceptions. */
   readOnly?: boolean;
+  /** When true, omit the year/year-range from the secondary line. Used by person-detail
+   *  cards so the involvement label ("as Walter White") shows without trailing year info.
+   *  Year is still on the entry for client-side date sorting; just not rendered. */
+  hideYear?: boolean;
 }) {
   const { getCoverUrl } = useCoverUrl();
   const {
@@ -226,8 +236,8 @@ export function SortableCoverCard({
           ) : (
             <>
               <p className="text-sm font-medium">{entry.title}</p>
-              {(entry.season_display || entry.collection_display || entry.year) && (
-                <p className="text-xs text-muted-foreground">{[entry.season_display || entry.collection_display, entry.year && `${entry.year}${entry.end_year ? `–${entry.end_year}` : ""}`].filter(Boolean).join(", ")}</p>
+              {(entry.season_display || entry.collection_display || (!hideYear && entry.year)) && (
+                <p className="text-xs text-muted-foreground">{[entry.season_display || entry.collection_display, !hideYear && entry.year && `${entry.year}${entry.end_year ? `–${entry.end_year}` : ""}`].filter(Boolean).join(", ")}</p>
               )}
             </>
           )}
@@ -297,6 +307,15 @@ export function SortableCoverCard({
               <ContextMenuItem onClick={onDeleteCover} disabled={entry.covers.length < 1}>
                 <Trash2 size={14} />
                 Delete cover
+              </ContextMenuItem>
+            )}
+            {onEditCharacterName && (
+              // Label swaps between Add/Edit based on whether the card already shows a
+              // character name. The label lives in `season_display` and starts with
+              // `as ` when a name is set.
+              <ContextMenuItem onClick={() => onEditCharacterName(entry)}>
+                <Pencil size={14} />
+                {entry.season_display?.startsWith("as ") ? "Edit character name" : "Add character name"}
               </ContextMenuItem>
             )}
             {onAddToPlaylist && entry.link_id == null && (entry.entry_type === "movie" || entry.entry_type === "show") && (

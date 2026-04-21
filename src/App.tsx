@@ -12,29 +12,8 @@ import { Toaster } from "@/components/ui/sonner";
 import { toast } from "sonner";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { Library, MediaEntry, EntriesResponse, BreadcrumbItem, ViewSpec, PersonSummary, PersonRole, PlaylistSummary, PlaylistContents, SortPreset } from "@/types";
+import { Library, MediaEntry, EntriesResponse, BreadcrumbItem, ViewSpec, PersonSummary, PersonRole, PersonEntriesResponse, PlaylistSummary, PlaylistContents, SortPreset } from "@/types";
 
-// Client-side sort for person-detail views (which have no backend-persisted sort state).
-// Only "alpha" and "date" are valid — person-detail has no sort_order concept, so the
-// dropdown hides "custom" there and the routing layer should never hand us anything else.
-function sortEntriesClientSide(entries: MediaEntry[], mode: "alpha" | "date"): MediaEntry[] {
-  const alpha = (a: MediaEntry, b: MediaEntry) =>
-    a.title.toLowerCase().localeCompare(b.title.toLowerCase());
-  const copy = [...entries];
-  if (mode === "date") {
-    copy.sort((a, b) => {
-      const ay = a.year ?? "";
-      const by = b.year ?? "";
-      if (ay === by) return alpha(a, b);
-      if (ay === "") return 1;
-      if (by === "") return -1;
-      return ay.localeCompare(by);
-    });
-  } else {
-    copy.sort(alpha);
-  }
-  return copy;
-}
 import { viewCacheKey, scopeKeyFor } from "@/lib/utils";
 
 function App() {
@@ -49,6 +28,7 @@ function App() {
   const [entries, setEntries] = useState<MediaEntry[]>([]);
   const [people, setPeople] = useState<PersonSummary[] | null>(null);
   const [playlists, setPlaylists] = useState<PlaylistSummary[] | null>(null);
+  const [personEntries, setPersonEntries] = useState<PersonEntriesResponse | null>(null);
   const [breadcrumbs, setBreadcrumbs] = useState<BreadcrumbItem[]>([]);
   const [forwardStack, setForwardStack] = useState<BreadcrumbItem[]>([]);
   const [sortMode, setSortMode] = useState("alpha");
@@ -106,6 +86,8 @@ function App() {
   const peopleCacheRef = useRef<Map<string, PersonSummary[]>>(new Map());
   // Cache: viewCacheKey(view) -> playlists
   const playlistsCacheRef = useRef<Map<string, PlaylistSummary[]>>(new Map());
+  // Cache: viewCacheKey(view) -> per-role grouped person entries (person-detail views)
+  const personEntriesCacheRef = useRef<Map<string, PersonEntriesResponse>>(new Map());
   // Scroll position cache: "libraryId:parentId" -> scrollTop
   const scrollCacheRef = useRef<Map<string, number>>(new Map());
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
@@ -286,12 +268,18 @@ function App() {
       attempts += 1;
       const el = scrollContainerRef.current;
       if (!el) return;
-      el.scrollTop = saved;
       const maxScroll = Math.max(0, el.scrollHeight - el.clientHeight);
-      const effective = Math.min(saved, maxScroll);
-      // Give up once the applied value matches what we want, or we've tried enough times
-      // that content must be final. ~300 ms worth of frames is plenty for async cover layout.
-      if (el.scrollTop === effective || attempts >= 20) return;
+      // If enough content is rendered to actually reach `saved`, land there exactly.
+      // Otherwise, scroll to the current maximum — this drives virtualized grids
+      // (Virtuoso) to render more items below, which grows scrollHeight. Next frame
+      // we try again. ~60 frames (~1s) is plenty for large person lists; we time out
+      // instead of looping forever if saved is beyond the actual content.
+      if (maxScroll >= saved) {
+        el.scrollTop = saved;
+        return;
+      }
+      el.scrollTop = maxScroll;
+      if (attempts >= 60) return;
       requestAnimationFrame(apply);
     };
     requestAnimationFrame(() => requestAnimationFrame(apply));
@@ -349,6 +337,42 @@ function App() {
           else resetScrollToTop();
         } catch (e) {
           console.error("Failed to load people:", e);
+        } finally {
+          setLoading(false);
+        }
+        return;
+      }
+
+      // person-detail returns per-role groupings (actor/director/composer) so the page
+      // can render them as separate sections. Has its own cache + state slot — does NOT
+      // populate `entries`; PersonDetailView reads from `personEntries`.
+      if (view.kind === "person-detail") {
+        const key = viewCacheKey(view);
+        const cached = personEntriesCacheRef.current.get(key);
+        setEntries([]);
+        setPeople(null);
+        setPlaylists(null);
+        if (cached) {
+          setPersonEntries(cached);
+          setBreadcrumbs(breadcrumb);
+          if (restoreScroll) restoreScrollPosition(view.libraryId, view.kind, view.personId);
+          else resetScrollToTop();
+          return;
+        }
+        setBreadcrumbs(breadcrumb);
+        setPersonEntries(null);
+        setLoading(true);
+        try {
+          const res = await invoke<PersonEntriesResponse>("get_entries_for_person", {
+            libraryId: view.libraryId,
+            personId: view.personId,
+          });
+          personEntriesCacheRef.current.set(key, res);
+          setPersonEntries(res);
+          if (restoreScroll) restoreScrollPosition(view.libraryId, view.kind, view.personId);
+          else resetScrollToTop();
+        } catch (e) {
+          console.error("Failed to load person entries:", e);
         } finally {
           setLoading(false);
         }
@@ -443,20 +467,6 @@ function App() {
             view_presets = res.presets;
             break;
           }
-          case "person-detail": {
-            entries = await invoke<MediaEntry[]>("get_entries_for_person", {
-              libraryId: view.libraryId,
-              personId: view.personId,
-              role: view.role,
-            });
-            // Person-detail has no backend sort_mode. Use whatever the user last picked in
-            // this session (or alpha on first load). Sort client-side since the backend
-            // always returns rows alpha-ordered.
-            const pd_mode: "alpha" | "date" = sortModeRef.current === "date" ? "date" : "alpha";
-            sort_mode = pd_mode;
-            entries = sortEntriesClientSide(entries, pd_mode);
-            break;
-          }
           case "playlist-detail": {
             const res = await invoke<PlaylistContents>("get_playlist_contents", {
               playlistId: view.playlistId,
@@ -495,6 +505,16 @@ function App() {
 
   // Re-fetch the grid entries behind the detail page without touching breadcrumbs or
   // navigating away. Fires after a detail-page edit so going back shows fresh year/covers/etc.
+  /** Invalidate the cached PersonEntriesResponse for the current person-detail view and
+   *  reload it. Called after the user edits a character name so the role labels update
+   *  in place without a full nav cycle. */
+  const refreshPersonEntries = useCallback(() => {
+    if (!activeView || activeView.kind !== "person-detail") return;
+    const key = viewCacheKey(activeView);
+    personEntriesCacheRef.current.delete(key);
+    loadView(activeView, null, breadcrumbs, true, true);
+  }, [activeView, breadcrumbs, loadView]);
+
   const refreshGridInPlace = useCallback(async () => {
     if (!selectedLibrary || !activeView) return;
     const view = activeView;
@@ -890,28 +910,10 @@ function App() {
     async (mode: string) => {
       if (!selectedLibrary) return;
 
-      // Person-detail has no persistent sort state — it's a filtered read, not a table we can
-      // write sort_mode onto. Handle the mode swap entirely client-side: re-sort the in-memory
-      // entries and update the session sortMode. No backend call, no reload (which would trigger
-      // a flash back to alpha from the person-detail loadView branch).
-      if (activeView?.kind === "person-detail") {
-        if (mode !== "alpha" && mode !== "date") {
-          console.warn(`Unsupported sort mode for person-detail: ${mode}`);
-          return;
-        }
-        setSortMode(mode);
-        setEntries((prev) => sortEntriesClientSide(prev, mode));
-        const key = viewCacheKey(activeView);
-        const cached = viewEntriesCacheRef.current.get(key);
-        if (cached) {
-          viewEntriesCacheRef.current.set(key, {
-            ...cached,
-            entries: sortEntriesClientSide(cached.entries, mode),
-            sort_mode: mode,
-          });
-        }
-        return;
-      }
+      // person-detail no longer goes through the global sort dropdown — each role section
+      // owns its own sort UI and state inside PersonRoleSection. If we somehow get called
+      // for person-detail, just no-op.
+      if (activeView?.kind === "person-detail") return;
 
       // Playlist-detail has its own per-level sort_mode storage (playlist root vs nested collection)
       // and a limited vocabulary ("custom" | "alpha"). Route there instead of set_sort_mode.
@@ -1552,6 +1554,8 @@ function App() {
           entries={entries}
           people={people}
           playlists={playlists}
+          personEntries={personEntries}
+          onPersonEntriesChanged={refreshPersonEntries}
           activeView={activeView}
           searchResults={searchResults}
           selectedEntry={selectedEntry}

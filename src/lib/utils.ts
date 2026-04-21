@@ -6,6 +6,29 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs))
 }
 
+/** Client-side sort for views without backend-persisted sort state (currently
+ *  person-detail sections). Only "alpha" and "date" are supported — no concept of
+ *  "custom" here since these views have no per-row sort_order. Date-sort uses the
+ *  string year (YYYY); empty years sink to the bottom. */
+export function sortEntriesClientSide(entries: MediaEntry[], mode: "alpha" | "date"): MediaEntry[] {
+  const alpha = (a: MediaEntry, b: MediaEntry) =>
+    a.title.toLowerCase().localeCompare(b.title.toLowerCase());
+  const copy = [...entries];
+  if (mode === "date") {
+    copy.sort((a, b) => {
+      const ay = a.year ?? "";
+      const by = b.year ?? "";
+      if (ay === by) return alpha(a, b);
+      if (ay === "") return 1;
+      if (by === "") return -1;
+      return ay.localeCompare(by);
+    });
+  } else {
+    copy.sort(alpha);
+  }
+  return copy;
+}
+
 /** Stable, collision-free sortable id for a grid entry. Playlist links use their `link_id`
  *  (distinct across playlists); nested playlist_collections use `pc-<id>` so they don't
  *  collide with real media_entry ids. Everything else keeps its numeric media_entry id so

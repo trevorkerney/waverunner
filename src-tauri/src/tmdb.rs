@@ -403,3 +403,89 @@ pub async fn get_episode_detail(
         .map_err(|e| format!("Failed to parse TMDB episode detail: {e}"))
 }
 
+// ---------- Person Search + Detail ----------
+
+/// `known_for` entries mix movies (title) and TV shows (name). We accept both so we
+/// can build a short summary like "Breaking Bad, El Camino, BoJack Horseman".
+#[derive(Debug, Deserialize, Clone)]
+pub struct TmdbKnownFor {
+    pub title: Option<String>,
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct TmdbPersonSearchHit {
+    pub id: i64,
+    pub name: String,
+    pub profile_path: Option<String>,
+    pub known_for_department: Option<String>,
+    #[serde(default)]
+    pub known_for: Vec<TmdbKnownFor>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TmdbPersonSearchResponse {
+    pub results: Vec<TmdbPersonSearchHit>,
+}
+
+pub async fn search_person(
+    client: &Client,
+    token: &str,
+    query: &str,
+) -> Result<TmdbPersonSearchResponse, String> {
+    let mut url = Url::parse(&format!("{BASE_URL}/search/person"))
+        .map_err(|e| format!("Invalid URL: {e}"))?;
+    url.query_pairs_mut().append_pair("query", query);
+
+    let resp = client
+        .get(url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| format!("TMDB request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("TMDB API error {status}: {body}"));
+    }
+
+    resp.json::<TmdbPersonSearchResponse>()
+        .await
+        .map_err(|e| format!("Failed to parse TMDB person search response: {e}"))
+}
+
+/// Full TMDB person record. We only pull the fields we actually use.
+#[derive(Debug, Deserialize, Clone)]
+pub struct TmdbPersonDetail {
+    pub id: i64,
+    pub name: String,
+    pub biography: Option<String>,
+    pub profile_path: Option<String>,
+    pub known_for_department: Option<String>,
+}
+
+pub async fn get_person_detail(
+    client: &Client,
+    token: &str,
+    tmdb_id: i64,
+) -> Result<TmdbPersonDetail, String> {
+    let url = format!("{BASE_URL}/person/{tmdb_id}");
+
+    let resp = client
+        .get(&url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| format!("TMDB request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("TMDB API error {status}: {body}"));
+    }
+
+    resp.json::<TmdbPersonDetail>()
+        .await
+        .map_err(|e| format!("Failed to parse TMDB person detail: {e}"))
+}

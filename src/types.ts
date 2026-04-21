@@ -85,6 +85,15 @@ export interface PersonSummary {
   show_count: number;
 }
 
+/** Per-role groupings of a person's works. Empty lists mean the person has no credits
+ *  in that role; the frontend hides empty sections. An entry can appear in multiple
+ *  sections (e.g. someone who acted and directed the same movie). */
+export interface PersonEntriesResponse {
+  actor: MediaEntry[];
+  director: MediaEntry[];
+  composer: MediaEntry[];
+}
+
 export interface PlaylistSummary {
   id: number;
   title: string;
@@ -132,6 +141,9 @@ export interface MovieDetail {
 }
 
 export interface CastUpdateInfo {
+  /** Set when the picker resolved to an existing person record. Backend applies use
+   *  this directly and skip name-matching, preserving identity across renames. */
+  person_id?: number;
   name: string;
   role: string | null;
   tmdb_id: number | null;
@@ -139,9 +151,34 @@ export interface CastUpdateInfo {
 }
 
 export interface PersonUpdateInfo {
+  /** See {@link CastUpdateInfo.person_id}. */
+  person_id?: number;
   name: string;
   tmdb_id: number | null;
   profile_path: string | null;
+}
+
+export interface PersonDetail {
+  id: number;
+  name: string;
+  image_path: string | null;
+  tmdb_id: number | null;
+  bio: string | null;
+}
+
+export interface LocalPersonSearchResult {
+  id: number;
+  name: string;
+  image_path: string | null;
+  tmdb_id: number | null;
+}
+
+export interface TmdbPersonSearchResult {
+  id: number;
+  name: string;
+  profile_path: string | null;
+  known_for_department: string | null;
+  known_for_summary: string | null;
 }
 
 export interface SeasonInfo {
@@ -256,9 +293,9 @@ export interface MovieDetailUpdate {
   runtime?: number | null;
   maturity_rating?: string | null;
   genres?: string[];
-  directors?: string[];
+  directors?: PersonUpdateInfo[];
   cast?: CastUpdateInfo[];
-  composers?: string[];
+  composers?: PersonUpdateInfo[];
   studios?: string[];
   keywords?: string[];
 }

@@ -39,7 +39,7 @@ import { useCoverUrl } from "@/context/CoverUrlContext";
 import { useSelectedLibrary } from "@/context/LibraryContext";
 import { getDisplayCover } from "@/components/cards/SortableCoverCard";
 import { EditField } from "@/views/video/detail/parts/EditField";
-import { PeopleListEdit } from "@/views/video/detail/parts/PeopleListEdit";
+import { PersonPickerList } from "@/views/video/detail/parts/PersonPickerList";
 import { TruncatedList } from "@/views/video/detail/parts/TruncatedList";
 import type {
   MediaEntry,
@@ -623,40 +623,22 @@ export function ShowDetailPage({
                   }))
                 }
               />
-              <EditField
-                label="Creators (comma-separated)"
-                value={(showDraft.creators ?? []).map((c) => c.name).join(", ")}
-                onChange={(v) =>
-                  setShowDraft((p) => ({
-                    ...p,
-                    creators: v
-                      .split(",")
-                      .map((s) => s.trim())
-                      .filter(Boolean)
-                      .map((name) => ({ name, tmdb_id: null, profile_path: null })),
-                  }))
-                }
+              <PersonPickerList
+                label="Creators"
+                items={showDraft.creators ?? []}
+                onChange={(items) => setShowDraft((p) => ({ ...p, creators: items }))}
               />
-              <EditField
-                label="Composers (comma-separated)"
-                value={(showDraft.composers ?? []).map((c) => c.name).join(", ")}
-                onChange={(v) =>
-                  setShowDraft((p) => ({
-                    ...p,
-                    composers: v
-                      .split(",")
-                      .map((s) => s.trim())
-                      .filter(Boolean)
-                      .map((name) => ({ name, tmdb_id: null, profile_path: null })),
-                  }))
-                }
+              <PersonPickerList
+                label="Composers"
+                items={showDraft.composers ?? []}
+                onChange={(items) => setShowDraft((p) => ({ ...p, composers: items }))}
               />
-              <PeopleListEdit
+              <PersonPickerList
                 label="Cast"
                 items={showDraft.cast ?? []}
                 onChange={(items) => setShowDraft((p) => ({ ...p, cast: items }))}
                 secondaryField="role"
-                secondaryLabel="Role"
+                secondaryLabel="Character"
               />
               <EditField
                 label="Studios (comma-separated)"
@@ -782,26 +764,17 @@ export function ShowDetailPage({
                     onChange={(v) => setSeasonDraft((p) => ({ ...p, plot: v }))}
                     multiline
                   />
-                  <EditField
-                    label="Season-wide Director (comma-separated — applied to every episode)"
-                    value={(seasonDraft.season_director ?? []).map((c) => c.name).join(", ")}
-                    onChange={(v) =>
-                      setSeasonDraft((p) => ({
-                        ...p,
-                        season_director: v
-                          .split(",")
-                          .map((s) => s.trim())
-                          .filter(Boolean)
-                          .map((name) => ({ name, tmdb_id: null, profile_path: null })),
-                      }))
-                    }
+                  <PersonPickerList
+                    label="Season-wide Director (applied to every episode)"
+                    items={seasonDraft.season_director ?? []}
+                    onChange={(items) => setSeasonDraft((p) => ({ ...p, season_director: items }))}
                   />
-                  <PeopleListEdit
+                  <PersonPickerList
                     label="Cast"
                     items={seasonDraft.cast ?? []}
                     onChange={(items) => setSeasonDraft((p) => ({ ...p, cast: items }))}
                     secondaryField="role"
-                    secondaryLabel="Role"
+                    secondaryLabel="Character"
                   />
                   <div className="flex gap-2">
                     <Button size="sm" variant="outline" onClick={() => setSeasonEditing(false)} disabled={seasonSaving}>
@@ -970,42 +943,24 @@ export function ShowDetailPage({
                             onChange={(v) => setEpisodeDraft((p) => ({ ...p, plot: v }))}
                             multiline
                           />
-                          <PeopleListEdit
+                          <PersonPickerList
                             label="Guest Stars"
                             items={episodeDraft.cast ?? []}
                             onChange={(items) =>
                               setEpisodeDraft((p) => ({ ...p, cast: items }))
                             }
                             secondaryField="role"
-                            secondaryLabel="Role"
+                            secondaryLabel="Character"
                           />
-                          <EditField
-                            label="Director (comma-separated)"
-                            value={(episodeDraft.director ?? []).map((d) => d.name).join(", ")}
-                            onChange={(v) =>
-                              setEpisodeDraft((p) => ({
-                                ...p,
-                                director: v
-                                  .split(",")
-                                  .map((s) => s.trim())
-                                  .filter(Boolean)
-                                  .map((name) => ({ name, tmdb_id: null, profile_path: null })),
-                              }))
-                            }
+                          <PersonPickerList
+                            label="Director"
+                            items={episodeDraft.director ?? []}
+                            onChange={(items) => setEpisodeDraft((p) => ({ ...p, director: items }))}
                           />
-                          <EditField
-                            label="Composer (comma-separated)"
-                            value={(episodeDraft.composer ?? []).map((c) => c.name).join(", ")}
-                            onChange={(v) =>
-                              setEpisodeDraft((p) => ({
-                                ...p,
-                                composer: v
-                                  .split(",")
-                                  .map((s) => s.trim())
-                                  .filter(Boolean)
-                                  .map((name) => ({ name, tmdb_id: null, profile_path: null })),
-                              }))
-                            }
+                          <PersonPickerList
+                            label="Composer"
+                            items={episodeDraft.composer ?? []}
+                            onChange={(items) => setEpisodeDraft((p) => ({ ...p, composer: items }))}
                           />
                           <div className="flex gap-2">
                             <Button

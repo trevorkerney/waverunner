@@ -13,6 +13,7 @@ import type {
   ViewSpec,
   PersonSummary,
   PersonRole,
+  PersonEntriesResponse,
   PlaylistSummary,
   SortPreset,
 } from "@/types";
@@ -26,6 +27,11 @@ interface MainContentProps {
   entries: MediaEntry[];
   people: PersonSummary[] | null;
   playlists: PlaylistSummary[] | null;
+  /** Per-role groupings for person-detail view. Populated only when activeView is person-detail. */
+  personEntries: PersonEntriesResponse | null;
+  /** Tells App to invalidate the person-detail entries cache and refetch. Wired into
+   *  PersonDetailView so character-name edits surface immediately. */
+  onPersonEntriesChanged: () => void;
   activeView: ViewSpec | null;
   searchResults: MediaEntry[] | null;
   selectedEntry: MediaEntry | null;
@@ -213,27 +219,20 @@ export function MainContent(props: MainContentProps) {
         <PersonDetailView
           view={activeView}
           breadcrumbBar={breadcrumbBar}
-          entries={props.entries}
-          searchResults={props.searchResults}
+          personEntries={props.personEntries}
           selectedEntry={props.selectedEntry}
           loading={props.loading}
           coverSize={props.coverSize}
-          onCoverSizeChange={props.onCoverSizeChange}
-          search={props.search}
-          onSearchChange={props.onSearchChange}
-          sortMode={props.sortMode}
-          onSortModeChange={props.onSortModeChange}
           onNavigate={props.onNavigate}
-          onRenameEntry={props.onRenameEntry}
+          onPersonEntriesChanged={props.onPersonEntriesChanged}
+          onEntryChanged={props.onEntryChanged}
           onTitleChanged={props.onTitleChanged}
           onSetCover={props.onSetCover}
           onAddCover={props.onAddCover}
           onDeleteCover={props.onDeleteCover}
-          onEntryChanged={props.onEntryChanged}
-          onPlaylistChanged={props.onPlaylistChanged}
-          scrollContainerRef={props.scrollContainerRef}
           onPlayFile={props.onPlayFile}
           onPlayEpisode={props.onPlayEpisode}
+          scrollContainerRef={props.scrollContainerRef}
         />
       );
     case "library-root":

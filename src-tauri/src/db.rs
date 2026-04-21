@@ -119,7 +119,8 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
             image_path TEXT,
-            tmdb_id INTEGER
+            tmdb_id INTEGER,
+            bio TEXT
         )",
     )
     .execute(&pool)

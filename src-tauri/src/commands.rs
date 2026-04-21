@@ -204,15 +204,21 @@ pub struct MovieDetailUpdate {
     pub runtime: Option<i64>,
     pub maturity_rating: Option<String>,
     pub genres: Option<Vec<String>>,
-    pub directors: Option<Vec<String>>,
+    pub directors: Option<Vec<PersonUpdateInfo>>,
     pub cast: Option<Vec<CastUpdateInfo>>,
-    pub composers: Option<Vec<String>>,
+    pub composers: Option<Vec<PersonUpdateInfo>>,
     pub studios: Option<Vec<String>>,
     pub keywords: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CastUpdateInfo {
+    /// Set when the picker resolved to an existing person record. Apply commands use
+    /// this directly and skip `ensure_person` — preserving identity across renames and
+    /// avoiding near-duplicate rows from minor spelling drift. Missing/null means
+    /// "create or match by (tmdb_id, name)" via `ensure_person` (existing behavior).
+    #[serde(default)]
+    pub person_id: Option<i64>,
     pub name: String,
     pub role: Option<String>,
     pub tmdb_id: Option<i64>,
@@ -222,9 +228,46 @@ pub struct CastUpdateInfo {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PersonUpdateInfo {
+    /// See [CastUpdateInfo::person_id].
+    #[serde(default)]
+    pub person_id: Option<i64>,
     pub name: String,
     pub tmdb_id: Option<i64>,
     pub profile_path: Option<String>,
+}
+
+/// Full person record returned to the frontend for the person-detail page's header +
+/// biography panel and for the "Match to TMDB" / "Refresh" / "Clear" flows.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PersonDetail {
+    pub id: i64,
+    pub name: String,
+    pub image_path: Option<String>,
+    pub tmdb_id: Option<i64>,
+    pub bio: Option<String>,
+}
+
+/// A local-DB hit in the picker. Same shape as PersonInfo but includes tmdb_id so
+/// the caller can show a "matched" badge without a second call.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct LocalPersonSearchResult {
+    pub id: i64,
+    pub name: String,
+    pub image_path: Option<String>,
+    pub tmdb_id: Option<i64>,
+}
+
+/// TMDB-person search result (flattened from `/search/person` into what the picker
+/// actually needs for display).
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TmdbPersonSearchResult {
+    pub id: i64,
+    pub name: String,
+    pub profile_path: Option<String>,
+    pub known_for_department: Option<String>,
+    /// Short description of top works (up to 3 titles joined by ", "). Null when TMDB
+    /// didn't include any known_for entries.
+    pub known_for_summary: Option<String>,
 }
 
 /// Insert or find a person, using tmdb_id for matching when available.
@@ -1540,29 +1583,37 @@ pub async fn update_movie_detail(
         }
     }
 
-    // Directors
+    // Directors / Cast / Composers — route every person reference through
+    // `ensure_person` so tmdb_id gets stored for TMDB-matched entries, and honor the
+    // picker's `person_id` hint to preserve existing identities without name-matching.
+    // Collected tmdb_id+profile_path tuples get handed to process_person_images at the
+    // end for image downloads.
+    let mut new_people: Vec<(i64, i64, Option<String>)> = Vec::new();
+
     if let Some(ref directors) = detail.directors {
         sqlx::query("DELETE FROM movie_director WHERE movie_id = ?")
             .bind(entry_id)
             .execute(&state.app_db)
             .await
             .map_err(|e| e.to_string())?;
-        for name in directors {
-            sqlx::query("INSERT OR IGNORE INTO person (name) VALUES (?)")
-                .bind(name)
-                .execute(&state.app_db)
-                .await
-                .map_err(|e| e.to_string())?;
-            sqlx::query("INSERT INTO movie_director (movie_id, person_id) VALUES (?, (SELECT id FROM person WHERE name = ?))")
+        for d in directors {
+            let person_id = if let Some(pid) = d.person_id {
+                pid
+            } else {
+                ensure_person(&state.app_db, &d.name, d.tmdb_id).await?
+            };
+            if let Some(tid) = d.tmdb_id {
+                new_people.push((person_id, tid, d.profile_path.clone()));
+            }
+            sqlx::query("INSERT INTO movie_director (movie_id, person_id) VALUES (?, ?)")
                 .bind(entry_id)
-                .bind(name)
+                .bind(person_id)
                 .execute(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
         }
     }
 
-    // Cast
     if let Some(ref cast) = detail.cast {
         sqlx::query("DELETE FROM movie_cast WHERE movie_id = ?")
             .bind(entry_id)
@@ -1570,14 +1621,17 @@ pub async fn update_movie_detail(
             .await
             .map_err(|e| e.to_string())?;
         for (i, c) in cast.iter().enumerate() {
-            sqlx::query("INSERT OR IGNORE INTO person (name) VALUES (?)")
-                .bind(&c.name)
-                .execute(&state.app_db)
-                .await
-                .map_err(|e| e.to_string())?;
-            sqlx::query("INSERT INTO movie_cast (movie_id, person_id, role, sort_order) VALUES (?, (SELECT id FROM person WHERE name = ?), ?, ?)")
+            let person_id = if let Some(pid) = c.person_id {
+                pid
+            } else {
+                ensure_person(&state.app_db, &c.name, c.tmdb_id).await?
+            };
+            if let Some(tid) = c.tmdb_id {
+                new_people.push((person_id, tid, c.profile_path.clone()));
+            }
+            sqlx::query("INSERT INTO movie_cast (movie_id, person_id, role, sort_order) VALUES (?, ?, ?, ?)")
                 .bind(entry_id)
-                .bind(&c.name)
+                .bind(person_id)
                 .bind(&c.role)
                 .bind(i as i64)
                 .execute(&state.app_db)
@@ -1586,22 +1640,24 @@ pub async fn update_movie_detail(
         }
     }
 
-    // Composers
     if let Some(ref composers) = detail.composers {
         sqlx::query("DELETE FROM movie_composer WHERE movie_id = ?")
             .bind(entry_id)
             .execute(&state.app_db)
             .await
             .map_err(|e| e.to_string())?;
-        for name in composers {
-            sqlx::query("INSERT OR IGNORE INTO person (name) VALUES (?)")
-                .bind(name)
-                .execute(&state.app_db)
-                .await
-                .map_err(|e| e.to_string())?;
-            sqlx::query("INSERT OR IGNORE INTO movie_composer (movie_id, person_id) VALUES (?, (SELECT id FROM person WHERE name = ?))")
+        for c in composers {
+            let person_id = if let Some(pid) = c.person_id {
+                pid
+            } else {
+                ensure_person(&state.app_db, &c.name, c.tmdb_id).await?
+            };
+            if let Some(tid) = c.tmdb_id {
+                new_people.push((person_id, tid, c.profile_path.clone()));
+            }
+            sqlx::query("INSERT OR IGNORE INTO movie_composer (movie_id, person_id) VALUES (?, ?)")
                 .bind(entry_id)
-                .bind(name)
+                .bind(person_id)
                 .execute(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -1652,6 +1708,7 @@ pub async fn update_movie_detail(
         }
     }
 
+    process_person_images(&state.app_db, &state.app_data_dir, new_people).await;
     Ok(())
 }
 
@@ -1831,7 +1888,11 @@ pub async fn apply_tmdb_metadata(
             .await
             .map_err(|e| e.to_string())?;
         for d in directors {
-            let person_id = ensure_person(&state.app_db, &d.name, d.tmdb_id).await?;
+            let person_id = if let Some(pid) = d.person_id {
+                pid
+            } else {
+                ensure_person(&state.app_db, &d.name, d.tmdb_id).await?
+            };
             if let Some(tid) = d.tmdb_id { new_people.push((person_id, tid, d.profile_path.clone())); }
             sqlx::query("INSERT INTO movie_director (movie_id, person_id) VALUES (?, ?)")
                 .bind(entry_id)
@@ -1849,7 +1910,11 @@ pub async fn apply_tmdb_metadata(
             .await
             .map_err(|e| e.to_string())?;
         for (i, c) in cast.iter().enumerate() {
-            let person_id = ensure_person(&state.app_db, &c.name, c.tmdb_id).await?;
+            let person_id = if let Some(pid) = c.person_id {
+                pid
+            } else {
+                ensure_person(&state.app_db, &c.name, c.tmdb_id).await?
+            };
             if let Some(tid) = c.tmdb_id { new_people.push((person_id, tid, c.profile_path.clone())); }
             sqlx::query("INSERT INTO movie_cast (movie_id, person_id, role, sort_order) VALUES (?, ?, ?, ?)")
                 .bind(entry_id)
@@ -1869,7 +1934,11 @@ pub async fn apply_tmdb_metadata(
             .await
             .map_err(|e| e.to_string())?;
         for c in composers {
-            let person_id = ensure_person(&state.app_db, &c.name, c.tmdb_id).await?;
+            let person_id = if let Some(pid) = c.person_id {
+                pid
+            } else {
+                ensure_person(&state.app_db, &c.name, c.tmdb_id).await?
+            };
             if let Some(tid) = c.tmdb_id { new_people.push((person_id, tid, c.profile_path.clone())); }
             sqlx::query("INSERT OR IGNORE INTO movie_composer (movie_id, person_id) VALUES (?, ?)")
                 .bind(entry_id)
@@ -2426,11 +2495,14 @@ async fn try_compute_label_for_role(
     entry_type: &str,
     role: &str,
 ) -> Result<Option<String>, String> {
-    fn cast_label(role: Option<String>) -> String {
-        match role {
-            Some(s) if !s.trim().is_empty() => format!("as {}", s.trim()),
-            _ => "acted in".to_string(),
-        }
+    /// Produces `Some("as {character}")` when the role is a non-empty string, else None.
+    /// The "acted in" fallback used to live here but was removed — the section header
+    /// ("actor") already conveys what the person did, so a bare "acted in" is noise.
+    fn cast_label(role: Option<String>) -> Option<String> {
+        role.and_then(|s| {
+            let t = s.trim();
+            if t.is_empty() { None } else { Some(format!("as {}", t)) }
+        })
     }
 
     match (entry_type, role) {
@@ -2443,33 +2515,19 @@ async fn try_compute_label_for_role(
             .fetch_optional(pool)
             .await
             .map_err(|e| e.to_string())?;
-            Ok(row.map(|(r,)| cast_label(r)))
+            // Only emit a label when there's an actual character name. No row, or a row
+            // with NULL/empty role → None (card's secondary line stays blank).
+            Ok(row.and_then(|(r,)| cast_label(r)))
         }
-        ("movie", "director_creator") => {
-            let row: Option<(i64,)> = sqlx::query_as(
-                "SELECT 1 FROM movie_director WHERE movie_id = ? AND person_id = ? LIMIT 1",
-            )
-            .bind(entry_id)
-            .bind(person_id)
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| e.to_string())?;
-            Ok(row.map(|_| "directed".to_string()))
-        }
-        ("movie", "composer") => {
-            let row: Option<(i64,)> = sqlx::query_as(
-                "SELECT 1 FROM movie_composer WHERE movie_id = ? AND person_id = ? LIMIT 1",
-            )
-            .bind(entry_id)
-            .bind(person_id)
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| e.to_string())?;
-            Ok(row.map(|_| "composed".to_string()))
-        }
+        // Directors and composers — their section header says what they did, so the
+        // card itself emits no label. Anthology variants that add an episode title or
+        // count stay below for the director/creator case only (those carry additional
+        // info beyond "directed").
+        ("movie", "director_creator") | ("movie", "composer") => Ok(None),
         ("show", "actor") => {
-            // Show-level cast first — if present, skip season/episode enrichment entirely
-            // (that's where spoiler-safe "acted in" / "as X" labels live).
+            // Prefer the most authoritative cast row (show-level → season-level →
+            // episode-level) for the character name. No bare "acted in" fallback
+            // anywhere — just the character name when one exists.
             let sc: Option<(Option<String>,)> = sqlx::query_as(
                 "SELECT role FROM show_cast WHERE show_id = ? AND person_id = ? LIMIT 1",
             )
@@ -2479,9 +2537,8 @@ async fn try_compute_label_for_role(
             .await
             .map_err(|e| e.to_string())?;
             if let Some((r,)) = sc {
-                return Ok(Some(cast_label(r)));
+                return Ok(cast_label(r));
             }
-            // Fall back to season_cast — some shows only record cast at the season level.
             let sec: Option<(Option<String>,)> = sqlx::query_as(
                 "SELECT sec.role FROM season_cast sec JOIN season s ON s.id = sec.season_id \
                  WHERE s.show_id = ? AND sec.person_id = ? LIMIT 1",
@@ -2492,10 +2549,12 @@ async fn try_compute_label_for_role(
             .await
             .map_err(|e| e.to_string())?;
             if let Some((r,)) = sec {
-                return Ok(Some(cast_label(r)));
+                return Ok(cast_label(r));
             }
-            // Only episode_cast rows — apply anthology rules. Non-anthology shows get a
-            // generic "acted in" (spoiler guardrail).
+            // episode_cast only. Non-anthology: surface just the character name; no
+            // "acted in N episodes" fallback (spoiler guardrail is already handled by
+            // NOT emitting counts/titles). Anthology: episode title allowed, also
+            // gated on character name presence.
             let total: (i64,) = sqlx::query_as(
                 "SELECT COUNT(*) FROM episode_cast ec \
                  JOIN episode e ON e.id = ec.episode_id \
@@ -2507,10 +2566,22 @@ async fn try_compute_label_for_role(
             .fetch_one(pool)
             .await
             .map_err(|e| e.to_string())?;
-            let n = total.0;
-            if n == 0 {
+            if total.0 == 0 {
                 return Ok(None);
             }
+            let role_name: Option<String> = sqlx::query_as::<_, (Option<String>,)>(
+                "SELECT ec.role FROM episode_cast ec \
+                 JOIN episode e ON e.id = ec.episode_id \
+                 JOIN season s ON s.id = e.season_id \
+                 WHERE s.show_id = ? AND ec.person_id = ? AND ec.role IS NOT NULL AND ec.role != '' \
+                 LIMIT 1",
+            )
+            .bind(entry_id)
+            .bind(person_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?
+            .and_then(|(r,)| r);
             let anthology_row: Option<(i64,)> = sqlx::query_as(
                 "SELECT is_anthology FROM show WHERE id = ?",
             )
@@ -2519,12 +2590,21 @@ async fn try_compute_label_for_role(
             .await
             .map_err(|e| e.to_string())?;
             let is_anthology = anthology_row.map(|(v,)| v != 0).unwrap_or(false);
+
+            // Not anthology → just the character name, or nothing.
             if !is_anthology {
-                return Ok(Some("acted in".to_string()));
+                return Ok(role_name.map(|s| format!("as {}", s.trim())));
             }
-            if n == 1 {
-                let row: Option<(Option<String>, String)> = sqlx::query_as(
-                    "SELECT ec.role, e.title FROM episode_cast ec \
+
+            // Anthology single-episode: tack on the episode title when we have both
+            // a character and a title. Missing character → None.
+            if total.0 == 1 {
+                let role = match role_name {
+                    Some(s) => s,
+                    None => return Ok(None),
+                };
+                let title: Option<String> = sqlx::query_as::<_, (String,)>(
+                    "SELECT e.title FROM episode_cast ec \
                      JOIN episode e ON e.id = ec.episode_id \
                      JOIN season s ON s.id = e.season_id \
                      WHERE s.show_id = ? AND ec.person_id = ? LIMIT 1",
@@ -2533,21 +2613,20 @@ async fn try_compute_label_for_role(
                 .bind(person_id)
                 .fetch_optional(pool)
                 .await
-                .map_err(|e| e.to_string())?;
-                if let Some((r, title)) = row {
-                    let label = match r {
-                        Some(s) if !s.trim().is_empty() => {
-                            format!("as {} in \"{}\"", s.trim(), title)
-                        }
-                        _ => format!("acted in \"{}\"", title),
-                    };
-                    return Ok(Some(label));
-                }
-                return Ok(Some("acted in".to_string()));
+                .map_err(|e| e.to_string())?
+                .map(|(t,)| t);
+                let label = match title {
+                    Some(t) if !t.is_empty() => format!("as {} in \"{}\"", role.trim(), t),
+                    _ => format!("as {}", role.trim()),
+                };
+                return Ok(Some(label));
             }
-            Ok(Some(format!("acted in {} episodes", n)))
+            // Anthology 2+ episodes: just the character name. Episode count isn't shown
+            // when character is present (kept concise).
+            Ok(role_name.map(|s| format!("as {}", s.trim())))
         }
         ("show", "director_creator") => {
+            // show_creator → header-only; no "created" label.
             let sc: Option<(i64,)> = sqlx::query_as(
                 "SELECT 1 FROM show_creator WHERE show_id = ? AND person_id = ? LIMIT 1",
             )
@@ -2557,9 +2636,12 @@ async fn try_compute_label_for_role(
             .await
             .map_err(|e| e.to_string())?;
             if sc.is_some() {
-                return Ok(Some("created".to_string()));
+                return Ok(None);
             }
-            // Episode-director case. Same anthology rules.
+            // Episode-director case. Anthology variants (`directed "Title"` /
+            // `directed N episodes`) still carry info beyond the section header, so
+            // they stay. Non-anthology case has no character name to anchor on and
+            // no extra info → None.
             let total: (i64,) = sqlx::query_as(
                 "SELECT COUNT(*) FROM episode_director ed \
                  JOIN episode e ON e.id = ed.episode_id \
@@ -2584,7 +2666,7 @@ async fn try_compute_label_for_role(
             .map_err(|e| e.to_string())?;
             let is_anthology = anthology_row.map(|(v,)| v != 0).unwrap_or(false);
             if !is_anthology {
-                return Ok(Some("directed".to_string()));
+                return Ok(None);
             }
             if n == 1 {
                 let row: Option<(String,)> = sqlx::query_as(
@@ -2604,31 +2686,8 @@ async fn try_compute_label_for_role(
             }
             Ok(Some(format!("directed {} episodes", n)))
         }
-        ("show", "composer") => {
-            let sc: Option<(i64,)> = sqlx::query_as(
-                "SELECT 1 FROM show_composer WHERE show_id = ? AND person_id = ? LIMIT 1",
-            )
-            .bind(entry_id)
-            .bind(person_id)
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| e.to_string())?;
-            if sc.is_some() {
-                return Ok(Some("composed".to_string()));
-            }
-            let ec: Option<(i64,)> = sqlx::query_as(
-                "SELECT 1 FROM episode_composer ec \
-                 JOIN episode e ON e.id = ec.episode_id \
-                 JOIN season s ON s.id = e.season_id \
-                 WHERE s.show_id = ? AND ec.person_id = ? LIMIT 1",
-            )
-            .bind(entry_id)
-            .bind(person_id)
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| e.to_string())?;
-            Ok(ec.map(|_| "composed".to_string()))
-        }
+        // Composer sections never emit a card label — the section header handles it.
+        ("show", "composer") => Ok(None),
         _ => Ok(None),
     }
 }
@@ -2693,23 +2752,32 @@ pub async fn get_people_in_library(
         .collect())
 }
 
-#[tauri::command]
-pub async fn get_entries_for_person(
-    state: tauri::State<'_, AppState>,
-    library_id: String,
+/// Person-detail page response: works grouped by role section. Each list contains the
+/// works the person is credited on for that role; an entry can appear in more than one
+/// section (e.g. a director who also acted in the same movie). Frontend hides empty
+/// sections and re-sorts client-side per section.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PersonEntriesResponse {
+    pub actor: Vec<MediaEntry>,
+    pub director: Vec<MediaEntry>,
+    pub composer: Vec<MediaEntry>,
+}
+
+/// Internal helper — fetches the works a person has credits on for a single role and
+/// labels each one with the role-specific involvement string ("as Walter White",
+/// "directed", "composed", etc.). Returns entries with `year`/`end_year` nulled and
+/// the label written into `season_display` so the existing card rendering works
+/// unchanged.
+async fn fetch_person_entries_for_role(
+    pool: &SqlitePool,
+    library_id: &str,
     person_id: i64,
-    role: String,
+    role: &str,
+    covers_map: &mut HashMap<String, Vec<String>>,
 ) -> Result<Vec<MediaEntry>, String> {
-    let cte = role_works_cte(&role)?;
-    let (format, _paths, _default_sort_mode) = get_library_meta(&state.app_db, &library_id).await?;
-    if format != "video" {
-        return Err("People browsing is only supported for video libraries".to_string());
-    }
-
-    let mut covers_map = get_all_cached_covers(&state.app_db, &library_id)
-        .await
-        .map_err(|e| e.to_string())?;
-
+    let cte = role_works_cte(role)?;
+    // Year is included so the frontend can sort sections by release date. The card
+    // suppresses year visually via a `hideYear` prop; sort uses it under the hood.
     let query = format!(
         "{cte} \
          SELECT mef.id, mef.title, \
@@ -2727,25 +2795,32 @@ pub async fn get_entries_for_person(
 
     let rows: Vec<(i64, String, Option<String>, String, Option<i64>, String, Option<String>, Option<String>)> =
         sqlx::query_as(&query)
-            .bind(&library_id)
+            .bind(library_id)
             .bind(person_id)
-            .fetch_all(&state.app_db)
+            .fetch_all(pool)
             .await
             .map_err(|e| e.to_string())?;
 
-    // Person-detail cards display a person-specific involvement label ("as Walter White",
-    // "directed", etc.) instead of the library-centric year/season-range shown on other
-    // grids. The label is computed per (person, entry) pair from cast/director/composer
-    // junctions; year/end_year are nulled so the card renders *only* the label.
     let mut entries: Vec<MediaEntry> = Vec::with_capacity(rows.len());
-    for (id, title, _year, folder_path, parent_id, entry_type, selected_cover, tmdb_id) in rows {
-        let covers = covers_map.remove(&folder_path).unwrap_or_default();
-        let label = compute_person_entry_label(&state.app_db, person_id, id, &entry_type, &role).await?;
+    for (id, title, year, folder_path, parent_id, entry_type, selected_cover, tmdb_id) in rows {
+        // Cover lookup uses a clone since the same entry may also appear in another role
+        // section (e.g. someone who acts AND directs the same movie) and would need its
+        // covers there too.
+        let covers = covers_map.get(&folder_path).cloned().unwrap_or_default();
+        let label = compute_person_entry_label(pool, person_id, id, &entry_type, role).await?;
+        // Shows: hydrate year/end_year so the section's date-sort can use the show's
+        // run range. Movies: year already inline from the SELECT above.
+        let (final_year, final_end_year) = if entry_type == "show" {
+            let (y, ey, _sd) = enrich_show_fields(pool, id).await?;
+            (y, ey)
+        } else {
+            (year, None)
+        };
         entries.push(MediaEntry {
             id,
             title,
-            year: None,
-            end_year: None,
+            year: final_year,
+            end_year: final_end_year,
             folder_path,
             parent_id,
             entry_type,
@@ -2760,6 +2835,334 @@ pub async fn get_entries_for_person(
     }
 
     Ok(entries)
+}
+
+/// Mass-update a person's character name (cast role) for a given work. Movies hit the
+/// single `movie_cast` row. Shows update across `show_cast`, all `season_cast` rows for
+/// that person on that show, and all `episode_cast` rows for that person on that show
+/// — the user can't see the layered structure, so we keep it consistent everywhere.
+///
+/// Empty `new_role` stores `NULL` (treated as "no character name" by the label code).
+///
+/// See [count_person_role_variants] — used by the frontend to warn when this update
+/// would clobber multiple distinct existing values (voice actors playing several
+/// characters across episodes).
+#[tauri::command]
+pub async fn update_person_cast_role(
+    state: tauri::State<'_, AppState>,
+    person_id: i64,
+    entry_id: i64,
+    entry_type: String,
+    new_role: String,
+) -> Result<(), String> {
+    let trimmed = new_role.trim();
+    let value: Option<&str> = if trimmed.is_empty() { None } else { Some(trimmed) };
+
+    match entry_type.as_str() {
+        "movie" => {
+            sqlx::query("UPDATE movie_cast SET role = ? WHERE movie_id = ? AND person_id = ?")
+                .bind(value)
+                .bind(entry_id)
+                .bind(person_id)
+                .execute(&state.app_db)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        "show" => {
+            sqlx::query("UPDATE show_cast SET role = ? WHERE show_id = ? AND person_id = ?")
+                .bind(value)
+                .bind(entry_id)
+                .bind(person_id)
+                .execute(&state.app_db)
+                .await
+                .map_err(|e| e.to_string())?;
+            sqlx::query(
+                "UPDATE season_cast SET role = ? \
+                 WHERE person_id = ? AND season_id IN (SELECT id FROM season WHERE show_id = ?)",
+            )
+            .bind(value)
+            .bind(person_id)
+            .bind(entry_id)
+            .execute(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+            sqlx::query(
+                "UPDATE episode_cast SET role = ? \
+                 WHERE person_id = ? AND episode_id IN ( \
+                   SELECT e.id FROM episode e JOIN season s ON s.id = e.season_id \
+                   WHERE s.show_id = ?)",
+            )
+            .bind(value)
+            .bind(person_id)
+            .bind(entry_id)
+            .execute(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+        }
+        other => return Err(format!("Unsupported entry_type for character edit: {}", other)),
+    }
+
+    Ok(())
+}
+
+/// Count of *distinct non-null* role values currently stored across a person's cast rows
+/// for a given work. Used by the character-edit dialog to warn when saving will replace
+/// multiple existing names with one — typically a voice actor or anthology guest playing
+/// different characters across episodes.
+#[tauri::command]
+pub async fn count_person_role_variants(
+    state: tauri::State<'_, AppState>,
+    person_id: i64,
+    entry_id: i64,
+    entry_type: String,
+) -> Result<i64, String> {
+    match entry_type.as_str() {
+        "movie" => {
+            let row: (i64,) = sqlx::query_as(
+                "SELECT COUNT(DISTINCT role) FROM movie_cast \
+                 WHERE movie_id = ? AND person_id = ? AND role IS NOT NULL AND role != ''",
+            )
+            .bind(entry_id)
+            .bind(person_id)
+            .fetch_one(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+            Ok(row.0)
+        }
+        "show" => {
+            let row: (i64,) = sqlx::query_as(
+                "SELECT COUNT(DISTINCT role) FROM ( \
+                   SELECT role FROM show_cast WHERE show_id = ? AND person_id = ? AND role IS NOT NULL AND role != '' \
+                   UNION ALL \
+                   SELECT sec.role FROM season_cast sec JOIN season s ON s.id = sec.season_id \
+                     WHERE s.show_id = ? AND sec.person_id = ? AND sec.role IS NOT NULL AND sec.role != '' \
+                   UNION ALL \
+                   SELECT ec.role FROM episode_cast ec \
+                     JOIN episode e ON e.id = ec.episode_id \
+                     JOIN season s ON s.id = e.season_id \
+                     WHERE s.show_id = ? AND ec.person_id = ? AND ec.role IS NOT NULL AND ec.role != '' \
+                 )",
+            )
+            .bind(entry_id)
+            .bind(person_id)
+            .bind(entry_id)
+            .bind(person_id)
+            .bind(entry_id)
+            .bind(person_id)
+            .fetch_one(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+            Ok(row.0)
+        }
+        other => Err(format!("Unsupported entry_type for role variant count: {}", other)),
+    }
+}
+
+#[tauri::command]
+pub async fn get_entries_for_person(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    person_id: i64,
+) -> Result<PersonEntriesResponse, String> {
+    let (format, _paths, _default_sort_mode) = get_library_meta(&state.app_db, &library_id).await?;
+    if format != "video" {
+        return Err("People browsing is only supported for video libraries".to_string());
+    }
+
+    let mut covers_map = get_all_cached_covers(&state.app_db, &library_id)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let actor = fetch_person_entries_for_role(&state.app_db, &library_id, person_id, "actor", &mut covers_map).await?;
+    let director = fetch_person_entries_for_role(&state.app_db, &library_id, person_id, "director_creator", &mut covers_map).await?;
+    let composer = fetch_person_entries_for_role(&state.app_db, &library_id, person_id, "composer", &mut covers_map).await?;
+
+    Ok(PersonEntriesResponse { actor, director, composer })
+}
+
+// ---------- Person identity / bio / TMDB matching ----------
+
+/// Read a single person record. Used by the person-detail page header + bio panel and
+/// as a refresh after match/refresh/clear actions.
+#[tauri::command]
+pub async fn get_person_detail(
+    state: tauri::State<'_, AppState>,
+    person_id: i64,
+) -> Result<PersonDetail, String> {
+    let row: Option<(i64, String, Option<String>, Option<i64>, Option<String>)> = sqlx::query_as(
+        "SELECT id, name, image_path, tmdb_id, bio FROM person WHERE id = ?",
+    )
+    .bind(person_id)
+    .fetch_optional(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    let (id, name, image_path, tmdb_id, bio) = row.ok_or("Person not found")?;
+    Ok(PersonDetail { id, name, image_path, tmdb_id, bio })
+}
+
+/// Local search used by the picker's "In library" section. Case-insensitive substring
+/// match on `person.name`, capped to 15 rows.
+#[tauri::command]
+pub async fn search_persons_local(
+    state: tauri::State<'_, AppState>,
+    query: String,
+) -> Result<Vec<LocalPersonSearchResult>, String> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Ok(Vec::new());
+    }
+    let pattern = format!("%{}%", q);
+    let rows: Vec<(i64, String, Option<String>, Option<i64>)> = sqlx::query_as(
+        "SELECT id, name, image_path, tmdb_id FROM person \
+         WHERE name LIKE ? COLLATE NOCASE \
+         ORDER BY name COLLATE NOCASE \
+         LIMIT 15",
+    )
+    .bind(&pattern)
+    .fetch_all(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, name, image_path, tmdb_id)| LocalPersonSearchResult {
+            id,
+            name,
+            image_path,
+            tmdb_id,
+        })
+        .collect())
+}
+
+/// TMDB person search for the picker's "From TMDB" section.
+#[tauri::command]
+pub async fn search_tmdb_person(
+    state: tauri::State<'_, AppState>,
+    query: String,
+) -> Result<Vec<TmdbPersonSearchResult>, String> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Ok(Vec::new());
+    }
+    let token: String = sqlx::query_scalar("SELECT value FROM settings WHERE key = 'tmdb_api_token'")
+        .fetch_optional(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "No TMDB API token configured. Add one in settings.".to_string())?;
+    let client = reqwest::Client::new();
+    let response = crate::tmdb::search_person(&client, &token, q).await?;
+    Ok(response
+        .results
+        .into_iter()
+        .map(|hit| {
+            let summary: Option<String> = {
+                let titles: Vec<String> = hit
+                    .known_for
+                    .iter()
+                    .take(3)
+                    .filter_map(|k| k.title.clone().or_else(|| k.name.clone()))
+                    .collect();
+                if titles.is_empty() { None } else { Some(titles.join(", ")) }
+            };
+            TmdbPersonSearchResult {
+                id: hit.id,
+                name: hit.name,
+                profile_path: hit.profile_path,
+                known_for_department: hit.known_for_department,
+                known_for_summary: summary,
+            }
+        })
+        .collect())
+}
+
+/// Internal helper — fetches /person/{tmdb_id} and writes name/tmdb_id/bio to the
+/// given person row. Kicks off a profile image download when the person has none.
+/// Used by both apply_tmdb_person_match and refresh_tmdb_person.
+async fn fetch_and_apply_tmdb_person(
+    pool: &sqlx::SqlitePool,
+    app_data_dir: &std::path::Path,
+    person_id: i64,
+    tmdb_id: i64,
+    token: &str,
+) -> Result<(), String> {
+    let client = reqwest::Client::new();
+    let detail = crate::tmdb::get_person_detail(&client, token, tmdb_id).await?;
+    let bio: Option<String> = detail
+        .biography
+        .as_ref()
+        .and_then(|b| {
+            let t = b.trim();
+            if t.is_empty() { None } else { Some(t.to_string()) }
+        });
+    sqlx::query("UPDATE person SET tmdb_id = ?, name = ?, bio = ? WHERE id = ?")
+        .bind(tmdb_id)
+        .bind(&detail.name)
+        .bind(bio.as_deref())
+        .bind(person_id)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    // Reuse the shared image-download path — it skips the work when the person
+    // already has an image, and handles missing profile_path gracefully.
+    process_person_images(pool, app_data_dir, vec![(person_id, tmdb_id, detail.profile_path)]).await;
+    Ok(())
+}
+
+/// Attach a TMDB record to an existing person. Writes tmdb_id, updates name to the
+/// canonical TMDB spelling, pulls biography, and downloads the profile image if the
+/// person has none locally.
+#[tauri::command]
+pub async fn apply_tmdb_person_match(
+    state: tauri::State<'_, AppState>,
+    person_id: i64,
+    tmdb_id: i64,
+) -> Result<(), String> {
+    let token: String = sqlx::query_scalar("SELECT value FROM settings WHERE key = 'tmdb_api_token'")
+        .fetch_optional(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "No TMDB API token configured. Add one in settings.".to_string())?;
+    fetch_and_apply_tmdb_person(&state.app_db, &state.app_data_dir, person_id, tmdb_id, &token).await
+}
+
+/// Re-pull TMDB data for a person that's already matched. Errors if the person has no
+/// tmdb_id (caller shouldn't expose the action in that state).
+#[tauri::command]
+pub async fn refresh_tmdb_person(
+    state: tauri::State<'_, AppState>,
+    person_id: i64,
+) -> Result<(), String> {
+    let existing: Option<(Option<i64>,)> = sqlx::query_as(
+        "SELECT tmdb_id FROM person WHERE id = ?",
+    )
+    .bind(person_id)
+    .fetch_optional(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    let tmdb_id = existing
+        .and_then(|(t,)| t)
+        .ok_or_else(|| "Person is not matched to TMDB.".to_string())?;
+    let token: String = sqlx::query_scalar("SELECT value FROM settings WHERE key = 'tmdb_api_token'")
+        .fetch_optional(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "No TMDB API token configured. Add one in settings.".to_string())?;
+    fetch_and_apply_tmdb_person(&state.app_db, &state.app_data_dir, person_id, tmdb_id, &token).await
+}
+
+/// Nulls the person's tmdb_id and bio. Keeps image_path + person_image rows (the
+/// previously-fetched portrait still belongs to this person; removing it is a
+/// separate UX we haven't surfaced).
+#[tauri::command]
+pub async fn clear_tmdb_person_match(
+    state: tauri::State<'_, AppState>,
+    person_id: i64,
+) -> Result<(), String> {
+    sqlx::query("UPDATE person SET tmdb_id = NULL, bio = NULL WHERE id = ?")
+        .bind(person_id)
+        .execute(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -7189,7 +7592,11 @@ pub async fn apply_tmdb_show_metadata(
     if let Some(ref creators) = fields.creators {
         sqlx::query("DELETE FROM show_creator WHERE show_id = ?").bind(show_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         for c in creators {
-            let person_id = ensure_person(&state.app_db, &c.name, c.tmdb_id).await?;
+            let person_id = if let Some(pid) = c.person_id {
+                pid
+            } else {
+                ensure_person(&state.app_db, &c.name, c.tmdb_id).await?
+            };
             if let Some(tid) = c.tmdb_id { new_people.push((person_id, tid, c.profile_path.clone())); }
             sqlx::query("INSERT INTO show_creator (show_id, person_id) VALUES (?, ?)")
                 .bind(show_id).bind(person_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
@@ -7199,7 +7606,11 @@ pub async fn apply_tmdb_show_metadata(
     if let Some(ref cast) = fields.cast {
         sqlx::query("DELETE FROM show_cast WHERE show_id = ?").bind(show_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         for (i, c) in cast.iter().enumerate() {
-            let person_id = ensure_person(&state.app_db, &c.name, c.tmdb_id).await?;
+            let person_id = if let Some(pid) = c.person_id {
+                pid
+            } else {
+                ensure_person(&state.app_db, &c.name, c.tmdb_id).await?
+            };
             if let Some(tid) = c.tmdb_id { new_people.push((person_id, tid, c.profile_path.clone())); }
             sqlx::query("INSERT INTO show_cast (show_id, person_id, role, sort_order) VALUES (?, ?, ?, ?)")
                 .bind(show_id).bind(person_id).bind(&c.role).bind(i as i64).execute(&state.app_db).await.map_err(|e| e.to_string())?;
@@ -7209,7 +7620,11 @@ pub async fn apply_tmdb_show_metadata(
     if let Some(ref composers) = fields.composers {
         sqlx::query("DELETE FROM show_composer WHERE show_id = ?").bind(show_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         for c in composers {
-            let person_id = ensure_person(&state.app_db, &c.name, c.tmdb_id).await?;
+            let person_id = if let Some(pid) = c.person_id {
+                pid
+            } else {
+                ensure_person(&state.app_db, &c.name, c.tmdb_id).await?
+            };
             if let Some(tid) = c.tmdb_id { new_people.push((person_id, tid, c.profile_path.clone())); }
             sqlx::query("INSERT OR IGNORE INTO show_composer (show_id, person_id) VALUES (?, ?)")
                 .bind(show_id).bind(person_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
@@ -7309,7 +7724,11 @@ pub async fn apply_tmdb_season_metadata(
     if let Some(ref cast) = fields.cast {
         sqlx::query("DELETE FROM season_cast WHERE season_id = ?").bind(season_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         for (i, c) in cast.iter().enumerate() {
-            let person_id = ensure_person(&state.app_db, &c.name, c.tmdb_id).await?;
+            let person_id = if let Some(pid) = c.person_id {
+                pid
+            } else {
+                ensure_person(&state.app_db, &c.name, c.tmdb_id).await?
+            };
             if let Some(tid) = c.tmdb_id { new_people.push((person_id, tid, c.profile_path.clone())); }
             sqlx::query("INSERT INTO season_cast (season_id, person_id, role, sort_order) VALUES (?, ?, ?, ?)")
                 .bind(season_id).bind(person_id).bind(&c.role).bind(i as i64).execute(&state.app_db).await.map_err(|e| e.to_string())?;
@@ -7325,7 +7744,11 @@ pub async fn apply_tmdb_season_metadata(
             .await
             .map_err(|e| e.to_string())?;
         for d in directors {
-            let person_id = ensure_person(&state.app_db, &d.name, d.tmdb_id).await?;
+            let person_id = if let Some(pid) = d.person_id {
+                pid
+            } else {
+                ensure_person(&state.app_db, &d.name, d.tmdb_id).await?
+            };
             if let Some(tid) = d.tmdb_id { new_people.push((person_id, tid, d.profile_path.clone())); }
             for (ep_id,) in &episode_ids {
                 sqlx::query("INSERT OR IGNORE INTO episode_director (episode_id, person_id) VALUES (?, ?)")
@@ -7395,7 +7818,11 @@ pub async fn apply_tmdb_episode_metadata(
     if let Some(ref cast) = fields.cast {
         sqlx::query("DELETE FROM episode_cast WHERE episode_id = ?").bind(episode_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         for (i, c) in cast.iter().enumerate() {
-            let person_id = ensure_person(&state.app_db, &c.name, c.tmdb_id).await?;
+            let person_id = if let Some(pid) = c.person_id {
+                pid
+            } else {
+                ensure_person(&state.app_db, &c.name, c.tmdb_id).await?
+            };
             if let Some(tid) = c.tmdb_id { new_people.push((person_id, tid, c.profile_path.clone())); }
             sqlx::query("INSERT INTO episode_cast (episode_id, person_id, role, sort_order) VALUES (?, ?, ?, ?)")
                 .bind(episode_id).bind(person_id).bind(&c.role).bind(i as i64).execute(&state.app_db).await.map_err(|e| e.to_string())?;
@@ -7405,7 +7832,11 @@ pub async fn apply_tmdb_episode_metadata(
     if let Some(ref directors) = fields.director {
         sqlx::query("DELETE FROM episode_director WHERE episode_id = ?").bind(episode_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         for d in directors {
-            let person_id = ensure_person(&state.app_db, &d.name, d.tmdb_id).await?;
+            let person_id = if let Some(pid) = d.person_id {
+                pid
+            } else {
+                ensure_person(&state.app_db, &d.name, d.tmdb_id).await?
+            };
             if let Some(tid) = d.tmdb_id { new_people.push((person_id, tid, d.profile_path.clone())); }
             sqlx::query("INSERT OR IGNORE INTO episode_director (episode_id, person_id) VALUES (?, ?)")
                 .bind(episode_id).bind(person_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
@@ -7415,7 +7846,11 @@ pub async fn apply_tmdb_episode_metadata(
     if let Some(ref composers) = fields.composer {
         sqlx::query("DELETE FROM episode_composer WHERE episode_id = ?").bind(episode_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         for c in composers {
-            let person_id = ensure_person(&state.app_db, &c.name, c.tmdb_id).await?;
+            let person_id = if let Some(pid) = c.person_id {
+                pid
+            } else {
+                ensure_person(&state.app_db, &c.name, c.tmdb_id).await?
+            };
             if let Some(tid) = c.tmdb_id { new_people.push((person_id, tid, c.profile_path.clone())); }
             sqlx::query("INSERT OR IGNORE INTO episode_composer (episode_id, person_id) VALUES (?, ?)")
                 .bind(episode_id).bind(person_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
