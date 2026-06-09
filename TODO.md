@@ -44,14 +44,20 @@ add warning when playing entire seasons without episode numbers (they will likel
 
 POSSIBLY FIXED: weird bugs when changing and viewing media covers, specifically when looking at the hobbit collection media and john wick 3. only pattern i see here is media inside collections, idk tho. basically it is just not displaying covers in the change cover and delete cover menus, which messes up their ui pretty bad. also when this happens the cover doesnt show up in detail view sometimes
 
-adding year to media should add it to movie/show folder name
-
 
 ## BIG STUFF NOW
 
-remember size slider better maybe
+window loses rounded edge sometimes after being maximized
 
-save custom sort sets. users should be able to create and name custom sorting sets and easily switch to them (i.e. named sorting sets based on things not in metadata like 'chronological')
+autoplay seems to not work most of the time. not sure what causes it not to.
+
+I want a little thumbnail showing the frame at the hovered spot when cursor is hovering seek bar
+
+playing something new while small screen in sidebar is visible should open the playing content (out of sidebar)
+
+adding year to media should add it to movie/show folder name
+
+remember size slider position (maybe)
 
 need to consider some sort of ability to queue up things for the player. TV show autoplay should probably take this system into heavy consideration. Users should be able to queue playlists. Users should be able to queue up individual movies in context menus at their whim. On the player and maybe not on the player, the user should be able to view the queue and manipulate it in a dialog or sidebar or something
 
@@ -64,6 +70,7 @@ bind comma and period to prev frame and next frame on player. keybinds menu
 highlight composers. tmdb has them as crew with job "Composer" or "Original Music Composer"
 
 tv shows have directors per episode, not season or show as a whole. tmdb has them in crew with 
+
 
 ## Embedded Player
 
