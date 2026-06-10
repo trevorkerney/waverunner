@@ -59,6 +59,28 @@ pub fn run() {
             #[cfg(windows)]
             win_maximize_fix::install(app);
 
+            // Windows: a maximize/restore cycle can wipe the DWM frame extension
+            // that gives this undecorated window its border, shadow, and rounded
+            // corners. Re-assert it (set_shadow → DwmExtendFrameIntoClientArea)
+            // whenever the window returns to the normal state.
+            #[cfg(windows)]
+            if let Some(window) = app.get_webview_window("main") {
+                use std::sync::atomic::Ordering;
+                let win = window.clone();
+                let was_normal = AtomicBool::new(true);
+                window.on_window_event(move |event| {
+                    if let tauri::WindowEvent::Resized(_) = event {
+                        let normal = !win.is_maximized().unwrap_or(false)
+                            && !win.is_fullscreen().unwrap_or(false)
+                            && !win.is_minimized().unwrap_or(false);
+                        let prev = was_normal.swap(normal, Ordering::Relaxed);
+                        if normal && !prev {
+                            let _ = win.set_shadow(true);
+                        }
+                    }
+                });
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

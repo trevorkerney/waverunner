@@ -119,6 +119,10 @@ export function usePlayer(): [PlayerState, PlayerActions] {
     }
   }, []);
 
+  // True while an auto-advance is in flight, so eof-reached and mpv-end-file
+  // (which can both signal the same EOF) never double-trigger.
+  const advancingRef = useRef(false);
+
   const playEpisodeAtIndex = useCallback(async (newIndex: number) => {
     const ctx = stateRef.current.context;
     if (ctx.kind !== "episode") return;
@@ -143,6 +147,29 @@ export function usePlayer(): [PlayerState, PlayerActions] {
     }
   }, []);
 
+  // Natural end of the current file. With keep-open=yes mpv signals this via
+  // the eof-reached property (END_FILE does not fire), pausing on the last frame.
+  const handleNaturalEnd = useCallback(() => {
+    if (advancingRef.current) return;
+    const cur = stateRef.current;
+    if (
+      cur.autoPlayNext &&
+      cur.context.kind === "episode" &&
+      cur.context.index < cur.context.episodes.length - 1
+    ) {
+      advancingRef.current = true;
+      playEpisodeAtIndex(cur.context.index + 1)
+        .catch(() => {
+          setState((p) => ({ ...p, isPlaying: false }));
+        })
+        .finally(() => {
+          advancingRef.current = false;
+        });
+    } else {
+      setState((prev) => ({ ...prev, isPlaying: false }));
+    }
+  }, [playEpisodeAtIndex]);
+
   // Set up event listeners when player becomes active
   useEffect(() => {
     if (!state.isActive) return;
@@ -152,6 +179,10 @@ export function usePlayer(): [PlayerState, PlayerActions] {
         "mpv-property-change",
         (event) => {
           const { name, value } = event.payload;
+          if (name === "eof-reached") {
+            if (value === true) handleNaturalEnd();
+            return;
+          }
           setState((prev) => {
             switch (name) {
               case "time-pos":
@@ -187,19 +218,10 @@ export function usePlayer(): [PlayerState, PlayerActions] {
       const unlisten3 = await listen<{ reason: number }>("mpv-end-file", (event) => {
         // Only auto-advance on natural EOF (reason 0). STOP/QUIT/REDIRECT fire
         // whenever we replace the file (e.g. user clicks another episode).
+        // With keep-open=yes this rarely fires for EOF (eof-reached covers it),
+        // but it's kept as a fallback; handleNaturalEnd dedupes.
         if (event.payload?.reason !== 0) return;
-        const cur = stateRef.current;
-        if (
-          cur.autoPlayNext &&
-          cur.context.kind === "episode" &&
-          cur.context.index < cur.context.episodes.length - 1
-        ) {
-          playEpisodeAtIndex(cur.context.index + 1).catch(() => {
-            setState((p) => ({ ...p, isPlaying: false }));
-          });
-        } else {
-          setState((prev) => ({ ...prev, isPlaying: false }));
-        }
+        handleNaturalEnd();
       });
 
       unlistenRefs.current = [unlisten1, unlisten2, unlisten3];
@@ -211,7 +233,7 @@ export function usePlayer(): [PlayerState, PlayerActions] {
       unlistenRefs.current.forEach((fn) => fn());
       unlistenRefs.current = [];
     };
-  }, [state.isActive, refreshTracksInternal, playEpisodeAtIndex]);
+  }, [state.isActive, refreshTracksInternal, handleNaturalEnd]);
 
   const play = useCallback(async (path: string, title: string) => {
     const wasActive = stateRef.current.isActive;

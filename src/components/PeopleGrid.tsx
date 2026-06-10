@@ -22,9 +22,9 @@ function PersonCard({ person, onClick }: { person: PersonSummary; onClick: () =>
   return (
     <button
       onClick={onClick}
-      className="flex flex-col items-center gap-2 rounded-md p-2 text-center transition-colors hover:bg-accent focus:bg-accent focus:outline-none"
+      className="group flex flex-col items-center gap-2 rounded-md p-2 text-center transition-colors hover:bg-accent/40 focus:bg-accent/60 focus:outline-none"
     >
-      <div className="flex h-32 w-32 items-center justify-center overflow-hidden rounded-full bg-muted">
+      <div className="flex h-32 w-32 items-center justify-center overflow-hidden rounded-full bg-muted shadow-md ring-1 ring-foreground/10 transition-all duration-200 group-hover:shadow-lg group-hover:ring-primary/50">
         {imageSrc ? (
           <img
             src={imageSrc}

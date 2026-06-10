@@ -120,7 +120,13 @@ pub fn destroy_player(state: State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 pub fn play_file(state: State<'_, AppState>, path: String) -> Result<(), String> {
-    with_mpv(&state, |mpv| mpv.command(&["loadfile", &path]))
+    with_mpv(&state, |mpv| {
+        mpv.command(&["loadfile", &path])?;
+        // `pause` is sticky across loadfile, and keep-open leaves mpv paused
+        // after a natural EOF — without this the next file sits frozen on its
+        // first frame.
+        mpv.set_property_string("pause", "no")
+    })
 }
 
 #[tauri::command]

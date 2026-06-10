@@ -1175,17 +1175,17 @@ function SortableCoverCard({
             onClick={() => !isRenaming && !isDragging && onNavigate(entry)}
           />
         }
-        className={`group flex flex-col items-center gap-2 rounded-md p-2 text-left hover:bg-accent ${
+        className={`group flex flex-col items-center gap-2 rounded-md p-2 text-left ${
           isDragging ? "opacity-0" : ""
-        } ${isOver && isDragActive ? "ring-2 ring-primary ring-offset-2" : ""}`}
+        } ${isOver && isDragActive ? "ring-2 ring-primary ring-offset-2 ring-offset-background" : ""}`}
         style={{ ...style, maxWidth: size }}
       >
-        <div className="relative overflow-hidden rounded-sm bg-muted">
+        <div className="relative overflow-hidden rounded-md bg-muted shadow-md ring-1 ring-foreground/10 transition-all duration-200 group-hover:-translate-y-1 group-hover:shadow-xl group-hover:ring-foreground/25">
           {coverSrc ? (
             <img
               src={coverSrc}
               alt={entry.title}
-              className="pointer-events-none w-full"
+              className="pointer-events-none w-full transition-transform duration-300 group-hover:scale-[1.04]"
               style={{ maxHeight: size * 2 }}
               draggable={false}
             />
@@ -1204,7 +1204,7 @@ function SortableCoverCard({
             </div>
           )}
           {isCollection && (
-            <div className="absolute bottom-1 right-1 rounded-sm bg-black/60 px-1.5 py-0.5 text-xs text-white">
+            <div className="absolute bottom-1 right-1 rounded-sm bg-black/70 px-1.5 py-0.5 text-xs text-white backdrop-blur-sm">
               Collection
             </div>
           )}
@@ -1375,7 +1375,7 @@ function DragOverlayCard({
 
   return (
     <div className="flex cursor-grabbing flex-col items-center gap-2 rounded-md bg-accent p-2 text-left shadow-lg">
-      <div className="relative overflow-hidden rounded-sm bg-muted">
+      <div className="relative overflow-hidden rounded-md bg-muted shadow-md ring-1 ring-foreground/10 transition-all duration-200 group-hover:-translate-y-1 group-hover:shadow-xl group-hover:ring-foreground/25">
         {coverSrc ? (
           <img
             src={coverSrc}
@@ -1623,7 +1623,18 @@ function EntryDetailPage({
   };
 
   return (
-    <div className="flex gap-8 p-4">
+    <div className="relative isolate flex gap-8 p-6">
+      {/* Ambient backdrop: the cover blurred and washed out behind the header,
+          fading into the page background. */}
+      {coverSrc && (
+        // -inset-x-4/-top-4 cancel the scroll container's p-4 so the wash reaches the section borders.
+        <div aria-hidden className="pointer-events-none absolute -inset-x-4 -top-4 -z-10 h-[420px] overflow-hidden">
+          {/* Oversized by the blur radius (64px) on every side so the blur's
+              transparent falloff lands outside the visible box. */}
+          <img src={coverSrc} alt="" className="absolute -left-16 -top-16 h-[calc(100%+8rem)] w-[calc(100%+8rem)] max-w-none object-cover opacity-25 blur-3xl" />
+          <div className="absolute inset-0 bg-linear-to-b from-transparent via-background/60 to-background" />
+        </div>
+      )}
       {coverSrc && (
         <ContextMenu>
           <ContextMenuTrigger
@@ -1631,7 +1642,7 @@ function EntryDetailPage({
               <img
                 src={coverSrc}
                 alt={entry.title}
-                className="h-auto max-h-[500px] w-auto shrink-0 rounded-lg object-contain shadow-lg"
+                className="h-auto max-h-[500px] w-auto shrink-0 rounded-lg object-contain shadow-2xl ring-1 ring-foreground/10"
               />
             }
           />
@@ -2138,7 +2149,18 @@ function ShowDetailPage({
   const canSeasonTmdb = hasTmdb && selectedSeason?.season_number != null;
 
   return (
-    <div className="flex gap-8 p-4">
+    <div className="relative isolate flex gap-8 p-6">
+      {/* Ambient backdrop: the cover blurred and washed out behind the header,
+          fading into the page background. */}
+      {coverSrc && (
+        // -inset-x-4/-top-4 cancel the scroll container's p-4 so the wash reaches the section borders.
+        <div aria-hidden className="pointer-events-none absolute -inset-x-4 -top-4 -z-10 h-[420px] overflow-hidden">
+          {/* Oversized by the blur radius (64px) on every side so the blur's
+              transparent falloff lands outside the visible box. */}
+          <img src={coverSrc} alt="" className="absolute -left-16 -top-16 h-[calc(100%+8rem)] w-[calc(100%+8rem)] max-w-none object-cover opacity-25 blur-3xl" />
+          <div className="absolute inset-0 bg-linear-to-b from-transparent via-background/60 to-background" />
+        </div>
+      )}
       {coverSrc && (
         <ContextMenu>
           <ContextMenuTrigger
@@ -2146,7 +2168,7 @@ function ShowDetailPage({
               <img
                 src={coverSrc}
                 alt={entry.title}
-                className="h-auto max-h-[500px] w-auto shrink-0 rounded-lg object-contain shadow-lg"
+                className="h-auto max-h-[500px] w-auto shrink-0 rounded-lg object-contain shadow-2xl ring-1 ring-foreground/10"
               />
             }
           />
@@ -2803,13 +2825,13 @@ function PlaylistCard({
           <button
             onClick={onClick}
             onContextMenu={(e) => e.stopPropagation()}
-            className="flex flex-col gap-2 rounded-md text-left transition-colors hover:bg-accent/40 focus:bg-accent/60 focus:outline-none"
+            className="group flex flex-col gap-2 rounded-md text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           />
         }
       >
-        <div className="relative aspect-[2/3] overflow-hidden rounded-md bg-muted">
+        <div className="relative aspect-[2/3] overflow-hidden rounded-md bg-muted shadow-md ring-1 ring-foreground/10 transition-all duration-200 group-hover:-translate-y-1 group-hover:shadow-xl group-hover:ring-foreground/25">
           {coverSrc ? (
-            <img src={coverSrc} alt={playlist.title} className="h-full w-full object-cover" draggable={false} />
+            <img src={coverSrc} alt={playlist.title} className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.04]" draggable={false} />
           ) : (
             <div className="flex h-full w-full items-center justify-center text-muted-foreground">
               <ListMusic size={36} />

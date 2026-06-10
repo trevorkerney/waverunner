@@ -47,10 +47,6 @@ POSSIBLY FIXED: weird bugs when changing and viewing media covers, specifically 
 
 ## BIG STUFF NOW
 
-window loses rounded edge sometimes after being maximized
-
-autoplay seems to not work most of the time. not sure what causes it not to.
-
 I want a little thumbnail showing the frame at the hovered spot when cursor is hovering seek bar
 
 playing something new while small screen in sidebar is visible should open the playing content (out of sidebar)

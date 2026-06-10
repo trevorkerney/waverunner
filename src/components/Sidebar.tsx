@@ -160,10 +160,10 @@ export function Sidebar({
                           }}
                         />
                       }
-                      className={`flex w-full items-start gap-1 rounded-sm py-1.5 pr-2 pl-1 text-left text-sm ${
+                      className={`flex w-full items-start gap-1 rounded-sm py-1.5 pr-2 pl-1 text-left text-sm font-medium transition-colors ${
                         isSelected
                           ? "bg-sidebar-accent text-sidebar-accent-foreground"
-                          : "text-sidebar-foreground hover:bg-sidebar-accent/50"
+                          : "text-sidebar-foreground/90 hover:bg-sidebar-accent/50 hover:text-sidebar-foreground"
                       }`}
                     >
                       <span
