@@ -1182,9 +1182,32 @@ function App() {
       const parentId = last?.id === entryId
         ? (breadcrumbs[breadcrumbs.length - 2]?.id ?? null)
         : (last?.id ?? null);
+      // Every cached list for this library holds its own copy of the entry (root
+      // cache + per-view caches like movies-only/shows-only) — patch them all, or
+      // the old cover resurfaces when navigating back to a view whose copy went
+      // stale. Link-backed copies keep their own pinned covers.
+      const patchCover = (e: MediaEntry) =>
+        e.id === entryId && e.link_id == null ? { ...e, selected_cover: coverPath } : e;
+      const libPrefix = `${selectedLibrary.id}:`;
+      for (const [key, val] of entryCacheRef.current.entries()) {
+        if (key.startsWith(libPrefix)) {
+          entryCacheRef.current.set(key, { ...val, entries: val.entries.map(patchCover) });
+        }
+      }
+      for (const [key, val] of viewEntriesCacheRef.current.entries()) {
+        if (key.startsWith(libPrefix)) {
+          viewEntriesCacheRef.current.set(key, { ...val, entries: val.entries.map(patchCover) });
+        }
+      }
       setEntries((prev) => {
-        const updated = prev.map((e) => (e.id === entryId ? { ...e, selected_cover: coverPath } : e));
-        updateCache(selectedLibrary.id, parentId, updated, sortMode);
+        const updated = prev.map(patchCover);
+        // Write the live list to the cache slot matching the ACTIVE view — writing a
+        // filtered view's list into the root slot would poison the root grid.
+        if (activeView && activeView.kind !== "library-root") {
+          cacheSetMerging(viewEntriesCacheRef.current, viewCacheKey(activeView), updated, sortMode);
+        } else {
+          updateCache(selectedLibrary.id, parentId, updated, sortMode);
+        }
         return updated;
       });
       setSelectedEntry((prev) =>
@@ -1202,7 +1225,7 @@ function App() {
         loadEntries(selectedLibrary, parentId, breadcrumbs);
       }
     },
-    [selectedLibrary, activeView, breadcrumbs, sortMode, loadEntries, loadView, invalidateCache, updateCache]
+    [selectedLibrary, activeView, breadcrumbs, sortMode, loadEntries, loadView, invalidateCache, updateCache, cacheSetMerging]
   );
 
   const addCover = useCallback(

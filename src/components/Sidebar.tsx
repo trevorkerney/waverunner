@@ -133,7 +133,7 @@ export function Sidebar({
         </div>
         <ContextMenu>
           <ContextMenuTrigger
-            render={<nav className="flex-1 overflow-y-auto p-1" />}
+            render={<nav className="flex-1 overflow-y-auto py-1" />}
           >
           {libraries.length === 0 ? (
             <p className="px-2 py-1.5 text-sm text-muted-foreground whitespace-nowrap">
@@ -160,7 +160,7 @@ export function Sidebar({
                           }}
                         />
                       }
-                      className={`flex w-full items-start gap-1 rounded-sm py-1.5 pr-2 pl-1 text-left text-sm font-medium transition-colors ${
+                      className={`flex w-full items-start gap-1 py-1.5 pr-2 pl-1 text-left text-sm font-medium transition-colors ${
                         isSelected
                           ? "bg-sidebar-accent text-sidebar-accent-foreground"
                           : "text-sidebar-foreground/90 hover:bg-sidebar-accent/50 hover:text-sidebar-foreground"

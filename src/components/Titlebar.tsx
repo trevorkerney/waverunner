@@ -19,6 +19,9 @@ const appWindow = getCurrentWindow();
 const MIN_ZOOM = 0.8;
 const MAX_ZOOM = 1.5;
 const ZOOM_STEP = 0.1;
+// The app renders 10% larger than the webview default. Applied underneath the
+// user-facing zoom, which stays neutral: default 1.0, displayed as 100%.
+const BASE_SCALE = 1.1;
 
 export const TITLEBAR_HEIGHT = 24; // px — keep in sync with h-6 class below
 
@@ -33,7 +36,7 @@ export function Titlebar() {
     const clamped = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, Math.round(factor * 100) / 100));
     try {
       const { getCurrentWebviewWindow } = await import("@tauri-apps/api/webviewWindow");
-      await getCurrentWebviewWindow().setZoom(clamped);
+      await getCurrentWebviewWindow().setZoom(clamped * BASE_SCALE);
       zoomRef.current = clamped;
       setZoom(clamped);
       localStorage.setItem("app-zoom", String(clamped));

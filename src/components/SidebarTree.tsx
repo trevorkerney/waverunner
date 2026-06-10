@@ -115,9 +115,9 @@ function TreeNode({ node, activeView, onSelectView, renderNodeMenu, depth }: Tre
         e.stopPropagation();
       }}
       style={{ paddingLeft: 4 + depth * 12 }}
-      className={`flex w-full items-start gap-1.5 rounded-sm py-1 pr-2 text-left text-sm transition-colors ${
+      className={`flex w-full items-start gap-1.5 py-1 pr-2 text-left text-sm transition-colors ${
         isActive
-          ? "bg-sidebar-accent font-medium text-sidebar-accent-foreground"
+          ? "bg-sidebar-accent font-medium text-primary"
           : "text-sidebar-foreground/75 hover:bg-sidebar-accent/50 hover:text-sidebar-foreground"
       }`}
     >
@@ -135,7 +135,7 @@ function TreeNode({ node, activeView, onSelectView, renderNodeMenu, depth }: Tre
         <span className="h-5 w-4 flex-shrink-0" />
       )}
       <span className="flex h-5 flex-shrink-0 items-center">
-        <Icon size={14} className={isActive ? "text-primary" : undefined} />
+        <Icon size={14} />
       </span>
       <span className="min-w-0 flex-1 break-words">{node.label}</span>
     </button>
