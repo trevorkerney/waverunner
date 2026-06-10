@@ -24,23 +24,15 @@ fn generate_sort_title(title: &str, language: &str) -> String {
     lower
 }
 
-fn sanitize_filename(name: &str) -> String {
-    name.chars()
-        .filter(|c| !matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'))
-        .collect::<String>()
-        .trim()
-        .to_string()
-}
-
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Library {
     pub id: String,
     pub name: String,
     pub paths: Vec<String>,
     pub format: String,
-    pub portable: bool,
+    /// 'local' = read folders from disk. Future: 'jellyfin', 'plex', ... (client mode).
+    pub source: String,
     pub default_sort_mode: String,
-    pub managed: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -525,11 +517,13 @@ pub async fn create_library(
     name: String,
     paths: Vec<String>,
     format: String,
-    portable: bool,
-    managed: bool,
+    source: String,
 ) -> Result<Library, String> {
     if !matches!(format.as_str(), "video" | "music") {
         return Err(format!("Unsupported library format: {}", format));
+    }
+    if source != "local" {
+        return Err(format!("Unsupported library source: {}", source));
     }
     if paths.is_empty() {
         return Err("At least one path is required".to_string());
@@ -552,21 +546,19 @@ pub async fn create_library(
         name: name.clone(),
         paths: paths.clone(),
         format: format.clone(),
-        portable,
+        source: source.clone(),
         default_sort_mode: "alpha".to_string(),
-        managed,
     };
 
     sqlx::query(
-        "INSERT INTO library (id, name, paths, format, portable, default_sort_mode, managed, creating) VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
+        "INSERT INTO library (id, name, paths, format, source, default_sort_mode, creating) VALUES (?, ?, ?, ?, ?, ?, 1)",
     )
     .bind(&library.id)
     .bind(&library.name)
     .bind(&paths_json)
     .bind(&library.format)
-    .bind(library.portable as i32)
+    .bind(&library.source)
     .bind(&library.default_sort_mode)
-    .bind(library.managed as i32)
     .execute(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
@@ -659,8 +651,8 @@ pub async fn cleanup_incomplete_libraries(
 
 #[tauri::command]
 pub async fn get_libraries(state: tauri::State<'_, AppState>) -> Result<Vec<Library>, String> {
-    let rows: Vec<(String, String, String, String, i32, String, i32)> = sqlx::query_as(
-        "SELECT id, name, paths, format, portable, default_sort_mode, managed FROM library WHERE creating = 0 ORDER BY name",
+    let rows: Vec<(String, String, String, String, String, String)> = sqlx::query_as(
+        "SELECT id, name, paths, format, source, default_sort_mode FROM library WHERE creating = 0 ORDER BY name",
     )
     .fetch_all(&state.app_db)
     .await
@@ -668,14 +660,13 @@ pub async fn get_libraries(state: tauri::State<'_, AppState>) -> Result<Vec<Libr
 
     Ok(rows
         .into_iter()
-        .map(|(id, name, paths_json, format, portable, default_sort_mode, managed)| Library {
+        .map(|(id, name, paths_json, format, source, default_sort_mode)| Library {
             id,
             name,
             paths: serde_json::from_str(&paths_json).unwrap_or_default(),
             format,
-            portable: portable != 0,
+            source,
             default_sort_mode,
-            managed: managed != 0,
         })
         .collect())
 }
@@ -1865,8 +1856,6 @@ pub async fn download_tmdb_images(
     entry_id: i64,
     images: Vec<TmdbImageDownload>,
 ) -> Result<(), String> {
-    let lib_paths = get_library_paths(&state.app_db, &library_id).await?;
-
     // Get entry folder_path from view
     let entry_row: Option<(String,)> = sqlx::query_as(
         "SELECT folder_path FROM media_entry_full WHERE id = ?",
@@ -1878,9 +1867,9 @@ pub async fn download_tmdb_images(
 
     let (folder_path,) = entry_row.ok_or("Entry not found")?;
 
-    let root = resolve_entry_root(&lib_paths, &folder_path)
-        .ok_or("Could not resolve entry folder on disk")?;
-    let full_entry_path = PathBuf::from(root).join(&folder_path);
+    // Downloaded artwork never touches the media folders — originals live in app-data.
+    let app_base = app_images_base(&state.app_data_dir, &library_id);
+    let full_entry_path = app_base.join(&folder_path);
 
     let client = reqwest::Client::new();
     let mut downloaded_covers = false;
@@ -1924,17 +1913,16 @@ pub async fn download_tmdb_images(
 
     // Sync cached images for updated directories
     let cache_base = state.app_data_dir.join("cache").join(&library_id);
-    let library_base = PathBuf::from(root);
 
     if downloaded_covers {
         sync_cached_images_for_entry(
-            &state.app_db, &library_id, &cache_base, &library_base, &folder_path, "covers", "cover",
+            &state.app_db, &library_id, &cache_base, &app_base, &folder_path, "covers", "cover", "app",
         )
         .await?;
     }
     if downloaded_backgrounds {
         sync_cached_images_for_entry(
-            &state.app_db, &library_id, &cache_base, &library_base, &folder_path, "backgrounds", "background",
+            &state.app_db, &library_id, &cache_base, &app_base, &folder_path, "backgrounds", "background", "app",
         )
         .await?;
     }
@@ -1949,8 +1937,6 @@ pub async fn add_cover(
     entry_id: i64,
     source_path: String,
 ) -> Result<String, String> {
-    let lib_paths = get_library_paths(&state.app_db, &library_id).await?;
-
     let entry_row: Option<(String,)> = sqlx::query_as(
         "SELECT folder_path FROM media_entry_full WHERE id = ?",
     )
@@ -1961,36 +1947,20 @@ pub async fn add_cover(
 
     let (folder_path,) = entry_row.ok_or("Entry not found")?;
 
-    let root = resolve_entry_root(&lib_paths, &folder_path)
-        .ok_or("Could not resolve entry folder on disk")?;
-    let library_base = PathBuf::from(root);
-    let target_dir = library_base.join(&folder_path).join("covers");
-    std::fs::create_dir_all(&target_dir).map_err(|e| format!("Failed to create covers dir: {e}"))?;
-
-    let src = PathBuf::from(&source_path);
-    if !src.exists() {
-        return Err("Source file does not exist".into());
-    }
-    if !is_image_file(&src) {
-        return Err("File is not a supported image".into());
-    }
-
-    let stem = src.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "cover".into());
-    let ext = src.extension().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "jpg".into());
-    let mut target_name = format!("{stem}.{ext}");
-    let mut target_path = target_dir.join(&target_name);
-    let mut counter = 1;
-    while target_path.exists() {
-        target_name = format!("{stem}_{counter}.{ext}");
-        target_path = target_dir.join(&target_name);
-        counter += 1;
-    }
-
-    std::fs::copy(&src, &target_path).map_err(|e| format!("Failed to copy cover: {e}"))?;
+    // App-added covers never touch the media folders — originals live in app-data.
+    // This also covers virtual collections, whose synthetic folder_path has no disk home.
+    let app_base = app_images_base(&state.app_data_dir, &library_id);
+    let target_dir = app_base.join(&folder_path).join("covers");
+    let target_abs = copy_cover_into_dir(&source_path, &target_dir)?;
+    let target_name = PathBuf::from(&target_abs)
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
 
     let cache_base = state.app_data_dir.join("cache").join(&library_id);
     sync_cached_images_for_entry(
-        &state.app_db, &library_id, &cache_base, &library_base, &folder_path, "covers", "cover",
+        &state.app_db, &library_id, &cache_base, &app_base, &folder_path, "covers", "cover", "app",
     )
     .await?;
 
@@ -2018,7 +1988,6 @@ pub async fn delete_cover(
     cover_path: String,
 ) -> Result<Option<String>, String> {
     let (format, _paths, _default_sort_mode) = get_library_meta(&state.app_db, &library_id).await?;
-    let lib_paths = _paths;
 
     let entry_row: Option<(String,)> = sqlx::query_as(
         "SELECT folder_path FROM media_entry_full WHERE id = ?",
@@ -2030,8 +1999,8 @@ pub async fn delete_cover(
 
     let (folder_path,) = entry_row.ok_or("Entry not found")?;
 
-    let source_row: Option<(String,)> = sqlx::query_as(
-        "SELECT source_filename FROM cached_images WHERE library_id = ? AND entry_folder_path = ? AND image_type = 'cover' AND cached_path = ?",
+    let source_row: Option<(String, String)> = sqlx::query_as(
+        "SELECT source_filename, origin FROM cached_images WHERE library_id = ? AND entry_folder_path = ? AND image_type = 'cover' AND cached_path = ?",
     )
     .bind(&library_id)
     .bind(&folder_path)
@@ -2040,12 +2009,18 @@ pub async fn delete_cover(
     .await
     .map_err(|e| e.to_string())?;
 
-    let (source_filename,) = source_row.ok_or("Cover not found in cache")?;
+    let (source_filename, origin) = source_row.ok_or("Cover not found in cache")?;
 
-    let root = resolve_entry_root(&lib_paths, &folder_path)
-        .ok_or("Could not resolve entry folder on disk")?;
-    let library_base = PathBuf::from(root);
-    let source_file = library_base.join(&folder_path).join("covers").join(&source_filename);
+    // waverunner never deletes files inside the media folders; only covers it added
+    // itself (stored in app-data) can be removed from within the app.
+    if origin != "app" {
+        return Err(
+            "This cover is a file in your library folder. waverunner doesn't modify library folders — remove the file there and rescan instead.".into(),
+        );
+    }
+
+    let app_base = app_images_base(&state.app_data_dir, &library_id);
+    let source_file = app_base.join(&folder_path).join("covers").join(&source_filename);
 
     if source_file.exists() {
         std::fs::remove_file(&source_file)
@@ -2054,7 +2029,7 @@ pub async fn delete_cover(
 
     let cache_base = state.app_data_dir.join("cache").join(&library_id);
     sync_cached_images_for_entry(
-        &state.app_db, &library_id, &cache_base, &library_base, &folder_path, "covers", "cover",
+        &state.app_db, &library_id, &cache_base, &app_base, &folder_path, "covers", "cover", "app",
     )
     .await?;
 
@@ -3793,237 +3768,9 @@ pub async fn rename_entry(
     new_title: String,
 ) -> Result<(), String> {
     let (format, _paths, _default_sort_mode) = get_library_meta(&state.app_db, &library_id).await?;
-    let lib_paths: Vec<String> = _paths;
-    let managed: i32 = sqlx::query_scalar("SELECT managed FROM library WHERE id = ?")
-        .bind(&library_id)
-        .fetch_one(&state.app_db)
-        .await
-        .map_err(|e| e.to_string())?;
 
-    // If managed library, rename the actual folder on disk and update paths
-    if managed != 0 {
-        let cache_base = state.app_data_dir.join("cache").join(&library_id);
-
-        match format.as_str() {
-            "video" => {
-                // Query from view for folder_path, release_date (year extracted), entry_type
-                let entry_row: Option<(String, Option<String>, String)> = sqlx::query_as(
-                    "SELECT folder_path, SUBSTR(release_date, 1, 4), entry_type FROM media_entry_full WHERE id = ?",
-                )
-                .bind(entry_id)
-                .fetch_optional(&state.app_db)
-                .await
-                .map_err(|e| e.to_string())?;
-
-                let (folder_path, year, entry_type) = entry_row.ok_or("Entry not found")?;
-                let lib_base = PathBuf::from(resolve_entry_root(&lib_paths, &folder_path).ok_or("Could not find entry on disk")?);
-                let old_full_path = lib_base.join(&folder_path);
-
-                let safe_title = sanitize_filename(&new_title);
-                let new_folder_name = if entry_type == "movie" {
-                    match &year {
-                        Some(y) => format!("{} ({})", safe_title, y),
-                        None => safe_title,
-                    }
-                } else {
-                    safe_title
-                };
-
-                let old_parent = old_full_path.parent().ok_or("Invalid folder path")?;
-                let new_full_path = old_parent.join(&new_folder_name);
-
-                if old_full_path != new_full_path {
-                    if new_full_path.exists() {
-                        return Err(format!("A folder named '{}' already exists", new_folder_name));
-                    }
-
-                    std::fs::rename(&old_full_path, &new_full_path)
-                        .map_err(|e| format!("Failed to rename folder: {}", e))?;
-
-                    let new_rel_path = new_full_path
-                        .strip_prefix(&lib_base)
-                        .unwrap_or(&new_full_path)
-                        .to_string_lossy()
-                        .to_string();
-
-                    let old_rel_prefix = format!("{}\\", folder_path);
-                    let new_rel_prefix = format!("{}\\", new_rel_path);
-
-                    // Update this entry's folder_path on the correct detail table
-                    match entry_type.as_str() {
-                        "movie" => sqlx::query("UPDATE movie SET folder_path = ? WHERE id = ?").bind(&new_rel_path).bind(entry_id).execute(&state.app_db).await.map_err(|e| e.to_string())?,
-                        "show" => sqlx::query("UPDATE show SET folder_path = ? WHERE id = ?").bind(&new_rel_path).bind(entry_id).execute(&state.app_db).await.map_err(|e| e.to_string())?,
-                        _ => sqlx::query("UPDATE media_collection SET folder_path = ? WHERE id = ?").bind(&new_rel_path).bind(entry_id).execute(&state.app_db).await.map_err(|e| e.to_string())?,
-                    };
-
-                    // Update child folder_paths across all detail tables
-                    for tbl in &["movie", "show", "media_collection"] {
-                        sqlx::query(
-                            &format!("UPDATE {} SET folder_path = ? || SUBSTR(folder_path, ?) WHERE folder_path LIKE ? AND id != ?", tbl),
-                        )
-                        .bind(&new_rel_prefix)
-                        .bind((old_rel_prefix.len() + 1) as i32)
-                        .bind(format!("{}%", old_rel_prefix))
-                        .bind(entry_id)
-                        .execute(&state.app_db)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    }
-
-                    // Update season folder_paths if this is a show
-                    if entry_type == "show" {
-                        sqlx::query(
-                            "UPDATE season SET folder_path = ? || SUBSTR(folder_path, ?) WHERE show_id = ?",
-                        )
-                        .bind(&new_rel_prefix)
-                        .bind((old_rel_prefix.len() + 1) as i32)
-                        .bind(entry_id)
-                        .execute(&state.app_db)
-                        .await
-                        .map_err(|e| e.to_string())?;
-
-                        sqlx::query(
-                            "UPDATE episode SET file_path = ? || SUBSTR(file_path, ?) WHERE season_id IN (SELECT id FROM season WHERE show_id = ?)",
-                        )
-                        .bind(&new_rel_prefix)
-                        .bind((old_rel_prefix.len() + 1) as i32)
-                        .bind(entry_id)
-                        .execute(&state.app_db)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    }
-
-                    // Update cached_images
-                    let old_cache = cache_base.join(&folder_path);
-                    let new_cache = cache_base.join(&new_rel_path);
-                    if old_cache.exists() {
-                        let _ = std::fs::rename(&old_cache, &new_cache);
-                    }
-                    let old_cache_abs = old_cache.to_string_lossy().to_string().replace('/', "\\");
-                    let new_cache_abs = new_cache.to_string_lossy().to_string().replace('/', "\\");
-                    let old_cache_abs_prefix = format!("{}\\", old_cache_abs);
-                    let new_cache_abs_prefix = format!("{}\\", new_cache_abs);
-                    sqlx::query("UPDATE cached_images SET entry_folder_path = ?, cached_path = REPLACE(cached_path, ?, ?) WHERE entry_folder_path = ?")
-                        .bind(&new_rel_path)
-                        .bind(&old_cache_abs)
-                        .bind(&new_cache_abs)
-                        .bind(&folder_path)
-                        .execute(&state.app_db)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    let old_rel_prefix_ci = format!("{}\\", folder_path);
-                    sqlx::query("UPDATE cached_images SET entry_folder_path = ? || SUBSTR(entry_folder_path, ?), cached_path = REPLACE(cached_path, ?, ?) WHERE entry_folder_path LIKE ?")
-                        .bind(&format!("{}\\", new_rel_path))
-                        .bind((old_rel_prefix_ci.len() + 1) as i32)
-                        .bind(&old_cache_abs_prefix)
-                        .bind(&new_cache_abs_prefix)
-                        .bind(format!("{}%", old_rel_prefix_ci))
-                        .execute(&state.app_db)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                }
-            }
-            "music" => {
-                let entry_row: Option<(String,)> = sqlx::query_as(
-                    "SELECT folder_path FROM artist WHERE id = ?",
-                )
-                .bind(entry_id)
-                .fetch_optional(&state.app_db)
-                .await
-                .map_err(|e| e.to_string())?;
-
-                let (folder_path,) = entry_row.ok_or("Entry not found")?;
-                let lib_base = PathBuf::from(resolve_entry_root(&lib_paths, &folder_path).ok_or("Could not find entry on disk")?);
-                let old_full_path = lib_base.join(&folder_path);
-
-                let safe_title = sanitize_filename(&new_title);
-
-                let new_full_path = old_full_path.parent().ok_or("Invalid folder path")?.join(&safe_title);
-
-                if old_full_path != new_full_path {
-                    if new_full_path.exists() {
-                        return Err(format!("A folder named '{}' already exists", safe_title));
-                    }
-
-                    std::fs::rename(&old_full_path, &new_full_path)
-                        .map_err(|e| format!("Failed to rename folder: {}", e))?;
-
-                    let new_rel_path = new_full_path
-                        .strip_prefix(&lib_base)
-                        .unwrap_or(&new_full_path)
-                        .to_string_lossy()
-                        .to_string();
-
-                    let old_rel_prefix = format!("{}\\", folder_path);
-                    let new_rel_prefix = format!("{}\\", new_rel_path);
-
-                    // Update artist folder_path
-                    sqlx::query("UPDATE artist SET folder_path = ? WHERE id = ?")
-                        .bind(&new_rel_path)
-                        .bind(entry_id)
-                        .execute(&state.app_db)
-                        .await
-                        .map_err(|e| e.to_string())?;
-
-                    // Update album folder_paths
-                    sqlx::query(
-                        "UPDATE album SET folder_path = ? || SUBSTR(folder_path, ?) WHERE artist_id = ?",
-                    )
-                    .bind(&new_rel_prefix)
-                    .bind((old_rel_prefix.len() + 1) as i32)
-                    .bind(entry_id)
-                    .execute(&state.app_db)
-                    .await
-                    .map_err(|e| e.to_string())?;
-
-                    // Update song file_paths
-                    sqlx::query(
-                        "UPDATE song SET file_path = ? || SUBSTR(file_path, ?) WHERE album_id IN (SELECT id FROM album WHERE artist_id = ?)",
-                    )
-                    .bind(&new_rel_prefix)
-                    .bind((old_rel_prefix.len() + 1) as i32)
-                    .bind(entry_id)
-                    .execute(&state.app_db)
-                    .await
-                    .map_err(|e| e.to_string())?;
-
-                    // Update cached_images
-                    let old_cache = cache_base.join(&folder_path);
-                    let new_cache = cache_base.join(&new_rel_path);
-                    if old_cache.exists() {
-                        let _ = std::fs::rename(&old_cache, &new_cache);
-                    }
-                    let old_cache_abs = old_cache.to_string_lossy().to_string().replace('/', "\\");
-                    let new_cache_abs = new_cache.to_string_lossy().to_string().replace('/', "\\");
-                    let old_cache_abs_prefix = format!("{}\\", old_cache_abs);
-                    let new_cache_abs_prefix = format!("{}\\", new_cache_abs);
-                    // Update this entry + child album entries
-                    sqlx::query("UPDATE cached_images SET entry_folder_path = ?, cached_path = REPLACE(cached_path, ?, ?) WHERE entry_folder_path = ?")
-                        .bind(&new_rel_path)
-                        .bind(&old_cache_abs)
-                        .bind(&new_cache_abs)
-                        .bind(&folder_path)
-                        .execute(&state.app_db)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    let old_rel_prefix_ci = format!("{}\\", folder_path);
-                    sqlx::query("UPDATE cached_images SET entry_folder_path = ? || SUBSTR(entry_folder_path, ?), cached_path = REPLACE(cached_path, ?, ?) WHERE entry_folder_path LIKE ?")
-                        .bind(&format!("{}\\", new_rel_path))
-                        .bind((old_rel_prefix_ci.len() + 1) as i32)
-                        .bind(&old_cache_abs_prefix)
-                        .bind(&new_cache_abs_prefix)
-                        .bind(format!("{}%", old_rel_prefix_ci))
-                        .execute(&state.app_db)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                }
-            }
-            _ => {
-                return Err(format!("Unsupported library format: {}", format));
-            }
-        }
-    }
-
+    // Rename is DB-only: waverunner never writes inside the media folders, so the
+    // title changes while folder_path keeps pointing at the unchanged disk location.
     let sort_title = generate_sort_title(&new_title, "en");
 
     match format.as_str() {
@@ -4053,39 +3800,6 @@ pub async fn rename_entry(
     Ok(())
 }
 
-/// Recursively copy a directory and all its contents.
-fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let dest_path = dst.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_dir_recursive(&entry.path(), &dest_path)?;
-        } else {
-            std::fs::copy(&entry.path(), &dest_path)?;
-        }
-    }
-    Ok(())
-}
-
-/// Move a directory: try rename first (instant, same-drive only), fall back to copy + delete.
-fn move_dir(src: &Path, dst: &Path) -> Result<(), String> {
-    if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create destination directory: {}", e))?;
-    }
-    match std::fs::rename(src, dst) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            copy_dir_recursive(src, dst)
-                .map_err(|e| format!("Failed to copy folder: {}", e))?;
-            std::fs::remove_dir_all(src)
-                .map_err(|e| format!("Copied but failed to remove original: {}", e))?;
-            Ok(())
-        }
-    }
-}
-
 #[tauri::command]
 pub async fn move_entry(
     state: tauri::State<'_, AppState>,
@@ -4095,18 +3809,12 @@ pub async fn move_entry(
     insert_before_id: Option<i64>,
 ) -> Result<(), String> {
     let (format, _paths, _default_sort_mode) = get_library_meta(&state.app_db, &library_id).await?;
-    let lib_paths: Vec<String> = _paths;
-    let managed: i32 = sqlx::query_scalar("SELECT managed FROM library WHERE id = ?")
-        .bind(&library_id)
-        .fetch_one(&state.app_db)
-        .await
-        .map_err(|e| e.to_string())?;
 
     match format.as_str() {
         "video" => {
             // Get the entry being moved
-            let entry_row: (String, Option<i64>) = sqlx::query_as(
-                "SELECT folder_path, parent_id FROM media_entry_full WHERE id = ?",
+            let entry_row: (Option<i64>,) = sqlx::query_as(
+                "SELECT parent_id FROM media_entry_full WHERE id = ?",
             )
             .bind(entry_id)
             .fetch_optional(&state.app_db)
@@ -4114,7 +3822,7 @@ pub async fn move_entry(
             .map_err(|e| e.to_string())?
             .ok_or("Entry not found")?;
 
-            let (old_folder_path, old_parent_id) = entry_row;
+            let (old_parent_id,) = entry_row;
 
             // No-op if already in the target parent
             if old_parent_id == new_parent_id {
@@ -4148,123 +3856,10 @@ pub async fn move_entry(
                 }
             }
 
-            // Determine the new folder_path
-            let folder_name = PathBuf::from(&old_folder_path)
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-
-            let new_folder_path = if let Some(target_id) = new_parent_id {
-                let (parent_folder,): (String,) = sqlx::query_as(
-                    "SELECT folder_path FROM media_entry_full WHERE id = ?",
-                )
-                .bind(target_id)
-                .fetch_optional(&state.app_db)
-                .await
-                .map_err(|e| e.to_string())?
-                .ok_or("Target collection not found")?;
-                format!("{}\\{}", parent_folder, folder_name)
-            } else {
-                // Moving to root level — folder_name only
-                folder_name.clone()
-            };
-
-            // --- Phase 1: Disk moves (reversible) ---
-            let mut source_moved = false;
-            let mut cache_moved = false;
-            let mut old_full_path = PathBuf::new();
-            let mut new_full_path = PathBuf::new();
-            let cache_base = state.app_data_dir.join("cache").join(&library_id);
-            let old_cache = cache_base.join(&old_folder_path);
-            let new_cache = cache_base.join(&new_folder_path);
-
-            // Move source folder on disk if managed
-            if managed != 0 {
-                let lib_base = PathBuf::from(
-                    resolve_entry_root(&lib_paths, &old_folder_path)
-                        .ok_or("Could not find entry on disk")?,
-                );
-                old_full_path = lib_base.join(&old_folder_path);
-                new_full_path = lib_base.join(&new_folder_path);
-
-                if old_full_path != new_full_path {
-                    if new_full_path.exists() {
-                        return Err(format!(
-                            "A folder named '{}' already exists at the destination",
-                            folder_name
-                        ));
-                    }
-                    move_dir(&old_full_path, &new_full_path)?;
-                    source_moved = true;
-                }
-            }
-
-            // Move cache directory on disk
-            if old_cache.exists() {
-                if move_dir(&old_cache, &new_cache).is_ok() {
-                    cache_moved = true;
-                }
-            }
-
-            // --- Phase 2: DB updates in a transaction ---
-            // Use full absolute cache prefixes for REPLACE to avoid matching
-            // folder names that appear elsewhere in the absolute path
-            let old_cache_abs = old_cache.to_string_lossy().to_string().replace('/', "\\");
-            let new_cache_abs = new_cache.to_string_lossy().to_string().replace('/', "\\");
-            let old_cache_abs_prefix = format!("{}\\", old_cache_abs);
-            let new_cache_abs_prefix = format!("{}\\", new_cache_abs);
-
+            // Moves are purely virtual: parent_id and sort_order change; folder_path
+            // (the disk location) and the image cache never do.
             let db_result: Result<(), String> = async {
                 let mut tx = state.app_db.begin().await.map_err(|e| e.to_string())?;
-
-                let old_rel_prefix = format!("{}\\", old_folder_path);
-                let new_rel_prefix = format!("{}\\", new_folder_path);
-
-                // This entry's cached_images
-                sqlx::query("UPDATE cached_images SET entry_folder_path = ?, cached_path = REPLACE(cached_path, ?, ?) WHERE entry_folder_path = ?")
-                    .bind(&new_folder_path)
-                    .bind(&old_cache_abs)
-                    .bind(&new_cache_abs)
-                    .bind(&old_folder_path)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| e.to_string())?;
-
-                // Child entries' cached_images
-                sqlx::query("UPDATE cached_images SET entry_folder_path = ? || SUBSTR(entry_folder_path, ?), cached_path = REPLACE(cached_path, ?, ?) WHERE entry_folder_path LIKE ?")
-                    .bind(&new_rel_prefix)
-                    .bind((old_rel_prefix.len() + 1) as i32)
-                    .bind(&old_cache_abs_prefix)
-                    .bind(&new_cache_abs_prefix)
-                    .bind(format!("{}%", old_rel_prefix))
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| e.to_string())?;
-
-                // Update selected_cover for this entry across all detail tables
-                for tbl in &["movie", "show", "media_collection"] {
-                    sqlx::query(&format!("UPDATE {} SET selected_cover = REPLACE(selected_cover, ?, ?) WHERE selected_cover LIKE ? AND id = ?", tbl))
-                        .bind(&old_cache_abs)
-                        .bind(&new_cache_abs)
-                        .bind(format!("{}%", old_cache_abs))
-                        .bind(entry_id)
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                }
-
-                // Update selected_cover for child entries across all detail tables
-                for tbl in &["movie", "show", "media_collection"] {
-                    sqlx::query(&format!("UPDATE {} SET selected_cover = REPLACE(selected_cover, ?, ?) WHERE selected_cover LIKE ? AND id != ?", tbl))
-                        .bind(&old_cache_abs_prefix)
-                        .bind(&new_cache_abs_prefix)
-                        .bind(format!("{}%", old_cache_abs_prefix))
-                        .bind(entry_id)
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                }
 
                 // Determine sort_order for the moved entry
                 // Note: sort_order is on detail tables but we can't use the view inside a transaction easily,
@@ -4324,10 +3919,9 @@ pub async fn move_entry(
                     .await
                     .map_err(|e| e.to_string())?;
 
-                // Update folder_path and sort_order on the correct detail table
+                // Update sort_order on the correct detail table
                 for tbl in &["movie", "show", "media_collection"] {
-                    sqlx::query(&format!("UPDATE {} SET folder_path = ?, sort_order = ? WHERE id = ?", tbl))
-                        .bind(&new_folder_path)
+                    sqlx::query(&format!("UPDATE {} SET sort_order = ? WHERE id = ?", tbl))
                         .bind(new_sort_order)
                         .bind(entry_id)
                         .execute(&mut *tx)
@@ -4335,67 +3929,12 @@ pub async fn move_entry(
                         .map_err(|e| e.to_string())?;
                 }
 
-                // Update child folder_paths across all detail tables
-                for tbl in &["movie", "show", "media_collection"] {
-                    sqlx::query(
-                        &format!("UPDATE {} SET folder_path = ? || SUBSTR(folder_path, ?) WHERE folder_path LIKE ? AND id != ?", tbl),
-                    )
-                    .bind(&new_rel_prefix)
-                    .bind((old_rel_prefix.len() + 1) as i32)
-                    .bind(format!("{}%", old_rel_prefix))
-                    .bind(entry_id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                }
-
-                // Update season/episode paths if entry is a show
-                let (entry_type_name,): (String,) = sqlx::query_as(
-                    "SELECT met.name FROM media_entry me JOIN media_entry_type met ON me.entry_type_id = met.id WHERE me.id = ?",
-                )
-                .bind(entry_id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| e.to_string())?
-                .ok_or("Entry not found")?;
-
-                if entry_type_name == "show" {
-                    sqlx::query(
-                        "UPDATE season SET folder_path = ? || SUBSTR(folder_path, ?) WHERE show_id = ?",
-                    )
-                    .bind(&new_rel_prefix)
-                    .bind((old_rel_prefix.len() + 1) as i32)
-                    .bind(entry_id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| e.to_string())?;
-
-                    sqlx::query(
-                        "UPDATE episode SET file_path = ? || SUBSTR(file_path, ?) WHERE season_id IN (SELECT id FROM season WHERE show_id = ?)",
-                    )
-                    .bind(&new_rel_prefix)
-                    .bind((old_rel_prefix.len() + 1) as i32)
-                    .bind(entry_id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                }
-
                 tx.commit().await.map_err(|e| e.to_string())?;
                 Ok(())
             }
             .await;
 
-            // --- Phase 3: Roll back disk moves if DB failed ---
-            if let Err(e) = db_result {
-                if source_moved {
-                    let _ = move_dir(&new_full_path, &old_full_path);
-                }
-                if cache_moved {
-                    let _ = move_dir(&new_cache, &old_cache);
-                }
-                return Err(e);
-            }
+            db_result?;
         }
         _ => {
             return Err("Move is only supported for video format libraries".to_string());
@@ -4411,55 +3950,13 @@ pub async fn create_collection(
     library_id: String,
     name: String,
     parent_id: Option<i64>,
-    base_path: Option<String>,
 ) -> Result<(), String> {
     let (format, _paths, _default_sort_mode) = get_library_meta(&state.app_db, &library_id).await?;
     if format != "video" {
         return Err("Collections are only supported for video libraries".to_string());
     }
-    let lib_paths: Vec<String> = _paths;
-    let managed: i32 = sqlx::query_scalar("SELECT managed FROM library WHERE id = ?")
-        .bind(&library_id)
-        .fetch_one(&state.app_db)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let safe_name = sanitize_filename(&name);
-    if safe_name.is_empty() {
+    if name.trim().is_empty() {
         return Err("Invalid collection name".to_string());
-    }
-
-    // Determine the parent folder path on disk
-    let parent_folder = if let Some(pid) = parent_id {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT folder_path FROM media_entry_full WHERE id = ?",
-        )
-        .bind(pid)
-        .fetch_optional(&state.app_db)
-        .await
-        .map_err(|e| e.to_string())?;
-        row.ok_or("Parent entry not found")?.0
-    } else {
-        String::new()
-    };
-
-    let rel_path = if parent_folder.is_empty() {
-        safe_name.clone()
-    } else {
-        format!("{}\\{}", parent_folder, safe_name)
-    };
-
-    // For managed libraries, create the folder on disk
-    if managed != 0 {
-        let lib_base = PathBuf::from(
-            base_path.as_deref().unwrap_or(&lib_paths[0])
-        );
-        let full_path = lib_base.join(&rel_path);
-        if full_path.exists() {
-            return Err(format!("A folder named '{}' already exists", safe_name));
-        }
-        std::fs::create_dir_all(&full_path)
-            .map_err(|e| format!("Failed to create folder: {}", e))?;
     }
 
     // Get the collection entry type id
@@ -4496,10 +3993,13 @@ pub async fn create_collection(
     .map_err(|e| e.to_string())?;
 
     let entry_id = result.last_insert_rowid();
+    // Collections are virtual — no disk folder. The synthetic '@collection-{id}'
+    // key keeps folder_path-keyed machinery (image cache, covers map) working
+    // without ever colliding with a real disk path.
     sqlx::query("INSERT INTO media_collection (id, title, folder_path, sort_title, sort_order) VALUES (?, ?, ?, ?, ?)")
         .bind(entry_id)
         .bind(&name)
-        .bind(&rel_path)
+        .bind(format!("@collection-{}", entry_id))
         .bind(&sort_title)
         .bind(max_order.0 + 1)
         .execute(&state.app_db)
@@ -4544,108 +4044,52 @@ pub async fn set_cover(
     Ok(())
 }
 
+/// Delete a virtual collection. Movies and shows cannot be deleted from within
+/// waverunner — the filesystem is the source of truth and rescan reconciles it.
+/// Children of the deleted collection are reparented to the collection's parent.
 #[tauri::command]
 pub async fn delete_entry(
     state: tauri::State<'_, AppState>,
     library_id: String,
     entry_id: i64,
-    delete_from_disk: bool,
 ) -> Result<(), String> {
-    let lib_paths = get_library_paths(&state.app_db, &library_id).await?;
-    let managed: i32 = sqlx::query_scalar("SELECT managed FROM library WHERE id = ?")
-        .bind(&library_id)
-        .fetch_one(&state.app_db)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // Get the entry's folder_path from the view
-    let entry_row: Option<(String,)> = sqlx::query_as(
-        "SELECT folder_path FROM media_entry_full WHERE id = ?",
+    let entry_row: Option<(String, String, Option<i64>)> = sqlx::query_as(
+        "SELECT folder_path, entry_type, parent_id FROM media_entry_full WHERE id = ?",
     )
     .bind(entry_id)
     .fetch_optional(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
 
-    let (folder_path,) = entry_row.ok_or("Entry not found")?;
+    let (folder_path, entry_type, parent_id) = entry_row.ok_or("Entry not found")?;
 
-    // Delete from disk if requested and library is managed
-    if delete_from_disk && managed != 0 {
-        if let Some(root) = resolve_entry_root(&lib_paths, &folder_path) {
-            let full_path = PathBuf::from(root).join(&folder_path);
-            if full_path.exists() {
-                // Read recycle bin threshold setting
-                let threshold_gb: i64 = sqlx::query_as::<_, (String,)>(
-                    "SELECT value FROM settings WHERE key = 'recycle_bin_max_gb'",
-                )
-                .fetch_optional(&state.app_db)
-                .await
-                .map_err(|e| e.to_string())?
-                .and_then(|(v,)| v.parse().ok())
-                .unwrap_or(50); // default 50 GB
-
-                let use_trash = if threshold_gb < 0 {
-                    true // always recycle
-                } else if threshold_gb == 0 {
-                    false // always permanent
-                } else {
-                    let size_bytes = dir_size(&full_path);
-                    let threshold_bytes = threshold_gb as u64 * 1_073_741_824;
-                    size_bytes <= threshold_bytes
-                };
-
-                if use_trash {
-                    trash::delete(&full_path)
-                        .map_err(|e| format!("Failed to send to Recycle Bin: {}", e))?;
-                } else {
-                    std::fs::remove_dir_all(&full_path)
-                        .map_err(|e| format!("Failed to delete folder: {}", e))?;
-                }
-            }
-        }
+    if entry_type != "collection" {
+        return Err("Only collections can be deleted. Media entries mirror the filesystem — remove the files and rescan.".into());
     }
 
-    // Clean up cached images on disk for this entry and descendants
-    let cache_base = state.app_data_dir.join("cache").join(&library_id);
-    if cache_base.exists() {
-        let cache_entry_dir = cache_base.join(&folder_path);
-        if cache_entry_dir.exists() {
-            let _ = std::fs::remove_dir_all(&cache_entry_dir);
-        }
-    }
-
-    // Remove cached_images DB rows for this entry and descendants
-    sqlx::query("DELETE FROM cached_images WHERE library_id = ? AND (entry_folder_path = ? OR entry_folder_path LIKE ?)")
-        .bind(&library_id)
-        .bind(&folder_path)
-        .bind(format!("{}\\%", folder_path))
+    // Reparent children to the collection's parent before the row goes away
+    // (the FK cascade would otherwise delete them).
+    sqlx::query("UPDATE media_entry SET parent_id = ? WHERE parent_id = ?")
+        .bind(parent_id)
+        .bind(entry_id)
         .execute(&state.app_db)
         .await
         .map_err(|e| e.to_string())?;
 
-    // Purge presets scoped to this entry or any descendant collection. We collect collection
-    // descendants before the cascade removes them from media_entry.
-    let descendant_collections: Vec<(i64,)> = sqlx::query_as(
-        "WITH RECURSIVE descendants(id) AS ( \
-           SELECT id FROM media_entry WHERE id = ? \
-           UNION ALL \
-           SELECT me.id FROM media_entry me JOIN descendants d ON me.parent_id = d.id \
-         ) \
-         SELECT id FROM descendants \
-         WHERE id IN (SELECT id FROM media_collection)",
-    )
-    .bind(entry_id)
-    .fetch_all(&state.app_db)
-    .await
-    .map_err(|e| e.to_string())?;
-    for (cid,) in descendant_collections {
-        let _ = sqlx::query("DELETE FROM sort_preset WHERE scope_key = ?")
-            .bind(format!("lib-coll:{}", cid))
-            .execute(&state.app_db)
-            .await;
+    // Clean up cached images (DB rows, cache dir, and app-data originals)
+    let cache_base = state.app_data_dir.join("cache").join(&library_id);
+    delete_cached_images_for_entry(&state.app_db, &library_id, &cache_base, &folder_path).await?;
+    let app_entry_dir = app_images_base(&state.app_data_dir, &library_id).join(&folder_path);
+    if app_entry_dir.exists() {
+        let _ = std::fs::remove_dir_all(&app_entry_dir);
     }
 
-    // Delete from DB (CASCADE handles children, movie, collection, show tables)
+    // Purge presets scoped to this collection
+    let _ = sqlx::query("DELETE FROM sort_preset WHERE scope_key = ?")
+        .bind(format!("lib-coll:{}", entry_id))
+        .execute(&state.app_db)
+        .await;
+
     sqlx::query("DELETE FROM media_entry WHERE id = ?")
         .bind(entry_id)
         .execute(&state.app_db)
@@ -4653,39 +4097,6 @@ pub async fn delete_entry(
         .map_err(|e| e.to_string())?;
 
     Ok(())
-}
-
-#[tauri::command]
-pub async fn check_entry_has_files(
-    state: tauri::State<'_, AppState>,
-    library_id: String,
-    entry_id: i64,
-) -> Result<bool, String> {
-    let lib_paths = get_library_paths(&state.app_db, &library_id).await?;
-
-    let entry_row: Option<(String,)> = sqlx::query_as(
-        "SELECT folder_path FROM media_entry_full WHERE id = ?",
-    )
-    .bind(entry_id)
-    .fetch_optional(&state.app_db)
-    .await
-    .map_err(|e| e.to_string())?;
-
-    let (folder_path,) = entry_row.ok_or("Entry not found")?;
-
-    if let Some(root) = resolve_entry_root(&lib_paths, &folder_path) {
-        let full_path = PathBuf::from(root).join(&folder_path);
-        if full_path.exists() {
-            let has_files = std::fs::read_dir(&full_path)
-                .map(|rd| rd.filter_map(|e| e.ok()).any(|e| {
-                    e.file_type().map(|ft| ft.is_file()).unwrap_or(false)
-                }))
-                .unwrap_or(false);
-            return Ok(has_files);
-        }
-    }
-
-    Ok(false)
 }
 
 #[tauri::command]
@@ -4730,28 +4141,25 @@ async fn rescan_video_library(
             .fetch_one(pool)
             .await
             .map_err(|e| e.to_string())?;
-    let collection_type_id: (i64,) =
-        sqlx::query_as("SELECT id FROM media_entry_type WHERE name = 'collection'")
-            .fetch_one(pool)
-            .await
-            .map_err(|e| e.to_string())?;
-
-    // Collect all disk paths from ALL bases
-    let mut disk_paths: HashSet<String> = HashSet::new();
+    // Collect classified disk entries (movie/show) from ALL bases. Container
+    // folders are recursed through and produce nothing; collections are virtual
+    // and never come from disk.
+    let mut disk_kinds: HashMap<String, bool> = HashMap::new(); // rel_path -> is_show
     let mut path_to_base: HashMap<String, PathBuf> = HashMap::new();
     for base_path in base_paths {
-        let mut paths_for_base: HashSet<String> = HashSet::new();
-        collect_disk_paths(base_path, base_path, &mut paths_for_base)
+        let mut kinds_for_base: HashMap<String, bool> = HashMap::new();
+        collect_video_entries(base_path, base_path, &mut kinds_for_base)
             .map_err(|e| e.to_string())?;
-        for p in &paths_for_base {
+        for p in kinds_for_base.keys() {
             path_to_base.insert(p.clone(), base_path.clone());
         }
-        disk_paths.extend(paths_for_base);
+        disk_kinds.extend(kinds_for_base);
     }
+    let disk_paths: HashSet<String> = disk_kinds.keys().cloned().collect();
 
-    // Get all DB entries
-    let db_rows: Vec<(i64, String, Option<i64>, i64)> = sqlx::query_as(
-        "SELECT id, folder_path, parent_id, entry_type_id FROM media_entry_full WHERE library_id = ?",
+    // Get movie/show DB entries. Collections are virtual — rescan never touches them.
+    let db_rows: Vec<(i64, String, Option<i64>, String)> = sqlx::query_as(
+        "SELECT id, folder_path, parent_id, entry_type FROM media_entry_full WHERE library_id = ? AND entry_type IN ('movie', 'show')",
     )
     .bind(library_id)
     .fetch_all(pool)
@@ -4760,16 +4168,12 @@ async fn rescan_video_library(
 
     let db_paths: HashSet<String> = db_rows.iter().map(|(_, p, _, _)| p.clone()).collect();
 
-    // Delete removed entries (deepest first to respect FK)
-    let mut to_delete: Vec<(i64, String)> = db_rows
+    // Delete entries whose folders disappeared from disk
+    let to_delete: Vec<(i64, String)> = db_rows
         .iter()
         .filter(|(_, p, _, _)| !disk_paths.contains(p))
         .map(|(id, p, _, _)| (*id, p.clone()))
         .collect();
-    to_delete.sort_by(|a, b| {
-        b.1.matches('\\').count().cmp(&a.1.matches('\\').count())
-            .then_with(|| b.1.matches('/').count().cmp(&a.1.matches('/').count()))
-    });
 
     for (id, rel_path) in &to_delete {
         delete_cached_images_for_entry(pool, library_id, cache_base, rel_path).await?;
@@ -4780,17 +4184,14 @@ async fn rescan_video_library(
             .map_err(|e| e.to_string())?;
     }
 
-    // Add new paths (shallowest first so parents exist before children)
+    // Add new disk entries, anchored at the library root (collection membership is
+    // virtual and only ever assigned by the user).
     let mut new_paths: Vec<String> = disk_paths
         .iter()
         .filter(|p| !db_paths.contains(*p))
         .cloned()
         .collect();
-    new_paths.sort_by(|a, b| {
-        let depth_a = a.matches('\\').count() + a.matches('/').count();
-        let depth_b = b.matches('\\').count() + b.matches('/').count();
-        depth_a.cmp(&depth_b).then_with(|| a.cmp(b))
-    });
+    new_paths.sort();
 
     for rel_path in &new_paths {
         let base_path = path_to_base.get(rel_path).unwrap();
@@ -4805,63 +4206,18 @@ async fn rescan_video_library(
 
         let (title, year) = parse_folder_name(&folder_name);
         let sort_title = generate_sort_title(&title, "en");
+        let is_show = disk_kinds.get(rel_path).copied().unwrap_or(false);
 
-        // Find parent
-        let parent_rel = full_path
-            .parent()
-            .and_then(|p| p.strip_prefix(base_path).ok())
-            .map(|p| p.to_string_lossy().to_string());
-
-        let parent_id: Option<i64> = if let Some(ref parent_path) = parent_rel {
-            if parent_path.is_empty() {
-                None
-            } else {
-                let row: Option<(i64,)> = sqlx::query_as(
-                    "SELECT id FROM media_entry_full WHERE folder_path = ? AND library_id = ?",
-                )
-                .bind(parent_path)
-                .bind(library_id)
-                .fetch_optional(pool)
-                .await
-                .map_err(|e| e.to_string())?;
-                row.map(|(id,)| id)
-            }
-        } else {
-            None
-        };
-
-        // Classify: check if subdirs match season pattern → show, else collection/movie
-        let subdirs: Vec<_> = std::fs::read_dir(&full_path)
-            .map_err(|e| e.to_string())?
-            .filter_map(|e| e.ok())
-            .filter(|e| is_scannable_dir(e))
-            .collect();
-
-        let has_season = subdirs.iter().any(|e| {
-            let (_, num) = parse_season_folder_name(&e.file_name().to_string_lossy());
-            num.is_some()
-        });
-
-        let max_order: Option<(i32,)> = if let Some(pid) = parent_id {
-            sqlx::query_as("SELECT COALESCE(MAX(sort_order), -1) FROM media_entry_full WHERE parent_id = ? AND library_id = ?")
-                .bind(pid)
-                .bind(library_id)
-                .fetch_optional(pool)
-                .await
-                .map_err(|e| e.to_string())?
-        } else {
-            sqlx::query_as(
-                "SELECT COALESCE(MAX(sort_order), -1) FROM media_entry_full WHERE parent_id IS NULL AND library_id = ?",
-            )
-            .bind(library_id)
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| e.to_string())?
-        };
+        let max_order: Option<(i32,)> = sqlx::query_as(
+            "SELECT COALESCE(MAX(sort_order), -1) FROM media_entry_full WHERE parent_id IS NULL AND library_id = ?",
+        )
+        .bind(library_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?;
         let sort_order = max_order.map(|(v,)| v + 1).unwrap_or(0);
 
-        if has_season && parent_id.is_none() {
-            // TV show (only at root level)
+        if is_show {
             let result = sqlx::query(
                 "INSERT INTO media_entry (library_id, parent_id, entry_type_id) VALUES (?, NULL, ?)",
             )
@@ -4887,25 +4243,24 @@ async fn rescan_video_library(
                 .map_err(|e| e.to_string())?;
 
             // Don't recurse into seasons here — they'll be handled in the season rescan below
-        } else if !subdirs.is_empty() {
-            // Collection
+        } else {
             let result = sqlx::query(
-                "INSERT INTO media_entry (library_id, parent_id, entry_type_id) VALUES (?, ?, ?)",
+                "INSERT INTO media_entry (library_id, parent_id, entry_type_id) VALUES (?, NULL, ?)",
             )
             .bind(library_id)
-            .bind(parent_id)
-            .bind(collection_type_id.0)
+            .bind(movie_type_id.0)
             .execute(pool)
             .await
             .map_err(|e| e.to_string())?;
 
             let entry_id = result.last_insert_rowid();
-            sqlx::query("INSERT INTO media_collection (id, title, folder_path, sort_title, sort_order) VALUES (?, ?, ?, ?, ?)")
+            sqlx::query("INSERT INTO movie (id, title, folder_path, sort_title, sort_order, release_date) VALUES (?, ?, ?, ?, ?, ?)")
                 .bind(entry_id)
                 .bind(&title)
                 .bind(rel_path)
                 .bind(&sort_title)
                 .bind(sort_order)
+                .bind(&year)
                 .execute(pool)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -4913,65 +4268,6 @@ async fn rescan_video_library(
             cache_entry_images(pool, library_id, cache_base, base_path, rel_path)
                 .await
                 .map_err(|e| e.to_string())?;
-        } else {
-            let has_video = std::fs::read_dir(&full_path)
-                .map(|rd| rd.filter_map(|e| e.ok()).any(|e| is_media_file(&e.path(), VIDEO_EXTENSIONS)))
-                .unwrap_or(false);
-
-            if has_video {
-                // Movie (leaf with video files)
-                let result = sqlx::query(
-                    "INSERT INTO media_entry (library_id, parent_id, entry_type_id) VALUES (?, ?, ?)",
-                )
-                .bind(library_id)
-                .bind(parent_id)
-                .bind(movie_type_id.0)
-                .execute(pool)
-                .await
-                .map_err(|e| e.to_string())?;
-
-                let entry_id = result.last_insert_rowid();
-                sqlx::query("INSERT INTO movie (id, title, folder_path, sort_title, sort_order, release_date) VALUES (?, ?, ?, ?, ?, ?)")
-                    .bind(entry_id)
-                    .bind(&title)
-                    .bind(rel_path)
-                    .bind(&sort_title)
-                    .bind(sort_order)
-                    .bind(&year)
-                    .execute(pool)
-                    .await
-                    .map_err(|e| e.to_string())?;
-
-                cache_entry_images(pool, library_id, cache_base, base_path, rel_path)
-                    .await
-                    .map_err(|e| e.to_string())?;
-            } else {
-                // Empty folder → collection
-                let result = sqlx::query(
-                    "INSERT INTO media_entry (library_id, parent_id, entry_type_id) VALUES (?, ?, ?)",
-                )
-                .bind(library_id)
-                .bind(parent_id)
-                .bind(collection_type_id.0)
-                .execute(pool)
-                .await
-                .map_err(|e| e.to_string())?;
-
-                let entry_id = result.last_insert_rowid();
-                sqlx::query("INSERT INTO media_collection (id, title, folder_path, sort_title, sort_order) VALUES (?, ?, ?, ?, ?)")
-                    .bind(entry_id)
-                    .bind(&title)
-                    .bind(rel_path)
-                    .bind(&sort_title)
-                    .bind(sort_order)
-                    .execute(pool)
-                    .await
-                    .map_err(|e| e.to_string())?;
-
-                cache_entry_images(pool, library_id, cache_base, base_path, rel_path)
-                    .await
-                    .map_err(|e| e.to_string())?;
-            }
         }
     }
 
@@ -5481,23 +4777,45 @@ async fn rescan_music_library(
     Ok(())
 }
 
-fn collect_disk_paths(
+/// Walk a library root collecting entry folders, classified with the same rules as
+/// the initial scan: season-pattern subdirs → show, video files → movie, anything
+/// else is a container to recurse through. Show and movie folders are not descended
+/// into (their interiors — seasons, extras — are not entries).
+fn collect_video_entries(
     base: &PathBuf,
     dir: &PathBuf,
-    out: &mut std::collections::HashSet<String>,
+    out: &mut std::collections::HashMap<String, bool>, // rel_path -> is_show
 ) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        if entry.path().is_dir() && name != "covers" && name != "backgrounds" && name != "extras" && !name.starts_with('.') {
-            let rel = entry
-                .path()
-                .strip_prefix(base)
-                .unwrap_or(&entry.path())
-                .to_string_lossy()
-                .to_string();
-            out.insert(rel);
-            collect_disk_paths(base, &entry.path(), out)?;
+        if !is_scannable_dir(&entry) {
+            continue;
+        }
+        let path = entry.path();
+        let subdirs: Vec<_> = std::fs::read_dir(&path)?
+            .filter_map(|e| e.ok())
+            .filter(|e| is_scannable_dir(e))
+            .collect();
+        let has_season = subdirs.iter().any(|e| {
+            let (_, num) = parse_season_folder_name(&e.file_name().to_string_lossy());
+            num.is_some()
+        });
+        let rel = path
+            .strip_prefix(base)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .to_string();
+        if has_season {
+            out.insert(rel, true);
+        } else {
+            let has_video = std::fs::read_dir(&path)?
+                .filter_map(|e| e.ok())
+                .any(|e| is_media_file(&e.path(), VIDEO_EXTENSIONS));
+            if has_video {
+                out.insert(rel, false);
+            } else {
+                collect_video_entries(base, &path, out)?;
+            }
         }
     }
     Ok(())
@@ -5604,17 +4922,19 @@ async fn insert_cached_images(
     library_id: &str,
     entry_folder_path: &str,
     image_type: &str, // "cover" or "background"
+    origin: &str,     // "library" (found in media folders) or "app" (added via waverunner)
     images: &[(String, String)], // (source_filename, cached_path)
 ) -> Result<(), sqlx::Error> {
     for (filename, cached_path) in images {
         sqlx::query(
-            "INSERT OR REPLACE INTO cached_images (library_id, entry_folder_path, image_type, source_filename, cached_path) VALUES (?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO cached_images (library_id, entry_folder_path, image_type, source_filename, cached_path, origin) VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(library_id)
         .bind(entry_folder_path)
         .bind(image_type)
         .bind(filename)
         .bind(cached_path)
+        .bind(origin)
         .execute(pool)
         .await?;
     }
@@ -5636,21 +4956,6 @@ async fn get_all_cached_covers(pool: &sqlx::SqlitePool, library_id: &str) -> Res
     Ok(map)
 }
 
-fn dir_size(path: &Path) -> u64 {
-    let mut total = 0u64;
-    if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.filter_map(|e| e.ok()) {
-            let p = entry.path();
-            if p.is_dir() {
-                total += dir_size(&p);
-            } else if let Ok(meta) = p.metadata() {
-                total += meta.len();
-            }
-        }
-    }
-    total
-}
-
 fn delete_cache_for_library(app_data_dir: &Path, library_id: &str) {
     let cache_dir = app_data_dir.join("cache").join(library_id);
     if cache_dir.exists() {
@@ -5658,7 +4963,13 @@ fn delete_cache_for_library(app_data_dir: &Path, library_id: &str) {
     }
 }
 
-/// Cache both covers and backgrounds for an entry, inserting into DB
+/// App-added artwork originals live in app-data, never in the media folders.
+/// Layout mirrors the media tree: <base>/{entry_folder_path}/covers/...
+fn app_images_base(app_data_dir: &Path, library_id: &str) -> PathBuf {
+    app_data_dir.join("added_images").join(library_id)
+}
+
+/// Cache both covers and backgrounds found inside the media folders for an entry
 async fn cache_entry_images(
     pool: &sqlx::SqlitePool,
     library_id: &str,
@@ -5667,23 +4978,26 @@ async fn cache_entry_images(
     entry_rel_path: &str,
 ) -> Result<(), sqlx::Error> {
     let covers = cache_images_for_entry(cache_base, library_base, entry_rel_path, "covers");
-    insert_cached_images(pool, library_id, entry_rel_path, "cover", &covers).await?;
+    insert_cached_images(pool, library_id, entry_rel_path, "cover", "library", &covers).await?;
     let backgrounds = cache_images_for_entry(cache_base, library_base, entry_rel_path, "backgrounds");
-    insert_cached_images(pool, library_id, entry_rel_path, "background", &backgrounds).await?;
+    insert_cached_images(pool, library_id, entry_rel_path, "background", "library", &backgrounds).await?;
     Ok(())
 }
 
-/// Diff-aware sync for rescan: add new images, remove deleted ones, skip unchanged
+/// Diff-aware sync: add new images, remove deleted ones, skip unchanged.
+/// Scoped to one origin ('library' = media folders, 'app' = app-data originals) so
+/// syncing one source never deletes cache rows belonging to the other.
 async fn sync_cached_images_for_entry(
     pool: &sqlx::SqlitePool,
     library_id: &str,
     cache_base: &Path,
-    library_base: &Path,
+    source_base: &Path,
     entry_rel_path: &str,
     image_type_dir: &str, // "covers" or "backgrounds"
     image_type_db: &str,  // "cover" or "background"
+    origin: &str,         // "library" or "app"
 ) -> Result<(), String> {
-    let source_dir = library_base.join(entry_rel_path).join(image_type_dir);
+    let source_dir = source_base.join(entry_rel_path).join(image_type_dir);
     let cache_dir = cache_base.join(entry_rel_path).join(image_type_dir);
 
     // Get current files on disk
@@ -5700,11 +5014,12 @@ async fn sync_cached_images_for_entry(
 
     // Get cached files from DB
     let db_rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT source_filename, cached_path FROM cached_images WHERE library_id = ? AND entry_folder_path = ? AND image_type = ?",
+        "SELECT source_filename, cached_path FROM cached_images WHERE library_id = ? AND entry_folder_path = ? AND image_type = ? AND origin = ?",
     )
     .bind(library_id)
     .bind(entry_rel_path)
     .bind(image_type_db)
+    .bind(origin)
     .fetch_all(pool)
     .await
     .map_err(|e| e.to_string())?;
@@ -5716,12 +5031,13 @@ async fn sync_cached_images_for_entry(
         if !disk_files.contains(filename) {
             let _ = std::fs::remove_file(cached_path);
             sqlx::query(
-                "DELETE FROM cached_images WHERE library_id = ? AND entry_folder_path = ? AND image_type = ? AND source_filename = ?",
+                "DELETE FROM cached_images WHERE library_id = ? AND entry_folder_path = ? AND image_type = ? AND source_filename = ? AND origin = ?",
             )
             .bind(library_id)
             .bind(entry_rel_path)
             .bind(image_type_db)
             .bind(filename)
+            .bind(origin)
             .execute(pool)
             .await
             .map_err(|e| e.to_string())?;
@@ -5736,13 +5052,14 @@ async fn sync_cached_images_for_entry(
             let cached = cache_dir.join(filename);
             if std::fs::copy(&source, &cached).is_ok() {
                 sqlx::query(
-                    "INSERT OR REPLACE INTO cached_images (library_id, entry_folder_path, image_type, source_filename, cached_path) VALUES (?, ?, ?, ?, ?)",
+                    "INSERT OR REPLACE INTO cached_images (library_id, entry_folder_path, image_type, source_filename, cached_path, origin) VALUES (?, ?, ?, ?, ?, ?)",
                 )
                 .bind(library_id)
                 .bind(entry_rel_path)
                 .bind(image_type_db)
                 .bind(filename)
                 .bind(cached.to_string_lossy().to_string())
+                .bind(origin)
                 .execute(pool)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -5753,7 +5070,7 @@ async fn sync_cached_images_for_entry(
     Ok(())
 }
 
-/// Sync both covers and backgrounds for an entry during rescan
+/// Sync both covers and backgrounds from the media folders for an entry during rescan
 async fn sync_entry_images(
     pool: &sqlx::SqlitePool,
     library_id: &str,
@@ -5761,8 +5078,8 @@ async fn sync_entry_images(
     library_base: &Path,
     entry_rel_path: &str,
 ) -> Result<(), String> {
-    sync_cached_images_for_entry(pool, library_id, cache_base, library_base, entry_rel_path, "covers", "cover").await?;
-    sync_cached_images_for_entry(pool, library_id, cache_base, library_base, entry_rel_path, "backgrounds", "background").await?;
+    sync_cached_images_for_entry(pool, library_id, cache_base, library_base, entry_rel_path, "covers", "cover", "library").await?;
+    sync_cached_images_for_entry(pool, library_id, cache_base, library_base, entry_rel_path, "backgrounds", "background", "library").await?;
     Ok(())
 }
 
@@ -5975,10 +5292,6 @@ async fn scan_video_library(
         sqlx::query_as("SELECT id FROM media_entry_type WHERE name = 'show'")
             .fetch_one(pool)
             .await?;
-    let collection_type_id: (i64,) =
-        sqlx::query_as("SELECT id FROM media_entry_type WHERE name = 'collection'")
-            .fetch_one(pool)
-            .await?;
 
     let mut top_dirs: Vec<_> = std::fs::read_dir(base_path)
         .map_err(|e| sqlx::Error::Protocol(e.to_string()))?
@@ -5987,149 +5300,30 @@ async fn scan_video_library(
         .collect();
     top_dirs.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
 
-    for (i, dir_entry) in top_dirs.iter().enumerate() {
-        if cancel.load(Ordering::SeqCst) {
-            return Err(sqlx::Error::Protocol("Library creation cancelled".to_string()));
-        }
-        let path = dir_entry.path();
-        let name = dir_entry.file_name().to_string_lossy().to_string();
-        let _ = app.emit("scan-progress", &name);
-
-        let subdirs: Vec<_> = std::fs::read_dir(&path)
-            .map_err(|e| sqlx::Error::Protocol(e.to_string()))?
-            .filter_map(|e| e.ok())
-            .filter(|e| is_scannable_dir(e))
-            .collect();
-
-        let has_season = subdirs.iter().any(|e| {
-            let (_, num) = parse_season_folder_name(&e.file_name().to_string_lossy());
-            num.is_some()
-        });
-
-        let (title, _) = parse_folder_name(&name);
-        let sort_title = generate_sort_title(&title, "en");
-        let rel_path = path
-            .strip_prefix(base_path)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .to_string();
-
-        if has_season {
-            // TV show
-            let result = sqlx::query(
-                "INSERT INTO media_entry (library_id, parent_id, entry_type_id) VALUES (?, NULL, ?)",
-            )
-            .bind(library_id)
-            .bind(show_type_id.0)
-            .execute(pool)
-            .await?;
-
-            let entry_id = result.last_insert_rowid();
-            sqlx::query("INSERT INTO show (id, title, folder_path, sort_title, sort_order) VALUES (?, ?, ?, ?, ?)")
-                .bind(entry_id)
-                .bind(&title)
-                .bind(&rel_path)
-                .bind(&sort_title)
-                .bind(i as i32)
-                .execute(pool)
-                .await?;
-
-            cache_entry_images(pool, library_id, cache_base, base_path, &rel_path).await?;
-
-            // Scan seasons
-            let mut season_dirs = subdirs;
-            season_dirs.sort_by(|a, b| {
-                let (_, a_num) = parse_season_folder_name(&a.file_name().to_string_lossy());
-                let (_, b_num) = parse_season_folder_name(&b.file_name().to_string_lossy());
-                match (a_num, b_num) {
-                    (Some(a), Some(b)) => a.cmp(&b),
-                    _ => a.file_name().cmp(&b.file_name()),
-                }
-            });
-
-            for (j, season_entry) in season_dirs.iter().enumerate() {
-                let season_path = season_entry.path();
-                let season_name = season_entry.file_name().to_string_lossy().to_string();
-                let (season_title, season_number) = parse_season_folder_name(&season_name);
-                let season_rel = season_path
-                    .strip_prefix(base_path)
-                    .unwrap_or(&season_path)
-                    .to_string_lossy()
-                    .to_string();
-
-                let result = sqlx::query(
-                    "INSERT INTO season (show_id, title, season_number, folder_path, sort_order) VALUES (?, ?, ?, ?, ?)",
-                )
-                .bind(entry_id)
-                .bind(&season_title)
-                .bind(season_number)
-                .bind(&season_rel)
-                .bind(j as i32)
-                .execute(pool)
-                .await?;
-
-                let season_id = result.last_insert_rowid();
-
-                // Episodes
-                let mut episode_files: Vec<_> = std::fs::read_dir(&season_path)
-                    .map_err(|e| sqlx::Error::Protocol(e.to_string()))?
-                    .filter_map(|e| e.ok())
-                    .filter(|e| is_media_file(&e.path(), VIDEO_EXTENSIONS))
-                    .collect();
-
-                episode_files.sort_by(|a, b| {
-                    let (_, a_num) = parse_episode_filename(&a.file_name().to_string_lossy());
-                    let (_, b_num) = parse_episode_filename(&b.file_name().to_string_lossy());
-                    match (a_num, b_num) {
-                        (Some(a), Some(b)) => a.cmp(&b),
-                        _ => a.file_name().cmp(&b.file_name()),
-                    }
-                });
-
-                for (k, ep_entry) in episode_files.iter().enumerate() {
-                    let ep_name = ep_entry.file_name().to_string_lossy().to_string();
-                    let (ep_title, ep_number) = parse_episode_filename(&ep_name);
-                    let ep_rel = ep_entry
-                        .path()
-                        .strip_prefix(base_path)
-                        .unwrap_or(&ep_entry.path())
-                        .to_string_lossy()
-                        .to_string();
-
-                    sqlx::query(
-                        "INSERT INTO episode (season_id, title, episode_number, file_path, sort_order) VALUES (?, ?, ?, ?, ?)",
-                    )
-                    .bind(season_id)
-                    .bind(&ep_title)
-                    .bind(ep_number)
-                    .bind(&ep_rel)
-                    .bind(k as i32)
-                    .execute(pool)
-                    .await?;
-                }
-            }
-        } else {
-            // Movie or collection — delegate to recursive scan
-            scan_video_dir(
-                app,
-                pool,
-                library_id,
-                base_path,
-                &path,
-                None,
-                cache_base,
-                i as i32,
-                movie_type_id.0,
-                collection_type_id.0,
-                cancel,
-            )
-            .await?;
-        }
+    let mut next_order: i32 = 0;
+    for dir_entry in top_dirs.iter() {
+        scan_video_dir(
+            app,
+            pool,
+            library_id,
+            base_path,
+            &dir_entry.path(),
+            cache_base,
+            &mut next_order,
+            movie_type_id.0,
+            show_type_id.0,
+            cancel,
+        )
+        .await?;
     }
 
     Ok(())
 }
 
+/// Recursively scan a directory tree. A folder with season-pattern subdirs is a
+/// show; a folder containing video files is a movie; anything else is a container
+/// that is recursed through without producing an entry — collections are virtual
+/// (DB-only) and never come from disk. All entries anchor at the library root.
 #[async_recursion::async_recursion]
 async fn scan_video_dir(
     app: &tauri::AppHandle,
@@ -6137,11 +5331,10 @@ async fn scan_video_dir(
     library_id: &str,
     base_path: &PathBuf,
     dir: &PathBuf,
-    parent_id: Option<i64>,
     cache_base: &Path,
-    sort_order: i32,
+    next_order: &mut i32,
     movie_type_id: i64,
-    collection_type_id: i64,
+    show_type_id: i64,
     cancel: &AtomicBool,
 ) -> Result<(), sqlx::Error> {
     if cancel.load(Ordering::SeqCst) {
@@ -6169,17 +5362,120 @@ async fn scan_video_dir(
         .to_string_lossy()
         .to_string();
 
-    let has_video_files = subdirs.is_empty() && std::fs::read_dir(dir)
+    let has_season = subdirs.iter().any(|e| {
+        let (_, num) = parse_season_folder_name(&e.file_name().to_string_lossy());
+        num.is_some()
+    });
+
+    if has_season {
+        // TV show
+        let result = sqlx::query(
+            "INSERT INTO media_entry (library_id, parent_id, entry_type_id) VALUES (?, NULL, ?)",
+        )
+        .bind(library_id)
+        .bind(show_type_id)
+        .execute(pool)
+        .await?;
+
+        let entry_id = result.last_insert_rowid();
+        sqlx::query("INSERT INTO show (id, title, folder_path, sort_title, sort_order) VALUES (?, ?, ?, ?, ?)")
+            .bind(entry_id)
+            .bind(&title)
+            .bind(&rel_path)
+            .bind(&sort_title)
+            .bind(*next_order)
+            .execute(pool)
+            .await?;
+        *next_order += 1;
+
+        cache_entry_images(pool, library_id, cache_base, base_path, &rel_path).await?;
+
+        // Scan seasons
+        let mut season_dirs = subdirs;
+        season_dirs.sort_by(|a, b| {
+            let (_, a_num) = parse_season_folder_name(&a.file_name().to_string_lossy());
+            let (_, b_num) = parse_season_folder_name(&b.file_name().to_string_lossy());
+            match (a_num, b_num) {
+                (Some(a), Some(b)) => a.cmp(&b),
+                _ => a.file_name().cmp(&b.file_name()),
+            }
+        });
+
+        for (j, season_entry) in season_dirs.iter().enumerate() {
+            let season_path = season_entry.path();
+            let season_name = season_entry.file_name().to_string_lossy().to_string();
+            let (season_title, season_number) = parse_season_folder_name(&season_name);
+            let season_rel = season_path
+                .strip_prefix(base_path)
+                .unwrap_or(&season_path)
+                .to_string_lossy()
+                .to_string();
+
+            let result = sqlx::query(
+                "INSERT INTO season (show_id, title, season_number, folder_path, sort_order) VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(entry_id)
+            .bind(&season_title)
+            .bind(season_number)
+            .bind(&season_rel)
+            .bind(j as i32)
+            .execute(pool)
+            .await?;
+
+            let season_id = result.last_insert_rowid();
+
+            // Episodes
+            let mut episode_files: Vec<_> = std::fs::read_dir(&season_path)
+                .map_err(|e| sqlx::Error::Protocol(e.to_string()))?
+                .filter_map(|e| e.ok())
+                .filter(|e| is_media_file(&e.path(), VIDEO_EXTENSIONS))
+                .collect();
+
+            episode_files.sort_by(|a, b| {
+                let (_, a_num) = parse_episode_filename(&a.file_name().to_string_lossy());
+                let (_, b_num) = parse_episode_filename(&b.file_name().to_string_lossy());
+                match (a_num, b_num) {
+                    (Some(a), Some(b)) => a.cmp(&b),
+                    _ => a.file_name().cmp(&b.file_name()),
+                }
+            });
+
+            for (k, ep_entry) in episode_files.iter().enumerate() {
+                let ep_name = ep_entry.file_name().to_string_lossy().to_string();
+                let (ep_title, ep_number) = parse_episode_filename(&ep_name);
+                let ep_rel = ep_entry
+                    .path()
+                    .strip_prefix(base_path)
+                    .unwrap_or(&ep_entry.path())
+                    .to_string_lossy()
+                    .to_string();
+
+                sqlx::query(
+                    "INSERT INTO episode (season_id, title, episode_number, file_path, sort_order) VALUES (?, ?, ?, ?, ?)",
+                )
+                .bind(season_id)
+                .bind(&ep_title)
+                .bind(ep_number)
+                .bind(&ep_rel)
+                .bind(k as i32)
+                .execute(pool)
+                .await?;
+            }
+        }
+
+        return Ok(());
+    }
+
+    let has_video_files = std::fs::read_dir(dir)
         .map(|rd| rd.filter_map(|e| e.ok()).any(|e| is_media_file(&e.path(), VIDEO_EXTENSIONS)))
         .unwrap_or(false);
 
     if has_video_files {
-        // Movie (leaf node with video files)
+        // Movie
         let result = sqlx::query(
-            "INSERT INTO media_entry (library_id, parent_id, entry_type_id) VALUES (?, ?, ?)",
+            "INSERT INTO media_entry (library_id, parent_id, entry_type_id) VALUES (?, NULL, ?)",
         )
         .bind(library_id)
-        .bind(parent_id)
         .bind(movie_type_id)
         .execute(pool)
         .await?;
@@ -6190,55 +5486,33 @@ async fn scan_video_dir(
             .bind(&title)
             .bind(&rel_path)
             .bind(&sort_title)
-            .bind(sort_order)
+            .bind(*next_order)
             .bind(&year)
             .execute(pool)
             .await?;
+        *next_order += 1;
 
         cache_entry_images(pool, library_id, cache_base, base_path, &rel_path).await?;
-    } else {
-        // Collection (has subdirs, or empty folder)
-        let result = sqlx::query(
-            "INSERT INTO media_entry (library_id, parent_id, entry_type_id) VALUES (?, ?, ?)",
+        return Ok(());
+    }
+
+    // Container (or empty) folder — recurse; the folder itself produces no entry.
+    let mut child_dirs: Vec<_> = subdirs;
+    child_dirs.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    for child_entry in child_dirs.iter() {
+        scan_video_dir(
+            app,
+            pool,
+            library_id,
+            base_path,
+            &child_entry.path(),
+            cache_base,
+            next_order,
+            movie_type_id,
+            show_type_id,
+            cancel,
         )
-        .bind(library_id)
-        .bind(parent_id)
-        .bind(collection_type_id)
-        .execute(pool)
         .await?;
-
-        let entry_id = result.last_insert_rowid();
-        sqlx::query("INSERT INTO media_collection (id, title, folder_path, sort_title, sort_order) VALUES (?, ?, ?, ?, ?)")
-            .bind(entry_id)
-            .bind(&title)
-            .bind(&rel_path)
-            .bind(&sort_title)
-            .bind(sort_order)
-            .execute(pool)
-            .await?;
-
-        cache_entry_images(pool, library_id, cache_base, base_path, &rel_path).await?;
-
-        let mut child_dirs: Vec<_> = subdirs;
-        child_dirs.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
-
-        for (j, child_entry) in child_dirs.iter().enumerate() {
-            let child_path = child_entry.path();
-            scan_video_dir(
-                app,
-                pool,
-                library_id,
-                base_path,
-                &child_path,
-                Some(entry_id),
-                cache_base,
-                j as i32,
-                movie_type_id,
-                collection_type_id,
-                cancel,
-            )
-            .await?;
-        }
     }
 
     Ok(())

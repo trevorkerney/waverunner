@@ -1074,7 +1074,7 @@ function App() {
   );
 
   const createCollection = useCallback(
-    async (name: string, basePath?: string) => {
+    async (name: string) => {
       if (!selectedLibrary) return;
       try {
         const parentId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
@@ -1082,7 +1082,6 @@ function App() {
           libraryId: selectedLibrary.id,
           name,
           parentId,
-          basePath: basePath ?? null,
         });
         invalidateCache(selectedLibrary.id, parentId);
         // Preserve current scroll across the reload. Without this the restore
@@ -1101,14 +1100,14 @@ function App() {
     [selectedLibrary, breadcrumbs, invalidateCache, loadEntries, saveScrollPosition]
   );
 
+  // Collections only — movies/shows mirror the filesystem and leave via rescan.
   const deleteEntry = useCallback(
-    async (entryId: number, deleteFromDisk: boolean) => {
+    async (entryId: number) => {
       if (!selectedLibrary) return;
       try {
         await invoke("delete_entry", {
           libraryId: selectedLibrary.id,
           entryId,
-          deleteFromDisk,
         });
         setEntries((prev) => prev.filter((e) => e.id !== entryId));
         invalidateCache(selectedLibrary.id);

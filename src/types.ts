@@ -3,9 +3,9 @@ export interface Library {
   name: string;
   paths: string[];
   format: string;
-  portable: boolean;
+  /** 'local' = read folders from disk. Future: 'jellyfin', 'plex', ... (client mode). */
+  source: string;
   default_sort_mode: string;
-  managed: boolean;
 }
 
 export interface EntriesResponse {

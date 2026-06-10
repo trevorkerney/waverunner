@@ -17,7 +17,6 @@ import {
   ToggleGroup,
   ToggleGroupItem,
 } from "@/components/ui/toggle-group";
-import { Switch } from "@/components/ui/switch";
 import {
   Tooltip,
   TooltipContent,
@@ -25,7 +24,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { Spinner } from "@/components/ui/spinner";
-import { FolderOpen, Film, Music, CircleHelp, FolderSync, FolderSearch, Plus, X } from "lucide-react";
+import { FolderOpen, Film, Music, Server, HardDrive, Plus, X } from "lucide-react";
 
 interface CreateLibraryDialogProps {
   open: boolean;
@@ -44,10 +43,12 @@ export function CreateLibraryDialog({
   onOpenChange,
   onCreated,
 }: CreateLibraryDialogProps) {
-  const [managed, setManaged] = useState(true);
   const [name, setName] = useState("");
   const [paths, setPaths] = useState<string[]>([""]);
   const [format, setFormat] = useState("video");
+  // Only 'local' is implemented; 'server' (Jellyfin/Plex/Emby client mode) is
+  // shown disabled so the direction is visible in the UI.
+  const [source, setSource] = useState("local");
   const [creating, setCreating] = useState(creatingGlobal);
   const [scanProgress, setScanProgress] = useState("");
   const toastIdRef = useRef<string | number | null>(null);
@@ -109,24 +110,27 @@ export function CreateLibraryDialog({
     onOpenChange(open);
   }
 
+  function resetForm() {
+    setName("");
+    setPaths([""]);
+    setFormat("video");
+    setSource("local");
+  }
+
   async function handleCreate() {
     if (!name || validPaths.length === 0 || creatingGlobal) return;
     setCreating(true);
     creatingGlobal = true;
     setScanProgress("");
     try {
-      await invoke("create_library", { name, paths: validPaths, format, portable: false, managed });
+      await invoke("create_library", { name, paths: validPaths, format, source });
       if (toastIdRef.current != null) {
         toast.success(`Library "${name}" created`, { id: toastIdRef.current, duration: 4000, action: undefined });
         toastIdRef.current = null;
       }
       onCreated();
       onOpenChange(false);
-      setManaged(true);
-      setName("");
-      setPaths([""]);
-      setFormat("video");
-
+      resetForm();
     } catch (e) {
       const msg = String(e);
       if (msg.includes("cancelled")) {
@@ -135,11 +139,7 @@ export function CreateLibraryDialog({
           toastIdRef.current = null;
         }
         onOpenChange(false);
-        setManaged(true);
-        setName("");
-        setPaths([""]);
-        setFormat("video");
-  
+        resetForm();
       } else if (toastIdRef.current != null) {
         toast.error(msg, { id: toastIdRef.current, duration: 4000, action: undefined });
         toastIdRef.current = null;
@@ -160,34 +160,22 @@ export function CreateLibraryDialog({
         </DialogHeader>
         <div className="grid gap-6 py-4 px-4 overflow-y-auto min-h-0">
           <div className="grid gap-3">
-            <Label>Library Type</Label>
-            <ToggleGroup
-              value={[managed ? "managed" : "unmanaged"]}
-              onValueChange={(v) => { if (v.length) setManaged(v[v.length - 1] === "managed"); }}
-              spacing={1}
-              className="grid w-full grid-cols-2 gap-3"
-            >
-              <ToggleGroupItem
-                value="managed"
-                className="flex h-auto flex-col items-center gap-2 rounded border border-border px-4 py-5 data-[state=on]:border-primary data-[state=on]:bg-accent"
-              >
-                <FolderSync size={32} />
-                <span className="text-sm font-medium">Managed</span>
-              </ToggleGroupItem>
-              <ToggleGroupItem
-                value="unmanaged"
-                className="flex h-auto flex-col items-center gap-2 rounded border border-border px-4 py-5 data-[state=on]:border-primary data-[state=on]:bg-accent"
-              >
-                <FolderSearch size={32} />
-                <span className="text-sm font-medium">Unmanaged</span>
-              </ToggleGroupItem>
-            </ToggleGroup>
+            <Label htmlFor="name">Name</Label>
+            <Input
+              id="name"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder={format === "video" ? "Videos" : "Music"}
+            />
           </div>
           <div className="grid gap-3">
             <Label>Format</Label>
             <ToggleGroup
               value={[format]}
-              onValueChange={(v) => { if (v.length) setFormat(v[v.length - 1]); }}
+              // Only 'video' is implemented; other formats are shown for direction
+              // but ignored here. Not using the disabled attribute — it suppresses
+              // hover events, which would kill the coming-soon tooltips.
+              onValueChange={(v) => { if (v.includes("video")) setFormat("video"); }}
               spacing={1}
               className="grid w-full grid-cols-2 gap-3"
             >
@@ -198,23 +186,64 @@ export function CreateLibraryDialog({
                 <Film size={28} />
                 <span className="text-sm font-medium">Video</span>
               </ToggleGroupItem>
-              <ToggleGroupItem
-                value="music"
-                className="flex h-auto flex-col items-center gap-2 rounded border border-border px-4 py-4 data-[state=on]:border-primary data-[state=on]:bg-accent"
-              >
-                <Music size={28} />
-                <span className="text-sm font-medium">Music</span>
-              </ToggleGroupItem>
+              <TooltipProvider>
+                <Tooltip>
+                  <TooltipTrigger
+                    render={
+                      <ToggleGroupItem
+                        value="music"
+                        aria-disabled
+                        className="flex h-auto cursor-not-allowed flex-col items-center gap-2 rounded border border-border px-4 py-4 opacity-50"
+                      >
+                        <Music size={28} />
+                        <span className="text-sm font-medium">Music</span>
+                      </ToggleGroupItem>
+                    }
+                  />
+                  <TooltipContent>
+                    Coming soon. Music libraries with a dedicated audio player are planned.
+                  </TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
             </ToggleGroup>
           </div>
           <div className="grid gap-3">
-            <Label htmlFor="name">Name</Label>
-            <Input
-              id="name"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              placeholder={format === "video" ? "Videos" : "Music"}
-            />
+            <Label>Source</Label>
+            <ToggleGroup
+              value={[source]}
+              // Only 'local' is implemented — see the format group note above.
+              onValueChange={(v) => { if (v.includes("local")) setSource("local"); }}
+              spacing={1}
+              className="grid w-full grid-cols-2 gap-3"
+            >
+              <ToggleGroupItem
+                value="local"
+                className="flex h-auto flex-col items-center gap-2 rounded border border-border px-4 py-5 data-[state=on]:border-primary data-[state=on]:bg-accent"
+              >
+                <HardDrive size={32} />
+                <span className="text-sm font-medium">Local folders</span>
+              </ToggleGroupItem>
+              <TooltipProvider>
+                <Tooltip>
+                  <TooltipTrigger
+                    render={
+                      <ToggleGroupItem
+                        value="server"
+                        aria-disabled
+                        className="flex h-auto cursor-not-allowed flex-col items-center gap-2 rounded border border-border px-4 py-5 opacity-50"
+                      >
+                        <Server size={32} />
+                        <span className="text-sm font-medium">Media server</span>
+                      </ToggleGroupItem>
+                    }
+                  />
+                  <TooltipContent>
+                    Coming soon. waverunner will be able to act as a client for a
+                    Jellyfin, Plex, or Emby server.
+                  </TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+            </ToggleGroup>
           </div>
           <div className="grid gap-3">
             <Label>Folders</Label>
@@ -242,22 +271,6 @@ export function CreateLibraryDialog({
                 Add folder
               </Button>
             </div>
-          </div>
-          <div className="flex items-center justify-center gap-2">
-            <Switch
-              id="portable"
-              checked={false}
-              disabled
-            />
-            <span className="text-xs font-normal tracking-wide text-muted-foreground">Portable</span>
-            <TooltipProvider>
-              <Tooltip>
-                <TooltipTrigger render={<CircleHelp size={13} className="text-muted-foreground cursor-help" />} />
-                <TooltipContent>
-                  Coming soon. Will allow storing the library index alongside your media files for portable/external drives.
-                </TooltipContent>
-              </Tooltip>
-            </TooltipProvider>
           </div>
         </div>
         <DialogFooter className="px-4 mx-0 -mb-4">

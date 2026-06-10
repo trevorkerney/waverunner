@@ -24,7 +24,11 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             name TEXT NOT NULL,
             paths TEXT NOT NULL,
             format TEXT NOT NULL,
-            portable INTEGER NOT NULL DEFAULT 0,
+            -- source: where the library's content comes from. 'local' reads folders from
+            -- disk; future values ('jellyfin', 'plex', ...) act as a client for a media
+            -- server, configured via source_config (JSON, adapter-specific).
+            source TEXT NOT NULL DEFAULT 'local',
+            source_config TEXT,
             -- default_sort_mode: library-root sort for video libraries; artist-root sort for music libraries.
             -- movies_sort_mode / shows_sort_mode: per-view sort_mode for the video filtered views, so
             -- movies-only / shows-only / library-root are independent scopes for both the basic sort and presets.
@@ -34,9 +38,6 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             library_root_selected_preset_id INTEGER,
             movies_only_selected_preset_id INTEGER,
             shows_only_selected_preset_id INTEGER,
-            managed INTEGER NOT NULL DEFAULT 0,
-            player_path TEXT,
-            player_args TEXT,
             creating INTEGER NOT NULL DEFAULT 0
         )",
     )
@@ -656,6 +657,10 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             image_type TEXT NOT NULL,
             source_filename TEXT NOT NULL,
             cached_path TEXT NOT NULL,
+            -- origin: 'library' = image found inside the (read-only) media folders;
+            -- 'app' = image added through waverunner, original stored in app-data.
+            -- Cache syncs are scoped per-origin so one source never clobbers the other.
+            origin TEXT NOT NULL DEFAULT 'library',
             FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE,
             UNIQUE(library_id, entry_folder_path, image_type, source_filename)
         )",

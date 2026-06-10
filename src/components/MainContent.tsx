@@ -20,7 +20,6 @@ import {
 import { CSS } from "@dnd-kit/utilities";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { Input } from "@/components/ui/input";
-import { Switch } from "@/components/ui/switch";
 import { Slider } from "@/components/ui/slider";
 import {
   Breadcrumb,
@@ -185,8 +184,8 @@ interface MainContentProps {
     opts?: { playlistCollection?: boolean },
   ) => Promise<void>;
   onMoveEntry: (entryId: number, newParentId: number | null, insertBeforeId: number | null) => Promise<void>;
-  onCreateCollection: (name: string, basePath?: string) => Promise<void>;
-  onDeleteEntry: (entryId: number, deleteFromDisk: boolean) => Promise<void>;
+  onCreateCollection: (name: string) => Promise<void>;
+  onDeleteEntry: (entryId: number) => Promise<void>;
   onRescan: () => void;
   onEntryChanged: () => void;
   getCoverUrl: (filePath: string) => string;
@@ -283,11 +282,7 @@ export function MainContent({
   const [dragId, setDragId] = useState<string | number | null>(null);
   const [newCollectionOpen, setNewCollectionOpen] = useState(false);
   const [newCollectionName, setNewCollectionName] = useState("");
-  const [newCollectionPath, setNewCollectionPath] = useState("");
   const [deleteTarget, setDeleteTarget] = useState<MediaEntry | null>(null);
-  const [deleteFromDisk, setDeleteFromDisk] = useState(false);
-  const [deleteConfirmText, setDeleteConfirmText] = useState("");
-  const [deleteFilesWarning, setDeleteFilesWarning] = useState<MediaEntry | null>(null);
   const [deletingId, setDeletingId] = useState<number | null>(null);
 
   // Playlist-related dialog state
@@ -295,10 +290,10 @@ export function MainContent({
   const [createCollectionOpen, setCreateCollectionOpen] = useState(false);
   const [renameCollectionFor, setRenameCollectionFor] = useState<MediaEntry | null>(null);
 
-  const handleDelete = useCallback(async (entryId: number, deleteFromDisk: boolean) => {
+  const handleDelete = useCallback(async (entryId: number) => {
     setDeletingId(entryId);
     try {
-      await onDeleteEntry(entryId, deleteFromDisk);
+      await onDeleteEntry(entryId);
     } finally {
       setDeletingId(null);
     }
@@ -716,20 +711,10 @@ export function MainContent({
                     onAddCoverFromTmdb={() => openTmdbImages(entry)}
                     onDeleteCover={() => openCoverDialog(entry, "delete")}
                     onDelete={async (entry) => {
-                      if (entry.entry_type === "collection" && entry.child_count === 0) {
-                        if (selectedLibrary?.managed) {
-                          const hasFiles = await invoke<boolean>("check_entry_has_files", {
-                            libraryId: selectedLibrary.id,
-                            entryId: entry.id,
-                          });
-                          if (hasFiles) {
-                            setDeleteFilesWarning(entry);
-                            return;
-                          }
-                          handleDelete(entry.id, true);
-                        } else {
-                          handleDelete(entry.id, false);
-                        }
+                      // Empty collections delete immediately; non-empty ones confirm
+                      // (their items move back to the parent, nothing touches disk).
+                      if (entry.child_count === 0) {
+                        handleDelete(entry.id);
                       } else {
                         setDeleteTarget(entry);
                       }
@@ -777,7 +762,7 @@ export function MainContent({
               </ContextMenuItem>
             )}
             {activeView?.kind === "library-root" && selectedLibrary?.format === "video" && (
-              <ContextMenuItem onClick={() => { setNewCollectionName(""); setNewCollectionPath(selectedLibrary?.paths[0] ?? ""); setNewCollectionOpen(true); }}>
+              <ContextMenuItem onClick={() => { setNewCollectionName(""); setNewCollectionOpen(true); }}>
                 <FolderPlus size={14} />
                 New Collection
               </ContextMenuItem>
@@ -821,24 +806,12 @@ export function MainContent({
               placeholder="Collection name"
               onKeyDown={(e) => {
                 if (e.key === "Enter" && newCollectionName.trim()) {
-                  onCreateCollection(newCollectionName.trim(), newCollectionPath || undefined);
+                  onCreateCollection(newCollectionName.trim());
                   setNewCollectionOpen(false);
                 }
               }}
               autoFocus
             />
-            {selectedLibrary?.managed && (selectedLibrary.paths.length > 1) && breadcrumbs.length <= 1 && (
-              <Select value={newCollectionPath} onValueChange={(v) => setNewCollectionPath(v ?? "")}>
-                <SelectTrigger className="text-xs">
-                  {newCollectionPath || "Select location"}
-                </SelectTrigger>
-                <SelectContent>
-                  {selectedLibrary.paths.map((p) => (
-                    <SelectItem key={p} value={p} className="text-xs">{p}</SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            )}
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setNewCollectionOpen(false)}>
@@ -847,7 +820,7 @@ export function MainContent({
             <Button
               disabled={!newCollectionName.trim()}
               onClick={() => {
-                onCreateCollection(newCollectionName.trim(), newCollectionPath || undefined);
+                onCreateCollection(newCollectionName.trim());
                 setNewCollectionOpen(false);
               }}
             >
@@ -857,92 +830,25 @@ export function MainContent({
         </DialogContent>
       </Dialog>
 
-      {/* Delete Confirmation Dialog */}
-      <Dialog open={deleteTarget != null} onOpenChange={(open) => { if (!open) { setDeleteTarget(null); setDeleteFromDisk(false); setDeleteConfirmText(""); } }}>
-        <DialogContent className="sm:max-w-sm">
-          <DialogHeader>
-            <DialogTitle>Delete {deleteTarget?.entry_type === "movie" ? "Movie" : deleteTarget?.entry_type === "show" ? "Show" : "Entry"}</DialogTitle>
-          </DialogHeader>
-          <p className="text-sm text-muted-foreground">
-            Are you sure you want to delete &ldquo;{deleteTarget?.title}&rdquo;?
-          </p>
-          {selectedLibrary?.managed && (
-            <div className="flex flex-col">
-              <div className="flex items-center justify-between">
-                <label className="text-sm">Delete from disk</label>
-                <Switch
-                  checked={deleteFromDisk}
-                  onCheckedChange={(checked) => { setDeleteFromDisk(checked); setDeleteConfirmText(""); }}
-                />
-              </div>
-              <div className="grid transition-[grid-template-rows] duration-200 ease-out" style={{ gridTemplateRows: deleteFromDisk ? "0fr" : "1fr" }}>
-                <div className="overflow-hidden">
-                  <p className="pt-2 text-xs text-muted-foreground">
-                    The folder will remain on disk. A rescan will bring it back.
-                  </p>
-                </div>
-              </div>
-              <div className="grid transition-[grid-template-rows] duration-200 ease-out" style={{ gridTemplateRows: deleteFromDisk ? "1fr" : "0fr" }}>
-                <div className="overflow-hidden">
-                  <div className="flex flex-col gap-2 px-1 pb-1 pt-2">
-                    <p className="text-xs text-muted-foreground">Type &ldquo;<ContextMenu><ContextMenuTrigger render={<span />} className="!inline !select-text cursor-text font-semibold text-foreground">{deleteTarget?.title}</ContextMenuTrigger><ContextMenuContent><ContextMenuItem onClick={() => { if (deleteTarget) navigator.clipboard.writeText(deleteTarget.title); }}>Copy title</ContextMenuItem></ContextMenuContent></ContextMenu>&rdquo; to confirm.</p>
-                    <ContextMenu>
-                      <ContextMenuTrigger className="w-full">
-                        <Input
-                          value={deleteConfirmText}
-                          onChange={(e) => setDeleteConfirmText(e.target.value)}
-                          placeholder={deleteTarget?.title ?? ""}
-                        />
-                      </ContextMenuTrigger>
-                      <ContextMenuContent>
-                        <ContextMenuItem onClick={async () => { const text = await navigator.clipboard.readText(); setDeleteConfirmText(text); }}>
-                          Paste
-                        </ContextMenuItem>
-                      </ContextMenuContent>
-                    </ContextMenu>
-                  </div>
-                </div>
-              </div>
-            </div>
-          )}
-          <DialogFooter>
-            <Button variant="outline" onClick={() => { setDeleteTarget(null); setDeleteFromDisk(false); setDeleteConfirmText(""); }}>
-              Cancel
-            </Button>
-            <Button
-              variant="destructive"
-              disabled={selectedLibrary?.managed && deleteFromDisk && deleteConfirmText !== deleteTarget?.title}
-              onClick={() => {
-                if (deleteTarget) handleDelete(deleteTarget.id, deleteFromDisk);
-                setDeleteTarget(null);
-                setDeleteFromDisk(false);
-                setDeleteConfirmText("");
-              }}
-            >
-              Delete
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      {/* Delete Empty Collection With Files Warning */}
-      <Dialog open={deleteFilesWarning != null} onOpenChange={(open) => { if (!open) setDeleteFilesWarning(null); }}>
+      {/* Delete Collection Confirmation Dialog (collections are virtual — nothing
+          on disk is touched; the items inside move back to the parent) */}
+      <Dialog open={deleteTarget != null} onOpenChange={(open) => { if (!open) setDeleteTarget(null); }}>
         <DialogContent className="sm:max-w-sm">
           <DialogHeader>
             <DialogTitle>Delete Collection</DialogTitle>
           </DialogHeader>
           <p className="text-sm text-muted-foreground">
-            &ldquo;{deleteFilesWarning?.title}&rdquo; contains files on disk. Are you sure you want to delete it?
+            Delete &ldquo;{deleteTarget?.title}&rdquo;? The {deleteTarget?.child_count === 1 ? "item" : "items"} inside will move out of the collection. Nothing is deleted from disk.
           </p>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setDeleteFilesWarning(null)}>
+            <Button variant="outline" onClick={() => setDeleteTarget(null)}>
               Cancel
             </Button>
             <Button
               variant="destructive"
               onClick={() => {
-                if (deleteFilesWarning) handleDelete(deleteFilesWarning.id, true);
-                setDeleteFilesWarning(null);
+                if (deleteTarget) handleDelete(deleteTarget.id);
+                setDeleteTarget(null);
               }}
             >
               Delete
@@ -1326,10 +1232,12 @@ function SortableCoverCard({
                 Remove from playlist
               </ContextMenuItem>
             )}
-            {entry.link_id == null && !(entry.entry_type === "collection" && entry.child_count > 0) && (
+            {/* Only collections are deletable — movies/shows mirror the filesystem
+                and leave the library via rescan. */}
+            {entry.link_id == null && entry.entry_type === "collection" && (
               <ContextMenuItem onClick={() => onDelete(entry)} className="text-destructive focus:text-destructive">
                 <Trash2 size={14} />
-                {entry.entry_type === "collection" ? "Delete collection" : "Delete media"}
+                Delete collection
               </ContextMenuItem>
             )}
           </>

@@ -110,7 +110,6 @@ pub fn run() {
             commands::get_show_seasons,
             commands::get_season_episodes,
             commands::delete_entry,
-            commands::check_entry_has_files,
             commands::search_tmdb_movie,
             commands::get_tmdb_movie_detail,
             commands::apply_tmdb_metadata,
