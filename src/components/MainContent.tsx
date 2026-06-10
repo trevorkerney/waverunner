@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef, useEffect, useMemo, type RefObject } from "react";
+import { useState, useCallback, useRef, useEffect, useLayoutEffect, useMemo, type RefObject } from "react";
 import {
   DndContext,
   closestCenter,
@@ -11,6 +11,9 @@ import {
   useDroppable,
   pointerWithin,
   type CollisionDetection,
+  type DropAnimation,
+  type Over,
+  defaultDropAnimationSideEffects,
 } from "@dnd-kit/core";
 import {
   SortableContext,
@@ -307,6 +310,100 @@ export function MainContent({
     setDragId(event.active.id as string | number);
   }, []);
 
+  // ── Drop-into-container animation support ─────────────────────────
+  // When a card is dropped into a collection / the move-up zone, the overlay
+  // "absorbs" into the target (see dropAnimation) and the source card stays
+  // hidden until the refreshed entry list arrives — without this it would pop
+  // back at its old spot and then vanish.
+  const absorbTargetRef = useRef<{ x: number; y: number } | null>(null);
+  const [pendingRemovalId, setPendingRemovalId] = useState<string | number | null>(null);
+
+  const beginAbsorb = useCallback((over: Over, activeId: string | number) => {
+    const r = over.rect;
+    absorbTargetRef.current = { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+    setPendingRemovalId(activeId);
+    // Safety net: if the move fails and the grid never changes, unhide the card.
+    window.setTimeout(() => {
+      setPendingRemovalId((cur) => (cur === activeId ? null : cur));
+    }, 2000);
+  }, []);
+
+  // Clear the hide as soon as the entry has actually left the list.
+  useEffect(() => {
+    if (pendingRemovalId == null) return;
+    if (!filteredEntries.some((e) => sortableIdFor(e) === pendingRemovalId)) {
+      setPendingRemovalId(null);
+    }
+  }, [filteredEntries, pendingRemovalId]);
+
+  // ── FLIP layout animation for the grid ────────────────────────────
+  // When cards change layout position between renders (entry moved into a
+  // collection, deleted, reordered), slide them from their previous spot
+  // instead of teleporting. Positions use offsetLeft/Top, which ignore both
+  // scrolling and dnd-kit's live drag transforms. The render that ends a drag
+  // is skipped so optimistic reorders don't double-animate.
+  const gridRef = useRef<HTMLDivElement | null>(null);
+  const flipPositionsRef = useRef<Map<string, { x: number; y: number; w: number; h: number }>>(new Map());
+  const wasDraggingRef = useRef(false);
+  // Cover resizes are animated by CSS width transitions on the cards themselves;
+  // FLIP sits those renders out (it would fight the transition).
+  const prevCoverSizeRef = useRef(coverSize);
+
+  useLayoutEffect(() => {
+    const grid = gridRef.current;
+    const dragging = dragId != null;
+    const justDropped = wasDraggingRef.current && !dragging;
+    wasDraggingRef.current = dragging;
+    const resized = prevCoverSizeRef.current !== coverSize;
+    prevCoverSizeRef.current = coverSize;
+    if (!grid) {
+      flipPositionsRef.current = new Map();
+      return;
+    }
+    const children = Array.from(grid.children) as HTMLElement[];
+
+    // ── List-change FLIP (drops, deletes, reorders): layout positions ──
+    const prev = flipPositionsRef.current;
+    const next = new Map<string, { x: number; y: number; w: number; h: number }>();
+    for (const child of children) {
+      const key = child.dataset.flipId;
+      if (!key) continue;
+      next.set(key, { x: child.offsetLeft, y: child.offsetTop, w: child.offsetWidth, h: child.offsetHeight });
+    }
+    if (!dragging && !justDropped && !resized) {
+      // Counts only cards that actually move, so the stagger cascades across
+      // the movers rather than indexing the whole grid.
+      let animated = 0;
+      for (const child of children) {
+        const key = child.dataset.flipId;
+        if (!key) continue;
+        const old = prev.get(key);
+        if (!old) continue;
+        const now = next.get(key)!;
+        const dx = old.x - now.x;
+        const dy = old.y - now.y;
+        if (dx !== 0 || dy !== 0) {
+          child.animate(
+            [
+              { transform: `translate(${dx}px, ${dy}px)` },
+              { transform: "translate(0px, 0px)" },
+            ],
+            {
+              duration: 280,
+              easing: "cubic-bezier(0.2, 0, 0, 1)",
+              // Stagger for a choreographed cascade; fill backwards holds the
+              // starting keyframe while a card waits its turn.
+              delay: Math.min(animated * 8, 160),
+              fill: "backwards",
+            },
+          );
+          animated++;
+        }
+      }
+    }
+    flipPositionsRef.current = next;
+  });
+
   const handleDragEnd = useCallback(
     async (event: DragEndEvent) => {
       setDragId(null);
@@ -327,6 +424,7 @@ export function MainContent({
         if (overId.startsWith("pc-drop-")) {
           const targetPcId = Number(overId.slice("pc-drop-".length));
           if (activeEntry.entry_type === "playlist_collection" && activeEntry.id === targetPcId) return;
+          beginAbsorb(over, active.id);
           try {
             if (activeEntry.link_id != null) {
               await invoke("move_media_link", {
@@ -369,6 +467,7 @@ export function MainContent({
             // No clean parent breadcrumb — fall back to the root of the current playlist.
             parentPlaylistId = activeView.playlistId;
           }
+          beginAbsorb(over, active.id);
           try {
             if (activeEntry.link_id != null) {
               await invoke("move_media_link", {
@@ -411,10 +510,12 @@ export function MainContent({
       if (overId === "move-up-zone") {
         const currentParentId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
         const grandparentId = breadcrumbs.length >= 3 ? breadcrumbs[breadcrumbs.length - 2].id : null;
+        beginAbsorb(over, active.id);
         await onMoveEntry(entryId, grandparentId, currentParentId);
       } else if (overId.startsWith("collection-")) {
         const targetId = Number(overId.replace("collection-", ""));
         if (targetId !== entryId) {
+          beginAbsorb(over, active.id);
           await onMoveEntry(entryId, targetId, null);
         }
       } else {
@@ -430,12 +531,49 @@ export function MainContent({
         onSortOrderChange(reordered);
       }
     },
-    [breadcrumbs, onMoveEntry, sortMode, filteredEntries, onSortOrderChange, activeView, selectedLibrary, onPlaylistChanged]
+    [breadcrumbs, onMoveEntry, sortMode, filteredEntries, onSortOrderChange, activeView, selectedLibrary, onPlaylistChanged, beginAbsorb]
   );
 
   const dragEntry = dragId != null
     ? filteredEntries.find((e) => sortableIdFor(e) === dragId) ?? null
     : null;
+
+  // Default drops animate the overlay back to the source card. When the drop
+  // went into a container (collection / move-up zone), fly into the target and
+  // shrink away instead.
+  const dropAnimation: DropAnimation = useMemo(
+    () => ({
+      duration: 280,
+      easing: "cubic-bezier(0.2, 0, 0, 1)",
+      keyframes({ dragOverlay, transform }) {
+        const absorb = absorbTargetRef.current;
+        absorbTargetRef.current = null;
+        if (absorb && dragOverlay.rect) {
+          const r = dragOverlay.rect;
+          const dx = absorb.x - (r.left + r.width / 2);
+          const dy = absorb.y - (r.top + r.height / 2);
+          return [
+            {
+              transform: `translate3d(${transform.initial.x}px, ${transform.initial.y}px, 0) scale(1)`,
+              opacity: "1",
+            },
+            {
+              transform: `translate3d(${transform.initial.x + dx}px, ${transform.initial.y + dy}px, 0) scale(0.15)`,
+              opacity: "0",
+            },
+          ];
+        }
+        return [
+          { transform: CSS.Transform.toString(transform.initial) ?? "translate3d(0, 0, 0)" },
+          { transform: CSS.Transform.toString(transform.final) ?? "translate3d(0, 0, 0)" },
+        ];
+      },
+      sideEffects: defaultDropAnimationSideEffects({
+        styles: { active: { opacity: "0" } },
+      }),
+    }),
+    [],
+  );
 
   // Prefer collection/move-up droppables (pointerWithin), fall back to closestCenter for sort
   const collisionDetection: CollisionDetection = useCallback((args) => {
@@ -689,6 +827,7 @@ export function MainContent({
               strategy={rectSortingStrategy}
             >
               <div
+                ref={gridRef}
                 className="grid gap-4"
                 style={{
                   gridTemplateColumns: `repeat(auto-fill, minmax(${coverSize}px, 1fr))`,
@@ -722,6 +861,7 @@ export function MainContent({
                     deletingId={deletingId}
                     getCoverUrl={getCoverUrl}
                     isDragActive={dragId != null}
+                    pendingRemoval={pendingRemovalId != null && pendingRemovalId === sortableIdFor(entry)}
                     sortMode={sortMode}
                     onAddToPlaylist={selectedLibrary ? (e) => setAddToPlaylistFor(e) : undefined}
                     onRemoveLink={activeView?.kind === "playlist-detail" ? async (linkId) => {
@@ -746,7 +886,7 @@ export function MainContent({
                 ))}
               </div>
             </SortableContext>
-            <DragOverlay>
+            <DragOverlay dropAnimation={dropAnimation}>
               {dragEntry && (
                 <DragOverlayCard entry={dragEntry} size={coverSize} getCoverUrl={getCoverUrl} />
               )}
@@ -972,6 +1112,7 @@ function SortableCoverCard({
   isDragActive,
   sortMode,
   deletingId,
+  pendingRemoval,
 }: {
   entry: MediaEntry;
   size: number;
@@ -994,6 +1135,9 @@ function SortableCoverCard({
   isDragActive: boolean;
   sortMode: string;
   deletingId: number | null;
+  /** True while this card's drop-into-container move is settling — keeps it
+   *  hidden so it doesn't pop back at its old spot before the grid refreshes. */
+  pendingRemoval?: boolean;
 }) {
   const {
     attributes,
@@ -1078,15 +1222,16 @@ function SortableCoverCard({
             ref={setRef}
             {...attributes}
             {...listeners}
+            data-flip-id={String(sortableId ?? entry.id)}
             onClick={() => !isRenaming && !isDragging && onNavigate(entry)}
           />
         }
         className={`group flex flex-col items-center gap-2 rounded-md p-2 text-left ${
-          isDragging ? "opacity-0" : ""
+          isDragging || pendingRemoval ? "pointer-events-none opacity-0" : ""
         } ${isOver && isDragActive ? "ring-2 ring-primary ring-offset-2 ring-offset-background" : ""}`}
         style={{ ...style, maxWidth: size }}
       >
-        <div className="relative overflow-hidden rounded-md bg-muted shadow-md ring-1 ring-foreground/10 transition-all duration-200 group-hover:-translate-y-1 group-hover:shadow-xl group-hover:ring-foreground/25">
+        <div className="relative overflow-hidden rounded-md bg-muted shadow-md ring-1 ring-foreground/10 transition-[transform,box-shadow] duration-200 group-hover:-translate-y-1 group-hover:shadow-xl group-hover:ring-foreground/25" style={{ width: size - 16 }}>
           {coverSrc ? (
             <img
               src={coverSrc}
@@ -1096,10 +1241,7 @@ function SortableCoverCard({
               draggable={false}
             />
           ) : (
-            <div
-              className="flex items-center justify-center"
-              style={{ height: size * 1.5, width: size - 16 }}
-            >
+            <div className="flex aspect-[2/3] w-full items-center justify-center">
               {entry.entry_type === "movie" ? (
                 <Film size={size * 0.3} className="text-muted-foreground" />
               ) : entry.entry_type === "show" ? (
@@ -1250,21 +1392,31 @@ function SortableCoverCard({
 function MoveUpDropZone({ isActive }: { isActive: boolean }) {
   const { setNodeRef, isOver } = useDroppable({
     id: "move-up-zone",
+    disabled: !isActive,
   });
 
-  if (!isActive) return null;
-
+  // Stays mounted so it can expand/collapse smoothly when a drag starts/ends
+  // instead of popping in. grid-template-rows 0fr→1fr animates height-to-auto;
+  // the overflow-hidden child is what lets the row actually collapse to zero.
   return (
     <div
-      ref={setNodeRef}
-      className={`mb-4 flex items-center justify-center gap-2 rounded-lg border-2 border-dashed px-4 py-3 text-sm transition-colors ${
-        isOver
-          ? "border-primary bg-primary/10 text-primary"
-          : "border-muted-foreground/30 text-muted-foreground"
-      }`}
+      className="grid transition-[grid-template-rows] duration-200 ease-out"
+      style={{ gridTemplateRows: isActive ? "1fr" : "0fr" }}
+      aria-hidden={!isActive}
     >
-      <ArrowUp size={16} />
-      Move up a level
+      <div className={`overflow-hidden transition-opacity duration-200 ${isActive ? "opacity-100" : "opacity-0"}`}>
+        <div
+          ref={setNodeRef}
+          className={`mb-4 flex items-center justify-center gap-2 rounded-lg border-2 border-dashed px-4 py-3 text-sm transition-colors ${
+            isOver
+              ? "border-primary bg-primary/10 text-primary"
+              : "border-muted-foreground/30 text-muted-foreground"
+          }`}
+        >
+          <ArrowUp size={16} />
+          Move up a level
+        </div>
+      </div>
     </div>
   );
 }
@@ -1282,21 +1434,18 @@ function DragOverlayCard({
   const coverSrc = coverPath ? getCoverUrl(coverPath) : null;
 
   return (
-    <div className="flex cursor-grabbing flex-col items-center gap-2 rounded-md bg-accent p-2 text-left shadow-lg">
-      <div className="relative overflow-hidden rounded-md bg-muted shadow-md ring-1 ring-foreground/10 transition-all duration-200 group-hover:-translate-y-1 group-hover:shadow-xl group-hover:ring-foreground/25">
+    <div className="flex rotate-1 scale-105 cursor-grabbing flex-col items-center gap-2 rounded-md bg-accent p-2 text-left shadow-2xl">
+      <div className="relative overflow-hidden rounded-md bg-muted shadow-md ring-1 ring-foreground/10 transition-[transform,box-shadow] duration-200 group-hover:-translate-y-1 group-hover:shadow-xl group-hover:ring-foreground/25" style={{ width: size - 16 }}>
         {coverSrc ? (
           <img
             src={coverSrc}
             alt={entry.title}
             className="pointer-events-none w-full"
-            style={{ maxHeight: size * 2, width: size }}
+            style={{ maxHeight: size * 2 }}
             draggable={false}
           />
         ) : (
-          <div
-            className="flex items-center justify-center"
-            style={{ height: size * 1.5, width: size }}
-          >
+          <div className="flex aspect-[2/3] w-full items-center justify-center">
             {entry.entry_type === "movie" ? (
               <Film size={size * 0.3} className="text-muted-foreground" />
             ) : entry.entry_type === "show" ? (
@@ -2737,7 +2886,7 @@ function PlaylistCard({
           />
         }
       >
-        <div className="relative aspect-[2/3] overflow-hidden rounded-md bg-muted shadow-md ring-1 ring-foreground/10 transition-all duration-200 group-hover:-translate-y-1 group-hover:shadow-xl group-hover:ring-foreground/25">
+        <div className="relative aspect-[2/3] overflow-hidden rounded-md bg-muted shadow-md ring-1 ring-foreground/10 transition-[transform,box-shadow] duration-200 group-hover:-translate-y-1 group-hover:shadow-xl group-hover:ring-foreground/25">
           {coverSrc ? (
             <img src={coverSrc} alt={playlist.title} className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.04]" draggable={false} />
           ) : (
