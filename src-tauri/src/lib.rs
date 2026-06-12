@@ -2,6 +2,7 @@ mod commands;
 mod db;
 mod mpv;
 mod player;
+mod rt;
 mod tmdb;
 #[cfg(windows)]
 mod win_maximize_fix;
@@ -95,6 +96,7 @@ pub fn run() {
             commands::create_library,
             commands::cancel_library_creation,
             commands::delete_library,
+            commands::rename_library,
             commands::get_libraries,
             commands::get_entries,
             commands::search_entries,
@@ -121,6 +123,14 @@ pub fn run() {
             commands::get_tmdb_show_detail,
             commands::get_tmdb_season_detail,
             commands::get_tmdb_episode_detail,
+            commands::get_tmdb_bulk_targets,
+            commands::get_ratings,
+            commands::fetch_ratings,
+            commands::get_backgrounds,
+            commands::set_selected_background,
+            commands::get_extras,
+            commands::get_extra_file_path,
+            commands::populate_extras_metadata,
             commands::apply_tmdb_show_metadata,
             commands::apply_tmdb_season_metadata,
             commands::apply_tmdb_episode_metadata,

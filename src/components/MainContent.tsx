@@ -70,12 +70,6 @@ import {
   EmptyDescription,
 } from "@/components/ui/empty";
 import {
-  Select,
-  SelectTrigger,
-  SelectContent,
-  SelectItem,
-} from "@/components/ui/select";
-import {
   Search,
   Folder,
   ArrowUpDown,
@@ -95,16 +89,19 @@ import {
   ListMusic,
   ListPlus,
   Save,
+  Clapperboard,
 } from "lucide-react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
-import { Library, MediaEntry, BreadcrumbItem, MovieDetail, MovieDetailUpdate, SeasonInfo, EpisodeInfo, ShowDetail, SeasonDetailLocal, EpisodeDetailLocal, TmdbSeasonDetail, TmdbEpisodeDetail, TmdbShowFieldSelection, TmdbSeasonFieldSelection, TmdbEpisodeFieldSelection, CastUpdateInfo, ViewSpec, PersonSummary, PersonRole, PlaylistSummary, SortPreset } from "@/types";
-import { scopeKeyFor } from "@/lib/complications";
+import { Library, MediaEntry, BreadcrumbItem, MovieDetail, MovieDetailUpdate, SeasonInfo, EpisodeInfo, ShowDetail, SeasonDetailLocal, EpisodeDetailLocal, TmdbSeasonDetail, TmdbEpisodeDetail, TmdbShowFieldSelection, TmdbSeasonFieldSelection, TmdbEpisodeFieldSelection, CastUpdateInfo, CastInfo, RatingInfo, ViewSpec, PersonSummary, PersonRole, PlaylistSummary, SortPreset } from "@/types";
+import { scopeKeyFor, viewCacheKey } from "@/lib/complications";
+import { ExtrasDialog } from "@/components/ExtrasDialog";
 import { SortPresetSaveDialog } from "@/components/SortPresetSaveDialog";
 import { TmdbMatchDialog } from "@/components/TmdbMatchDialog";
 import { TmdbShowMatchDialog } from "@/components/TmdbShowMatchDialog";
 import { TmdbImageBrowserDialog } from "@/components/TmdbImageBrowserDialog";
+import { BackgroundSelectDialog } from "@/components/BackgroundSelectDialog";
 import { PeopleGrid } from "@/components/PeopleGrid";
 import { CreatePlaylistDialog } from "@/components/CreatePlaylistDialog";
 import { CreatePlaylistCollectionDialog } from "@/components/CreatePlaylistCollectionDialog";
@@ -258,10 +255,10 @@ export function MainContent({
   const openTmdbImages = useCallback(async (entry: MediaEntry) => {
     if (!selectedLibrary) return;
     try {
-      const cmd = entry.entry_type === "show" ? "get_show_detail" : "get_movie_detail";
-      const detail = await invoke<{ tmdb_id: string | null }>(cmd, {
-        entryId: entry.id,
-      });
+      // The two commands take differently-named id args (showId vs entryId).
+      const detail = entry.entry_type === "show"
+        ? await invoke<{ tmdb_id: string | null }>("get_show_detail", { showId: entry.id })
+        : await invoke<{ tmdb_id: string | null }>("get_movie_detail", { entryId: entry.id });
       if (!detail.tmdb_id) {
         toast.error("Match to TMDB first");
         return;
@@ -344,10 +341,16 @@ export function MainContent({
   // is skipped so optimistic reorders don't double-animate.
   const gridRef = useRef<HTMLDivElement | null>(null);
   const flipPositionsRef = useRef<Map<string, { x: number; y: number; w: number; h: number }>>(new Map());
+  const flipKeysRef = useRef<string[]>([]);
   const wasDraggingRef = useRef(false);
   // Cover resizes are animated by CSS width transitions on the cards themselves;
   // FLIP sits those renders out (it would fight the transition).
   const prevCoverSizeRef = useRef(coverSize);
+  // Navigation (switching All/Movies/TV, entering/leaving collections, toggling
+  // search) shows the same entries at unrelated positions — FLIP would send them
+  // flying across the grid. Rebaseline without animating on those renders.
+  const navKey = `${activeView ? viewCacheKey(activeView) : "none"}|${breadcrumbs[breadcrumbs.length - 1]?.id ?? "root"}|${isSearching ? "s" : ""}`;
+  const prevNavKeyRef = useRef(navKey);
 
   useLayoutEffect(() => {
     const grid = gridRef.current;
@@ -356,6 +359,8 @@ export function MainContent({
     wasDraggingRef.current = dragging;
     const resized = prevCoverSizeRef.current !== coverSize;
     prevCoverSizeRef.current = coverSize;
+    const navigated = prevNavKeyRef.current !== navKey;
+    prevNavKeyRef.current = navKey;
     if (!grid) {
       flipPositionsRef.current = new Map();
       return;
@@ -365,12 +370,22 @@ export function MainContent({
     // ── List-change FLIP (drops, deletes, reorders): layout positions ──
     const prev = flipPositionsRef.current;
     const next = new Map<string, { x: number; y: number; w: number; h: number }>();
+    const keys: string[] = [];
     for (const child of children) {
       const key = child.dataset.flipId;
       if (!key) continue;
+      keys.push(key);
       next.set(key, { x: child.offsetLeft, y: child.offsetTop, w: child.offsetWidth, h: child.offsetHeight });
     }
-    if (!dragging && !justDropped && !resized) {
+    // Only animate when the list composition/order actually changed. Positions can
+    // also drift between renders without any list change (cover images finish
+    // loading and grow their cards, window resizes) — the baseline is stale then,
+    // and animating against it makes cards jump on otherwise-benign re-renders.
+    const prevKeys = flipKeysRef.current;
+    flipKeysRef.current = keys;
+    const listChanged =
+      prevKeys.length !== keys.length || keys.some((k, i) => prevKeys[i] !== k);
+    if (!dragging && !justDropped && !resized && !navigated && listChanged) {
       // Counts only cards that actually move, so the stagger cascades across
       // the movers rather than indexing the whole grid.
       let animated = 0;
@@ -625,7 +640,11 @@ export function MainContent({
       <main className="flex flex-1 flex-col overflow-hidden bg-background">
         {breadcrumbBar}
         <div ref={scrollContainerRef} className="flex-1 overflow-y-auto">
-          {loading && <p className="p-4 text-sm text-muted-foreground">Loading…</p>}
+          {loading && (
+            <div className="flex h-full items-center justify-center">
+              <Spinner className="size-6" />
+            </div>
+          )}
           {!loading && people && people.length === 0 && (
             <p className="p-4 text-sm text-muted-foreground">No people found.</p>
           )}
@@ -671,8 +690,9 @@ export function MainContent({
             />
           )}
 
-          {/* Search + Sort + Size Slider */}
-          {!selectedEntry && <div className="flex items-center gap-3 border-b border-border px-4 py-2">
+          {/* Search + Sort + Size Slider. Hidden on person pages — the filmography
+              is a small curated list, always alphabetical. */}
+          {!selectedEntry && activeView?.kind !== "person-detail" && <div className="flex items-center gap-3 border-b border-border px-4 py-2">
             <div className="relative flex-1">
               <Search
                 size={14}
@@ -781,8 +801,8 @@ export function MainContent({
       <div ref={scrollContainerRef} className="flex-1 overflow-y-auto overflow-x-hidden p-4">
       {selectedEntry ? (
         selectedEntry.entry_type === "show"
-          ? <ShowDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getFullCoverUrl={getFullCoverUrl} onEntryChanged={onEntryChanged} onTitleChanged={onTitleChanged} onChangeCover={() => openCoverDialog(selectedEntry, "select")} onAddCover={() => onAddCover(selectedEntry.id)} onDeleteCover={() => openCoverDialog(selectedEntry, "delete")} onPlayEpisode={onPlayEpisode} />
-          : <EntryDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getFullCoverUrl={getFullCoverUrl} onEntryChanged={onEntryChanged} onTitleChanged={onTitleChanged} onChangeCover={() => openCoverDialog(selectedEntry, "select")} onAddCover={() => onAddCover(selectedEntry.id)} onDeleteCover={() => openCoverDialog(selectedEntry, "delete")} onPlayFile={onPlayFile} />
+          ? <ShowDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getCoverUrl={getCoverUrl} getFullCoverUrl={getFullCoverUrl} onEntryChanged={onEntryChanged} onTitleChanged={onTitleChanged} onChangeCover={() => openCoverDialog(selectedEntry, "select")} onAddCover={() => onAddCover(selectedEntry.id)} onDeleteCover={() => openCoverDialog(selectedEntry, "delete")} onPlayEpisode={onPlayEpisode} onPlayFile={onPlayFile} onNavigateToPerson={onNavigateToPerson} />
+          : <EntryDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getCoverUrl={getCoverUrl} getFullCoverUrl={getFullCoverUrl} onEntryChanged={onEntryChanged} onTitleChanged={onTitleChanged} onChangeCover={() => openCoverDialog(selectedEntry, "select")} onAddCover={() => onAddCover(selectedEntry.id)} onDeleteCover={() => openCoverDialog(selectedEntry, "delete")} onPlayFile={onPlayFile} onNavigateToPerson={onNavigateToPerson} />
       ) : (
       <ContextMenu>
         <ContextMenuTrigger render={<div className="flex min-h-full flex-col" />}>
@@ -828,7 +848,9 @@ export function MainContent({
             >
               <div
                 ref={gridRef}
-                className="grid gap-4"
+                // gap-2.5: cards carry 8px of their own padding per side, so the
+                // visible cover-to-cover distance is gap + 16px.
+                className="grid gap-2.5"
                 style={{
                   gridTemplateColumns: `repeat(auto-fill, minmax(${coverSize}px, 1fr))`,
                   alignItems: "center",
@@ -1037,6 +1059,7 @@ export function MainContent({
           libraryId={selectedLibrary.id}
           entryId={tmdbImagesEntry.entry.id}
           tmdbId={tmdbImagesEntry.tmdbId}
+          mediaType={tmdbImagesEntry.entry.entry_type === "show" ? "tv" : "movie"}
           onDownloaded={() => { onEntryChanged(); }}
         />
       )}
@@ -1231,12 +1254,12 @@ function SortableCoverCard({
         } ${isOver && isDragActive ? "ring-2 ring-primary ring-offset-2 ring-offset-background" : ""}`}
         style={{ ...style, maxWidth: size }}
       >
-        <div className="relative overflow-hidden rounded-md bg-muted shadow-md ring-1 ring-foreground/10 transition-[transform,box-shadow] duration-200 group-hover:-translate-y-1 group-hover:shadow-xl group-hover:ring-foreground/25" style={{ width: size - 16 }}>
+        <div className="relative overflow-hidden rounded-[3px] bg-muted shadow-md ring-1 ring-foreground/10 transition-[translate,scale] duration-200 group-hover:-translate-y-1 group-hover:scale-[1.04] group-hover:shadow-xl group-hover:ring-foreground/25" style={{ width: size - 16 }}>
           {coverSrc ? (
             <img
               src={coverSrc}
               alt={entry.title}
-              className="pointer-events-none w-full transition-transform duration-300 group-hover:scale-[1.04]"
+              className="pointer-events-none w-full"
               style={{ maxHeight: size * 2 }}
               draggable={false}
             />
@@ -1288,7 +1311,10 @@ function SortableCoverCard({
           ) : (
             <>
               <p className="text-sm font-medium">{entry.title}</p>
-              {(entry.season_display || entry.collection_display || entry.year) && (
+              {/* Person-page filmography shows the character ("as …") instead of the usual subtitle */}
+              {entry.role_display ? (
+                <p className="text-xs text-muted-foreground">{entry.role_display}</p>
+              ) : (entry.season_display || entry.collection_display || entry.year) && (
                 <p className="text-xs text-muted-foreground">{[entry.season_display || entry.collection_display, entry.year && `${entry.year}${entry.end_year ? `–${entry.end_year}` : ""}`].filter(Boolean).join(", ")}</p>
               )}
             </>
@@ -1435,7 +1461,7 @@ function DragOverlayCard({
 
   return (
     <div className="flex rotate-1 scale-105 cursor-grabbing flex-col items-center gap-2 rounded-md bg-accent p-2 text-left shadow-2xl">
-      <div className="relative overflow-hidden rounded-md bg-muted shadow-md ring-1 ring-foreground/10 transition-[transform,box-shadow] duration-200 group-hover:-translate-y-1 group-hover:shadow-xl group-hover:ring-foreground/25" style={{ width: size - 16 }}>
+      <div className="relative overflow-hidden rounded-[3px] bg-muted shadow-md ring-1 ring-foreground/10 transition-[translate,scale] duration-200 group-hover:-translate-y-1 group-hover:scale-[1.04] group-hover:shadow-xl group-hover:ring-foreground/25" style={{ width: size - 16 }}>
         {coverSrc ? (
           <img
             src={coverSrc}
@@ -1491,6 +1517,8 @@ function CoverCarouselDialog({
   const [api, setApi] = useState<CarouselApi>();
   const [dims, setDims] = useState<Map<number, { w: number; h: number }>>(new Map());
   const [sizes, setSizes] = useState<Map<number, number>>(new Map());
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [deleting, setDeleting] = useState(false);
 
   useEffect(() => {
     if (!api) return;
@@ -1561,15 +1589,7 @@ function CoverCarouselDialog({
             {mode === "delete" ? "Close" : "Cancel"}
           </Button>
           {mode === "delete" ? (
-            <Button
-              variant="destructive"
-              onClick={async () => {
-                const cover = entry.covers[selectedIndex];
-                if (!cover) return;
-                await onDelete(cover);
-                setSelectedIndex((prev) => Math.max(0, Math.min(prev, entry.covers.length - 2)));
-              }}
-            >
+            <Button variant="destructive" onClick={() => setConfirmingDelete(true)}>
               Delete
             </Button>
           ) : (
@@ -1579,13 +1599,122 @@ function CoverCarouselDialog({
           )}
         </DialogFooter>
       </DialogContent>
+
+      {/* Confirmation for the destructive path */}
+      <Dialog open={confirmingDelete} onOpenChange={(o) => { if (!o) setConfirmingDelete(false); }}>
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle>Delete Cover</DialogTitle>
+          </DialogHeader>
+          <p className="text-sm text-muted-foreground">
+            Permanently delete this cover image? This cannot be undone.
+          </p>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setConfirmingDelete(false)} disabled={deleting}>
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              disabled={deleting}
+              onClick={async () => {
+                const cover = entry.covers[selectedIndex];
+                if (!cover) return;
+                setDeleting(true);
+                try {
+                  await onDelete(cover);
+                  setSelectedIndex((prev) => Math.max(0, Math.min(prev, entry.covers.length - 2)));
+                } finally {
+                  setDeleting(false);
+                  setConfirmingDelete(false);
+                }
+              }}
+            >
+              {deleting ? "Deleting…" : "Delete"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </Dialog>
   );
+}
+
+function fmtRuntime(minutes: number): string {
+  return minutes >= 60 ? `${Math.floor(minutes / 60)}h ${minutes % 60}m` : `${minutes}m`;
+}
+
+// Audience score leads — it's the one people actually decide by.
+const RATING_ORDER = ["rotten_tomatoes_audience", "rotten_tomatoes", "imdb", "metacritic"];
+const RATING_LABELS: Record<string, string> = {
+  rotten_tomatoes_audience: "RT Audience",
+  rotten_tomatoes: "RT Critics",
+  imdb: "IMDb",
+  metacritic: "Metacritic",
+};
+
+function PersonFace({ imagePath, className, iconSize }: { imagePath: string | null; className: string; iconSize: number }) {
+  return (
+    <span className={`flex shrink-0 items-center justify-center overflow-hidden rounded-full bg-muted ring-1 ring-foreground/10 ${className}`}>
+      {imagePath ? (
+        <img src={convertFileSrc(imagePath)} alt="" className="h-full w-full object-cover" draggable={false} />
+      ) : (
+        <UserIcon size={iconSize} className="text-muted-foreground" />
+      )}
+    </span>
+  );
+}
+
+/** Vertical face card for people (cast grid, crew rows). Names and roles wrap
+ *  to two lines so they rarely need to truncate. */
+function CastCard({
+  person,
+  onClick,
+  className = "w-full min-w-0",
+}: {
+  person: CastInfo;
+  onClick?: () => void;
+  className?: string;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={`flex flex-col items-center gap-1.5 rounded-md p-1.5 text-center transition-colors hover:bg-accent/50 ${className}`}
+    >
+      <PersonFace imagePath={person.image_path} className="h-20 w-20" iconSize={28} />
+      <span className="w-full text-xs font-medium leading-tight line-clamp-2">{person.name}</span>
+      {person.role && (
+        <span className="-mt-0.5 w-full text-[11px] leading-tight text-muted-foreground line-clamp-2">{person.role}</span>
+      )}
+    </button>
+  );
+}
+
+/** Returns the cover src to render right now: the already-cached grid thumbnail
+ *  paints in the same frame as the page text, then swaps to the full-res cover
+ *  once it has decoded. Thumbnails (600×900) exceed the hero's 500px height cap,
+ *  so both versions render at identical size and the swap is invisible. */
+function useProgressiveCover(thumbSrc: string | null, fullSrc: string | null): string | null {
+  const [readySrc, setReadySrc] = useState<string | null>(null);
+  useEffect(() => {
+    if (!fullSrc) return;
+    let cancelled = false;
+    const img = new Image();
+    img.src = fullSrc;
+    img.decode().then(() => {
+      if (!cancelled) setReadySrc(fullSrc);
+    }).catch(() => { /* keep showing the thumbnail */ });
+    return () => {
+      cancelled = true;
+    };
+  }, [fullSrc]);
+  // Compare instead of resetting on src change — a stale readySrc from the
+  // previous entry must not flash the old cover on the new page.
+  return readySrc === fullSrc ? fullSrc : thumbSrc;
 }
 
 function EntryDetailPage({
   entry,
   selectedLibrary,
+  getCoverUrl,
   getFullCoverUrl,
   onEntryChanged,
   onTitleChanged,
@@ -1593,9 +1722,11 @@ function EntryDetailPage({
   onAddCover,
   onDeleteCover,
   onPlayFile,
+  onNavigateToPerson,
 }: {
   entry: MediaEntry;
   selectedLibrary: Library;
+  getCoverUrl: (filePath: string) => string;
   getFullCoverUrl: (filePath: string) => string;
   onEntryChanged: () => void;
   onTitleChanged: (entryId: number, newTitle: string) => void;
@@ -1603,6 +1734,7 @@ function EntryDetailPage({
   onAddCover: () => void;
   onDeleteCover: () => void;
   onPlayFile?: (path: string, title: string) => void;
+  onNavigateToPerson?: (person: PersonSummary, role: PersonRole) => void;
 }) {
   const [detail, setDetail] = useState<MovieDetail | null>(null);
   const [editing, setEditing] = useState(false);
@@ -1610,7 +1742,60 @@ function EntryDetailPage({
   const [saving, setSaving] = useState(false);
   const [tmdbDialogOpen, setTmdbDialogOpen] = useState(false);
   const [tmdbImagesOpen, setTmdbImagesOpen] = useState(false);
+  const [backgroundDialogOpen, setBackgroundDialogOpen] = useState(false);
+  const [extrasOpen, setExtrasOpen] = useState(false);
+  const [extrasCount, setExtrasCount] = useState(0);
+  const [ratings, setRatings] = useState<RatingInfo[]>([]);
+  const [omdbEnabled, setOmdbEnabled] = useState(false);
+  // Entry id everything below has finished loading for. Render is gated on it so
+  // the page appears in one piece instead of sections popping in one by one.
+  const [loadedId, setLoadedId] = useState<number | null>(null);
 
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const [extras, cachedRatings, settings, d] = await Promise.all([
+        invoke<unknown[]>("get_extras", { entryId: entry.id }).catch(() => [] as unknown[]),
+        // Cached ratings only — fetching is always explicit (context menu / bulk match).
+        invoke<RatingInfo[]>("get_ratings", { entryId: entry.id }).catch(() => [] as RatingInfo[]),
+        invoke<Record<string, string>>("get_settings").catch(() => ({} as Record<string, string>)),
+        invoke<MovieDetail | null>("get_movie_detail", { entryId: entry.id }).catch((e) => {
+          console.error("Failed to load movie detail:", e);
+          return null;
+        }),
+      ]);
+      // Decode the hero backdrop before the gate opens so it paints with the page.
+      if (d?.background) {
+        try {
+          const img = new Image();
+          img.src = convertFileSrc(d.background);
+          await img.decode();
+        } catch { /* paint will decode it instead */ }
+      }
+      if (cancelled) return;
+      setExtrasCount(extras.length);
+      setRatings(cachedRatings);
+      setOmdbEnabled(settings["omdb_enabled"] === "true");
+      setDetail(d);
+      setLoadedId(entry.id);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [entry.id]);
+
+  const fetchRatings = useCallback(async () => {
+    try {
+      const fetched = await invoke<RatingInfo[]>("fetch_ratings", { entryId: entry.id });
+      setRatings(fetched);
+      if (fetched.length > 0) toast.success("Ratings updated");
+      else toast.info("No ratings found");
+    } catch (e) {
+      toast.error(String(e));
+    }
+  }, [entry.id]);
+
+  // Re-fetch after saves / TMDB applies — initial load happens in the combined effect above.
   const loadDetail = useCallback(async () => {
     try {
       const d = await invoke<MovieDetail>("get_movie_detail", {
@@ -1621,10 +1806,6 @@ function EntryDetailPage({
       console.error("Failed to load movie detail:", e);
     }
   }, [entry.id]);
-
-  useEffect(() => {
-    loadDetail();
-  }, [loadDetail]);
 
   const startEditing = () => {
     setDraft({
@@ -1669,7 +1850,10 @@ function EntryDetailPage({
   };
 
   const coverPath = getDisplayCover(entry);
-  const coverSrc = coverPath ? getFullCoverUrl(coverPath) : null;
+  const coverSrc = useProgressiveCover(
+    coverPath ? getCoverUrl(coverPath) : null,
+    coverPath ? getFullCoverUrl(coverPath) : null,
+  );
 
   const updateDraft = (field: keyof MovieDetailUpdate, value: unknown) => {
     setDraft((prev: MovieDetailUpdate) => ({ ...prev, [field]: value }));
@@ -1679,17 +1863,26 @@ function EntryDetailPage({
     updateDraft(field, value.split(",").map((s) => s.trim()).filter(Boolean));
   };
 
+  // Everything or nothing: a blank frame beats sections trickling in.
+  if (loadedId !== entry.id) return null;
+
   return (
-    <div className="relative isolate flex gap-8 p-6">
-      {/* Ambient backdrop: the cover blurred and washed out behind the header,
-          fading into the page background. */}
-      {coverSrc && (
+    <div className="relative isolate flex flex-wrap gap-8 p-6">
+      {/* Hero backdrop: real backdrop art when one is downloaded; otherwise the
+          cover blurred and washed out. Both fade into the page background. */}
+      {(detail?.background || coverSrc) && (
         // -inset-x-4/-top-4 cancel the scroll container's p-4 so the wash reaches the section borders.
-        <div aria-hidden className="pointer-events-none absolute -inset-x-4 -top-4 -z-10 h-[420px] overflow-hidden">
-          {/* Oversized by the blur radius (64px) on every side so the blur's
-              transparent falloff lands outside the visible box. */}
-          <img src={coverSrc} alt="" className="absolute -left-16 -top-16 h-[calc(100%+8rem)] w-[calc(100%+8rem)] max-w-none object-cover opacity-25 blur-3xl" />
-          <div className="absolute inset-0 bg-linear-to-b from-transparent via-background/60 to-background" />
+        <div aria-hidden className="pointer-events-none absolute -inset-x-4 -top-4 -z-10 h-[490px] overflow-hidden">
+          {detail?.background ? (
+            <img src={convertFileSrc(detail.background)} alt="" className="absolute inset-0 h-full w-full object-cover opacity-15" />
+          ) : (
+            // Oversized by the blur radius (64px) on every side so the blur's
+            // transparent falloff lands outside the visible box.
+            <img src={coverSrc!} alt="" className="absolute -left-16 -top-16 h-[calc(100%+8rem)] w-[calc(100%+8rem)] max-w-none object-cover opacity-25 blur-3xl" />
+          )}
+          {/* via-35%: pulling the midpoint up stretches the fade-to-solid over
+              the lower two-thirds of the band for a longer, cleaner falloff */}
+          <div className="absolute inset-0 bg-linear-to-b from-transparent via-background/60 via-35% to-background" />
         </div>
       )}
       {coverSrc && (
@@ -1744,14 +1937,43 @@ function EntryDetailPage({
             ) : (
               <>
                 <h1 className="text-3xl font-bold">{entry.title}</h1>
-                {(() => {
-                  const dateDisplay = formatReleaseDate(detail?.release_date) ?? (entry.year && `${entry.year}${entry.end_year ? `–${entry.end_year}` : ""}`);
-                  return dateDisplay && <p className="text-lg text-muted-foreground">{dateDisplay}</p>;
-                })()}
+                <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-muted-foreground">
+                  {(() => {
+                    const dateDisplay = formatReleaseDate(detail?.release_date) ?? (entry.year && `${entry.year}${entry.end_year ? `–${entry.end_year}` : ""}`);
+                    return dateDisplay && <span>{dateDisplay}</span>;
+                  })()}
+                  {detail?.runtime != null && (
+                    <>
+                      <span className="text-muted-foreground/50">·</span>
+                      <span>{fmtRuntime(detail.runtime)}</span>
+                    </>
+                  )}
+                  {detail?.maturity_rating && (
+                    <span className="rounded border border-border px-1.5 py-px text-xs">
+                      {detail.maturity_rating}
+                    </span>
+                  )}
+                </div>
+                {ratings.length > 0 && (
+                  <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+                    {RATING_ORDER.filter((s) => ratings.some((r) => r.source === s)).map((source) => {
+                      const r = ratings.find((x) => x.source === source)!;
+                      return (
+                        <span key={source}>
+                          {RATING_LABELS[source] ?? source}{" "}
+                          <span className="font-medium text-foreground">{r.value}</span>
+                        </span>
+                      );
+                    })}
+                  </div>
+                )}
+                {detail?.tagline && (
+                  <p className="mt-2 italic text-muted-foreground">{detail.tagline}</p>
+                )}
               </>
             )}
           </div>
-          <div className="flex gap-2">
+          <div className="flex shrink-0 gap-2">
             <Button
               size="sm"
               onClick={async () => {
@@ -1766,6 +1988,12 @@ function EntryDetailPage({
               <Play size={14} />
               Play
             </Button>
+            {extrasCount > 0 && (
+              <Button size="sm" variant="outline" onClick={() => setExtrasOpen(true)}>
+                <Clapperboard size={14} />
+                Extras ({extrasCount})
+              </Button>
+            )}
             {editing && (
               <>
                 <Button size="sm" variant="outline" onClick={() => setEditing(false)} disabled={saving}>
@@ -1780,22 +2008,62 @@ function EntryDetailPage({
         </div>
 
         {detail && !editing && (
-          <div className="flex flex-col gap-3 text-sm">
-            {detail.tagline && <p className="italic text-muted-foreground">{detail.tagline}</p>}
-            {detail.plot && <p>{detail.plot}</p>}
-            {detail.runtime != null && <p><span className="font-medium">Runtime:</span> {detail.runtime} min</p>}
-            {detail.maturity_rating && <p><span className="font-medium">Rating:</span> {detail.maturity_rating}</p>}
-            {detail.genres.length > 0 && <p><span className="font-medium">Genres:</span> {detail.genres.join(", ")}</p>}
-            {detail.directors.length > 0 && <p><span className="font-medium">Director:</span> {detail.directors.map((d: { name: string }) => d.name).join(", ")}</p>}
-            {detail.cast.length > 0 && (
-              <p><span className="font-medium">Cast:</span> {detail.cast.map((c: { name: string; role: string | null }) => c.role ? `${c.name} (${c.role})` : c.name).join(", ")}</p>
+          <div className="flex min-w-0 flex-col gap-5">
+            {detail.genres.length > 0 && (
+              <div className="flex flex-wrap gap-1.5">
+                {detail.genres.map((g) => (
+                  // Buttons so genre filtering can hang off these later.
+                  <button
+                    key={g}
+                    className="rounded-full bg-secondary px-2.5 py-1 text-xs font-medium text-secondary-foreground transition-colors hover:bg-accent"
+                  >
+                    {g}
+                  </button>
+                ))}
+              </div>
             )}
-            {detail.composers.length > 0 && <p><span className="font-medium">Composers:</span> {detail.composers.map((p: { name: string }) => p.name).join(", ")}</p>}
-            {detail.studios.length > 0 && <p><span className="font-medium">Studios:</span> {detail.studios.join(", ")}</p>}
-            {detail.keywords.length > 0 && <p><span className="font-medium">Keywords:</span> {detail.keywords.join(", ")}</p>}
-            {detail.tmdb_id && <p><span className="font-medium">TMDB:</span> {detail.tmdb_id}</p>}
-            {detail.imdb_id && <p><span className="font-medium">IMDB:</span> {detail.imdb_id}</p>}
-            {detail.rotten_tomatoes_id && <p><span className="font-medium">Rotten Tomatoes:</span> {detail.rotten_tomatoes_id}</p>}
+
+            {detail.plot && <p className="text-sm leading-relaxed">{detail.plot}</p>}
+
+            {(detail.directors.length > 0 || detail.composers.length > 0) && (
+              <div className="flex flex-wrap gap-x-12 gap-y-4">
+                {detail.directors.length > 0 && (
+                  <div className="flex flex-col gap-1.5">
+                    <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                      {detail.directors.length === 1 ? "Director" : "Directors"}
+                    </p>
+                    <div className="-mx-1.5 flex flex-wrap gap-1">
+                      {detail.directors.map((d) => (
+                        <CastCard
+                          key={d.id}
+                          person={{ ...d, role: null }}
+                          className="w-28"
+                          onClick={() => onNavigateToPerson?.({ ...d, work_count: 0 }, "director_creator")}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                )}
+                {detail.composers.length > 0 && (
+                  <div className="flex flex-col gap-1.5">
+                    <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                      {detail.composers.length === 1 ? "Composer" : "Composers"}
+                    </p>
+                    <div className="-mx-1.5 flex flex-wrap gap-1">
+                      {detail.composers.map((c) => (
+                        <CastCard
+                          key={c.id}
+                          person={{ ...c, role: null }}
+                          className="w-28"
+                          onClick={() => onNavigateToPerson?.({ ...c, work_count: 0 }, "composer")}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
           </div>
         )}
 
@@ -1826,8 +2094,73 @@ function EntryDetailPage({
             <Pencil size={14} />
             Edit
           </ContextMenuItem>
+          <ContextMenuItem onClick={() => setBackgroundDialogOpen(true)}>
+            <ImageIcon size={14} />
+            Change background
+          </ContextMenuItem>
+          {omdbEnabled && (
+            <ContextMenuItem onClick={fetchRatings}>
+              <RefreshCw size={14} />
+              Get ratings
+            </ContextMenuItem>
+          )}
+          {extrasCount > 0 && (
+            <ContextMenuItem onClick={() => setExtrasOpen(true)}>
+              <Clapperboard size={14} />
+              View extras
+            </ContextMenuItem>
+          )}
         </ContextMenuContent>
       </ContextMenu>
+      {/* Full-width band below the hero row (w-full forces the wrap) */}
+      {detail && !editing && (detail.cast.length > 0 || detail.studios.length > 0 || detail.tmdb_id || detail.imdb_id || detail.rotten_tomatoes_id) && (
+        <div className="flex w-full min-w-0 flex-col gap-5">
+          {detail.cast.length > 0 && (
+            <div className="flex min-w-0 flex-col gap-1.5">
+              <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Cast</p>
+              <div
+                className="grid gap-x-1 gap-y-3"
+                style={{ gridTemplateColumns: "repeat(auto-fill, minmax(108px, 1fr))" }}
+              >
+                {detail.cast.map((c) => (
+                  <CastCard
+                    key={c.id}
+                    person={c}
+                    onClick={() =>
+                      onNavigateToPerson?.(
+                        { id: c.id, name: c.name, image_path: c.image_path, work_count: 0 },
+                        "actor",
+                      )
+                    }
+                  />
+                ))}
+              </div>
+            </div>
+          )}
+
+          {(detail.studios.length > 0 || detail.tmdb_id || detail.imdb_id || detail.rotten_tomatoes_id) && (
+            <p className="text-xs text-muted-foreground/70">
+              {[
+                detail.studios.length > 0 ? detail.studios.join(", ") : null,
+                detail.tmdb_id ? `TMDB ${detail.tmdb_id}` : null,
+                detail.imdb_id ? `IMDB ${detail.imdb_id}` : null,
+                detail.rotten_tomatoes_id ? `Rotten Tomatoes ${detail.rotten_tomatoes_id}` : null,
+              ]
+                .filter(Boolean)
+                .join("  ·  ")}
+            </p>
+          )}
+        </div>
+      )}
+      <ExtrasDialog
+        open={extrasOpen}
+        onOpenChange={setExtrasOpen}
+        libraryId={selectedLibrary.id}
+        entryId={entry.id}
+        entryTitle={entry.title}
+        isShow={false}
+        onPlayFile={onPlayFile}
+      />
       <TmdbMatchDialog
         open={tmdbDialogOpen}
         onOpenChange={setTmdbDialogOpen}
@@ -1844,30 +2177,17 @@ function EntryDetailPage({
           libraryId={selectedLibrary.id}
           entryId={entry.id}
           tmdbId={detail.tmdb_id}
+          mediaType="movie"
           onDownloaded={() => { loadDetail(); onEntryChanged(); }}
         />
       )}
-    </div>
-  );
-}
-
-function TruncatedList({ label, items, limit = 5 }: { label: string; items: string[]; limit?: number }) {
-  const [expanded, setExpanded] = useState(false);
-  if (items.length === 0) return null;
-  const visible = expanded ? items : items.slice(0, limit);
-  const hasMore = items.length > limit;
-  return (
-    <div className="text-sm">
-      <span className="text-muted-foreground">{label}: </span>
-      {visible.join(", ")}
-      {hasMore && (
-        <button
-          className="ml-1 text-muted-foreground underline hover:text-foreground"
-          onClick={() => setExpanded(!expanded)}
-        >
-          {expanded ? "show less" : `+${items.length - limit} more`}
-        </button>
-      )}
+      <BackgroundSelectDialog
+        open={backgroundDialogOpen}
+        onOpenChange={setBackgroundDialogOpen}
+        entryId={entry.id}
+        current={detail?.background ?? null}
+        onChanged={loadDetail}
+      />
     </div>
   );
 }
@@ -1875,6 +2195,7 @@ function TruncatedList({ label, items, limit = 5 }: { label: string; items: stri
 function ShowDetailPage({
   entry,
   selectedLibrary,
+  getCoverUrl,
   getFullCoverUrl,
   onEntryChanged,
   onTitleChanged: _onTitleChanged,
@@ -1882,9 +2203,12 @@ function ShowDetailPage({
   onAddCover,
   onDeleteCover,
   onPlayEpisode,
+  onPlayFile,
+  onNavigateToPerson,
 }: {
   entry: MediaEntry;
   selectedLibrary: Library;
+  getCoverUrl: (filePath: string) => string;
   getFullCoverUrl: (filePath: string) => string;
   onEntryChanged: () => void;
   onTitleChanged: (entryId: number, newTitle: string) => void;
@@ -1892,6 +2216,9 @@ function ShowDetailPage({
   onAddCover: () => void;
   onDeleteCover: () => void;
   onPlayEpisode?: (args: { libraryId: string; showId: number; showTitle: string; startEpisodeId: number }) => void;
+  /** Plays a standalone file (used for extras — episodes go through onPlayEpisode). */
+  onPlayFile?: (path: string, title: string) => void;
+  onNavigateToPerson?: (person: PersonSummary, role: PersonRole) => void;
 }) {
   const [detail, setDetail] = useState<ShowDetail | null>(null);
   const [seasons, setSeasons] = useState<SeasonInfo[]>([]);
@@ -1899,6 +2226,9 @@ function ShowDetailPage({
   const [episodes, setEpisodes] = useState<EpisodeInfo[]>([]);
   const [tmdbDialogOpen, setTmdbDialogOpen] = useState(false);
   const [tmdbImagesOpen, setTmdbImagesOpen] = useState(false);
+  const [backgroundDialogOpen, setBackgroundDialogOpen] = useState(false);
+  const [extrasOpen, setExtrasOpen] = useState(false);
+  const [extrasCount, setExtrasCount] = useState(0);
   const [seasonDetail, setSeasonDetail] = useState<SeasonDetailLocal | null>(null);
   const [episodeDetails, setEpisodeDetails] = useState<Map<number, EpisodeDetailLocal>>(new Map());
   const [expandedEpisodeId, setExpandedEpisodeId] = useState<number | null>(null);
@@ -1915,10 +2245,10 @@ function ShowDetailPage({
   const [editingEpisodeId, setEditingEpisodeId] = useState<number | null>(null);
   const [episodeDraft, setEpisodeDraft] = useState<TmdbEpisodeFieldSelection>({});
   const [episodeSaving, setEpisodeSaving] = useState(false);
+  // Entry id everything below has finished loading for. Render is gated on it so
+  // the page appears in one piece instead of sections popping in one by one.
+  const [loadedId, setLoadedId] = useState<number | null>(null);
   const selectedSeason = seasons.find((s) => s.id === selectedSeasonId);
-  const selectedSeasonLabel = selectedSeason
-    ? (selectedSeason.season_number != null ? `Season ${selectedSeason.season_number}` : selectedSeason.title)
-    : "Select season";
 
   const loadDetail = useCallback(async () => {
     try {
@@ -1954,39 +2284,80 @@ function ShowDetailPage({
   }, []);
 
   useEffect(() => {
-    loadDetail();
+    // One combined load — detail, seasons, extras, and the first season's
+    // episodes — applied in a single render. The page render is gated on
+    // loadedId so nothing trickles in section by section.
+    let cancelled = false;
     (async () => {
-      try {
-        const s = await invoke<SeasonInfo[]>("get_show_seasons", {
-          showId: entry.id,
-        });
-        setSeasons(s);
-        if (s.length > 0) {
-          setSelectedSeasonId(s[0].id);
+      const [d, s, extras] = await Promise.all([
+        invoke<ShowDetail | null>("get_show_detail", { showId: entry.id }).catch((e) => {
+          console.error("Failed to load show detail:", e);
+          return null;
+        }),
+        invoke<SeasonInfo[]>("get_show_seasons", { showId: entry.id }).catch((e) => {
+          console.error("Failed to load seasons:", e);
+          return [] as SeasonInfo[];
+        }),
+        invoke<unknown[]>("get_extras", { entryId: entry.id }).catch(() => [] as unknown[]),
+      ]);
+      let sd: SeasonDetailLocal | null = null;
+      let eps: EpisodeInfo[] = [];
+      if (s.length > 0) {
+        try {
+          [sd, eps] = await Promise.all([
+            invoke<SeasonDetailLocal>("get_season_detail_local", { seasonId: s[0].id }),
+            invoke<EpisodeInfo[]>("get_season_episodes", { seasonId: s[0].id }),
+          ]);
+        } catch (e) {
+          console.error("Failed to load season:", e);
         }
-      } catch (e) {
-        console.error("Failed to load seasons:", e);
       }
+      // Decode the hero backdrop before the gate opens so it paints with the page.
+      if (d?.background) {
+        try {
+          const img = new Image();
+          img.src = convertFileSrc(d.background);
+          await img.decode();
+        } catch { /* paint will decode it instead */ }
+      }
+      if (cancelled) return;
+      setDetail(d);
+      setSeasons(s);
+      setExtrasCount(extras.length);
+      setSelectedSeasonId(s[0]?.id ?? null);
+      setSeasonDetail(sd);
+      setEpisodes(eps);
+      setEpisodeDetails(new Map());
+      setExpandedEpisodeId(null);
+      setLoadedId(entry.id);
     })();
-  }, [entry.id, loadDetail]);
+    return () => {
+      cancelled = true;
+    };
+  }, [entry.id]);
 
-  useEffect(() => {
-    if (selectedSeasonId == null) return;
-    setSeasonDetail(null);
-    setEpisodeDetails(new Map());
-    setExpandedEpisodeId(null);
-    loadSeasonDetail(selectedSeasonId);
-    (async () => {
-      try {
-        const eps = await invoke<EpisodeInfo[]>("get_season_episodes", {
-          seasonId: selectedSeasonId,
-        });
-        setEpisodes(eps);
-      } catch (e) {
-        console.error("Failed to load episodes:", e);
-      }
-    })();
-  }, [selectedSeasonId, loadSeasonDetail]);
+  // Pill click: keep the old season on screen and swap everything in one render
+  // once both queries land — clearing eagerly (or setting the two results
+  // separately) causes a visible two-phase jump when switching seasons. The
+  // request counter keeps a slow response from clobbering a faster later click.
+  const seasonReqRef = useRef(0);
+  const selectSeason = useCallback(async (seasonId: number) => {
+    setSelectedSeasonId(seasonId);
+    const req = ++seasonReqRef.current;
+    try {
+      const [d, eps] = await Promise.all([
+        invoke<SeasonDetailLocal>("get_season_detail_local", { seasonId }),
+        invoke<EpisodeInfo[]>("get_season_episodes", { seasonId }),
+      ]);
+      if (seasonReqRef.current !== req) return;
+      setSeasonDetail(d);
+      setEpisodes(eps);
+      setEpisodeDetails(new Map());
+      setExpandedEpisodeId(null);
+    } catch (e) {
+      console.error("Failed to load season:", e);
+    }
+  }, []);
 
   const handleSeasonTmdb = useCallback(async () => {
     if (!detail?.tmdb_id || !selectedSeason || selectedSeason.season_number == null) return;
@@ -2026,6 +2397,17 @@ function ShowDetailPage({
     }
   }, [detail, selectedSeason, loadSeasonDetail]);
 
+  // The episode list itself carries plot/runtime now, so anything that writes
+  // episode metadata must reload it (not just the per-episode detail cache).
+  const reloadEpisodes = useCallback(async () => {
+    if (selectedSeasonId == null) return;
+    try {
+      setEpisodes(await invoke<EpisodeInfo[]>("get_season_episodes", { seasonId: selectedSeasonId }));
+    } catch {
+      // keep showing the stale list
+    }
+  }, [selectedSeasonId]);
+
   const handleBulkEpisodes = useCallback(async () => {
     if (!detail?.tmdb_id || !selectedSeason || selectedSeason.season_number == null) return;
     setBulkConfirmOpen(false);
@@ -2040,13 +2422,14 @@ function ShowDetailPage({
       // Reload episode details
       setEpisodeDetails(new Map());
       setExpandedEpisodeId(null);
+      reloadEpisodes();
       onEntryChanged();
     } catch (e) {
       toast.error(String(e));
     } finally {
       setBulkEpisodesLoading(false);
     }
-  }, [detail, selectedSeason, selectedLibrary.id, onEntryChanged]);
+  }, [detail, selectedSeason, selectedLibrary.id, onEntryChanged, reloadEpisodes]);
 
   const handleEpisodeTmdb = useCallback(async (ep: EpisodeInfo) => {
     if (!detail?.tmdb_id || !selectedSeason || selectedSeason.season_number == null || ep.episode_number == null) return;
@@ -2058,6 +2441,7 @@ function ShowDetailPage({
         episodeNumber: ep.episode_number,
       });
       const fields: TmdbEpisodeFieldSelection = {};
+      if (tmdbEp.name) fields.title = tmdbEp.name;
       if (tmdbEp.overview) fields.plot = tmdbEp.overview;
       if (tmdbEp.runtime) fields.runtime = tmdbEp.runtime;
       if (tmdbEp.air_date) fields.release_date = tmdbEp.air_date;
@@ -2085,13 +2469,14 @@ function ShowDetailPage({
       });
       toast.success(`Episode ${ep.episode_number} metadata populated`);
       loadEpisodeDetail(ep.id);
+      reloadEpisodes();
       onEntryChanged();
     } catch (e) {
       toast.error(String(e));
     } finally {
       setEpisodeTmdbLoading(null);
     }
-  }, [detail, selectedSeason, loadEpisodeDetail, onEntryChanged]);
+  }, [detail, selectedSeason, loadEpisodeDetail, onEntryChanged, reloadEpisodes]);
 
   const startEditShow = useCallback(() => {
     if (!detail) return;
@@ -2161,6 +2546,7 @@ function ShowDetailPage({
     setSeasonEditing(false);
     const d = episodeDetails.get(ep.id);
     setEpisodeDraft({
+      title: ep.title,
       plot: d?.plot ?? "",
       runtime: d?.runtime ?? undefined,
       release_date: d?.release_date ?? "",
@@ -2180,6 +2566,7 @@ function ShowDetailPage({
         fields: episodeDraft,
       });
       loadEpisodeDetail(editingEpisodeId);
+      reloadEpisodes();
       onEntryChanged();
       setEditingEpisodeId(null);
     } catch (e) {
@@ -2187,7 +2574,7 @@ function ShowDetailPage({
     } finally {
       setEpisodeSaving(false);
     }
-  }, [selectedLibrary.id, editingEpisodeId, episodeDraft, loadEpisodeDetail, onEntryChanged]);
+  }, [selectedLibrary.id, editingEpisodeId, episodeDraft, loadEpisodeDetail, onEntryChanged, reloadEpisodes]);
 
   const toggleEpisode = useCallback((epId: number) => {
     if (expandedEpisodeId === epId) {
@@ -2201,21 +2588,33 @@ function ShowDetailPage({
   }, [expandedEpisodeId, episodeDetails, loadEpisodeDetail]);
 
   const coverPath = getDisplayCover(entry);
-  const coverSrc = coverPath ? getFullCoverUrl(coverPath) : null;
+  const coverSrc = useProgressiveCover(
+    coverPath ? getCoverUrl(coverPath) : null,
+    coverPath ? getFullCoverUrl(coverPath) : null,
+  );
   const hasTmdb = !!detail?.tmdb_id;
   const canSeasonTmdb = hasTmdb && selectedSeason?.season_number != null;
 
+  // Everything or nothing: a blank frame beats sections trickling in.
+  if (loadedId !== entry.id) return null;
+
   return (
-    <div className="relative isolate flex gap-8 p-6">
-      {/* Ambient backdrop: the cover blurred and washed out behind the header,
-          fading into the page background. */}
-      {coverSrc && (
+    <div className="relative isolate flex flex-wrap gap-8 p-6">
+      {/* Hero backdrop: real backdrop art when one is downloaded; otherwise the
+          cover blurred and washed out. Both fade into the page background. */}
+      {(detail?.background || coverSrc) && (
         // -inset-x-4/-top-4 cancel the scroll container's p-4 so the wash reaches the section borders.
-        <div aria-hidden className="pointer-events-none absolute -inset-x-4 -top-4 -z-10 h-[420px] overflow-hidden">
-          {/* Oversized by the blur radius (64px) on every side so the blur's
-              transparent falloff lands outside the visible box. */}
-          <img src={coverSrc} alt="" className="absolute -left-16 -top-16 h-[calc(100%+8rem)] w-[calc(100%+8rem)] max-w-none object-cover opacity-25 blur-3xl" />
-          <div className="absolute inset-0 bg-linear-to-b from-transparent via-background/60 to-background" />
+        <div aria-hidden className="pointer-events-none absolute -inset-x-4 -top-4 -z-10 h-[490px] overflow-hidden">
+          {detail?.background ? (
+            <img src={convertFileSrc(detail.background)} alt="" className="absolute inset-0 h-full w-full object-cover opacity-15" />
+          ) : (
+            // Oversized by the blur radius (64px) on every side so the blur's
+            // transparent falloff lands outside the visible box.
+            <img src={coverSrc!} alt="" className="absolute -left-16 -top-16 h-[calc(100%+8rem)] w-[calc(100%+8rem)] max-w-none object-cover opacity-25 blur-3xl" />
+          )}
+          {/* via-35%: pulling the midpoint up stretches the fade-to-solid over
+              the lower two-thirds of the band for a longer, cleaner falloff */}
+          <div className="absolute inset-0 bg-linear-to-b from-transparent via-background/60 via-35% to-background" />
         </div>
       )}
       {coverSrc && (
@@ -2252,58 +2651,100 @@ function ShowDetailPage({
       <ContextMenu>
         <ContextMenuTrigger render={<div className="flex min-w-0 flex-1 flex-col gap-4" />}>
         <div className="flex items-start justify-between gap-4">
-          <div>
+          <div className="min-w-0">
             <h1 className="text-3xl font-bold">{entry.title}</h1>
-            {(entry.season_display || entry.collection_display || entry.year) && (
-              <p className="text-lg text-muted-foreground">
-                {[entry.season_display || entry.collection_display, entry.year && `${entry.year}${entry.end_year ? `–${entry.end_year}` : ""}`].filter(Boolean).join(", ")}
-              </p>
+            <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-muted-foreground">
+              {entry.year && (
+                <span>{entry.year}{entry.end_year ? `–${entry.end_year}` : ""}</span>
+              )}
+              {/* Whole-show runtime — backend sends it only when every episode has one */}
+              {detail?.total_runtime != null && (
+                <>
+                  <span className="text-muted-foreground/50">·</span>
+                  <span>{fmtRuntime(detail.total_runtime)}</span>
+                </>
+              )}
+              {detail?.maturity_rating && (
+                <span className="rounded border border-border px-1.5 py-px text-xs">
+                  {detail.maturity_rating}
+                </span>
+              )}
+              {seasons.length > 0 && (
+                <>
+                  <span className="text-muted-foreground/50">·</span>
+                  <span>{seasons.length} {seasons.length === 1 ? "season" : "seasons"}</span>
+                </>
+              )}
+            </div>
+            {detail?.tagline && (
+              <p className="mt-2 italic text-muted-foreground">{detail.tagline}</p>
             )}
           </div>
+          {extrasCount > 0 && (
+            <Button size="sm" variant="outline" className="shrink-0" onClick={() => setExtrasOpen(true)}>
+              <Clapperboard size={14} />
+              Extras ({extrasCount})
+            </Button>
+          )}
         </div>
 
         {/* Show metadata */}
         {detail && !showEditing && (
-          <div className="flex flex-col gap-3">
-            {detail.tagline && (
-              <p className="text-sm italic text-muted-foreground">{detail.tagline}</p>
-            )}
-            {detail.plot && (
-              <p className="text-sm">{detail.plot}</p>
-            )}
-            <div className="flex flex-wrap gap-x-6 gap-y-2 text-sm">
-              {detail.maturity_rating && (
-                <div>
-                  <span className="text-muted-foreground">Rating: </span>
-                  {detail.maturity_rating}
-                </div>
-              )}
-              {detail.genres.length > 0 && (
-                <div>
-                  <span className="text-muted-foreground">Genres: </span>
-                  {detail.genres.join(", ")}
-                </div>
-              )}
-              {detail.studios.length > 0 && (
-                <div>
-                  <span className="text-muted-foreground">Studios: </span>
-                  {detail.studios.join(", ")}
-                </div>
-              )}
-            </div>
-            <TruncatedList label="Cast" items={detail.cast.map((c) => c.role ? `${c.name} (${c.role})` : c.name)} />
-            <TruncatedList label="Created By" items={detail.creators.map((c) => c.name)} />
-            <TruncatedList label="Composers" items={detail.composers.map((c) => c.name)} />
-            {detail.keywords.length > 0 && (
-              <div className="text-sm">
-                <span className="text-muted-foreground">Keywords: </span>
-                {detail.keywords.join(", ")}
+          <div className="flex min-w-0 flex-col gap-5">
+            {detail.genres.length > 0 && (
+              <div className="flex flex-wrap gap-1.5">
+                {detail.genres.map((g) => (
+                  // Buttons so genre filtering can hang off these later.
+                  <button
+                    key={g}
+                    className="rounded-full bg-secondary px-2.5 py-1 text-xs font-medium text-secondary-foreground transition-colors hover:bg-accent"
+                  >
+                    {g}
+                  </button>
+                ))}
               </div>
             )}
-            <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
-              {detail.tmdb_id && <span>TMDB: {detail.tmdb_id}</span>}
-              {detail.imdb_id && <span>IMDB: {detail.imdb_id}</span>}
-            </div>
+
+            {detail.plot && <p className="text-sm leading-relaxed">{detail.plot}</p>}
+
+            {(detail.creators.length > 0 || detail.composers.length > 0) && (
+              <div className="flex flex-wrap gap-x-12 gap-y-4">
+                {detail.creators.length > 0 && (
+                  <div className="flex flex-col gap-1.5">
+                    <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                      Created by
+                    </p>
+                    <div className="-mx-1.5 flex flex-wrap gap-1">
+                      {detail.creators.map((c) => (
+                        <CastCard
+                          key={c.id}
+                          person={{ ...c, role: null }}
+                          className="w-28"
+                          onClick={() => onNavigateToPerson?.({ ...c, work_count: 0 }, "director_creator")}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                )}
+                {detail.composers.length > 0 && (
+                  <div className="flex flex-col gap-1.5">
+                    <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                      {detail.composers.length === 1 ? "Composer" : "Composers"}
+                    </p>
+                    <div className="-mx-1.5 flex flex-wrap gap-1">
+                      {detail.composers.map((c) => (
+                        <CastCard
+                          key={c.id}
+                          person={{ ...c, role: null }}
+                          className="w-28"
+                          onClick={() => onNavigateToPerson?.({ ...c, work_count: 0 }, "composer")}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         )}
 
@@ -2325,44 +2766,74 @@ function ShowDetailPage({
           </div>
         )}
 
-        {/* Seasons + episodes */}
+        </ContextMenuTrigger>
+        <ContextMenuContent>
+          <ContextMenuItem onClick={() => setTmdbDialogOpen(true)}>
+            <Film size={14} />
+            {detail?.tmdb_id ? "Rematch TMDB" : "Match TMDB"}
+          </ContextMenuItem>
+          <ContextMenuItem onClick={startEditShow} disabled={!detail}>
+            <Pencil size={14} />
+            Edit
+          </ContextMenuItem>
+          <ContextMenuItem onClick={() => setBackgroundDialogOpen(true)}>
+            <ImageIcon size={14} />
+            Change background
+          </ContextMenuItem>
+          {extrasCount > 0 && (
+            <ContextMenuItem onClick={() => setExtrasOpen(true)}>
+              <Clapperboard size={14} />
+              View extras
+            </ContextMenuItem>
+          )}
+        </ContextMenuContent>
+      </ContextMenu>
+
+      {/* Seasons + episodes — full-width band below the hero (w-full forces the wrap) */}
+      <div className="flex w-full min-w-0 flex-col gap-4">
         {seasons.length > 0 && (
           <div className="flex flex-col gap-3">
-            <div className="flex items-center gap-2">
-              <Select
-                value={String(selectedSeasonId)}
-                onValueChange={(val) => setSelectedSeasonId(Number(val))}
-              >
-                <SelectTrigger className="w-48">
-                  {selectedSeasonLabel}
-                </SelectTrigger>
-                <SelectContent>
-                  {seasons.map((s) => (
-                    <SelectItem key={s.id} value={String(s.id)}>
-                      {s.season_number != null ? `Season ${s.season_number}` : s.title}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+            {/* Season pills: the show's shape at a glance, one click to switch */}
+            <div className="-mx-1 flex gap-1.5 overflow-x-auto px-1 pb-1">
+              {seasons.map((s) => {
+                const active = s.id === selectedSeasonId;
+                return (
+                  <button
+                    key={s.id}
+                    onClick={() => selectSeason(s.id)}
+                    className={`shrink-0 rounded-full px-3 py-1 text-sm transition-colors ${
+                      active
+                        ? "bg-primary font-medium text-primary-foreground"
+                        : "bg-secondary text-secondary-foreground hover:bg-accent"
+                    }`}
+                  >
+                    {s.season_number != null ? `Season ${s.season_number}` : s.title}
+                  </button>
+                );
+              })}
             </div>
 
-            {/* Season metadata */}
+            {/* Season metadata — borderless header band; the meta line always renders
+                so there's a right-click target even when the season has no metadata */}
             {selectedSeason && !seasonEditing && (() => {
-              const hasMeta = seasonDetail && (seasonDetail.plot || seasonDetail.cast.length > 0);
               const episodesNumbered = episodes.length > 0 && episodes.every((e) => e.episode_number != null);
+              const totalRuntime = episodes.reduce((sum, e) => sum + (e.runtime ?? 0), 0);
+              const years = [...new Set(episodes.map((e) => e.release_date?.slice(0, 4)).filter((y): y is string => !!y))].sort();
+              const seasonMeta = [
+                `${episodes.length} episode${episodes.length === 1 ? "" : "s"}`,
+                totalRuntime > 0 ? fmtRuntime(totalRuntime) : null,
+                years.length > 0 ? (years.length === 1 ? years[0] : `${years[0]}–${years[years.length - 1]}`) : null,
+              ].filter(Boolean).join("  ·  ");
               return (
                 <ContextMenu>
-                  <ContextMenuTrigger render={<div className="flex flex-col gap-2 rounded-md border p-3" />}>
-                    {!seasonDetail && <Spinner className="h-4 w-4" />}
-                    {seasonDetail && !hasMeta && (
-                      <p className="text-sm text-muted-foreground">No metadata</p>
-                    )}
-                    {seasonDetail && hasMeta && (
-                      <>
-                        {seasonDetail.plot && <p className="text-sm">{seasonDetail.plot}</p>}
-                        <TruncatedList label="Cast" items={seasonDetail.cast.map((c) => c.role ? `${c.name} (${c.role})` : c.name)} />
-                      </>
-                    )}
+                  <ContextMenuTrigger render={<div className="flex flex-col gap-2" />}>
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                      <span>{seasonMeta}</span>
+                      {!seasonDetail && <Spinner className="h-3.5 w-3.5" />}
+                    </div>
+                    {/* Season cast intentionally not shown — per-season billing spoils
+                        character exits. It's merged into the show-wide Cast band instead. */}
+                    {seasonDetail?.plot && <p className="text-sm">{seasonDetail.plot}</p>}
                   </ContextMenuTrigger>
                   <ContextMenuContent>
                     <ContextMenuItem onClick={startEditSeason} disabled={!seasonDetail}>
@@ -2406,19 +2877,31 @@ function ShowDetailPage({
                       <ContextMenuTrigger
                         render={
                           <div
-                            className="flex cursor-pointer items-center gap-3 rounded-md px-3 py-2 hover:bg-accent"
+                            className="flex cursor-pointer items-start gap-3 rounded-md px-3 py-2 hover:bg-accent"
                             onClick={() => toggleEpisode(ep.id)}
                           />
                         }
                       >
-                      {isExpanded ? <ChevronDown size={14} className="shrink-0 text-muted-foreground" /> : <ChevronRight size={14} className="shrink-0 text-muted-foreground" />}
-                      <span className="w-8 text-right text-sm text-muted-foreground">
+                      {isExpanded ? <ChevronDown size={14} className="mt-1 shrink-0 text-muted-foreground" /> : <ChevronRight size={14} className="mt-1 shrink-0 text-muted-foreground" />}
+                      <span className="mt-0.5 w-8 shrink-0 text-right text-sm text-muted-foreground">
                         {ep.episode_number != null ? ep.episode_number : "–"}
                       </span>
-                      <span className="flex-1 truncate text-sm">{ep.title}</span>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-baseline gap-2">
+                          <span className="truncate text-sm font-medium">{ep.title}</span>
+                          {ep.runtime != null && (
+                            <span className="shrink-0 text-xs text-muted-foreground">{fmtRuntime(ep.runtime)}</span>
+                          )}
+                        </div>
+                        {/* Snippet hides while expanded — the panel below shows the full plot */}
+                        {!isExpanded && ep.plot && (
+                          <p className="mt-0.5 text-xs leading-snug text-muted-foreground line-clamp-2">{ep.plot}</p>
+                        )}
+                      </div>
                       <Button
                         size="sm"
                         variant="ghost"
+                        className="self-center"
                         onClick={(e) => {
                           e.stopPropagation();
                           try {
@@ -2446,33 +2929,91 @@ function ShowDetailPage({
                         </ContextMenuItem>
                       </ContextMenuContent>
                     </ContextMenu>
-                    {isExpanded && editingEpisodeId !== ep.id && (
+                    {/* Expanded panel slides open via the 0fr→1fr grid-rows trick; loaded
+                        panels stay mounted (height 0) so collapse animates instead of snapping */}
+                    <div
+                      className="grid transition-[grid-template-rows] duration-200 ease-out"
+                      style={{ gridTemplateRows: isExpanded ? "1fr" : "0fr" }}
+                    >
+                    <div className="overflow-hidden">
+                    {(isExpanded || epDetail) && editingEpisodeId !== ep.id && (
                       <ContextMenu>
-                        <ContextMenuTrigger render={<div className="ml-14 mb-1 flex flex-col gap-1 rounded-md border p-3 text-sm" />}>
+                        <ContextMenuTrigger render={<div className="mb-2 ml-14 mt-1 flex flex-col gap-2 border-l-2 border-primary/40 bg-muted/30 py-2.5 pl-4 pr-3 text-sm" />}>
                           {!epDetail && <Spinner className="h-4 w-4" />}
                           {epDetail && !hasDetail && (
                             <p className="text-muted-foreground">No metadata</p>
                           )}
                           {epDetail && hasDetail && (
                             <>
-                              {epDetail.release_date && (
-                                <div>
-                                  <span className="text-muted-foreground">Air Date: </span>
-                                  {formatReleaseDate(epDetail.release_date)}
-                                </div>
-                              )}
-                              {epDetail.runtime && (
-                                <div>
-                                  <span className="text-muted-foreground">Runtime: </span>
-                                  {epDetail.runtime} min
-                                </div>
+                              {(epDetail.release_date || epDetail.runtime) && (
+                                <p className="text-xs text-muted-foreground">
+                                  {[
+                                    formatReleaseDate(epDetail.release_date),
+                                    epDetail.runtime ? fmtRuntime(epDetail.runtime) : null,
+                                  ].filter(Boolean).join("  ·  ")}
+                                </p>
                               )}
                               {epDetail.plot && (
                                 <p>{epDetail.plot}</p>
                               )}
-                              <TruncatedList label="Guest Stars" items={epDetail.cast.map((c) => c.role ? `${c.name} (${c.role})` : c.name)} />
-                              <TruncatedList label="Directors" items={epDetail.directors.map((d) => d.name)} />
-                              <TruncatedList label="Composers" items={epDetail.composers.map((c) => c.name)} />
+                              {(epDetail.directors.length > 0 || epDetail.composers.length > 0) && (
+                                <div className="flex flex-wrap gap-x-10 gap-y-3">
+                                  {epDetail.directors.length > 0 && (
+                                    <div className="flex flex-col gap-1">
+                                      <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                                        {epDetail.directors.length === 1 ? "Director" : "Directors"}
+                                      </p>
+                                      <div className="-mx-1.5 flex flex-wrap gap-1">
+                                        {epDetail.directors.map((d) => (
+                                          <CastCard
+                                            key={d.id}
+                                            person={{ ...d, role: null }}
+                                            className="w-24"
+                                            onClick={() => onNavigateToPerson?.({ ...d, work_count: 0 }, "director_creator")}
+                                          />
+                                        ))}
+                                      </div>
+                                    </div>
+                                  )}
+                                  {epDetail.composers.length > 0 && (
+                                    <div className="flex flex-col gap-1">
+                                      <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                                        {epDetail.composers.length === 1 ? "Composer" : "Composers"}
+                                      </p>
+                                      <div className="-mx-1.5 flex flex-wrap gap-1">
+                                        {epDetail.composers.map((c) => (
+                                          <CastCard
+                                            key={c.id}
+                                            person={{ ...c, role: null }}
+                                            className="w-24"
+                                            onClick={() => onNavigateToPerson?.({ ...c, work_count: 0 }, "composer")}
+                                          />
+                                        ))}
+                                      </div>
+                                    </div>
+                                  )}
+                                </div>
+                              )}
+                              {epDetail.cast.length > 0 && (
+                                <div className="flex min-w-0 flex-col gap-1">
+                                  <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Guest Stars</p>
+                                  <div className="-mx-1.5 flex flex-wrap gap-1">
+                                    {epDetail.cast.map((c) => (
+                                      <CastCard
+                                        key={c.id}
+                                        person={c}
+                                        className="w-24"
+                                        onClick={() =>
+                                          onNavigateToPerson?.(
+                                            { id: c.id, name: c.name, image_path: c.image_path, work_count: 0 },
+                                            "actor",
+                                          )
+                                        }
+                                      />
+                                    ))}
+                                  </div>
+                                </div>
+                              )}
                             </>
                           )}
                         </ContextMenuTrigger>
@@ -2492,7 +3033,8 @@ function ShowDetailPage({
                       </ContextMenu>
                     )}
                     {isExpanded && editingEpisodeId === ep.id && (
-                      <div className="ml-14 mb-1 flex flex-col gap-3 rounded-md border p-3 text-sm">
+                      <div className="mb-2 ml-14 mt-1 flex flex-col gap-3 rounded-md border p-3 text-sm">
+                        <EditField label="Title" value={episodeDraft.title ?? ""} onChange={(v) => setEpisodeDraft((p) => ({ ...p, title: v }))} />
                         <EditField label="Air Date" value={episodeDraft.release_date ?? ""} onChange={(v) => setEpisodeDraft((p) => ({ ...p, release_date: v }))} />
                         <EditField label="Runtime (min)" value={episodeDraft.runtime != null ? String(episodeDraft.runtime) : ""} onChange={(v) => setEpisodeDraft((p) => ({ ...p, runtime: v ? Number(v) : undefined }))} />
                         <EditField label="Plot" value={episodeDraft.plot ?? ""} onChange={(v) => setEpisodeDraft((p) => ({ ...p, plot: v }))} multiline />
@@ -2505,6 +3047,8 @@ function ShowDetailPage({
                         </div>
                       </div>
                     )}
+                    </div>
+                    </div>
                   </div>
                 );
               })}
@@ -2518,19 +3062,56 @@ function ShowDetailPage({
         {seasons.length === 0 && (
           <p className="text-sm text-muted-foreground">No seasons</p>
         )}
-        </ContextMenuTrigger>
-        <ContextMenuContent>
-          <ContextMenuItem onClick={() => setTmdbDialogOpen(true)}>
-            <Film size={14} />
-            {detail?.tmdb_id ? "Rematch TMDB" : "Match TMDB"}
-          </ContextMenuItem>
-          <ContextMenuItem onClick={startEditShow} disabled={!detail}>
-            <Pencil size={14} />
-            Edit
-          </ContextMenuItem>
-        </ContextMenuContent>
-      </ContextMenu>
+      </div>
 
+      {/* Cast + reference footer — full-width band below the episodes */}
+      {detail && !showEditing && (detail.cast.length > 0 || detail.studios.length > 0 || detail.tmdb_id || detail.imdb_id) && (
+        <div className="flex w-full min-w-0 flex-col gap-5">
+          {detail.cast.length > 0 && (
+            <div className="flex min-w-0 flex-col gap-1.5">
+              <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Cast</p>
+              <div
+                className="grid gap-x-1 gap-y-3"
+                style={{ gridTemplateColumns: "repeat(auto-fill, minmax(108px, 1fr))" }}
+              >
+                {detail.cast.map((c) => (
+                  <CastCard
+                    key={c.id}
+                    person={c}
+                    onClick={() =>
+                      onNavigateToPerson?.(
+                        { id: c.id, name: c.name, image_path: c.image_path, work_count: 0 },
+                        "actor",
+                      )
+                    }
+                  />
+                ))}
+              </div>
+            </div>
+          )}
+          {(detail.studios.length > 0 || detail.tmdb_id || detail.imdb_id) && (
+            <p className="text-xs text-muted-foreground/70">
+              {[
+                detail.studios.length > 0 ? detail.studios.join(", ") : null,
+                detail.tmdb_id ? `TMDB ${detail.tmdb_id}` : null,
+                detail.imdb_id ? `IMDB ${detail.imdb_id}` : null,
+              ]
+                .filter(Boolean)
+                .join("  ·  ")}
+            </p>
+          )}
+        </div>
+      )}
+
+      <ExtrasDialog
+        open={extrasOpen}
+        onOpenChange={setExtrasOpen}
+        libraryId={selectedLibrary.id}
+        entryId={entry.id}
+        entryTitle={entry.title}
+        isShow
+        onPlayFile={onPlayFile}
+      />
       <TmdbShowMatchDialog
         open={tmdbDialogOpen}
         onOpenChange={setTmdbDialogOpen}
@@ -2548,9 +3129,17 @@ function ShowDetailPage({
           libraryId={selectedLibrary.id}
           entryId={entry.id}
           tmdbId={detail.tmdb_id}
+          mediaType="tv"
           onDownloaded={() => { loadDetail(); onEntryChanged(); }}
         />
       )}
+      <BackgroundSelectDialog
+        open={backgroundDialogOpen}
+        onOpenChange={setBackgroundDialogOpen}
+        entryId={entry.id}
+        current={detail?.background ?? null}
+        onChanged={loadDetail}
+      />
 
       {/* Bulk episode fetch confirmation */}
       <Dialog open={bulkConfirmOpen} onOpenChange={setBulkConfirmOpen}>
@@ -2770,7 +3359,11 @@ function PlaylistsView({
       {breadcrumbBar}
       <ContextMenu>
         <ContextMenuTrigger render={<div ref={scrollContainerRef} className="flex-1 overflow-y-auto" />}>
-          {loading && <p className="p-4 text-sm text-muted-foreground">Loading…</p>}
+          {loading && (
+            <div className="flex h-full items-center justify-center">
+              <Spinner className="size-6" />
+            </div>
+          )}
           {!loading && playlists && playlists.length === 0 && (
             <p className="p-4 text-sm text-muted-foreground">No playlists yet. Right-click here to create one.</p>
           )}
@@ -2886,9 +3479,9 @@ function PlaylistCard({
           />
         }
       >
-        <div className="relative aspect-[2/3] overflow-hidden rounded-md bg-muted shadow-md ring-1 ring-foreground/10 transition-[transform,box-shadow] duration-200 group-hover:-translate-y-1 group-hover:shadow-xl group-hover:ring-foreground/25">
+        <div className="relative aspect-[2/3] overflow-hidden rounded-[3px] bg-muted shadow-md ring-1 ring-foreground/10 transition-[translate,scale] duration-200 group-hover:-translate-y-1 group-hover:scale-[1.04] group-hover:shadow-xl group-hover:ring-foreground/25">
           {coverSrc ? (
-            <img src={coverSrc} alt={playlist.title} className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.04]" draggable={false} />
+            <img src={coverSrc} alt={playlist.title} className="h-full w-full object-cover" draggable={false} />
           ) : (
             <div className="flex h-full w-full items-center justify-center text-muted-foreground">
               <ListMusic size={36} />

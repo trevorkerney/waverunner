@@ -1,5 +1,7 @@
 # TODO
 
+surface extras (featurettes, trailers, behind the scenes, webisodes, ...) as a playable Extras section on detail pages. The Plex/Jellyfin-convention folders are currently recognized but ignored by the scanner (RESERVED_DIRS in commands.rs). Webisodes could alternatively map to Season 0 (Specials) — TMDB catalogs The Office webisodes there.
+
 add hover tooltips to format options explaining them
 
 when there are options between local library and externally managed library, have hover tooltips for that too

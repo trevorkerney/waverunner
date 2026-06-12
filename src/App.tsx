@@ -97,22 +97,51 @@ function App() {
           entry.selected_cover && entry.covers.includes(entry.selected_cover)
             ? entry.selected_cover
             : entry.covers[0];
-        if (!cover || thumbCacheRef.current.has(cover)) return;
-        try {
-          const thumbPath = toThumbPath(cover);
-          const resp = await fetch(convertFileSrc(thumbPath));
-          if (!resp.ok) throw new Error();
-          const blob = await resp.blob();
-          thumbCacheRef.current.set(cover, URL.createObjectURL(blob));
-        } catch {
-          // Fallback: cache full-res as blob
+        if (!cover) return;
+        let url = thumbCacheRef.current.get(cover);
+        if (!url) {
           try {
-            const resp = await fetch(convertFileSrc(cover));
+            const thumbPath = toThumbPath(cover);
+            const resp = await fetch(convertFileSrc(thumbPath));
+            if (!resp.ok) throw new Error();
             const blob = await resp.blob();
-            thumbCacheRef.current.set(cover, URL.createObjectURL(blob));
-          } catch { /* skip */ }
+            url = URL.createObjectURL(blob);
+          } catch {
+            // Fallback: cache full-res as blob
+            try {
+              const resp = await fetch(convertFileSrc(cover));
+              const blob = await resp.blob();
+              url = URL.createObjectURL(blob);
+            } catch {
+              return;
+            }
+          }
+          thumbCacheRef.current.set(cover, url);
         }
+        // Decode up front so the grid paints with covers already rasterized —
+        // a bare <img> decodes lazily, making covers pop in one by one.
+        try {
+          const img = new Image();
+          img.src = url;
+          await img.decode();
+        } catch { /* paint will decode it instead */ }
       })
+    );
+  }, []);
+
+  // Same idea for non-entry grids (people faces, playlist covers): fetch and
+  // decode before the grid swaps in, so it appears fully formed.
+  const preloadImages = useCallback(async (paths: (string | null)[]) => {
+    await Promise.all(
+      paths
+        .filter((p): p is string => !!p)
+        .map(async (p) => {
+          try {
+            const img = new Image();
+            img.src = convertFileSrc(p);
+            await img.decode();
+          } catch { /* paint will decode it instead */ }
+        })
     );
   }, []);
 
@@ -286,6 +315,7 @@ function App() {
             libraryId: view.libraryId,
             role,
           });
+          await preloadImages(res.map((p) => p.image_path));
           peopleCacheRef.current.set(key, res);
           setPeople(res);
         } catch (e) {
@@ -313,6 +343,7 @@ function App() {
           const res = await invoke<PlaylistSummary[]>("get_playlists", {
             libraryId: view.libraryId,
           });
+          await preloadImages(res.map((pl) => pl.selected_cover));
           playlistsCacheRef.current.set(key, res);
           setPlaylists(res);
         } catch (e) {
@@ -419,7 +450,7 @@ function App() {
         setLoading(false);
       }
     },
-    [restoreScrollPosition, resetScrollToTop, preloadCovers]
+    [restoreScrollPosition, resetScrollToTop, preloadCovers, preloadImages]
   );
 
   // Thin wrapper for the existing call sites that drive library-root navigation by (library, parentId).
@@ -429,16 +460,17 @@ function App() {
     [loadView]
   );
 
-  // Re-fetch the grid entries behind the detail page without touching breadcrumbs or
-  // navigating away. Fires after a detail-page edit so going back shows fresh year/covers/etc.
+  // Re-fetch the active grid's entries without touching breadcrumbs, navigating,
+  // or flashing the loading state. Fires after detail-page edits and bulk TMDB
+  // matching so the grid quietly catches up.
   const refreshGridInPlace = useCallback(async () => {
     if (!selectedLibrary || !activeView) return;
     const view = activeView;
-    // The grid parent is the breadcrumb one above the detail entry; if the detail
-    // page is at the top level, parent is null.
-    const gridParentId = breadcrumbs.length >= 2
-      ? breadcrumbs[breadcrumbs.length - 2]?.id ?? null
-      : null;
+    // With a detail page open, the grid behind it belongs to the breadcrumb one
+    // above the detail entry; when browsing, the last breadcrumb IS the parent.
+    const gridParentId = selectedEntry
+      ? (breadcrumbs.length >= 2 ? breadcrumbs[breadcrumbs.length - 2]?.id ?? null : null)
+      : breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
     try {
       let fresh: MediaEntry[] = [];
       let fresh_sort = sortMode;
@@ -490,10 +522,21 @@ function App() {
       setSortMode(fresh_sort);
       setSelectedPresetId(fresh_selected_preset_id);
       setPresets(fresh_presets);
+      // The open detail page (and its cover dialog) reads covers/year off
+      // selectedEntry — patch it from the fresh list so e.g. a newly downloaded
+      // cover shows up in the options without a restart. Same for the entry
+      // snapshots breadcrumb crumbs carry for detail-page restore.
+      setSelectedEntry((prev) => (prev && fresh.find((e) => e.id === prev.id)) || prev);
+      setBreadcrumbs((prev) =>
+        prev.map((c) => {
+          const updated = c.entry ? fresh.find((e) => e.id === c.entry!.id) : undefined;
+          return updated ? { ...c, entry: updated } : c;
+        }),
+      );
     } catch (e) {
       console.error("Failed to refresh grid:", e);
     }
-  }, [selectedLibrary, activeView, breadcrumbs, sortMode, preloadCovers]);
+  }, [selectedLibrary, activeView, breadcrumbs, sortMode, preloadCovers, selectedEntry]);
 
   const selectLibrary = useCallback(
     (library: Library) => {
@@ -541,16 +584,13 @@ function App() {
       if (view.kind === "people-all") {
         chain = [{ id: null, title: rootLabel("people-all"), view }];
       } else if (view.kind === "people-list") {
-        const peopleAll: ViewSpec = { kind: "people-all", libraryId: view.libraryId };
+        // Role lists are top-level sections like Movies/TV: one "<lib> - Actors" crumb.
         const roleLabel =
           view.role === "actor" ? "Actors"
           : view.role === "director_creator" ? "Directors & Creators"
           : view.role === "composer" ? "Composers"
           : "People";
-        chain = [
-          { id: null, title: rootLabel("people-all"), view: peopleAll },
-          { id: null, title: roleLabel, view },
-        ];
+        chain = [{ id: null, title: `${libLabel} - ${roleLabel}`, view }];
       } else if (view.kind === "person-detail") {
         // Sidebar doesn't click person-detail directly; this branch is a safety net
         // for programmatic selectView() calls with person-detail. Use navigateToPerson for drilling.
@@ -573,6 +613,71 @@ function App() {
   // Drill into a person-detail view while preserving the current breadcrumb chain.
   // Called from PeopleGrid — click on a card anywhere (Actors, People-all, Composers etc.)
   // appends this step so "People > Actors > Clark Gregg" is preserved on subsequent navigation.
+  // ── Breadcrumb loop collapse ─────────────────────────────────────────────
+  // Navigating to something already in the chain would grow it forever
+  // (All > Movie A > Actor B > Movie A > …). Instead we keep the NEWEST tail —
+  // preserving back-button recency — drop the old occurrence and everything
+  // before it, and re-root the tail's first crumb at its canonical sidebar
+  // location. So the chain above becomes People > Actors > Actor B > Movie A.
+
+  // Canonical sidebar path for a crumb that ends up leading the chain. Crumbs are
+  // flagged `synthetic` — the user didn't actually travel through them, which the
+  // sidebar-highlight rule cares about.
+  const canonicalPrefix = useCallback(
+    (head: BreadcrumbItem, libraryId: string): BreadcrumbItem[] => {
+      const libLabel = libraries.find((l) => l.id === libraryId)?.name ?? "Library";
+      const v = head.view;
+      if (v?.kind === "people-list") return []; // role lists are root crumbs themselves
+      if (v?.kind === "person-detail") {
+        if (v.role === "all") {
+          return [{ id: null, title: `${libLabel} - People`, view: { kind: "people-all", libraryId }, synthetic: true }];
+        }
+        const roleLabel =
+          v.role === "actor" ? "Actors"
+          : v.role === "director_creator" ? "Directors & Creators"
+          : "Composers";
+        return [{ id: null, title: `${libLabel} - ${roleLabel}`, view: { kind: "people-list", libraryId, role: v.role }, synthetic: true }];
+      }
+      if (v?.kind === "playlist-detail") {
+        const crumbs: BreadcrumbItem[] = [
+          { id: null, title: `${libLabel} - Playlists`, view: { kind: "playlists", libraryId }, synthetic: true },
+        ];
+        if (v.collectionId !== null) {
+          // Nested playlist-collection — keep the owning playlist in the path.
+          crumbs.push({
+            id: v.playlistId,
+            title: v.playlistName,
+            view: { kind: "playlist-detail", libraryId, playlistId: v.playlistId, playlistName: v.playlistName, collectionId: null },
+            synthetic: true,
+          });
+        }
+        return crumbs;
+      }
+      if (v) return []; // other view kinds are already chain roots
+      // Detail crumbs root under their type's section (TV > Breaking Bad reads
+      // better than All > Breaking Bad); collections under the library's All root.
+      // (Collection ancestors are deliberately not reconstructed.)
+      if (head.entry?.entry_type === "movie") {
+        return [{ id: null, title: `${libLabel} - Movies`, view: { kind: "movies-only", libraryId }, synthetic: true }];
+      }
+      if (head.entry?.entry_type === "show") {
+        return [{ id: null, title: `${libLabel} - TV`, view: { kind: "shows-only", libraryId }, synthetic: true }];
+      }
+      return [{ id: null, title: `${libLabel} - All`, view: { kind: "library-root", libraryId }, synthetic: true }];
+    },
+    [libraries]
+  );
+
+  // Chain to build the new crumb on after a loop to chain[dupIndex] was detected.
+  const collapseLoop = useCallback(
+    (chain: BreadcrumbItem[], dupIndex: number, libraryId: string): BreadcrumbItem[] => {
+      const tail = chain.slice(dupIndex + 1);
+      if (tail.length === 0) return []; // duplicate was the last crumb — callers no-op before this
+      return [...canonicalPrefix(tail[0], libraryId), ...tail];
+    },
+    [canonicalPrefix]
+  );
+
   const navigateToPerson = useCallback(
     (person: PersonSummary, role: PersonRole) => {
       if (!selectedLibrary) return;
@@ -584,8 +689,13 @@ function App() {
         personName: person.name,
         personImage: person.image_path,
       };
+      const dupIndex = breadcrumbs.findIndex(
+        (c) => c.view?.kind === "person-detail" && c.view.personId === person.id && c.view.role === role,
+      );
+      if (dupIndex !== -1 && dupIndex === breadcrumbs.length - 1) return; // already on this person
+      const base = dupIndex === -1 ? breadcrumbs : collapseLoop(breadcrumbs, dupIndex, selectedLibrary.id);
       const newBreadcrumbs: BreadcrumbItem[] = [
-        ...breadcrumbs,
+        ...base,
         { id: person.id, title: person.name, view },
       ];
       setActiveView(view);
@@ -594,7 +704,7 @@ function App() {
       setForwardStack([]);
       loadView(view, null, newBreadcrumbs, false);
     },
-    [selectedLibrary, breadcrumbs, loadView]
+    [selectedLibrary, breadcrumbs, loadView, collapseLoop]
   );
 
   // Drill into a playlist from the Playlists grid. Appends to the current breadcrumb chain
@@ -649,32 +759,64 @@ function App() {
         return;
       }
 
-      const newBreadcrumbs = [...breadcrumbs, { id: entry.id, title: entry.title }];
       if (entry.entry_type === "movie" || entry.entry_type === "show") {
+        if (breadcrumbs[breadcrumbs.length - 1]?.entry?.id === entry.id) return; // already on this page
+        // Opening a detail page RESETS the chain to the current location's canonical
+        // path: drop all history before the current view's crumb, re-root that crumb
+        // at its sidebar home, append the movie. Without this, alternating
+        // movie → person → movie grows the chain without bound. Collection drill-ins
+        // survive because their crumbs sit after the view crumb (All > Coll > Movie).
+        let lastViewIdx = -1;
+        for (let i = breadcrumbs.length - 1; i >= 0; i--) {
+          if (breadcrumbs[i].view) { lastViewIdx = i; break; }
+        }
+        // Drop detail crumbs from the location tail too — e.g. jumping movie-to-movie
+        // via search shouldn't leave the old movie's crumb mid-chain.
+        const location = (lastViewIdx === -1 ? breadcrumbs : breadcrumbs.slice(lastViewIdx)).filter((c) => !c.entry);
+        const base = lastViewIdx === -1 || location.length === 0
+          ? breadcrumbs.filter((c) => !c.entry)
+          : [...canonicalPrefix(location[0], selectedLibrary.id), ...location];
+        // `entry` on the crumb marks it as a detail page for breadcrumb/back navigation.
         setSelectedEntry(entry);
-        setBreadcrumbs(newBreadcrumbs);
+        setBreadcrumbs([...base, { id: entry.id, title: entry.title, entry }]);
       } else if (entry.entry_type === "collection") {
+        const dupIndex = breadcrumbs.findIndex((c) => !c.view && !c.entry && c.id === entry.id);
+        if (dupIndex !== -1 && dupIndex === breadcrumbs.length - 1) return; // already here
+        const base = dupIndex === -1 ? breadcrumbs : collapseLoop(breadcrumbs, dupIndex, selectedLibrary.id);
         setSelectedEntry(null);
-        loadEntries(selectedLibrary, entry.id, newBreadcrumbs);
+        loadEntries(selectedLibrary, entry.id, [...base, { id: entry.id, title: entry.title }]);
       }
     },
-    [selectedLibrary, breadcrumbs, activeView, loadEntries, loadView, saveScrollPosition]
+    [selectedLibrary, breadcrumbs, activeView, loadEntries, loadView, saveScrollPosition, collapseLoop]
   );
 
   const navigateBreadcrumb = useCallback(
     (index: number) => {
       if (!selectedLibrary) return;
       saveScrollPosition();
-      setSelectedEntry(null);
       setForwardStack([]);
       const newBreadcrumbs = breadcrumbs.slice(0, index + 1);
       const target = newBreadcrumbs[newBreadcrumbs.length - 1];
       if (target.view) {
         // Distinct view step — restore it.
+        setSelectedEntry(null);
         setActiveView(target.view);
         loadView(target.view, null, newBreadcrumbs, true);
+      } else if (target.entry) {
+        // Movie/show detail crumb (e.g. clicked back to a movie from a cast member's
+        // page). Restore the detail page and the view that owns the grid behind it,
+        // then quietly reload that grid so a later back lands somewhere sane.
+        const ownerView =
+          [...newBreadcrumbs].reverse().find((c) => c.view)?.view ??
+          ({ kind: "library-root", libraryId: selectedLibrary.id } as ViewSpec);
+        const parentId = newBreadcrumbs[newBreadcrumbs.length - 2]?.id ?? null;
+        setSelectedEntry(target.entry);
+        setActiveView(ownerView);
+        setBreadcrumbs(newBreadcrumbs);
+        loadView(ownerView, parentId, newBreadcrumbs, false, true);
       } else {
         // Drill-in within the current view (e.g. a collection chain in library-root).
+        setSelectedEntry(null);
         loadEntries(selectedLibrary, target.id, newBreadcrumbs);
       }
     },
@@ -699,6 +841,17 @@ function App() {
       setSelectedEntry(null);
       setBreadcrumbs(newBreadcrumbs);
       restoreScrollPosition(selectedLibrary.id, activeView?.kind ?? "library-root", newLast.id);
+    } else if (newLast.entry) {
+      // Popping back onto a movie/show detail page (e.g. from a cast member's page).
+      // Restore the detail page + owning view, and quietly reload the grid behind it.
+      const ownerView =
+        [...newBreadcrumbs].reverse().find((c) => c.view)?.view ??
+        ({ kind: "library-root", libraryId: selectedLibrary.id } as ViewSpec);
+      const parentId = newBreadcrumbs[newBreadcrumbs.length - 2]?.id ?? null;
+      setSelectedEntry(newLast.entry);
+      setActiveView(ownerView);
+      setBreadcrumbs(newBreadcrumbs);
+      loadView(ownerView, parentId, newBreadcrumbs, false, true);
     } else {
       // Popping to a shallower drill-in (collection chain) within the current view.
       loadEntries(selectedLibrary, newLast.id, newBreadcrumbs);
@@ -717,7 +870,9 @@ function App() {
       loadView(next.view, null, newBreadcrumbs, true);
     } else {
       // Non-view crumb — either a collection drill-in or a movie/show detail page.
-      const forwardEntry = entries.find((e) => e.id === next.id);
+      // Detail crumbs carry their entry; the entries-list lookup is a fallback for
+      // forward stacks recorded before the crumb was created with one.
+      const forwardEntry = next.entry ?? entries.find((e) => e.id === next.id);
       if (forwardEntry && forwardEntry.entry_type !== "collection") {
         setSelectedEntry(forwardEntry);
         setBreadcrumbs(newBreadcrumbs);
@@ -1454,24 +1609,79 @@ function App() {
         <Sidebar
           libraries={libraries}
           selectedLibrary={selectedLibrary}
-          activeView={activeView}
+          // Sidebar highlight: a GENUINE chain root (the user really started there —
+          // All, People, a role list…) stays lit while drilling within it. When the
+          // root is synthetic (loop collapse / detail reset re-rooted the chain),
+          // highlight what's on screen instead: the open entry's section, or the
+          // person's role list. Playlist-detail passes through unchanged — individual
+          // playlists have their own sidebar nodes and a node-level matcher.
+          activeView={(() => {
+            if (!activeView) return activeView;
+            if (activeView.kind === "playlist-detail") return activeView;
+            const root = breadcrumbs[0];
+            if (root?.view && !root.synthetic) return root.view;
+            if (selectedEntry?.entry_type === "movie") return { kind: "movies-only", libraryId: activeView.libraryId };
+            if (selectedEntry?.entry_type === "show") return { kind: "shows-only", libraryId: activeView.libraryId };
+            if (activeView.kind === "person-detail") {
+              return activeView.role === "all"
+                ? { kind: "people-all", libraryId: activeView.libraryId }
+                : { kind: "people-list", libraryId: activeView.libraryId, role: activeView.role };
+            }
+            return root?.view ?? activeView;
+          })()}
           onSelectLibrary={selectLibrary}
           onSelectView={selectView}
           onLibraryCreated={loadLibraries}
-          onLibraryDeleted={() => {
-            loadLibraries();
+          onLibraryDeleted={async (deletedId) => {
             invalidateCache();
-            setActiveView(null);
-            setEntries([]);
-            setPeople(null);
-            setPlaylists(null);
-            setBreadcrumbs([]);
+            try {
+              const libs = await invoke<Library[]>("get_libraries");
+              setLibraries(libs);
+              if (activeView?.libraryId !== deletedId) {
+                // Deleted a library we weren't looking at — nothing else changes.
+                return;
+              }
+              // Clear ALL view state — selectedEntry especially, or MainContent
+              // keeps rendering a detail page whose library no longer exists.
+              setSelectedEntry(null);
+              setSearch("");
+              setForwardStack([]);
+              setEntries([]);
+              setPeople(null);
+              setPlaylists(null);
+              setBreadcrumbs([]);
+              setActiveView(null);
+              // Land somewhere sensible: the first remaining library, or the
+              // empty state when none are left.
+              if (libs.length > 0) {
+                selectLibrary(libs[0]);
+              }
+            } catch (e) {
+              console.error("Failed to reload libraries after delete:", e);
+            }
+          }}
+          onLibraryRenamed={(libraryId, oldName, newName) => {
+            // selectedLibrary derives from this list, so the sidebar and most UI
+            // pick the new name up automatically…
+            loadLibraries();
+            // …but breadcrumb labels bake the library name in ("<lib> - All"), so
+            // patch the top-level crumb if it belongs to the renamed library.
+            if (activeView?.libraryId === libraryId) {
+              setBreadcrumbs((prev) =>
+                prev.map((b, i) =>
+                  i === 0 && b.title.startsWith(`${oldName} - `)
+                    ? { ...b, title: `${newName} - ${b.title.slice(oldName.length + 3)}` }
+                    : b,
+                ),
+              );
+            }
           }}
           onLibraryRescanned={() => {
             if (selectedLibrary) {
               invalidateCache(selectedLibrary.id);
-              const parentId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
-              loadEntries(selectedLibrary, parentId, breadcrumbs);
+              // Silent in-place refresh — no loading flash; the grid (and any
+              // open detail page's backing grid) quietly picks up new metadata.
+              refreshGridInPlace();
             }
           }}
           onPlaylistChanged={handlePlaylistChanged}

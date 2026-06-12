@@ -29,9 +29,16 @@ function videoComplications(libraryId: string, playlists: PlaylistSummary[]): Co
   }));
 
   return [
-    { id: "all",     label: "All",    iconName: "Library", view: { kind: "library-root", libraryId } },
-    { id: "movies",  label: "Movies", iconName: "Film",    view: { kind: "movies-only",  libraryId } },
-    { id: "shows",   label: "TV",     iconName: "Tv",      view: { kind: "shows-only",   libraryId } },
+    {
+      id: "all",
+      label: "All",
+      iconName: "Library",
+      view: { kind: "library-root", libraryId },
+      children: [
+        { id: "all.movies", label: "Movies", iconName: "Film", view: { kind: "movies-only", libraryId } },
+        { id: "all.shows",  label: "TV",     iconName: "Tv",   view: { kind: "shows-only",  libraryId } },
+      ],
+    },
     {
       id: "people",
       label: "People",

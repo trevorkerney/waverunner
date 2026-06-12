@@ -19,7 +19,7 @@ import {
   SelectItem,
 } from "@/components/ui/select";
 import { Download } from "lucide-react";
-import type { TmdbImage, TmdbMovieDetail, TmdbImageDownload } from "@/types";
+import type { TmdbImage, TmdbImageDownload } from "@/types";
 
 const POSTER_SIZES = ["w342", "w500", "w780", "original"];
 const BACKDROP_SIZES = ["w780", "w1280", "original"];
@@ -30,6 +30,8 @@ interface TmdbImageBrowserDialogProps {
   libraryId: string;
   entryId: number;
   tmdbId: string;
+  /** Which TMDB endpoint the id belongs to — movie and TV ids overlap. */
+  mediaType: "movie" | "tv";
   onDownloaded: () => void;
 }
 
@@ -46,6 +48,7 @@ export function TmdbImageBrowserDialog({
   libraryId,
   entryId,
   tmdbId,
+  mediaType,
   onDownloaded,
 }: TmdbImageBrowserDialogProps) {
   const [loading, setLoading] = useState(false);
@@ -63,9 +66,10 @@ export function TmdbImageBrowserDialog({
     setPosterSelections({});
     setBackdropSelections({});
 
-    invoke<TmdbMovieDetail>("get_tmdb_movie_detail", {
-      tmdbId: Number(tmdbId),
-    })
+    invoke<{ images: { posters: TmdbImage[]; backdrops: TmdbImage[] } | null }>(
+      mediaType === "tv" ? "get_tmdb_show_detail" : "get_tmdb_movie_detail",
+      { tmdbId: Number(tmdbId) },
+    )
       .then((detail) => {
         const p = detail.images?.posters ?? [];
         const b = detail.images?.backdrops ?? [];
@@ -87,7 +91,7 @@ export function TmdbImageBrowserDialog({
       })
       .catch((e) => toast.error(String(e)))
       .finally(() => setLoading(false));
-  }, [open, tmdbId]);
+  }, [open, tmdbId, mediaType]);
 
   const togglePoster = (idx: number, checked: boolean) => {
     setPosterSelections((prev) => ({

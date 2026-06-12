@@ -649,6 +649,65 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
 
     // ── Cached images ─────────────────────────────────────────────────
 
+    // ── Third-party ratings (OMDB: IMDb, Rotten Tomatoes, Metacritic) ─
+    // Fetched lazily the first time a detail page wants them, then cached.
+    // source 'none' is a sentinel marking "fetch attempted, nothing found" so
+    // we don't hammer OMDB for unrated/unknown titles on every page view.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS rating (
+            entry_id INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            value TEXT NOT NULL,
+            fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (entry_id, source),
+            FOREIGN KEY (entry_id) REFERENCES media_entry(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // ── Extras (featurettes, trailers, webisodes, ...) ───────────────
+    // Bonus videos found in reserved subfolders of a movie/show folder. Owned by
+    // the media_entry, categorized by the folder they came from. Deliberately NOT
+    // seasons/episodes: they never affect season counts, autoplay, or grids.
+    // plot/release_date/runtime are TMDB-populated where a source exists
+    // (webisodes match against the show's TMDB season 0).
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS extra (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            title TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            plot TEXT,
+            release_date TEXT,
+            runtime INTEGER,
+            FOREIGN KEY (owner_id) REFERENCES media_entry(id) ON DELETE CASCADE,
+            UNIQUE (owner_id, file_path)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_extra_owner ON extra(owner_id, kind)")
+        .execute(&pool)
+        .await?;
+
+    // ── Selected backdrop per entry ───────────────────────────────────
+    // Separate table (not a column on movie/show) so it needs no ALTER
+    // migrations and covers any entry type that grows a backdrop later.
+    // The path references cached_images.cached_path with image_type='background'.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS selected_background (
+            entry_id INTEGER PRIMARY KEY,
+            path TEXT NOT NULL,
+            FOREIGN KEY (entry_id) REFERENCES media_entry(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS cached_images (
             id INTEGER PRIMARY KEY AUTOINCREMENT,

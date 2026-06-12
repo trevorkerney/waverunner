@@ -49,6 +49,10 @@ pub struct MediaEntry {
     pub child_count: i64,
     pub season_display: Option<String>,
     pub collection_display: Option<String>,
+    /// "as Walter White" — the person's character(s) in this title. Only set by
+    /// get_entries_for_person; person-page cards show it instead of the usual subtitle.
+    #[serde(default)]
+    pub role_display: Option<String>,
     pub tmdb_id: Option<String>,
     /// Non-null only when this row represents a `media_link` inside a playlist view.
     /// Frontend uses it to offer "Remove from playlist".
@@ -107,6 +111,8 @@ pub struct MovieDetail {
     pub composers: Vec<PersonInfo>,
     pub studios: Vec<String>,
     pub keywords: Vec<String>,
+    /// Backdrop for the detail-page hero (selected, or first cached).
+    pub background: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -672,6 +678,25 @@ pub async fn get_libraries(state: tauri::State<'_, AppState>) -> Result<Vec<Libr
 }
 
 #[tauri::command]
+pub async fn rename_library(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    new_name: String,
+) -> Result<(), String> {
+    let trimmed = new_name.trim();
+    if trimmed.is_empty() {
+        return Err("Library name cannot be empty".to_string());
+    }
+    sqlx::query("UPDATE library SET name = ? WHERE id = ?")
+        .bind(trimmed)
+        .bind(&library_id)
+        .execute(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn delete_library(
     state: tauri::State<'_, AppState>,
     library_id: String,
@@ -954,6 +979,7 @@ pub async fn get_entries(
                         child_count,
                         season_display,
                         collection_display: None,
+                        role_display: None,
                         tmdb_id,
                         link_id: None,
                     }
@@ -1054,6 +1080,7 @@ pub async fn get_entries(
                         child_count: 0,
                         season_display: None,
                         collection_display: None,
+                        role_display: None,
                         tmdb_id: None,
                         link_id: None,
                     }
@@ -1186,7 +1213,7 @@ pub async fn search_entries(
             let mut entries: Vec<MediaEntry> = rows.into_iter()
                 .map(|(id, title, year, end_year, folder_path, parent_id, entry_type, selected_cover, tmdb_id, season_display)| {
                     let covers = covers_map.remove(&folder_path).unwrap_or_default();
-                    MediaEntry { id, title, year, end_year, folder_path, parent_id, entry_type, covers, selected_cover, child_count: 0, season_display, collection_display: None, tmdb_id, link_id: None }
+                    MediaEntry { id, title, year, end_year, folder_path, parent_id, entry_type, covers, selected_cover, child_count: 0, season_display, collection_display: None, role_display: None, tmdb_id, link_id: None }
                 })
                 .collect();
 
@@ -1244,7 +1271,7 @@ pub async fn search_entries(
             rows.into_iter()
                 .map(|(id, title, folder_path, selected_cover)| {
                     let covers = covers_map.remove(&folder_path).unwrap_or_default();
-                    MediaEntry { id, title, year: None, end_year: None, folder_path, parent_id: None, entry_type: "artist".to_string(), covers, selected_cover, child_count: 0, season_display: None, collection_display: None, tmdb_id: None, link_id: None }
+                    MediaEntry { id, title, year: None, end_year: None, folder_path, parent_id: None, entry_type: "artist".to_string(), covers, selected_cover, child_count: 0, season_display: None, collection_display: None, role_display: None, tmdb_id: None, link_id: None }
                 })
                 .collect()
         }
@@ -1254,6 +1281,66 @@ pub async fn search_entries(
     };
 
     Ok(entries)
+}
+
+/// All cached backdrops for an entry, in cache order.
+async fn entry_background_list(pool: &sqlx::SqlitePool, entry_id: i64) -> Result<Vec<String>, String> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT ci.cached_path FROM cached_images ci \
+         JOIN media_entry_full mef ON mef.library_id = ci.library_id AND mef.folder_path = ci.entry_folder_path \
+         WHERE mef.id = ? AND ci.image_type = 'background' \
+         ORDER BY ci.id",
+    )
+    .bind(entry_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(rows.into_iter().map(|(p,)| p).collect())
+}
+
+/// Backdrop to show on a detail page: the user-selected one if it still exists
+/// in the cache, otherwise the first cached backdrop, if any.
+async fn entry_background(pool: &sqlx::SqlitePool, entry_id: i64) -> Result<Option<String>, String> {
+    let all = entry_background_list(pool, entry_id).await?;
+    if all.is_empty() {
+        return Ok(None);
+    }
+    let selected: Option<String> =
+        sqlx::query_scalar("SELECT path FROM selected_background WHERE entry_id = ?")
+            .bind(entry_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    Ok(match selected {
+        Some(s) if all.contains(&s) => Some(s),
+        _ => all.into_iter().next(),
+    })
+}
+
+#[tauri::command]
+pub async fn get_backgrounds(
+    state: tauri::State<'_, AppState>,
+    entry_id: i64,
+) -> Result<Vec<String>, String> {
+    entry_background_list(&state.app_db, entry_id).await
+}
+
+#[tauri::command]
+pub async fn set_selected_background(
+    state: tauri::State<'_, AppState>,
+    entry_id: i64,
+    path: String,
+) -> Result<(), String> {
+    sqlx::query(
+        "INSERT INTO selected_background (entry_id, path) VALUES (?, ?) \
+         ON CONFLICT(entry_id) DO UPDATE SET path = excluded.path",
+    )
+    .bind(entry_id)
+    .bind(&path)
+    .execute(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -1347,6 +1434,7 @@ pub async fn get_movie_detail(
     .map_err(|e| e.to_string())?;
     let keywords: Vec<String> = keyword_rows.into_iter().map(|(n,)| n).collect();
 
+    let background = entry_background(&state.app_db, entry_id).await?;
 
     Ok(MovieDetail {
         id,
@@ -1364,6 +1452,7 @@ pub async fn get_movie_detail(
         composers,
         studios,
         keywords,
+        background,
     })
 }
 
@@ -2129,6 +2218,10 @@ pub struct EpisodeInfo {
     pub episode_number: Option<i64>,
     pub file_path: String,
     pub sort_order: i64,
+    /// Shown inline in the episode list (clamped) — full detail loads on expand.
+    pub plot: Option<String>,
+    pub runtime: Option<i64>,
+    pub release_date: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -2171,23 +2264,25 @@ pub async fn get_season_episodes(
     state: tauri::State<'_, AppState>,
     season_id: i64,
 ) -> Result<Vec<EpisodeInfo>, String> {
-    let rows: Vec<(i64, String, Option<i64>, String, i64)> = sqlx::query_as(
-        "SELECT id, title, episode_number, file_path, sort_order FROM episode WHERE season_id = ? ORDER BY sort_order",
+    let rows: Vec<(i64, String, Option<i64>, String, i64, Option<String>, Option<i64>, Option<String>)> = sqlx::query_as(
+        "SELECT id, title, episode_number, file_path, sort_order, plot, runtime, release_date FROM episode WHERE season_id = ? ORDER BY sort_order",
     )
     .bind(season_id)
     .fetch_all(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
 
-
     Ok(rows
         .into_iter()
-        .map(|(id, title, episode_number, file_path, sort_order)| EpisodeInfo {
+        .map(|(id, title, episode_number, file_path, sort_order, plot, runtime, release_date)| EpisodeInfo {
             id,
             title,
             episode_number,
             file_path,
             sort_order,
+            plot,
+            runtime,
+            release_date,
         })
         .collect())
 }
@@ -2354,10 +2449,24 @@ pub async fn get_entries_for_person(
         .await
         .map_err(|e| e.to_string())?;
 
+    // Same year/end_year shape as get_entries — these entries become detail-page
+    // crumbs and selectedEntry snapshots, so shows need their episode-derived
+    // year range here too (a NULL year leaves the detail hero without one).
+    let show_episode_years = "\
+        SELECT SUBSTR(e.release_date, 1, 4) as yr FROM episode e \
+          JOIN season s ON e.season_id = s.id \
+          WHERE s.show_id = mef.id AND e.release_date IS NOT NULL";
     let query = format!(
         "{cte} \
          SELECT mef.id, mef.title, \
-           CASE WHEN mef.entry_type = 'movie' THEN SUBSTR(mef.release_date, 1, 4) ELSE NULL END AS year, \
+           CASE \
+             WHEN mef.entry_type = 'movie' THEN SUBSTR(mef.release_date, 1, 4) \
+             WHEN mef.entry_type = 'show' THEN (SELECT MIN(yr) FROM ({show_episode_years})) \
+           END AS year, \
+           CASE \
+             WHEN mef.entry_type = 'show' THEN \
+               NULLIF((SELECT MAX(yr) FROM ({show_episode_years})), (SELECT MIN(yr) FROM ({show_episode_years}))) \
+           END AS end_year, \
            mef.folder_path, mef.parent_id, mef.entry_type, mef.selected_cover, \
            CASE \
              WHEN mef.entry_type = 'movie' THEN (SELECT tmdb_id FROM movie WHERE id = mef.id) \
@@ -2369,7 +2478,7 @@ pub async fn get_entries_for_person(
          ORDER BY mef.sort_title COLLATE NOCASE ASC"
     );
 
-    let rows: Vec<(i64, String, Option<String>, String, Option<i64>, String, Option<String>, Option<String>)> =
+    let rows: Vec<(i64, String, Option<String>, Option<String>, String, Option<i64>, String, Option<String>, Option<String>)> =
         sqlx::query_as(&query)
             .bind(&library_id)
             .bind(person_id)
@@ -2377,15 +2486,51 @@ pub async fn get_entries_for_person(
             .await
             .map_err(|e| e.to_string())?;
 
+    // Character names per title, billing order first (show/movie cast, then season,
+    // then episode guest roles). Cards show "as Walter White" instead of the year.
+    let role_rows: Vec<(i64, Option<String>)> = sqlx::query_as(
+        "SELECT mc.movie_id, mc.role FROM movie_cast mc WHERE mc.person_id = ? \
+         UNION ALL \
+         SELECT sc.show_id, sc.role FROM show_cast sc WHERE sc.person_id = ? \
+         UNION ALL \
+         SELECT s.show_id, sec.role FROM season_cast sec JOIN season s ON sec.season_id = s.id WHERE sec.person_id = ? \
+         UNION ALL \
+         SELECT s.show_id, ec.role FROM episode_cast ec JOIN episode e ON ec.episode_id = e.id JOIN season s ON e.season_id = s.id WHERE ec.person_id = ?",
+    )
+    .bind(person_id)
+    .bind(person_id)
+    .bind(person_id)
+    .bind(person_id)
+    .fetch_all(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    let mut roles_by_entry: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
+    for (eid, role) in role_rows {
+        let Some(role) = role.filter(|r| !r.trim().is_empty()) else { continue };
+        let list = roles_by_entry.entry(eid).or_default();
+        if !list.contains(&role) {
+            list.push(role);
+        }
+    }
+
     let entries: Vec<MediaEntry> = rows
         .into_iter()
-        .map(|(id, title, year, folder_path, parent_id, entry_type, selected_cover, tmdb_id)| {
+        .map(|(id, title, year, end_year, folder_path, parent_id, entry_type, selected_cover, tmdb_id)| {
             let covers = covers_map.remove(&folder_path).unwrap_or_default();
+            let role_display = roles_by_entry.get(&id).map(|roles| {
+                // "as X" / "as X & Y" / "as X, Y & Z"
+                let joined = match roles.len() {
+                    1 => roles[0].clone(),
+                    2 => format!("{} & {}", roles[0], roles[1]),
+                    _ => format!("{} & {}", roles[..roles.len() - 1].join(", "), roles[roles.len() - 1]),
+                };
+                format!("as {joined}")
+            });
             MediaEntry {
                 id,
                 title,
                 year,
-                end_year: None,
+                end_year,
                 folder_path,
                 parent_id,
                 entry_type,
@@ -2394,6 +2539,7 @@ pub async fn get_entries_for_person(
                 child_count: 0,
                 season_display: None,
                 collection_display: None,
+                role_display,
                 tmdb_id,
                 link_id: None,
             }
@@ -3359,6 +3505,7 @@ pub async fn get_playlist_contents(
             child_count: 0,
             season_display: None,
             collection_display: None,
+            role_display: None,
             tmdb_id: None,
             link_id: Some(link_id),
         };
@@ -3393,6 +3540,7 @@ pub async fn get_playlist_contents(
             child_count: child_count.0,
             season_display: None,
             collection_display: None,
+            role_display: None,
             tmdb_id: None,
             link_id: None,
         };
@@ -3588,6 +3736,332 @@ pub async fn get_movie_file_path(
         .ok_or("No video file found in movie folder")?;
 
     Ok(video_file.to_string_lossy().into_owned())
+}
+
+// ---------- Ratings (RT scraper + optional OMDB) ----------
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RatingInfo {
+    /// 'rotten_tomatoes_audience' | 'rotten_tomatoes' | 'imdb' | 'metacritic'
+    pub source: String,
+    pub value: String,
+}
+
+async fn fetch_omdb(client: &reqwest::Client, key: &str, imdb_id: &str) -> Option<Vec<(String, String)>> {
+    let url = format!("https://www.omdbapi.com/?i={imdb_id}&apikey={key}");
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body: serde_json::Value = resp.json().await.ok()?;
+    let mut out = Vec::new();
+    if let Some(r) = body.get("imdbRating").and_then(|v| v.as_str()) {
+        if r != "N/A" && !r.is_empty() {
+            out.push(("imdb".to_string(), r.to_string()));
+        }
+    }
+    if let Some(ratings) = body.get("Ratings").and_then(|v| v.as_array()) {
+        for r in ratings {
+            let source = r.get("Source").and_then(|v| v.as_str()).unwrap_or("");
+            let value = r.get("Value").and_then(|v| v.as_str()).unwrap_or("");
+            if value.is_empty() || value == "N/A" {
+                continue;
+            }
+            match source {
+                "Rotten Tomatoes" => out.push(("rotten_tomatoes".to_string(), value.to_string())),
+                "Metacritic" => {
+                    out.push(("metacritic".to_string(), value.trim_end_matches("/100").to_string()))
+                }
+                _ => {}
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Cached ratings only — never fetches. Fetching is always explicit, via
+/// `fetch_ratings` (detail-page context menu or the bulk match dialog).
+#[tauri::command]
+pub async fn get_ratings(
+    state: tauri::State<'_, AppState>,
+    entry_id: i64,
+) -> Result<Vec<RatingInfo>, String> {
+    let cached: Vec<(String, String)> =
+        sqlx::query_as("SELECT source, value FROM rating WHERE entry_id = ?")
+            .bind(entry_id)
+            .fetch_all(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+    Ok(cached
+        .into_iter()
+        .filter(|(s, _)| s != "none")
+        .map(|(source, value)| RatingInfo { source, value })
+        .collect())
+}
+
+/// Fetch ratings for one movie and cache them, replacing whatever was stored.
+/// Requires the OMDB setting (IMDb / Metacritic / RT critics); when the RT
+/// audience setting is also enabled, the scraper adds the audience score.
+/// Per-movie gaps (no IMDb id, no RT page) are not errors — they just yield
+/// fewer sources.
+#[tauri::command]
+pub async fn fetch_ratings(
+    state: tauri::State<'_, AppState>,
+    entry_id: i64,
+) -> Result<Vec<RatingInfo>, String> {
+    let setting = |key: &'static str| {
+        let db = state.app_db.clone();
+        async move {
+            sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = ?")
+                .bind(key)
+                .fetch_optional(&db)
+                .await
+                .ok()
+                .flatten()
+        }
+    };
+    let omdb_enabled = setting("omdb_enabled").await.as_deref() == Some("true");
+    let omdb_key = setting("omdb_api_key").await.filter(|k| !k.trim().is_empty());
+    let rt_enabled = setting("rt_scraper_enabled").await.as_deref() == Some("true");
+
+    if !omdb_enabled {
+        return Err("Enable OMDB ratings in Settings first.".into());
+    }
+    let Some(key) = omdb_key else {
+        return Err("No OMDB API key configured. Add one in Settings.".into());
+    };
+
+    let movie: Option<(String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT title, SUBSTR(release_date, 1, 4), imdb_id, rotten_tomatoes_id FROM movie WHERE id = ?",
+    )
+    .bind(entry_id)
+    .fetch_optional(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    let Some((title, year, imdb_id, rt_id)) = movie else {
+        return Err("Ratings are only supported for movies right now.".into());
+    };
+
+    let client = reqwest::Client::new();
+    let mut found: Vec<RatingInfo> = Vec::new();
+
+    // OMDB: IMDb + Metacritic + RT critic score.
+    if let Some(imdb) = imdb_id.filter(|i| !i.trim().is_empty()) {
+        if let Some(omdb) = fetch_omdb(&client, key.trim(), imdb.trim()).await {
+            for (source, value) in omdb {
+                if !found.iter().any(|r| r.source == source) {
+                    found.push(RatingInfo { source, value });
+                }
+            }
+        }
+    }
+
+    // Rotten Tomatoes audience score (scraper) — opt-in on top of OMDB.
+    if rt_enabled {
+        if let Some(scores) =
+            crate::rt::fetch_movie_scores(&client, &title, year.as_deref(), rt_id.as_deref()).await
+        {
+            if let Some(a) = scores.audience {
+                found.push(RatingInfo {
+                    source: "rotten_tomatoes_audience".into(),
+                    value: format!("{a}%"),
+                });
+            }
+            // Self-heal: remember the slug so future fetches skip discovery. The
+            // user can overwrite it in Edit mode if the scraper matched wrong.
+            let _ = sqlx::query(
+                "UPDATE movie SET rotten_tomatoes_id = ? WHERE id = ? AND (rotten_tomatoes_id IS NULL OR rotten_tomatoes_id = '')",
+            )
+            .bind(&scores.slug)
+            .bind(entry_id)
+            .execute(&state.app_db)
+            .await;
+        }
+    }
+
+    sqlx::query("DELETE FROM rating WHERE entry_id = ?")
+        .bind(entry_id)
+        .execute(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+    for r in &found {
+        sqlx::query("INSERT OR REPLACE INTO rating (entry_id, source, value) VALUES (?, ?, ?)")
+            .bind(entry_id)
+            .bind(&r.source)
+            .bind(&r.value)
+            .execute(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    Ok(found)
+}
+
+// ---------- Extras ----------
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ExtraInfo {
+    pub id: i64,
+    pub kind: String,
+    pub title: String,
+    pub file_path: String,
+    pub plot: Option<String>,
+    pub release_date: Option<String>,
+    pub runtime: Option<i64>,
+}
+
+#[tauri::command]
+pub async fn get_extras(
+    state: tauri::State<'_, AppState>,
+    entry_id: i64,
+) -> Result<Vec<ExtraInfo>, String> {
+    let rows: Vec<(i64, String, String, String, Option<String>, Option<String>, Option<i64>)> =
+        sqlx::query_as(
+            "SELECT id, kind, title, file_path, plot, release_date, runtime \
+             FROM extra WHERE owner_id = ? ORDER BY kind, sort_order",
+        )
+        .bind(entry_id)
+        .fetch_all(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(id, kind, title, file_path, plot, release_date, runtime)| ExtraInfo {
+            id,
+            kind,
+            title,
+            file_path,
+            plot,
+            release_date,
+            runtime,
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub async fn get_extra_file_path(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    extra_id: i64,
+) -> Result<String, String> {
+    let lib_paths = get_library_paths(&state.app_db, &library_id).await?;
+    let row: Option<(String,)> = sqlx::query_as("SELECT file_path FROM extra WHERE id = ?")
+        .bind(extra_id)
+        .fetch_optional(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+    let (file_path,) = row.ok_or("Extra not found")?;
+
+    for p in &lib_paths {
+        let full = Path::new(p).join(&file_path);
+        if full.exists() {
+            return Ok(full.to_string_lossy().into_owned());
+        }
+    }
+    Err("Extra file not found on disk".to_string())
+}
+
+/// Normalize a title for fuzzy webisode↔TMDB-episode matching.
+fn norm_match_title(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Populate TMDB metadata for a show's webisode extras by matching against the
+/// show's TMDB "Specials" season (season 0). `extra_id = None` covers all of the
+/// owner's webisodes. Returns the number of extras that found a match. Webisodes
+/// are the only extras kind TMDB catalogs — featurettes/trailers have no source.
+#[tauri::command]
+pub async fn populate_extras_metadata(
+    state: tauri::State<'_, AppState>,
+    owner_id: i64,
+    extra_id: Option<i64>,
+) -> Result<i64, String> {
+    if let Some(eid) = extra_id {
+        let kind: Option<(String,)> = sqlx::query_as("SELECT kind FROM extra WHERE id = ?")
+            .bind(eid)
+            .fetch_optional(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+        if kind.map(|(k,)| k) != Some("webisodes".to_string()) {
+            return Err("TMDB only catalogs webisodes — there's no metadata source for this type of extra.".into());
+        }
+    }
+
+    let show_tmdb: Option<(Option<i64>,)> = sqlx::query_as("SELECT tmdb_id FROM show WHERE id = ?")
+        .bind(owner_id)
+        .fetch_optional(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+    let tmdb_id = match show_tmdb {
+        Some((Some(id),)) => id,
+        Some((None,)) => return Err("Match this show to TMDB first.".into()),
+        None => return Err("Webisode metadata is only available for TV shows.".into()),
+    };
+
+    let extras: Vec<(i64, String)> = if let Some(eid) = extra_id {
+        sqlx::query_as("SELECT id, title FROM extra WHERE id = ? AND owner_id = ?")
+            .bind(eid)
+            .bind(owner_id)
+            .fetch_all(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?
+    } else {
+        sqlx::query_as("SELECT id, title FROM extra WHERE owner_id = ? AND kind = 'webisodes'")
+            .bind(owner_id)
+            .fetch_all(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?
+    };
+    if extras.is_empty() {
+        return Ok(0);
+    }
+
+    let token: String = sqlx::query_scalar("SELECT value FROM settings WHERE key = 'tmdb_api_token'")
+        .fetch_optional(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "No TMDB API token configured. Add one in settings.".to_string())?;
+
+    let client = reqwest::Client::new();
+    let specials = crate::tmdb::get_season_detail(&client, &token, tmdb_id, 0)
+        .await
+        .map_err(|e| format!("This show has no Specials season on TMDB ({e})"))?;
+
+    let mut matched: i64 = 0;
+    for (id, title) in &extras {
+        // First try an explicit episode number in the filename, then fall back to
+        // title containment against TMDB's episode names.
+        let (_, file_num) = parse_episode_filename(title);
+        let tmdb_ep = if let Some(n) = file_num {
+            specials.episodes.iter().find(|e| e.episode_number == n as i64)
+        } else {
+            let want = norm_match_title(title);
+            specials.episodes.iter().find(|e| {
+                let name = norm_match_title(&e.name);
+                !name.is_empty() && (want.contains(&name) || name.contains(&want))
+            })
+        };
+        let Some(ep) = tmdb_ep else { continue };
+
+        sqlx::query("UPDATE extra SET plot = ?, release_date = ?, runtime = ? WHERE id = ?")
+            .bind(&ep.overview)
+            .bind(&ep.air_date)
+            .bind(ep.runtime)
+            .bind(id)
+            .execute(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+        matched += 1;
+    }
+
+    Ok(matched)
 }
 
 #[tauri::command]
@@ -4241,6 +4715,9 @@ async fn rescan_video_library(
             cache_entry_images(pool, library_id, cache_base, base_path, rel_path)
                 .await
                 .map_err(|e| e.to_string())?;
+            sync_extras_for_entry(pool, entry_id, base_path, rel_path)
+                .await
+                .map_err(|e| e.to_string())?;
 
             // Don't recurse into seasons here — they'll be handled in the season rescan below
         } else {
@@ -4268,18 +4745,24 @@ async fn rescan_video_library(
             cache_entry_images(pool, library_id, cache_base, base_path, rel_path)
                 .await
                 .map_err(|e| e.to_string())?;
+            sync_extras_for_entry(pool, entry_id, base_path, rel_path)
+                .await
+                .map_err(|e| e.to_string())?;
         }
     }
 
-    // Sync cached images for existing entries
-    let existing_paths: Vec<String> = db_rows
+    // Sync cached images + extras for existing entries
+    let existing_entries: Vec<(i64, String)> = db_rows
         .iter()
         .filter(|(_, p, _, _)| disk_paths.contains(p))
-        .map(|(_, p, _, _)| p.clone())
+        .map(|(id, p, _, _)| (*id, p.clone()))
         .collect();
-    for rel_path in &existing_paths {
+    for (entry_id, rel_path) in &existing_entries {
         if let Some(base) = path_to_base.get(rel_path) {
             sync_entry_images(pool, library_id, cache_base, base, rel_path).await?;
+            sync_extras_for_entry(pool, *entry_id, base, rel_path)
+                .await
+                .map_err(|e| e.to_string())?;
         }
     }
 
@@ -5463,6 +5946,7 @@ async fn scan_video_dir(
             }
         }
 
+        sync_extras_for_entry(pool, entry_id, base_path, &rel_path).await?;
         return Ok(());
     }
 
@@ -5493,6 +5977,7 @@ async fn scan_video_dir(
         *next_order += 1;
 
         cache_entry_images(pool, library_id, cache_base, base_path, &rel_path).await?;
+        sync_extras_for_entry(pool, entry_id, base_path, &rel_path).await?;
         return Ok(());
     }
 
@@ -5620,13 +6105,174 @@ fn parse_song_filename(name: &str) -> (String, Option<i32>) {
     (stem, None)
 }
 
+/// Folder names that never scan as entries or seasons. Mirrors the Plex/Jellyfin
+/// extras conventions (plus our own covers/backgrounds) so media that ships with
+/// featurettes, trailers, webisodes, etc. doesn't produce bogus entries.
+/// Case-insensitive. Not yet surfaced as playable extras — see TODO.
+const RESERVED_DIRS: &[&str] = &[
+    "covers",
+    "backgrounds",
+    "extras",
+    "featurettes",
+    "behind the scenes",
+    "deleted scenes",
+    "interviews",
+    "scenes",
+    "samples",
+    "shorts",
+    "clips",
+    "trailers",
+    "other",
+    "webisodes",
+];
+
 fn is_scannable_dir(entry: &std::fs::DirEntry) -> bool {
-    let name = entry.file_name().to_string_lossy().to_string();
+    let raw = entry.file_name().to_string_lossy().to_lowercase();
+    // Releases often prefix extras folders to control sort order ("~featurettes",
+    // "_extras", "- trailers"); strip that junk before the reserved-name check.
+    let name = raw.trim_start_matches(['~', '-', '_', ' ', '.']);
     entry.path().is_dir()
-        && name != "covers"
-        && name != "backgrounds"
-        && name != "extras"
-        && !name.starts_with('.')
+        && !raw.starts_with('.')
+        && !RESERVED_DIRS.contains(&name)
+}
+
+/// Reserved dirs whose videos surface as playable extras ("samples" is junk and
+/// covers/backgrounds are artwork — those stay invisible).
+const EXTRA_DIRS: &[&str] = &[
+    "extras",
+    "featurettes",
+    "behind the scenes",
+    "deleted scenes",
+    "interviews",
+    "scenes",
+    "shorts",
+    "clips",
+    "trailers",
+    "other",
+    "webisodes",
+];
+
+/// Normalized extras kind for a folder name ("~Featurettes" → "featurettes"),
+/// or None if the folder isn't an extras dir.
+fn extra_kind_for_dir(name: &str) -> Option<String> {
+    let lower = name.to_lowercase();
+    let stripped = lower.trim_start_matches(['~', '-', '_', ' ', '.']);
+    if EXTRA_DIRS.contains(&stripped) {
+        Some(stripped.to_string())
+    } else {
+        None
+    }
+}
+
+fn collect_extra_files(
+    kind: &str,
+    dir: &Path,
+    base_path: &Path,
+    out: &mut Vec<(String, String, String)>, // (kind, title, rel_file_path)
+) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut entries: Vec<_> = rd.filter_map(|e| e.ok()).collect();
+    entries.sort_by_key(|e| e.file_name());
+    for f in entries {
+        let p = f.path();
+        if p.is_dir() {
+            // Extras often nest ("webisodes\1. The Accountants\<file>",
+            // "featurettes\Season 2\Deleted Scenes\<file>"). Recurse, and when a
+            // nested folder is itself an extras kind, re-categorize its subtree.
+            let name = f.file_name().to_string_lossy().to_string();
+            let sub_kind = extra_kind_for_dir(&name).unwrap_or_else(|| kind.to_string());
+            collect_extra_files(&sub_kind, &p, base_path, out);
+        } else if is_media_file(&p, VIDEO_EXTENSIONS) {
+            let title = p
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let rel = p
+                .strip_prefix(base_path)
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .to_string();
+            out.push((kind.to_string(), title, rel));
+        }
+    }
+}
+
+/// Rebuild the extras for one movie/show entry from disk: extras dirs directly
+/// inside the entry folder, plus one level deeper (season folders). Diff-aware so
+/// already-populated TMDB metadata survives rescans.
+async fn sync_extras_for_entry(
+    pool: &sqlx::SqlitePool,
+    owner_id: i64,
+    base_path: &Path,
+    entry_rel_path: &str,
+) -> Result<(), sqlx::Error> {
+    let entry_dir = base_path.join(entry_rel_path);
+    let mut found: Vec<(String, String, String)> = Vec::new();
+
+    if let Ok(rd) = std::fs::read_dir(&entry_dir) {
+        for e in rd.filter_map(|e| e.ok()) {
+            if !e.path().is_dir() {
+                continue;
+            }
+            let name = e.file_name().to_string_lossy().to_string();
+            if let Some(kind) = extra_kind_for_dir(&name) {
+                collect_extra_files(&kind, &e.path(), base_path, &mut found);
+            } else {
+                let lower = name.to_lowercase();
+                let stripped = lower.trim_start_matches(['~', '-', '_', ' ', '.']);
+                if lower.starts_with('.') || RESERVED_DIRS.contains(&stripped) {
+                    continue; // covers/backgrounds/samples — not extras, not containers
+                }
+                // Season (or container) folder — check one level deeper
+                if let Ok(rd2) = std::fs::read_dir(e.path()) {
+                    for e2 in rd2.filter_map(|x| x.ok()) {
+                        if !e2.path().is_dir() {
+                            continue;
+                        }
+                        if let Some(kind) =
+                            extra_kind_for_dir(&e2.file_name().to_string_lossy())
+                        {
+                            collect_extra_files(&kind, &e2.path(), base_path, &mut found);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Remove rows whose files vanished
+    let existing: Vec<(i64, String)> =
+        sqlx::query_as("SELECT id, file_path FROM extra WHERE owner_id = ?")
+            .bind(owner_id)
+            .fetch_all(pool)
+            .await?;
+    let found_paths: std::collections::HashSet<&str> =
+        found.iter().map(|(_, _, p)| p.as_str()).collect();
+    for (id, fp) in &existing {
+        if !found_paths.contains(fp.as_str()) {
+            sqlx::query("DELETE FROM extra WHERE id = ?")
+                .bind(id)
+                .execute(pool)
+                .await?;
+        }
+    }
+
+    // Upsert current files; keeps metadata on rows that already exist
+    for (i, (kind, title, rel)) in found.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO extra (owner_id, kind, title, file_path, sort_order) VALUES (?, ?, ?, ?, ?) \
+             ON CONFLICT(owner_id, file_path) DO UPDATE SET kind = excluded.kind, sort_order = excluded.sort_order",
+        )
+        .bind(owner_id)
+        .bind(kind)
+        .bind(title)
+        .bind(rel)
+        .bind(i as i64)
+        .execute(pool)
+        .await?;
+    }
+
+    Ok(())
 }
 
 fn parse_folder_name(name: &str) -> (String, Option<String>) {
@@ -5660,6 +6306,11 @@ pub struct ShowDetail {
     pub composers: Vec<PersonInfo>,
     pub studios: Vec<String>,
     pub keywords: Vec<String>,
+    /// Sum of every episode's runtime — None unless ALL episodes have one,
+    /// so a partial sum is never presented as the show's total.
+    pub total_runtime: Option<i64>,
+    /// Backdrop for the detail-page hero (selected, or first cached).
+    pub background: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -5747,7 +6398,9 @@ pub async fn get_show_detail(
     .map_err(|e| e.to_string())?;
     let creators: Vec<PersonInfo> = creator_rows.into_iter().map(|(id, name, image_path)| PersonInfo { id, name, image_path }).collect();
 
-    // Cast
+    // Cast — show-level billing first, then anyone billed only on individual
+    // seasons. Season casts aren't shown per-season in the UI (who appears in
+    // which season spoils exits), so they fold into the one show-wide list.
     let cast_rows: Vec<(i64, String, Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT p.id, p.name, p.image_path, sc.role FROM show_cast sc JOIN person p ON sc.person_id = p.id WHERE sc.show_id = ? ORDER BY sc.sort_order",
     )
@@ -5755,7 +6408,25 @@ pub async fn get_show_detail(
     .fetch_all(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
-    let cast: Vec<CastInfo> = cast_rows.into_iter().map(|(id, name, image_path, role)| CastInfo { id, name, image_path, role }).collect();
+    let season_cast_rows: Vec<(i64, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT p.id, p.name, p.image_path, sec.role \
+         FROM season_cast sec \
+         JOIN season s ON sec.season_id = s.id \
+         JOIN person p ON sec.person_id = p.id \
+         WHERE s.show_id = ? \
+         ORDER BY s.season_number, sec.sort_order",
+    )
+    .bind(show_id)
+    .fetch_all(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    let mut seen_cast = std::collections::HashSet::new();
+    let cast: Vec<CastInfo> = cast_rows
+        .into_iter()
+        .chain(season_cast_rows)
+        .filter(|(id, _, _, _)| seen_cast.insert(*id))
+        .map(|(id, name, image_path, role)| CastInfo { id, name, image_path, role })
+        .collect();
 
     // Composers
     let composer_rows: Vec<(i64, String, Option<String>)> = sqlx::query_as(
@@ -5787,6 +6458,17 @@ pub async fn get_show_detail(
     .map_err(|e| e.to_string())?;
     let keywords: Vec<String> = keyword_rows.into_iter().map(|(n,)| n).collect();
 
+    // Total runtime, only when every episode has one
+    let (ep_count, runtime_count, runtime_sum): (i64, i64, Option<i64>) = sqlx::query_as(
+        "SELECT COUNT(*), COUNT(e.runtime), SUM(e.runtime) FROM episode e JOIN season s ON e.season_id = s.id WHERE s.show_id = ?",
+    )
+    .bind(show_id)
+    .fetch_one(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    let total_runtime = if ep_count > 0 && ep_count == runtime_count { runtime_sum } else { None };
+
+    let background = entry_background(&state.app_db, show_id).await?;
 
     Ok(ShowDetail {
         id: show_id,
@@ -5801,6 +6483,8 @@ pub async fn get_show_detail(
         composers,
         studios,
         keywords,
+        total_runtime,
+        background,
     })
 }
 
@@ -5961,6 +6645,154 @@ pub async fn get_tmdb_episode_detail(
 
     let client = reqwest::Client::new();
     crate::tmdb::get_episode_detail(&client, &token, tmdb_id, season_number, episode_number).await
+}
+
+// ---------- Bulk TMDB matching targets ----------
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct BulkMovieTarget {
+    pub id: i64,
+    pub title: String,
+    pub year: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct BulkShowTarget {
+    pub id: i64,
+    pub title: String,
+    /// Already-matched shows carry their tmdb_id so season/episode passes can
+    /// cover them even when the "shows" checkbox is off.
+    pub tmdb_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct BulkSeasonTarget {
+    pub id: i64,
+    pub show_id: i64,
+    pub season_number: i64,
+    pub episode_count: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct BulkWebisodeTarget {
+    pub show_id: i64,
+    pub extra_count: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TmdbBulkTargets {
+    pub movies: Vec<BulkMovieTarget>,
+    pub shows: Vec<BulkShowTarget>,
+    pub seasons: Vec<BulkSeasonTarget>,
+    /// Shows that have webisode extras (matchable against TMDB season 0).
+    pub webisodes: Vec<BulkWebisodeTarget>,
+    /// Every movie in the library — the ratings pass targets all of them.
+    pub all_movies: Vec<BulkMovieTarget>,
+}
+
+/// Everything the bulk-match dialog needs to show counts and drive the run:
+/// movies/shows still missing a TMDB match, plus all numbered seasons (with
+/// episode counts) so season/episode passes can be estimated and executed.
+#[tauri::command]
+pub async fn get_tmdb_bulk_targets(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+) -> Result<TmdbBulkTargets, String> {
+    let movies: Vec<(i64, String, Option<String>)> = sqlx::query_as(
+        "SELECT m.id, m.title, SUBSTR(m.release_date, 1, 4) \
+         FROM movie m JOIN media_entry me ON me.id = m.id \
+         WHERE me.library_id = ? AND (m.tmdb_id IS NULL OR m.tmdb_id = '') \
+         ORDER BY m.sort_title COLLATE NOCASE",
+    )
+    .bind(&library_id)
+    .fetch_all(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let shows: Vec<(i64, String, Option<String>)> = sqlx::query_as(
+        "SELECT s.id, s.title, CAST(s.tmdb_id AS TEXT) \
+         FROM show s JOIN media_entry me ON me.id = s.id \
+         WHERE me.library_id = ? \
+         ORDER BY s.sort_title COLLATE NOCASE",
+    )
+    .bind(&library_id)
+    .fetch_all(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let seasons: Vec<(i64, i64, i64, i64)> = sqlx::query_as(
+        "SELECT se.id, se.show_id, se.season_number, \
+           (SELECT COUNT(*) FROM episode e WHERE e.season_id = se.id) \
+         FROM season se JOIN media_entry me ON me.id = se.show_id \
+         WHERE me.library_id = ? AND se.season_number IS NOT NULL \
+         ORDER BY se.show_id, se.season_number",
+    )
+    .bind(&library_id)
+    .fetch_all(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let webisodes: Vec<(i64, i64)> = sqlx::query_as(
+        "SELECT e.owner_id, COUNT(*) FROM extra e \
+         JOIN media_entry me ON me.id = e.owner_id \
+         WHERE me.library_id = ? AND e.kind = 'webisodes' \
+         GROUP BY e.owner_id",
+    )
+    .bind(&library_id)
+    .fetch_all(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let all_movies: Vec<(i64, String, Option<String>)> = sqlx::query_as(
+        "SELECT m.id, m.title, SUBSTR(m.release_date, 1, 4) \
+         FROM movie m JOIN media_entry me ON me.id = m.id \
+         WHERE me.library_id = ? \
+         ORDER BY m.sort_title COLLATE NOCASE",
+    )
+    .bind(&library_id)
+    .fetch_all(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(TmdbBulkTargets {
+        movies: movies
+            .into_iter()
+            .map(|(id, title, year)| BulkMovieTarget {
+                id,
+                title,
+                year: year.filter(|y| !y.is_empty()),
+            })
+            .collect(),
+        shows: shows
+            .into_iter()
+            .map(|(id, title, tmdb_id)| BulkShowTarget {
+                id,
+                title,
+                tmdb_id: tmdb_id.filter(|t| !t.is_empty()),
+            })
+            .collect(),
+        seasons: seasons
+            .into_iter()
+            .map(|(id, show_id, season_number, episode_count)| BulkSeasonTarget {
+                id,
+                show_id,
+                season_number,
+                episode_count,
+            })
+            .collect(),
+        webisodes: webisodes
+            .into_iter()
+            .map(|(show_id, extra_count)| BulkWebisodeTarget { show_id, extra_count })
+            .collect(),
+        all_movies: all_movies
+            .into_iter()
+            .map(|(id, title, year)| BulkMovieTarget {
+                id,
+                title,
+                year: year.filter(|y| !y.is_empty()),
+            })
+            .collect(),
+    })
 }
 
 // ---------- Apply TMDB Show Metadata ----------
@@ -6144,6 +6976,7 @@ pub async fn apply_tmdb_season_metadata(
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TmdbEpisodeFieldSelection {
+    pub title: Option<String>,
     pub plot: Option<String>,
     pub runtime: Option<i64>,
     pub release_date: Option<String>,
@@ -6160,6 +6993,12 @@ pub async fn apply_tmdb_episode_metadata(
 ) -> Result<(), String> {
     let mut new_people: Vec<(i64, i64, Option<String>)> = Vec::new();
 
+    if let Some(ref title) = fields.title {
+        if !title.trim().is_empty() {
+            sqlx::query("UPDATE episode SET title = ? WHERE id = ?")
+                .bind(title.trim()).bind(episode_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
+        }
+    }
     if let Some(ref plot) = fields.plot {
         sqlx::query("UPDATE episode SET plot = ? WHERE id = ?")
             .bind(plot).bind(episode_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
@@ -6251,6 +7090,13 @@ pub async fn apply_tmdb_season_episodes(
             Some(e) => e,
             None => continue,
         };
+
+        // Scan can only ever use the filename as the title; TMDB's episode name
+        // is authoritative, so overwrite (unlike the fill-if-empty fields below).
+        if !tmdb_ep.name.is_empty() {
+            sqlx::query("UPDATE episode SET title = ? WHERE id = ?")
+                .bind(&tmdb_ep.name).bind(local_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
+        }
 
         // Apply plot + runtime
         if let Some(ref overview) = tmdb_ep.overview {

@@ -34,6 +34,9 @@ export interface MediaEntry {
   child_count: number;
   season_display: string | null;
   collection_display: string | null;
+  /** "as Walter White" — only set on person-page filmography entries; shown
+   *  instead of the usual subtitle. */
+  role_display?: string | null;
   tmdb_id: string | null;
   /** Non-null only when this row represents a `media_link` inside a playlist view.
    *  Used to offer "Remove from playlist" from the context menu. */
@@ -48,6 +51,14 @@ export interface BreadcrumbItem {
   id: number | null;
   title: string;
   view?: ViewSpec;
+  /** Set when this crumb is a movie/show detail page. Lets breadcrumb/back/forward
+   *  navigation restore the detail page instead of treating the id as a grid parent
+   *  (a movie id used as parent_id loads an empty grid). */
+  entry?: MediaEntry;
+  /** True for crumbs synthesized by canonical re-rooting (loop collapse / detail
+   *  reset) rather than actually visited. The sidebar highlights a genuine root,
+   *  but falls back to content-based highlighting when the root is synthetic. */
+  synthetic?: boolean;
 }
 
 // ---------- Sidebar complications ----------
@@ -128,6 +139,8 @@ export interface MovieDetail {
   composers: PersonInfo[];
   studios: string[];
   keywords: string[];
+  /** Backdrop for the detail-page hero (selected, or first cached). */
+  background: string | null;
 }
 
 export interface CastUpdateInfo {
@@ -156,6 +169,10 @@ export interface EpisodeInfo {
   episode_number: number | null;
   file_path: string;
   sort_order: number;
+  /** Shown inline in the episode list (clamped) — full detail loads on expand. */
+  plot: string | null;
+  runtime: number | null;
+  release_date: string | null;
 }
 
 // TMDB types
@@ -277,6 +294,10 @@ export interface ShowDetail {
   composers: PersonInfo[];
   studios: string[];
   keywords: string[];
+  /** Sum of every episode's runtime — null unless ALL episodes have one. */
+  total_runtime: number | null;
+  /** Backdrop for the detail-page hero (selected, or first cached). */
+  background: string | null;
 }
 
 export interface SeasonDetailLocal {
@@ -388,12 +409,62 @@ export interface TmdbSeasonFieldSelection {
 }
 
 export interface TmdbEpisodeFieldSelection {
+  title?: string;
   plot?: string;
   runtime?: number;
   release_date?: string;
   cast?: CastUpdateInfo[];
   director?: PersonUpdateInfo[];
   composer?: PersonUpdateInfo[];
+}
+
+export interface BulkMovieTarget {
+  id: number;
+  title: string;
+  year: string | null;
+}
+
+export interface BulkShowTarget {
+  id: number;
+  title: string;
+  tmdb_id: string | null;
+}
+
+export interface BulkSeasonTarget {
+  id: number;
+  show_id: number;
+  season_number: number;
+  episode_count: number;
+}
+
+export interface BulkWebisodeTarget {
+  show_id: number;
+  extra_count: number;
+}
+
+export interface TmdbBulkTargets {
+  movies: BulkMovieTarget[];
+  shows: BulkShowTarget[];
+  seasons: BulkSeasonTarget[];
+  webisodes: BulkWebisodeTarget[];
+  /** Every movie in the library — the ratings pass targets all of them. */
+  all_movies: BulkMovieTarget[];
+}
+
+export interface RatingInfo {
+  /** 'rotten_tomatoes_audience' | 'rotten_tomatoes' | 'imdb' | 'metacritic' */
+  source: string;
+  value: string;
+}
+
+export interface ExtraInfo {
+  id: number;
+  kind: string;
+  title: string;
+  file_path: string;
+  plot: string | null;
+  release_date: string | null;
+  runtime: number | null;
 }
 
 export interface ShowEpisodeFlat {

@@ -2,7 +2,7 @@ import { useCallback, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
-import { Trash2, RefreshCw, FolderPlus, ChevronRight } from "lucide-react";
+import { Trash2, RefreshCw, FolderPlus, ChevronRight, Sparkles, Pencil } from "lucide-react";
 import {
   ContextMenu,
   ContextMenuTrigger,
@@ -20,6 +20,8 @@ import {
 import { Button } from "@/components/ui/button";
 import { CreateLibraryDialog } from "@/components/CreateLibraryDialog";
 import { CreatePlaylistDialog } from "@/components/CreatePlaylistDialog";
+import { TmdbBulkMatchDialog } from "@/components/TmdbBulkMatchDialog";
+import { RenameDialog } from "@/components/RenameDialog";
 import { PlayerDock } from "@/components/player/PlayerDock";
 import { PlayerState, PlayerActions } from "@/hooks/usePlayer";
 import { SidebarTree } from "@/components/SidebarTree";
@@ -40,8 +42,10 @@ interface SidebarProps {
   onSelectLibrary: (library: Library) => void;
   onSelectView: (view: ViewSpec) => void;
   onLibraryCreated: () => void;
-  onLibraryDeleted: () => void;
+  onLibraryDeleted: (deletedId: string) => void;
   onLibraryRescanned: () => void;
+  /** Called after a rename so App can reload libraries and fix baked-in labels. */
+  onLibraryRenamed: (libraryId: string, oldName: string, newName: string) => void;
   /** Called after a playlist is created via the sidebar so App.tsx can invalidate caches. */
   onPlaylistChanged: (libraryId: string) => void;
   /** Per-library playlists to show as children of the "Playlists" sidebar node. */
@@ -59,6 +63,7 @@ export function Sidebar({
   onLibraryCreated,
   onLibraryDeleted,
   onLibraryRescanned,
+  onLibraryRenamed,
   onPlaylistChanged,
   sidebarPlaylists,
   playerState,
@@ -68,6 +73,9 @@ export function Sidebar({
   const [dragging, setDragging] = useState(false);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Library | null>(null);
+  // Library whose media is being bulk-matched to TMDB, or null when closed.
+  const [tmdbMatchTarget, setTmdbMatchTarget] = useState<Library | null>(null);
+  const [renameTarget, setRenameTarget] = useState<Library | null>(null);
   // Which library to create a playlist inside, or null when the dialog is closed.
   const [createPlaylistFor, setCreatePlaylistFor] = useState<string | null>(null);
   // Track libraries the user has explicitly collapsed; default is expanded.
@@ -181,6 +189,10 @@ export function Sidebar({
                       <span className="min-w-0 flex-1 break-words">{lib.name}</span>
                     </ContextMenuTrigger>
                     <ContextMenuContent>
+                      <ContextMenuItem onClick={() => setRenameTarget(lib)}>
+                        <Pencil size={14} />
+                        Rename
+                      </ContextMenuItem>
                       <ContextMenuItem
                         onClick={async () => {
                           const toastId = toast.loading("Rescanning...");
@@ -201,6 +213,12 @@ export function Sidebar({
                         <RefreshCw size={14} />
                         Rescan
                       </ContextMenuItem>
+                      {lib.format === "video" && (
+                        <ContextMenuItem onClick={() => setTmdbMatchTarget(lib)}>
+                          <Sparkles size={14} />
+                          Match to TMDB
+                        </ContextMenuItem>
+                      )}
                       <ContextMenuItem
                         onClick={() => setDeleteTarget(lib)}
                         className="text-destructive focus:text-destructive"
@@ -249,6 +267,27 @@ export function Sidebar({
         onOpenChange={setDialogOpen}
         onCreated={onLibraryCreated}
       />
+      <RenameDialog
+        open={renameTarget !== null}
+        onOpenChange={(o) => { if (!o) setRenameTarget(null); }}
+        title="Rename library"
+        initialValue={renameTarget?.name ?? ""}
+        onSubmit={async (newName) => {
+          if (!renameTarget) return;
+          try {
+            await invoke("rename_library", { libraryId: renameTarget.id, newName });
+            onLibraryRenamed(renameTarget.id, renameTarget.name, newName);
+          } catch (e) {
+            toast.error(String(e));
+          }
+        }}
+      />
+      <TmdbBulkMatchDialog
+        libraryId={tmdbMatchTarget?.id ?? null}
+        open={tmdbMatchTarget !== null}
+        onOpenChange={(o) => { if (!o) setTmdbMatchTarget(null); }}
+        onApplied={onLibraryRescanned}
+      />
       <CreatePlaylistDialog
         libraryId={createPlaylistFor}
         open={createPlaylistFor !== null}
@@ -276,7 +315,7 @@ export function Sidebar({
                 try {
                   await invoke("delete_library", { libraryId: deleteTarget.id });
                   setDeleteTarget(null);
-                  onLibraryDeleted();
+                  onLibraryDeleted(deleteTarget.id);
                 } catch (err) {
                   toast.error(String(err));
                 }

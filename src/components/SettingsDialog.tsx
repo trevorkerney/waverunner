@@ -33,6 +33,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
   >("idle");
   const [updateVersion, setUpdateVersion] = useState("");
   const [showToken, setShowToken] = useState(false);
+  const [showOmdbKey, setShowOmdbKey] = useState(false);
 
   useEffect(() => {
     if (!open) return;
@@ -211,6 +212,59 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                         </button>
                       </div>
                     </div>
+                  </div>
+                </div>
+              </div>
+              <div>
+                <h3 className="mb-4 text-sm font-semibold">Ratings</h3>
+                <div className="flex flex-col gap-4">
+                  <div className="flex items-center justify-between gap-4">
+                    <div>
+                      <p className="text-sm">OMDB ratings</p>
+                      <p className="text-xs text-muted-foreground">
+                        IMDb, Metacritic, and RT critic scores. Free API keys at omdbapi.com.
+                      </p>
+                    </div>
+                    <Switch
+                      checked={settings["omdb_enabled"] === "true"}
+                      onCheckedChange={(v) => {
+                        setSetting("omdb_enabled", v ? "true" : "false");
+                        // The RT scraper rides along with OMDB fetches; it can't be on alone.
+                        if (!v) setSetting("rt_scraper_enabled", "false");
+                      }}
+                    />
+                  </div>
+                  {settings["omdb_enabled"] === "true" && (
+                    <div className="relative">
+                      <Input
+                        type={showOmdbKey ? "text" : "password"}
+                        value={settings["omdb_api_key"] || ""}
+                        onChange={(e) => setSetting("omdb_api_key", e.target.value)}
+                        placeholder="Enter your OMDB API key"
+                        className="pr-9"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowOmdbKey((v) => !v)}
+                        className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                      >
+                        {showOmdbKey ? <EyeOff size={14} /> : <Eye size={14} />}
+                      </button>
+                    </div>
+                  )}
+                  <div className="flex items-center justify-between gap-4">
+                    <div className={settings["omdb_enabled"] === "true" ? "" : "opacity-50"}>
+                      <p className="text-sm">Rotten Tomatoes audience score</p>
+                      <p className="text-xs text-muted-foreground">
+                        Scraped from the RT website alongside OMDB fetches — no key needed.
+                        May stop working if RT changes their site. Requires OMDB ratings.
+                      </p>
+                    </div>
+                    <Switch
+                      checked={settings["rt_scraper_enabled"] === "true"}
+                      disabled={settings["omdb_enabled"] !== "true"}
+                      onCheckedChange={(v) => setSetting("rt_scraper_enabled", v ? "true" : "false")}
+                    />
                   </div>
                 </div>
               </div>
