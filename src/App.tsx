@@ -10,7 +10,7 @@ import { Toaster } from "@/components/ui/sonner";
 import { toast } from "sonner";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { Library, MediaEntry, EntriesResponse, BreadcrumbItem, ViewSpec, PersonSummary, PersonRole, PlaylistSummary, PlaylistContents, SortPreset } from "@/types";
+import { Library, MediaEntry, EntriesResponse, BreadcrumbItem, ViewSpec, PersonInfo, PersonSummary, PersonRole, PlaylistSummary, PlaylistContents, SortPreset } from "@/types";
 import { viewCacheKey, scopeKeyFor } from "@/lib/complications";
 
 function App() {
@@ -75,6 +75,9 @@ function App() {
   const viewEntriesCacheRef = useRef<Map<string, { entries: MediaEntry[]; sort_mode: string; selected_preset_id: number | null; presets: SortPreset[] }>>(new Map());
   // Cache: viewCacheKey(view) -> people (people-list views)
   const peopleCacheRef = useRef<Map<string, PersonSummary[]>>(new Map());
+  // Top-100/All mode per people view. Navigation (back/breadcrumb) restores it;
+  // sidebar clicks delete the entry so a fresh visit always lands on Top 100.
+  const peopleModeRef = useRef<Map<string, "top" | "all">>(new Map());
   // Cache: viewCacheKey(view) -> playlists
   const playlistsCacheRef = useRef<Map<string, PlaylistSummary[]>>(new Map());
   // Scroll position cache: "libraryId:parentId" -> scrollTop
@@ -90,9 +93,14 @@ function App() {
     );
   }
 
+  // Only the first screenfuls are decode-gated before the grid swaps in; the
+  // rest lazy-load their thumbnails as cards scroll near (content-visibility +
+  // loading="lazy" on the cards keep offscreen work at zero).
+  const PRELOAD_COVER_CAP = 150;
+
   const preloadCovers = useCallback(async (entries: MediaEntry[]) => {
     await Promise.all(
-      entries.map(async (entry) => {
+      entries.slice(0, PRELOAD_COVER_CAP).map(async (entry) => {
         const cover =
           entry.selected_cover && entry.covers.includes(entry.selected_cover)
             ? entry.selected_cover
@@ -145,9 +153,11 @@ function App() {
     );
   }, []);
 
-  // For grid: returns cached thumbnail blob URL
+  // For grid: returns cached thumbnail blob URL. Uncached (beyond the preload
+  // cap) falls back to the on-disk thumbnail file — NOT the full-res cover —
+  // so lazy-loaded tail entries stay cheap.
   const getCoverUrl = useCallback((filePath: string): string => {
-    return thumbCacheRef.current.get(filePath) || convertFileSrc(filePath);
+    return thumbCacheRef.current.get(filePath) || convertFileSrc(toThumbPath(filePath));
   }, []);
 
   // For carousel: always full-res
@@ -245,13 +255,18 @@ function App() {
     return () => clearTimeout(timer);
   }, [search, selectedLibrary, breadcrumbs, activeView, preloadCovers]);
 
+  // Scroll-key "kind": role lists must not share a slot (Actors vs Composers
+  // both have kind people-list and parentId null).
+  const scrollKindFor = useCallback((view: ViewSpec | null): string => {
+    return view?.kind === "people-list" ? `people-list:${view.role}` : view?.kind ?? "library-root";
+  }, []);
+
   const saveScrollPosition = useCallback(() => {
     if (!selectedLibrary || !scrollContainerRef.current) return;
     const parentId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
-    const kind = activeView?.kind ?? "library-root";
-    const key = `${selectedLibrary.id}:${kind}:${parentId}`;
+    const key = `${selectedLibrary.id}:${scrollKindFor(activeView)}:${parentId}`;
     scrollCacheRef.current.set(key, scrollContainerRef.current.scrollTop);
-  }, [selectedLibrary, breadcrumbs, activeView]);
+  }, [selectedLibrary, breadcrumbs, activeView, scrollKindFor]);
 
   // restoreScrollPosition: apply the saved scroll for a (library, view-kind, parent) triple,
   // or reset to top when none is saved. Scroll keys include view kind so sidebar switches
@@ -302,6 +317,8 @@ function App() {
         if (cached) {
           setPeople(cached);
           setBreadcrumbs(breadcrumb);
+          if (restoreScroll) restoreScrollPosition(view.libraryId, scrollKindFor(view), null);
+          else resetScrollToTop();
           return;
         }
         // Update breadcrumb and clear the stale people list *before* awaiting the fetch,
@@ -315,9 +332,17 @@ function App() {
             libraryId: view.libraryId,
             role,
           });
-          await preloadImages(res.map((p) => p.image_path));
+          // Only the default Top-100 view is decode-gated; the virtualized
+          // "All" view lazy-loads faces as they scroll into view.
+          const topFaces = [...res]
+            .sort((a, b) => b.work_count - a.work_count)
+            .slice(0, 100)
+            .map((p) => p.image_path);
+          await preloadImages(topFaces);
           peopleCacheRef.current.set(key, res);
           setPeople(res);
+          if (restoreScroll) restoreScrollPosition(view.libraryId, scrollKindFor(view), null);
+          else resetScrollToTop();
         } catch (e) {
           console.error("Failed to load people:", e);
         } finally {
@@ -450,7 +475,7 @@ function App() {
         setLoading(false);
       }
     },
-    [restoreScrollPosition, resetScrollToTop, preloadCovers, preloadImages]
+    [restoreScrollPosition, resetScrollToTop, preloadCovers, preloadImages, scrollKindFor]
   );
 
   // Thin wrapper for the existing call sites that drive library-root navigation by (library, parentId).
@@ -561,6 +586,10 @@ function App() {
       // Sidebar view switches intentionally discard scroll — they always land at the top.
       // Don't save outgoing scroll; pass restoreScroll=false so loadView resets to 0.
       // Also clear the forward stack so mouse-forward can't cross into a stale view's history.
+      if (view.kind === "people-all" || view.kind === "people-list") {
+        // Sidebar clicks land on Top 100; only back/breadcrumb navigation remembers.
+        peopleModeRef.current.delete(viewCacheKey(view));
+      }
       setActiveView(view);
       setSelectedEntry(null);
       setSearch("");
@@ -679,7 +708,9 @@ function App() {
   );
 
   const navigateToPerson = useCallback(
-    (person: PersonSummary, role: PersonRole) => {
+    // Takes the minimal person shape — cast cards on detail pages navigate with
+    // just {id, name, image_path}; only real PersonSummary rows know `favorite`.
+    (person: PersonInfo, role: PersonRole) => {
       if (!selectedLibrary) return;
       const view: ViewSpec = {
         kind: "person-detail",
@@ -693,6 +724,8 @@ function App() {
         (c) => c.view?.kind === "person-detail" && c.view.personId === person.id && c.view.role === role,
       );
       if (dupIndex !== -1 && dupIndex === breadcrumbs.length - 1) return; // already on this person
+      // Save the outgoing scroll (e.g. position in a people grid) so back restores it.
+      saveScrollPosition();
       const base = dupIndex === -1 ? breadcrumbs : collapseLoop(breadcrumbs, dupIndex, selectedLibrary.id);
       const newBreadcrumbs: BreadcrumbItem[] = [
         ...base,
@@ -704,11 +737,25 @@ function App() {
       setForwardStack([]);
       loadView(view, null, newBreadcrumbs, false);
     },
-    [selectedLibrary, breadcrumbs, loadView, collapseLoop]
+    [selectedLibrary, breadcrumbs, loadView, collapseLoop, saveScrollPosition]
   );
 
   // Drill into a playlist from the Playlists grid. Appends to the current breadcrumb chain
   // so clicking "Playlists" crumb returns to the list.
+  const togglePersonFavorite = useCallback(async (person: PersonSummary) => {
+    try {
+      await invoke("set_person_favorite", { personId: person.id, favorite: !person.favorite });
+      // Patch the live list in place; drop the people caches so the other role
+      // views re-fetch with fresh favorite flags.
+      setPeople((prev) =>
+        prev ? prev.map((p) => (p.id === person.id ? { ...p, favorite: !person.favorite } : p)) : prev,
+      );
+      peopleCacheRef.current.clear();
+    } catch (e) {
+      toast.error(String(e));
+    }
+  }, []);
+
   const navigateToPlaylist = useCallback(
     (playlist: PlaylistSummary) => {
       if (!selectedLibrary) return;
@@ -1704,6 +1751,17 @@ function App() {
           onSearchChange={setSearch}
           onNavigate={navigateTo}
           onNavigateToPerson={navigateToPerson}
+          onTogglePersonFavorite={togglePersonFavorite}
+          peopleMode={
+            activeView && (activeView.kind === "people-all" || activeView.kind === "people-list")
+              ? peopleModeRef.current.get(viewCacheKey(activeView)) ?? "top"
+              : "top"
+          }
+          onPeopleModeChange={(mode) => {
+            if (activeView && (activeView.kind === "people-all" || activeView.kind === "people-list")) {
+              peopleModeRef.current.set(viewCacheKey(activeView), mode);
+            }
+          }}
           onNavigateToPlaylist={navigateToPlaylist}
           onPlaylistChanged={handlePlaylistChanged}
           onBreadcrumbClick={navigateBreadcrumb}

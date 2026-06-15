@@ -1,73 +1,53 @@
 # TODO
 
-surface extras (featurettes, trailers, behind the scenes, webisodes, ...) as a playable Extras section on detail pages. The Plex/Jellyfin-convention folders are currently recognized but ignored by the scanner (RESERVED_DIRS in commands.rs). Webisodes could alternatively map to Season 0 (Specials) — TMDB catalogs The Office webisodes there.
+## bugs / needs fixing
 
-add hover tooltips to format options explaining them
 
-when there are options between local library and externally managed library, have hover tooltips for that too
+## changes / small new features
 
-implement ratings display by user self-submitted OMDB api key in settings
+sometimes media is stored on drives that arent fully active all the time. for instance when you start a movie, the drive will spin up and waverunner sorta freezes for a sec while it starts up (i say sorta because it doesn't fully freeze, buttons just stop working), then it loads and starts playing. I'd like to look into solving that issue and making waverunner fully responsive for the couple seconds the disk is booting up. The user should be able to click pause/play, shrink screen to sidebar, stop playback, etc mid drive startup
 
-add some sort of recently watched feature
+I want a little thumbnail showing the frame at the hovered spot when cursor is hovering seek bar
+
+personal movie/show ratings
+
+switch to skeleton loaders
+
+ability to edit subtitle size/styling/etc
 
 add some sort of way to choose default library to display
 
+remember size slider position
+
+button somewhere to open source folders, maybe some as well per media
+
+
+## new features
+
+watch history, resume where left off button, make play say play from beginning if the user has watch history on a movie/show
+
+save cover sets. users should be able to save a set of media covers so that they can easily switch all media covers in a library to the saved set. 
+
+settings system where changes are all set at once on save button click, instead of on settings exit
+
+add warnings about tv episodes without episode numbers (they will likely play out of order)
+
+need to consider some sort of ability to queue up things for the player. TV show autoplay should probably take this system into heavy consideration. Users should be able to queue playlists. Users should be able to queue up individual movies in context menus at their whim. On the player and maybe not on the player, the user should be able to view the queue and manipulate it in a dialog or sidebar or something
+
+bind comma and period to prev frame and next frame on player. KEYBINDS MENU IN SETTINGS
+
 consider how streamed media should be dealt with as opposed to local media (like from a plex server)
 
-settings: sorting language selection (determines which articles like "The", "A", "An" are ignored for alphabetical sort — currently hardcoded to English)
 
-shadcn badges for genres/tags etc
+## minor/later
+
+button or ability to import media not currently on media drive
 
 on the first time someone sets sort mode to custom OR creates a collection, show a very quick tutorial about how to drag media
 
 go through everything ensuring compatibility with MacOS and Linux
 
-custom collections / playlists / whatever you want to call it - user should be able to create custom collections
-
-save cover sets. users should be able to save a set of media covers so that they can easily switch all media covers in a library to the saved set. 
-
-
-
-sidebar complications (complications like a watch)
-  - movies/tv
-    - just movies
-    - just tv
-    - people
-      - actors
-      - directors/producers
-      - composers
-    - custom collections/playlists
-
-rotten tomatoes (audience especially) and imdb (maybe metacritic) ratings as well as personal ratings
-
-settings system where changes are all set at once on save button click, instead of on settings exit
-
-add warning when playing entire seasons without episode numbers (they will likely play out of order)
-
-POSSIBLY FIXED: weird bugs when changing and viewing media covers, specifically when looking at the hobbit collection media and john wick 3. only pattern i see here is media inside collections, idk tho. basically it is just not displaying covers in the change cover and delete cover menus, which messes up their ui pretty bad. also when this happens the cover doesnt show up in detail view sometimes
-
-
-## BIG STUFF NOW
-
-I want a little thumbnail showing the frame at the hovered spot when cursor is hovering seek bar
-
-playing something new while small screen in sidebar is visible should open the playing content (out of sidebar)
-
-adding year to media should add it to movie/show folder name
-
-remember size slider position (maybe)
-
-need to consider some sort of ability to queue up things for the player. TV show autoplay should probably take this system into heavy consideration. Users should be able to queue playlists. Users should be able to queue up individual movies in context menus at their whim. On the player and maybe not on the player, the user should be able to view the queue and manipulate it in a dialog or sidebar or something
-
-need some kind of resume where left off functionality
-
-button or ability to import media not currently on media drive. this can potentially provide another method of making collections as well
-
-bind comma and period to prev frame and next frame on player. keybinds menu
-
-highlight composers. tmdb has them as crew with job "Composer" or "Original Music Composer"
-
-tv shows have directors per episode, not season or show as a whole. tmdb has them in crew with 
+settings: sorting language selection (determines which articles like "The", "A", "An" are ignored for alphabetical sort — currently hardcoded to English)
 
 
 ## Embedded Player

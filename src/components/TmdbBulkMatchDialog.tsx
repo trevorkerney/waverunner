@@ -162,6 +162,9 @@ interface RunStats {
   seasonsApplied: number;
   episodeSeasonsApplied: number;
   webisodesMatched: number;
+  /** Movies the ratings pass actually queried — distinguishes "found nothing"
+   *  from "didn't run" in the summary. */
+  ratingsChecked: number;
   ratingsFetched: number;
   skipped: number;
   failed: number;
@@ -173,6 +176,7 @@ const EMPTY_STATS: RunStats = {
   seasonsApplied: 0,
   episodeSeasonsApplied: 0,
   webisodesMatched: 0,
+  ratingsChecked: 0,
   ratingsFetched: 0,
   skipped: 0,
   failed: 0,
@@ -215,6 +219,13 @@ export function TmdbBulkMatchDialog({
   // Items whose TMDB search returned nothing at all — listed by name in the
   // summary (when there aren't absurdly many) so the user knows what to rename.
   const [noResultItems, setNoResultItems] = useState<{ title: string; year: string | null }[]>([]);
+  // Titles OMDB confirmed it has nothing for.
+  const [ratingsMissing, setRatingsMissing] = useState<{ title: string; year: string | null }[]>([]);
+  // Titles skipped because they have no IMDb id (need a TMDB match first).
+  const [ratingsNoId, setRatingsNoId] = useState<{ title: string; year: string | null }[]>([]);
+  // Fatal ratings error (rejected key, quota, repeated network failures) that
+  // aborted the pass — shown prominently in the summary.
+  const [ratingsFatal, setRatingsFatal] = useState<string | null>(null);
   const [reviewing, setReviewing] = useState<ReviewItem | null>(null);
   // The entry's current metadata — the match dialogs need it to build their
   // field-comparison list (passing null renders an empty, unusable review step).
@@ -240,6 +251,9 @@ export function TmdbBulkMatchDialog({
     setStats(EMPTY_STATS);
     setReviewItems([]);
     setNoResultItems([]);
+    setRatingsMissing([]);
+    setRatingsNoId([]);
+    setRatingsFatal(null);
     setReviewing(null);
     cancelRef.current = false;
     (async () => {
@@ -252,6 +266,16 @@ export function TmdbBulkMatchDialog({
         setHasToken(Boolean(settings["tmdb_api_token"]?.trim()));
         setOmdbEnabled(settings["omdb_enabled"] === "true" && Boolean(settings["omdb_api_key"]?.trim()));
         setRtEnabled(settings["rt_scraper_enabled"] === "true");
+        // Empty passes start unchecked instead of greyed-out-but-checked.
+        const willDoShows = t.shows.some((s) => !s.tmdb_id);
+        const anyEligibleSeasons = t.seasons.some((se) => {
+          const show = t.shows.find((s) => s.id === se.show_id);
+          return show != null && (show.tmdb_id != null || willDoShows);
+        });
+        setDoMovies(t.movies.length > 0);
+        setDoShows(willDoShows);
+        setDoSeasons(anyEligibleSeasons);
+        setDoEpisodes(anyEligibleSeasons);
         setPhase("configure");
       } catch (e) {
         toast.error(String(e));
@@ -310,8 +334,8 @@ export function TmdbBulkMatchDialog({
     if (doSeasons) hits += eligibleSeasons.length;
     if (doEpisodes) hits += eligibleSeasons.length;
     if (doWebisodes) hits += eligibleWebisodeShows.length;
-    // OMDB once per movie; the RT scrape adds up to 2 page requests per movie.
-    if (doRatings) hits += targets.all_movies.length * (rtEnabled ? 3 : 1);
+    // OMDB once per title; the RT scrape adds up to 2 page requests per title.
+    if (doRatings) hits += (targets.all_movies.length + targets.all_shows.length) * (rtEnabled ? 3 : 1);
     return hits;
   }, [targets, doMovies, doShows, doSeasons, doEpisodes, doWebisodes, doRatings, rtEnabled, unmatchedShows, eligibleSeasons, eligibleWebisodeShows]);
 
@@ -321,7 +345,7 @@ export function TmdbBulkMatchDialog({
       (doShows ? unmatchedShows.length : 0) +
       ((doSeasons || doEpisodes) ? eligibleSeasons.length : 0) +
       (doWebisodes ? eligibleWebisodeShows.length : 0) +
-      (doRatings ? targets.all_movies.length : 0)) === 0;
+      (doRatings ? targets.all_movies.length + targets.all_shows.length : 0)) === 0;
 
   const run = useCallback(async () => {
     if (!targets || !libraryId) return;
@@ -330,6 +354,9 @@ export function TmdbBulkMatchDialog({
     const s: RunStats = { ...EMPTY_STATS };
     const review: ReviewItem[] = [];
     const noResult: { title: string; year: string | null }[] = [];
+    const noRatings: { title: string; year: string | null }[] = [];
+    const noId: { title: string; year: string | null }[] = [];
+    let ratingsAborted: string | null = null;
     // Live tmdb ids for shows: pre-matched ones plus those matched this run.
     const showTmdb = new Map<number, number>();
     for (const sh of targets.shows) {
@@ -342,7 +369,7 @@ export function TmdbBulkMatchDialog({
       (doSeasons ? eligibleSeasons.length : 0) +
       (doEpisodes ? eligibleSeasons.length : 0) +
       (doWebisodes ? eligibleWebisodeShows.length : 0) +
-      (doRatings ? targets.all_movies.length : 0);
+      (doRatings ? targets.all_movies.length + targets.all_shows.length : 0);
     let step = 0;
     const tick = (label: string) => {
       step++;
@@ -480,14 +507,41 @@ export function TmdbBulkMatchDialog({
       }
 
       if (doRatings && !cancelRef.current) {
-        for (const m of targets.all_movies) {
+        let consecutiveNetFails = 0;
+        for (const m of [...targets.all_movies, ...targets.all_shows]) {
           if (cancelRef.current) break;
           tick(`${m.title} ratings`);
           try {
             const fetched = await invoke<unknown[]>("fetch_ratings", { entryId: m.id });
+            s.ratingsChecked++;
+            consecutiveNetFails = 0;
             if (fetched.length > 0) s.ratingsFetched++;
-          } catch {
+            else noRatings.push({ title: m.title, year: m.year });
+          } catch (err) {
+            const msg = String(err);
+            // Configuration/quota problems won't fix themselves mid-run —
+            // stop instead of hammering OMDB once per remaining title.
+            if (
+              msg.includes("rejected the API key") ||
+              msg.includes("request limit") ||
+              msg.includes("Enable OMDB") ||
+              msg.includes("No OMDB API key")
+            ) {
+              ratingsAborted = `Ratings pass stopped: ${msg}`;
+              break;
+            }
+            if (msg.includes("No IMDb ID")) {
+              noId.push({ title: m.title, year: m.year });
+              continue;
+            }
             s.failed++;
+            if (msg.includes("Couldn't reach OMDB")) {
+              consecutiveNetFails++;
+              if (consecutiveNetFails >= 5) {
+                ratingsAborted = "Ratings pass stopped: OMDB unreachable (5 titles in a row failed).";
+                break;
+              }
+            }
           }
         }
       }
@@ -495,10 +549,13 @@ export function TmdbBulkMatchDialog({
       setStats(s);
       setReviewItems(review);
       setNoResultItems(noResult);
+      setRatingsMissing(noRatings);
+      setRatingsNoId(noId);
+      setRatingsFatal(ratingsAborted);
       setPhase("done");
       onApplied();
     }
-  }, [targets, libraryId, doMovies, doShows, doSeasons, doEpisodes, unmatchedShows, eligibleSeasons, onApplied]);
+  }, [targets, libraryId, doMovies, doShows, doSeasons, doEpisodes, doWebisodes, doRatings, unmatchedShows, eligibleSeasons, eligibleWebisodeShows, onApplied]);
 
   // After a show is confirmed through the manual review dialog, fetch its
   // seasons/episodes (per the run's checkboxes) — the bulk run deliberately
@@ -639,10 +696,10 @@ export function TmdbBulkMatchDialog({
               {omdbEnabled &&
                 checkboxRow(
                   "Ratings",
-                  targets.all_movies.length,
+                  targets.all_movies.length + targets.all_shows.length,
                   doRatings,
                   setDoRatings,
-                  `movies · ${targets.all_movies.length * (rtEnabled ? 3 : 1)} requests${rtEnabled ? " (incl. RT scrape)" : ""}`,
+                  `titles · ${(targets.all_movies.length + targets.all_shows.length) * (rtEnabled ? 3 : 1)} requests${rtEnabled ? " (incl. RT scrape)" : ""}`,
                 )}
               {allWebisodesCount > 0 &&
                 checkboxRow("Webisodes", allWebisodesCount, doWebisodes, setDoWebisodes, `· ${eligibleWebisodeShows.length} ${eligibleWebisodeShows.length === 1 ? "request" : "requests"} (fuzzy matching)`, eligibleWebisodeShows.length === 0)}
@@ -697,10 +754,10 @@ export function TmdbBulkMatchDialog({
                   {stats.webisodesMatched === 1 ? "webisode" : "webisodes"}
                 </p>
               )}
-              {stats.ratingsFetched > 0 && (
+              {stats.ratingsChecked > 0 && (
                 <p>
-                  Ratings fetched for {stats.ratingsFetched}{" "}
-                  {stats.ratingsFetched === 1 ? "movie" : "movies"}
+                  Ratings fetched for {stats.ratingsFetched} of {stats.ratingsChecked}{" "}
+                  {stats.ratingsChecked === 1 ? "title" : "titles"}
                 </p>
               )}
               {stats.skipped > 0 && (
@@ -709,12 +766,45 @@ export function TmdbBulkMatchDialog({
                 </p>
               )}
               {stats.failed > 0 && <p className="text-destructive">{stats.failed} failed</p>}
-              {stats.moviesMatched + stats.showsMatched + stats.seasonsApplied + stats.episodeSeasonsApplied === 0 &&
+              {ratingsFatal && <p className="text-destructive">{ratingsFatal}</p>}
+              {stats.moviesMatched + stats.showsMatched + stats.seasonsApplied + stats.episodeSeasonsApplied + stats.webisodesMatched + stats.ratingsChecked === 0 &&
                 stats.skipped === 0 &&
                 stats.failed === 0 &&
+                !ratingsFatal &&
+                ratingsNoId.length === 0 &&
                 noResultItems.length === 0 &&
                 reviewItems.length === 0 && <p className="text-muted-foreground">Nothing to do.</p>}
             </div>
+            {ratingsNoId.length > 0 && (
+              <div className="flex min-w-0 flex-col gap-1">
+                <p className="text-sm text-muted-foreground">
+                  {ratingsNoId.length} {ratingsNoId.length === 1 ? "title has" : "titles have"} no IMDb ID — match to TMDB first:
+                </p>
+                <div className="flex flex-col gap-0.5">
+                  {ratingsNoId.map((item, i) => (
+                    <p key={i} className="shrink-0 truncate text-sm">
+                      {item.title}
+                      {item.year ? ` (${item.year})` : ""}
+                    </p>
+                  ))}
+                </div>
+              </div>
+            )}
+            {ratingsMissing.length > 0 && (
+              <div className="flex min-w-0 flex-col gap-1">
+                <p className="text-sm text-muted-foreground">
+                  No ratings found for {ratingsMissing.length} {ratingsMissing.length === 1 ? "title" : "titles"}:
+                </p>
+                <div className="flex flex-col gap-0.5">
+                  {ratingsMissing.map((item, i) => (
+                    <p key={i} className="shrink-0 truncate text-sm">
+                      {item.title}
+                      {item.year ? ` (${item.year})` : ""}
+                    </p>
+                  ))}
+                </div>
+              </div>
+            )}
             {noResultItems.length > 0 && (
               <div className="flex min-w-0 flex-col gap-1">
                 <p className="text-sm text-muted-foreground">

@@ -37,30 +37,63 @@ pub async fn fetch_movie_scores(
     year: Option<&str>,
     known_slug: Option<&str>,
 ) -> Option<RtScores> {
+    fetch_scores(client, title, year, known_slug, "m").await
+}
+
+/// Same, for TV series — RT serves those under /tv/ with a separate search section.
+pub async fn fetch_tv_scores(
+    client: &Client,
+    title: &str,
+    year: Option<&str>,
+    known_slug: Option<&str>,
+) -> Option<RtScores> {
+    fetch_scores(client, title, year, known_slug, "tv").await
+}
+
+async fn fetch_scores(
+    client: &Client,
+    title: &str,
+    year: Option<&str>,
+    known_slug: Option<&str>,
+    prefix: &str, // "m" (movies) or "tv" (series)
+) -> Option<RtScores> {
     let mut candidates: Vec<String> = Vec::new();
 
     if let Some(slug) = known_slug {
-        let cleaned = slug.trim().trim_start_matches("/m/").trim_start_matches("m/");
+        let cleaned = slug
+            .trim()
+            .trim_start_matches("/m/")
+            .trim_start_matches("m/")
+            .trim_start_matches("/tv/")
+            .trim_start_matches("tv/");
         if !cleaned.is_empty() {
             candidates.push(cleaned.to_string());
         }
     }
 
     if candidates.is_empty() {
-        if let Some(slug) = search_slug(client, title, year).await {
+        if let Some(slug) = search_slug(client, title, year, prefix).await {
             candidates.push(slug);
         }
         let guess = slugify(title);
         if !guess.is_empty() {
-            if let Some(y) = year {
-                candidates.push(format!("{guess}_{y}"));
+            if prefix == "tv" {
+                // TV slugs rarely carry a year suffix — plain guess first.
+                candidates.push(guess.clone());
+                if let Some(y) = year {
+                    candidates.push(format!("{guess}_{y}"));
+                }
+            } else {
+                if let Some(y) = year {
+                    candidates.push(format!("{guess}_{y}"));
+                }
+                candidates.push(guess);
             }
-            candidates.push(guess);
         }
     }
 
     for slug in candidates {
-        if let Some(scores) = scrape_page(client, &slug).await {
+        if let Some(scores) = scrape_page(client, &slug, prefix).await {
             return Some(scores);
         }
     }
@@ -69,7 +102,7 @@ pub async fn fetch_movie_scores(
 
 /// RT's site-search JSON endpoint. Private but long-stable; parsed leniently
 /// through serde_json::Value so shape drift doesn't panic.
-async fn search_slug(client: &Client, title: &str, year: Option<&str>) -> Option<String> {
+async fn search_slug(client: &Client, title: &str, year: Option<&str>, prefix: &str) -> Option<String> {
     let url = format!(
         "https://www.rottentomatoes.com/api/private/v2.0/search?q={}&limit=10",
         urlencoding(title)
@@ -84,17 +117,26 @@ async fn search_slug(client: &Client, title: &str, year: Option<&str>) -> Option
         return None;
     }
     let body: serde_json::Value = resp.json().await.ok()?;
-    let movies = body.get("movies")?.as_array()?;
+    let (section, url_prefix) = if prefix == "tv" { ("tvSeries", "/tv/") } else { ("movies", "/m/") };
+    let items = body.get(section)?.as_array()?;
 
     let want_title = normalize(title);
     let want_year: Option<i64> = year.and_then(|y| y.parse().ok());
 
     let mut fallback: Option<String> = None;
-    for m in movies {
-        let name = m.get("name").and_then(|v| v.as_str()).unwrap_or("");
-        let m_year = m.get("year").and_then(|v| v.as_i64());
+    for m in items {
+        // Movies carry name/year; tvSeries carries title/startYear. Read both.
+        let name = m
+            .get("name")
+            .or_else(|| m.get("title"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let m_year = m
+            .get("year")
+            .or_else(|| m.get("startYear"))
+            .and_then(|v| v.as_i64());
         let url = m.get("url").and_then(|v| v.as_str()).unwrap_or("");
-        let slug = url.trim_start_matches("/m/");
+        let slug = url.trim_start_matches(url_prefix);
         if slug.is_empty() || normalize(name) != want_title {
             continue;
         }
@@ -112,9 +154,9 @@ async fn search_slug(client: &Client, title: &str, year: Option<&str>) -> Option
     fallback
 }
 
-/// Fetch /m/{slug} and run the extraction strategy chain.
-async fn scrape_page(client: &Client, slug: &str) -> Option<RtScores> {
-    let url = format!("https://www.rottentomatoes.com/m/{slug}");
+/// Fetch /{prefix}/{slug} and run the extraction strategy chain.
+async fn scrape_page(client: &Client, slug: &str, prefix: &str) -> Option<RtScores> {
+    let url = format!("https://www.rottentomatoes.com/{prefix}/{slug}");
     let resp = client
         .get(&url)
         .header("User-Agent", USER_AGENT)
@@ -128,6 +170,14 @@ async fn scrape_page(client: &Client, slug: &str) -> Option<RtScores> {
 
     let audience = extract_score(&html, "\"audienceScore\"")
         .or_else(|| extract_attr_score(&html, "audiencescore=\""));
+
+    if audience.is_none() {
+        // The page exists but no strategy matched — either the title genuinely
+        // has no audience score yet, or RT changed their markup. Logged so a
+        // scraper breakage is diagnosable instead of silently looking like
+        // "RT doesn't have it" for everything.
+        eprintln!("rt: /{prefix}/{slug} loaded but no audience score extracted");
+    }
 
     audience.map(|_| RtScores {
         audience,

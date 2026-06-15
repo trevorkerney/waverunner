@@ -94,7 +94,7 @@ import {
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
-import { Library, MediaEntry, BreadcrumbItem, MovieDetail, MovieDetailUpdate, SeasonInfo, EpisodeInfo, ShowDetail, SeasonDetailLocal, EpisodeDetailLocal, TmdbSeasonDetail, TmdbEpisodeDetail, TmdbShowFieldSelection, TmdbSeasonFieldSelection, TmdbEpisodeFieldSelection, CastUpdateInfo, CastInfo, RatingInfo, ViewSpec, PersonSummary, PersonRole, PlaylistSummary, SortPreset } from "@/types";
+import { Library, MediaEntry, BreadcrumbItem, MovieDetail, MovieDetailUpdate, SeasonInfo, EpisodeInfo, ShowDetail, SeasonDetailLocal, EpisodeDetailLocal, TmdbSeasonDetail, TmdbEpisodeDetail, TmdbShowFieldSelection, TmdbSeasonFieldSelection, TmdbEpisodeFieldSelection, CastUpdateInfo, CastInfo, RatingInfo, ViewSpec, PersonInfo, PersonSummary, PersonRole, PlaylistSummary, SortPreset } from "@/types";
 import { scopeKeyFor, viewCacheKey } from "@/lib/complications";
 import { ExtrasDialog } from "@/components/ExtrasDialog";
 import { SortPresetSaveDialog } from "@/components/SortPresetSaveDialog";
@@ -102,11 +102,31 @@ import { TmdbMatchDialog } from "@/components/TmdbMatchDialog";
 import { TmdbShowMatchDialog } from "@/components/TmdbShowMatchDialog";
 import { TmdbImageBrowserDialog } from "@/components/TmdbImageBrowserDialog";
 import { BackgroundSelectDialog } from "@/components/BackgroundSelectDialog";
-import { PeopleGrid } from "@/components/PeopleGrid";
+import rtCriticsIcon from "@/assets/ratings/rt-critics.svg";
+import rtAudienceIcon from "@/assets/ratings/rt-audience.svg";
+import imdbIcon from "@/assets/ratings/imdb.svg";
+import metacriticIcon from "@/assets/ratings/metacritic.svg";
+import { PeoplePage } from "@/components/PeopleGrid";
+import { ScrubberRail } from "@/components/ScrubberRail";
 import { CreatePlaylistDialog } from "@/components/CreatePlaylistDialog";
 import { CreatePlaylistCollectionDialog } from "@/components/CreatePlaylistCollectionDialog";
 import { AddToPlaylistDialog } from "@/components/AddToPlaylistDialog";
 import { RenameDialog } from "@/components/RenameDialog";
+
+function letterForTitle(title: string): string {
+  // Mirrors the backend's generate_sort_title: grids sort with leading English
+  // articles stripped ("The Office" files under O), so the scrubber letter must
+  // come from the same key or T-jumps land on "The …" titles sorted elsewhere.
+  let t = title.trim().toLowerCase();
+  for (const article of ["the ", "a ", "an "]) {
+    if (t.startsWith(article)) {
+      t = t.slice(article.length).trim();
+      break;
+    }
+  }
+  const c = t.charAt(0).toUpperCase();
+  return c >= "A" && c <= "Z" ? c : "#";
+}
 
 function getDisplayCover(entry: MediaEntry): string | null {
   if (entry.selected_cover && entry.covers.includes(entry.selected_cover)) {
@@ -156,7 +176,10 @@ interface MainContentProps {
   search: string;
   onSearchChange: (search: string) => void;
   onNavigate: (entry: MediaEntry) => void;
-  onNavigateToPerson: (person: PersonSummary, role: PersonRole) => void;
+  onNavigateToPerson: (person: PersonInfo, role: PersonRole) => void;
+  onTogglePersonFavorite: (person: PersonSummary) => void;
+  peopleMode: "top" | "all";
+  onPeopleModeChange: (mode: "top" | "all") => void;
   onNavigateToPlaylist: (playlist: PlaylistSummary) => void;
   onPlaylistChanged: (libraryId: string) => void;
   onBreadcrumbClick: (index: number) => void;
@@ -210,6 +233,9 @@ export function MainContent({
   onSearchChange,
   onNavigate,
   onNavigateToPerson,
+  onTogglePersonFavorite,
+  peopleMode,
+  onPeopleModeChange,
   onNavigateToPlaylist,
   onPlaylistChanged,
   onBreadcrumbClick,
@@ -278,6 +304,63 @@ export function MainContent({
   }, [coverDialogEntry, entries, selectedEntry]);
   const isSearching = searchResults != null;
   const filteredEntries = isSearching ? searchResults : entries;
+
+  // Jump rail for big grids — letters in alphabetical sort, decades in date sort.
+  // Hidden while searching (ranked order) and for grids small enough to scan.
+  const gridScrubber = useMemo(() => {
+    if (selectedEntry || loading || isSearching) return null;
+    if (sortMode === "alpha") {
+      const seen = new Set<string>();
+      for (const e of filteredEntries) seen.add(letterForTitle(e.title));
+      if (seen.size < 2) return null;
+      const labels = [...seen].sort((a, b) => (a === "#" ? -1 : b === "#" ? 1 : a.localeCompare(b)));
+      return { labels, find: (l: string) => filteredEntries.find((e) => letterForTitle(e.title) === l) };
+    }
+    if (sortMode === "date" || sortMode === "year") {
+      // Decades in encounter order so the rail follows the sort direction.
+      const labels: string[] = [];
+      const seen = new Set<string>();
+      for (const e of filteredEntries) {
+        if (!e.year || e.year.length < 4) continue;
+        const dec = `${e.year.slice(0, 3)}0`;
+        if (!seen.has(dec)) {
+          seen.add(dec);
+          labels.push(dec);
+        }
+      }
+      if (labels.length < 2) return null;
+      return { labels, find: (l: string) => filteredEntries.find((e) => e.year?.slice(0, 3) === l.slice(0, 3)) };
+    }
+    return null;
+  }, [selectedEntry, loading, isSearching, filteredEntries, sortMode]);
+
+  const jumpToGridEntry = useCallback(
+    (label: string) => {
+      const target = gridScrubber?.find(label);
+      const container = scrollContainerRef.current;
+      if (!target || !container) return;
+      // window.CSS — the bare `CSS` identifier is dnd-kit's transform helper here.
+      const sel = `[data-flip-id="${window.CSS.escape(String(sortableIdFor(target)))}"]`;
+      gridRef.current?.querySelector(sel)?.scrollIntoView({ block: "start" });
+      // content-visibility makes offsets above the target ESTIMATES until that
+      // region renders, so the first jump can land off (worse at some zoom
+      // levels). Re-align over a few frames until the target stops moving —
+      // each pass renders the surroundings and tightens the layout.
+      let attempts = 0;
+      const settle = () => {
+        const el = gridRef.current?.querySelector(sel);
+        if (!el) return;
+        const delta = el.getBoundingClientRect().top - container.getBoundingClientRect().top;
+        if (Math.abs(delta) > 2 && attempts < 8) {
+          attempts++;
+          el.scrollIntoView({ block: "start" });
+          requestAnimationFrame(settle);
+        }
+      };
+      requestAnimationFrame(settle);
+    },
+    [gridScrubber, scrollContainerRef],
+  );
 
   const [dragId, setDragId] = useState<string | number | null>(null);
   const [newCollectionOpen, setNewCollectionOpen] = useState(false);
@@ -639,22 +722,29 @@ export function MainContent({
     return (
       <main className="flex flex-1 flex-col overflow-hidden bg-background">
         {breadcrumbBar}
-        <div ref={scrollContainerRef} className="flex-1 overflow-y-auto">
-          {loading && (
-            <div className="flex h-full items-center justify-center">
-              <Spinner className="size-6" />
-            </div>
-          )}
-          {!loading && people && people.length === 0 && (
-            <p className="p-4 text-sm text-muted-foreground">No people found.</p>
-          )}
-          {!loading && people && people.length > 0 && (
-            <PeopleGrid
-              people={people}
-              onSelectPerson={(p) => onNavigateToPerson(p, role)}
-            />
-          )}
-        </div>
+        {loading && (
+          <div className="flex flex-1 items-center justify-center">
+            <Spinner className="size-6" />
+          </div>
+        )}
+        {!loading && people && people.length === 0 && (
+          <p className="p-4 text-sm text-muted-foreground">No people found.</p>
+        )}
+        {!loading && people && people.length > 0 && (
+          <PeoplePage
+            // Keyed per view: the mode is per-page state and must not bleed
+            // between e.g. Actors and Composers when React reuses the instance.
+            key={viewCacheKey(activeView)}
+            people={people}
+            libraryId={activeView.libraryId}
+            role={role}
+            initialMode={peopleMode}
+            onModeChange={onPeopleModeChange}
+            onSelectPerson={(p) => onNavigateToPerson(p, role)}
+            onToggleFavorite={onTogglePersonFavorite}
+            scrollContainerRef={scrollContainerRef}
+          />
+        )}
       </main>
     );
   }
@@ -797,8 +887,10 @@ export function MainContent({
         </>
       )}
 
-      {/* Content */}
-      <div ref={scrollContainerRef} className="flex-1 overflow-y-auto overflow-x-hidden p-4">
+      {/* Content. The jump rail floats inside the right edge (the scrollbar keeps
+          the page edge); content gets extra right padding so it never sits under it. */}
+      <div className="relative flex min-h-0 flex-1">
+      <div ref={scrollContainerRef} className={`min-w-0 flex-1 overflow-y-auto overflow-x-hidden p-4 ${gridScrubber ? "pr-10" : ""}`}>
       {selectedEntry ? (
         selectedEntry.entry_type === "show"
           ? <ShowDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getCoverUrl={getCoverUrl} getFullCoverUrl={getFullCoverUrl} onEntryChanged={onEntryChanged} onTitleChanged={onTitleChanged} onChangeCover={() => openCoverDialog(selectedEntry, "select")} onAddCover={() => onAddCover(selectedEntry.id)} onDeleteCover={() => openCoverDialog(selectedEntry, "delete")} onPlayEpisode={onPlayEpisode} onPlayFile={onPlayFile} onNavigateToPerson={onNavigateToPerson} />
@@ -953,6 +1045,8 @@ export function MainContent({
           </ContextMenuContent>
       </ContextMenu>
       )}
+      </div>
+      {gridScrubber && <ScrubberRail labels={gridScrubber.labels} onJump={jumpToGridEntry} />}
       </div>
 
       {/* New Collection Dialog */}
@@ -1254,11 +1348,34 @@ function SortableCoverCard({
         } ${isOver && isDragActive ? "ring-2 ring-primary ring-offset-2 ring-offset-background" : ""}`}
         style={{ ...style, maxWidth: size }}
       >
-        <div className="relative overflow-hidden rounded-[3px] bg-muted shadow-md ring-1 ring-foreground/10 transition-[translate,scale] duration-200 group-hover:-translate-y-1 group-hover:scale-[1.04] group-hover:shadow-xl group-hover:ring-foreground/25" style={{ width: size - 16 }}>
+        {/* content-visibility lives on the cover box, NOT the card root: it brings
+            paint containment, and on the root it would clip the hover lift (the
+            cover translates above the card's padding). Here the clip box is the
+            already-overflow-hidden cover and transforms along with the hover. */}
+        <div
+          className="relative overflow-hidden rounded-[3px] bg-muted shadow-md ring-1 ring-foreground/10 transition-[translate,scale] duration-200 group-hover:-translate-y-1 group-hover:scale-[1.04] group-hover:shadow-xl group-hover:ring-foreground/25"
+          style={{
+            width: size - 16,
+            // Skips layout/paint/decode for offscreen covers; estimates a 2:3 poster.
+            contentVisibility: "auto",
+            containIntrinsicSize: `${size - 16}px ${Math.round((size - 16) * 1.5)}px`,
+          }}
+        >
           {coverSrc ? (
             <img
               src={coverSrc}
               alt={entry.title}
+              loading="lazy"
+              decoding="async"
+              // Covers cached before thumbnails existed for app-added images
+              // 404 on the thumb path — fall back to the full-res original.
+              onError={(e) => {
+                const img = e.currentTarget;
+                if (!img.dataset.fullFallback && coverPath) {
+                  img.dataset.fullFallback = "1";
+                  img.src = convertFileSrc(coverPath);
+                }
+              }}
               className="pointer-events-none w-full"
               style={{ maxHeight: size * 2 }}
               draggable={false}
@@ -1642,14 +1759,44 @@ function fmtRuntime(minutes: number): string {
   return minutes >= 60 ? `${Math.floor(minutes / 60)}h ${minutes % 60}m` : `${minutes}m`;
 }
 
-// Audience score leads — it's the one people actually decide by.
-const RATING_ORDER = ["rotten_tomatoes_audience", "rotten_tomatoes", "imdb", "metacritic"];
+const RATING_ORDER = ["rotten_tomatoes", "rotten_tomatoes_audience", "imdb", "metacritic"];
 const RATING_LABELS: Record<string, string> = {
   rotten_tomatoes_audience: "RT Audience",
   rotten_tomatoes: "RT Critics",
   imdb: "IMDb",
   metacritic: "Metacritic",
 };
+// Source icons replace the text labels as they're added to src/assets/ratings
+// (svg and png both load as plain <img>); sources without one keep the label.
+const RATING_ICONS: Record<string, string> = {
+  rotten_tomatoes_audience: rtAudienceIcon,
+  rotten_tomatoes: rtCriticsIcon,
+  imdb: imdbIcon,
+  metacritic: metacriticIcon,
+};
+
+/** The hero ratings row shared by movie and show detail pages. */
+function RatingsLine({ ratings }: { ratings: RatingInfo[] }) {
+  if (ratings.length === 0) return null;
+  return (
+    // Between the old mt-1.5 and the section gap-4 — gap-4 below LOOKS bigger
+    // than it measures (the genres band is visually heavier), so true-equal
+    // margins read lopsided.
+    <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+      {RATING_ORDER.filter((s) => ratings.some((r) => r.source === s)).map((source) => {
+        const r = ratings.find((x) => x.source === source)!;
+        const icon = RATING_ICONS[source];
+        const label = RATING_LABELS[source] ?? source;
+        return (
+          <span key={source} className="flex items-center gap-1" title={label}>
+            {icon ? <img src={icon} alt={label} className="h-4 w-4" draggable={false} /> : <span>{label}</span>}
+            <span className="font-medium text-foreground">{r.value}</span>
+          </span>
+        );
+      })}
+    </div>
+  );
+}
 
 function PersonFace({ imagePath, className, iconSize }: { imagePath: string | null; className: string; iconSize: number }) {
   return (
@@ -1734,7 +1881,7 @@ function EntryDetailPage({
   onAddCover: () => void;
   onDeleteCover: () => void;
   onPlayFile?: (path: string, title: string) => void;
-  onNavigateToPerson?: (person: PersonSummary, role: PersonRole) => void;
+  onNavigateToPerson?: (person: PersonInfo, role: PersonRole) => void;
 }) {
   const [detail, setDetail] = useState<MovieDetail | null>(null);
   const [editing, setEditing] = useState(false);
@@ -1954,22 +2101,10 @@ function EntryDetailPage({
                     </span>
                   )}
                 </div>
-                {ratings.length > 0 && (
-                  <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
-                    {RATING_ORDER.filter((s) => ratings.some((r) => r.source === s)).map((source) => {
-                      const r = ratings.find((x) => x.source === source)!;
-                      return (
-                        <span key={source}>
-                          {RATING_LABELS[source] ?? source}{" "}
-                          <span className="font-medium text-foreground">{r.value}</span>
-                        </span>
-                      );
-                    })}
-                  </div>
-                )}
                 {detail?.tagline && (
                   <p className="mt-2 italic text-muted-foreground">{detail.tagline}</p>
                 )}
+                <RatingsLine ratings={ratings} />
               </>
             )}
           </div>
@@ -2038,7 +2173,7 @@ function EntryDetailPage({
                           key={d.id}
                           person={{ ...d, role: null }}
                           className="w-28"
-                          onClick={() => onNavigateToPerson?.({ ...d, work_count: 0 }, "director_creator")}
+                          onClick={() => onNavigateToPerson?.(d, "director_creator")}
                         />
                       ))}
                     </div>
@@ -2055,7 +2190,7 @@ function EntryDetailPage({
                           key={c.id}
                           person={{ ...c, role: null }}
                           className="w-28"
-                          onClick={() => onNavigateToPerson?.({ ...c, work_count: 0 }, "composer")}
+                          onClick={() => onNavigateToPerson?.(c, "composer")}
                         />
                       ))}
                     </div>
@@ -2128,7 +2263,7 @@ function EntryDetailPage({
                     person={c}
                     onClick={() =>
                       onNavigateToPerson?.(
-                        { id: c.id, name: c.name, image_path: c.image_path, work_count: 0 },
+                        { id: c.id, name: c.name, image_path: c.image_path },
                         "actor",
                       )
                     }
@@ -2218,7 +2353,7 @@ function ShowDetailPage({
   onPlayEpisode?: (args: { libraryId: string; showId: number; showTitle: string; startEpisodeId: number }) => void;
   /** Plays a standalone file (used for extras — episodes go through onPlayEpisode). */
   onPlayFile?: (path: string, title: string) => void;
-  onNavigateToPerson?: (person: PersonSummary, role: PersonRole) => void;
+  onNavigateToPerson?: (person: PersonInfo, role: PersonRole) => void;
 }) {
   const [detail, setDetail] = useState<ShowDetail | null>(null);
   const [seasons, setSeasons] = useState<SeasonInfo[]>([]);
@@ -2227,6 +2362,8 @@ function ShowDetailPage({
   const [tmdbDialogOpen, setTmdbDialogOpen] = useState(false);
   const [tmdbImagesOpen, setTmdbImagesOpen] = useState(false);
   const [backgroundDialogOpen, setBackgroundDialogOpen] = useState(false);
+  const [ratings, setRatings] = useState<RatingInfo[]>([]);
+  const [omdbEnabled, setOmdbEnabled] = useState(false);
   const [extrasOpen, setExtrasOpen] = useState(false);
   const [extrasCount, setExtrasCount] = useState(0);
   const [seasonDetail, setSeasonDetail] = useState<SeasonDetailLocal | null>(null);
@@ -2261,6 +2398,17 @@ function ShowDetailPage({
     }
   }, [entry.id]);
 
+  const fetchRatings = useCallback(async () => {
+    try {
+      const fetched = await invoke<RatingInfo[]>("fetch_ratings", { entryId: entry.id });
+      setRatings(fetched);
+      if (fetched.length > 0) toast.success("Ratings updated");
+      else toast.info("No ratings found");
+    } catch (e) {
+      toast.error(String(e));
+    }
+  }, [entry.id]);
+
   const loadSeasonDetail = useCallback(async (seasonId: number) => {
     try {
       const d = await invoke<SeasonDetailLocal>("get_season_detail_local", {
@@ -2289,7 +2437,7 @@ function ShowDetailPage({
     // loadedId so nothing trickles in section by section.
     let cancelled = false;
     (async () => {
-      const [d, s, extras] = await Promise.all([
+      const [d, s, extras, cachedRatings, settings] = await Promise.all([
         invoke<ShowDetail | null>("get_show_detail", { showId: entry.id }).catch((e) => {
           console.error("Failed to load show detail:", e);
           return null;
@@ -2299,6 +2447,9 @@ function ShowDetailPage({
           return [] as SeasonInfo[];
         }),
         invoke<unknown[]>("get_extras", { entryId: entry.id }).catch(() => [] as unknown[]),
+        // Cached ratings only — fetching is always explicit (context menu / bulk match).
+        invoke<RatingInfo[]>("get_ratings", { entryId: entry.id }).catch(() => [] as RatingInfo[]),
+        invoke<Record<string, string>>("get_settings").catch(() => ({} as Record<string, string>)),
       ]);
       let sd: SeasonDetailLocal | null = null;
       let eps: EpisodeInfo[] = [];
@@ -2324,6 +2475,8 @@ function ShowDetailPage({
       setDetail(d);
       setSeasons(s);
       setExtrasCount(extras.length);
+      setRatings(cachedRatings);
+      setOmdbEnabled(settings["omdb_enabled"] === "true");
       setSelectedSeasonId(s[0]?.id ?? null);
       setSeasonDetail(sd);
       setEpisodes(eps);
@@ -2679,6 +2832,7 @@ function ShowDetailPage({
             {detail?.tagline && (
               <p className="mt-2 italic text-muted-foreground">{detail.tagline}</p>
             )}
+            <RatingsLine ratings={ratings} />
           </div>
           {extrasCount > 0 && (
             <Button size="sm" variant="outline" className="shrink-0" onClick={() => setExtrasOpen(true)}>
@@ -2720,7 +2874,7 @@ function ShowDetailPage({
                           key={c.id}
                           person={{ ...c, role: null }}
                           className="w-28"
-                          onClick={() => onNavigateToPerson?.({ ...c, work_count: 0 }, "director_creator")}
+                          onClick={() => onNavigateToPerson?.(c, "director_creator")}
                         />
                       ))}
                     </div>
@@ -2737,7 +2891,7 @@ function ShowDetailPage({
                           key={c.id}
                           person={{ ...c, role: null }}
                           className="w-28"
-                          onClick={() => onNavigateToPerson?.({ ...c, work_count: 0 }, "composer")}
+                          onClick={() => onNavigateToPerson?.(c, "composer")}
                         />
                       ))}
                     </div>
@@ -2780,6 +2934,12 @@ function ShowDetailPage({
             <ImageIcon size={14} />
             Change background
           </ContextMenuItem>
+          {omdbEnabled && (
+            <ContextMenuItem onClick={fetchRatings}>
+              <RefreshCw size={14} />
+              Get ratings
+            </ContextMenuItem>
+          )}
           {extrasCount > 0 && (
             <ContextMenuItem onClick={() => setExtrasOpen(true)}>
               <Clapperboard size={14} />
@@ -2969,7 +3129,7 @@ function ShowDetailPage({
                                             key={d.id}
                                             person={{ ...d, role: null }}
                                             className="w-24"
-                                            onClick={() => onNavigateToPerson?.({ ...d, work_count: 0 }, "director_creator")}
+                                            onClick={() => onNavigateToPerson?.(d, "director_creator")}
                                           />
                                         ))}
                                       </div>
@@ -2986,7 +3146,7 @@ function ShowDetailPage({
                                             key={c.id}
                                             person={{ ...c, role: null }}
                                             className="w-24"
-                                            onClick={() => onNavigateToPerson?.({ ...c, work_count: 0 }, "composer")}
+                                            onClick={() => onNavigateToPerson?.(c, "composer")}
                                           />
                                         ))}
                                       </div>
@@ -3005,7 +3165,7 @@ function ShowDetailPage({
                                         className="w-24"
                                         onClick={() =>
                                           onNavigateToPerson?.(
-                                            { id: c.id, name: c.name, image_path: c.image_path, work_count: 0 },
+                                            { id: c.id, name: c.name, image_path: c.image_path },
                                             "actor",
                                           )
                                         }
@@ -3080,7 +3240,7 @@ function ShowDetailPage({
                     person={c}
                     onClick={() =>
                       onNavigateToPerson?.(
-                        { id: c.id, name: c.name, image_path: c.image_path, work_count: 0 },
+                        { id: c.id, name: c.name, image_path: c.image_path },
                         "actor",
                       )
                     }
@@ -3174,6 +3334,44 @@ function PeopleListEdit<T extends CastUpdateInfo>({
   secondaryField: "role";
   secondaryLabel: string;
 }) {
+  // Name autocomplete: suggest existing people from the DB as you type, so
+  // additions reuse the canonical person row instead of typo-spawning a twin.
+  const [suggest, setSuggest] = useState<{ row: number; options: PersonInfo[] } | null>(null);
+  const suggestSeq = useRef(0);
+  const suggestTimer = useRef<number | undefined>(undefined);
+
+  const queryNames = (row: number, q: string) => {
+    window.clearTimeout(suggestTimer.current);
+    const trimmed = q.trim();
+    if (trimmed.length < 2) {
+      setSuggest(null);
+      return;
+    }
+    const seq = ++suggestSeq.current;
+    suggestTimer.current = window.setTimeout(async () => {
+      try {
+        const options = await invoke<PersonInfo[]>("search_persons", { query: trimmed });
+        if (suggestSeq.current === seq) setSuggest(options.length > 0 ? { row, options } : null);
+      } catch {
+        /* suggestions are best-effort */
+      }
+    }, 150);
+  };
+
+  // Hide names already in the list (including this row's exact current value)
+  // and collapse duplicate person rows that share a name.
+  const visibleOptions = (row: number): PersonInfo[] => {
+    if (!suggest || suggest.row !== row) return [];
+    const taken = new Set(items.map((it) => it.name.trim().toLowerCase()).filter(Boolean));
+    const seen = new Set<string>();
+    return suggest.options.filter((p) => {
+      const key = p.name.toLowerCase();
+      if (taken.has(key) || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  };
+
   const update = (i: number, patch: Partial<T>) => {
     const next = items.slice();
     next[i] = { ...next[i], ...patch };
@@ -3185,14 +3383,42 @@ function PeopleListEdit<T extends CastUpdateInfo>({
     <div className="flex flex-col gap-1">
       <label className="text-xs font-medium text-muted-foreground">{label}</label>
       <div className="flex flex-col gap-1">
-        {items.map((item, i) => (
+        {items.map((item, i) => {
+          const options = visibleOptions(i);
+          return (
           <div key={i} className="flex gap-1">
-            <input
-              value={item.name}
-              onChange={(e) => update(i, { name: e.target.value } as Partial<T>)}
-              placeholder="Name"
-              className="flex-1 rounded border border-input bg-transparent px-2 py-1 text-sm outline-none"
-            />
+            <div className="relative flex-1">
+              <input
+                value={item.name}
+                onChange={(e) => {
+                  update(i, { name: e.target.value } as Partial<T>);
+                  queryNames(i, e.target.value);
+                }}
+                // Delayed so a click on a suggestion (onMouseDown) wins the race.
+                onBlur={() => setTimeout(() => setSuggest((s) => (s?.row === i ? null : s)), 100)}
+                placeholder="Name"
+                className="w-full rounded border border-input bg-transparent px-2 py-1 text-sm outline-none"
+              />
+              {options.length > 0 && (
+                <div className="absolute left-0 right-0 top-full z-20 mt-1 max-h-56 overflow-y-auto rounded-md border border-border bg-popover p-1 shadow-md">
+                  {options.map((p) => (
+                    <button
+                      key={p.id}
+                      type="button"
+                      onMouseDown={(e) => {
+                        e.preventDefault();
+                        update(i, { name: p.name } as Partial<T>);
+                        setSuggest(null);
+                      }}
+                      className="flex w-full items-center gap-2 rounded px-2 py-1 text-left text-sm hover:bg-accent"
+                    >
+                      <PersonFace imagePath={p.image_path} className="h-6 w-6" iconSize={12} />
+                      <span className="truncate">{p.name}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
             <input
               value={(item as unknown as Record<string, string | null>)[secondaryField] ?? ""}
               onChange={(e) => update(i, { [secondaryField]: e.target.value || null } as unknown as Partial<T>)}
@@ -3203,7 +3429,8 @@ function PeopleListEdit<T extends CastUpdateInfo>({
               <Trash2 size={14} />
             </Button>
           </div>
-        ))}
+          );
+        })}
         <Button size="sm" variant="outline" onClick={add} className="w-fit">
           + Add
         </Button>

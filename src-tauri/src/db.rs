@@ -694,6 +694,32 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
         .execute(&pool)
         .await?;
 
+    // ── Rotten Tomatoes slug cache for shows ──────────────────────────
+    // Movies cache their RT slug in movie.rotten_tomatoes_id; the show table
+    // predates ratings and has no such column, so shows use this side table
+    // (no ALTER migrations).
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS rt_slug (
+            entry_id INTEGER PRIMARY KEY,
+            slug TEXT NOT NULL,
+            FOREIGN KEY (entry_id) REFERENCES media_entry(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // ── Favorite people ───────────────────────────────────────────────
+    // Pinned to the top of alphabetical people views. Separate table (not a
+    // column on person) so it needs no ALTER migrations.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS favorite_person (
+            person_id INTEGER PRIMARY KEY,
+            FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     // ── Selected backdrop per entry ───────────────────────────────────
     // Separate table (not a column on movie/show) so it needs no ALTER
     // migrations and covers any entry type that grows a backdrop later.

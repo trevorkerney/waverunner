@@ -93,6 +93,8 @@ export interface PersonSummary {
   name: string;
   image_path: string | null;
   work_count: number;
+  /** Pinned to the top of alphabetical people views. */
+  favorite: boolean;
 }
 
 export interface PlaylistSummary {
@@ -117,6 +119,15 @@ export interface PersonInfo {
   id: number;
   name: string;
   image_path: string | null;
+}
+
+// Returned by search_people_by_character (people-page search by character name).
+export interface CharacterMatch {
+  person: PersonSummary;
+  matched_role: string;
+  matched_title: string;
+  /** Other distinct matching character strings for this person. */
+  extra_matches: number;
 }
 
 export interface CastInfo extends PersonInfo {
@@ -449,6 +460,8 @@ export interface TmdbBulkTargets {
   webisodes: BulkWebisodeTarget[];
   /** Every movie in the library — the ratings pass targets all of them. */
   all_movies: BulkMovieTarget[];
+  /** Every show in the library — the ratings pass covers these too. */
+  all_shows: BulkMovieTarget[];
 }
 
 export interface RatingInfo {

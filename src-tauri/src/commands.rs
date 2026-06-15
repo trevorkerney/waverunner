@@ -84,6 +84,7 @@ pub struct PersonSummary {
     pub name: String,
     pub image_path: Option<String>,
     pub work_count: i64,
+    pub favorite: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -2409,27 +2410,260 @@ pub async fn get_people_in_library(
 
     let query = format!(
         "{cte} \
-         SELECT p.id, p.name, p.image_path, COUNT(*) AS work_count \
+         SELECT p.id, p.name, p.image_path, COUNT(*) AS work_count, \
+                EXISTS(SELECT 1 FROM favorite_person fp WHERE fp.person_id = p.id) AS favorite \
          FROM person p \
          JOIN role_works rw ON rw.person_id = p.id \
          GROUP BY p.id \
          ORDER BY p.name COLLATE NOCASE ASC"
     );
 
-    let rows: Vec<(i64, String, Option<String>, i64)> = sqlx::query_as(&query)
+    let rows: Vec<(i64, String, Option<String>, i64, i64)> = sqlx::query_as(&query)
         .fetch_all(&state.app_db)
         .await
         .map_err(|e| e.to_string())?;
 
     Ok(rows
         .into_iter()
-        .map(|(id, name, image_path, work_count)| PersonSummary {
+        .map(|(id, name, image_path, work_count, favorite)| PersonSummary {
             id,
             name,
             image_path,
             work_count,
+            favorite: favorite != 0,
         })
         .collect())
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CharacterMatch {
+    pub person: PersonSummary,
+    pub matched_role: String,
+    pub matched_title: String,
+    /// Other distinct matching character strings for this person.
+    pub extra_matches: i64,
+}
+
+/// People-page search by CHARACTER name ("Walter White" -> Bryan Cranston).
+/// Searches every cast table (episode guest credits included — that's where
+/// most obscure characters live), scoped to the library and the page's role
+/// list. Show/movie billing outranks season, then episode credits.
+#[tauri::command]
+pub async fn search_people_by_character(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    role: String,
+    query: String,
+) -> Result<Vec<CharacterMatch>, String> {
+    let q = query.trim();
+    if q.len() < 2 {
+        return Ok(Vec::new());
+    }
+    // Escape LIKE wildcards so a literal % or _ can't distort matching.
+    let escaped = q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+    let pattern = format!("%{escaped}%");
+
+    let rows: Vec<(i64, String, String, i64)> = sqlx::query_as(
+        "SELECT mc.person_id, mc.role, m.title, 0 AS lvl \
+           FROM movie_cast mc \
+           JOIN movie m ON m.id = mc.movie_id \
+           JOIN media_entry me ON me.id = mc.movie_id \
+          WHERE me.library_id = ?1 AND mc.role LIKE ?2 ESCAPE '\\' \
+         UNION ALL \
+         SELECT sc.person_id, sc.role, sh.title, 0 \
+           FROM show_cast sc \
+           JOIN show sh ON sh.id = sc.show_id \
+           JOIN media_entry me ON me.id = sc.show_id \
+          WHERE me.library_id = ?1 AND sc.role LIKE ?2 ESCAPE '\\' \
+         UNION ALL \
+         SELECT sec.person_id, sec.role, sh.title, 1 \
+           FROM season_cast sec \
+           JOIN season s ON sec.season_id = s.id \
+           JOIN show sh ON sh.id = s.show_id \
+           JOIN media_entry me ON me.id = sh.id \
+          WHERE me.library_id = ?1 AND sec.role LIKE ?2 ESCAPE '\\' \
+         UNION ALL \
+         SELECT ec.person_id, ec.role, sh.title, 2 \
+           FROM episode_cast ec \
+           JOIN episode e ON ec.episode_id = e.id \
+           JOIN season s ON e.season_id = s.id \
+           JOIN show sh ON sh.id = s.show_id \
+           JOIN media_entry me ON me.id = sh.id \
+          WHERE me.library_id = ?1 AND ec.role LIKE ?2 ESCAPE '\\'",
+    )
+    .bind(&library_id)
+    .bind(&pattern)
+    .fetch_all(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Best match per person: prefix beats substring (checked per slash-segment
+    // — combined credits read "Jessica / Cynthia"), then higher billing level.
+    let q_lower = q.to_lowercase();
+    let is_prefix =
+        |role: &str| role.split('/').any(|seg| seg.trim().to_lowercase().starts_with(&q_lower));
+
+    struct Best {
+        role: String,
+        title: String,
+        lvl: i64,
+        prefix: bool,
+        distinct: std::collections::HashSet<String>,
+    }
+    let mut by_person: std::collections::HashMap<i64, Best> = std::collections::HashMap::new();
+    for (pid, role, title, lvl) in rows {
+        let prefix = is_prefix(&role);
+        match by_person.entry(pid) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                let mut distinct = std::collections::HashSet::new();
+                distinct.insert(role.clone());
+                v.insert(Best { role, title, lvl, prefix, distinct });
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                let e = o.get_mut();
+                e.distinct.insert(role.clone());
+                if (prefix && !e.prefix) || (prefix == e.prefix && lvl < e.lvl) {
+                    e.role = role;
+                    e.title = title;
+                    e.lvl = lvl;
+                    e.prefix = prefix;
+                }
+            }
+        }
+    }
+
+    let mut ranked: Vec<(i64, Best)> = by_person.into_iter().collect();
+    ranked.sort_by(|a, b| {
+        (!a.1.prefix, a.1.lvl, std::cmp::Reverse(a.1.distinct.len()))
+            .cmp(&(!b.1.prefix, b.1.lvl, std::cmp::Reverse(b.1.distinct.len())))
+    });
+    ranked.truncate(60);
+
+    // Person summaries, restricted to the page's role list.
+    let cte = role_works_cte(&role)?;
+    let placeholders = ranked.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let pquery = format!(
+        "{cte} \
+         SELECT p.id, p.name, p.image_path, COUNT(*) AS work_count, \
+                EXISTS(SELECT 1 FROM favorite_person fp WHERE fp.person_id = p.id) AS favorite \
+         FROM person p \
+         JOIN role_works rw ON rw.person_id = p.id \
+         WHERE p.id IN ({placeholders}) \
+         GROUP BY p.id"
+    );
+    let mut pq = sqlx::query_as::<_, (i64, String, Option<String>, i64, i64)>(&pquery);
+    for (pid, _) in &ranked {
+        pq = pq.bind(pid);
+    }
+    let prows = pq.fetch_all(&state.app_db).await.map_err(|e| e.to_string())?;
+    let mut people: std::collections::HashMap<i64, PersonSummary> = prows
+        .into_iter()
+        .map(|(id, name, image_path, work_count, favorite)| {
+            (id, PersonSummary { id, name, image_path, work_count, favorite: favorite != 0 })
+        })
+        .collect();
+
+    Ok(ranked
+        .into_iter()
+        .filter_map(|(pid, best)| {
+            let person = people.remove(&pid)?; // absent = not in this page's role list
+            Some(CharacterMatch {
+                person,
+                matched_role: best.role,
+                matched_title: best.title,
+                extra_matches: (best.distinct.len() as i64 - 1).max(0),
+            })
+        })
+        .collect())
+}
+
+/// Name autocomplete for the cast editors — existing people whose name matches,
+/// prefix matches first. Small limit; this fires on every few keystrokes.
+#[tauri::command]
+pub async fn search_persons(
+    state: tauri::State<'_, AppState>,
+    query: String,
+) -> Result<Vec<PersonInfo>, String> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Ok(Vec::new());
+    }
+    let escaped = q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+    let substr = format!("%{escaped}%");
+    let prefix = format!("{escaped}%");
+    let rows: Vec<(i64, String, Option<String>)> = sqlx::query_as(
+        "SELECT id, name, image_path FROM person \
+         WHERE name LIKE ?1 ESCAPE '\\' \
+         ORDER BY CASE WHEN name LIKE ?2 ESCAPE '\\' THEN 0 ELSE 1 END, name COLLATE NOCASE \
+         LIMIT 8",
+    )
+    .bind(&substr)
+    .bind(&prefix)
+    .fetch_all(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, name, image_path)| PersonInfo { id, name, image_path })
+        .collect())
+}
+
+#[tauri::command]
+pub async fn set_person_favorite(
+    state: tauri::State<'_, AppState>,
+    person_id: i64,
+    favorite: bool,
+) -> Result<(), String> {
+    if favorite {
+        sqlx::query("INSERT OR IGNORE INTO favorite_person (person_id) VALUES (?)")
+            .bind(person_id)
+            .execute(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+    } else {
+        sqlx::query("DELETE FROM favorite_person WHERE person_id = ?")
+            .bind(person_id)
+            .execute(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// "as X" / "as X & Y" / "as X, Y, & Z" (Oxford comma). Beyond 3 roles, the
+/// first two are listed and the rest summarized: "voices X, Y, & 14 more
+/// characters". The overflow count is total - 2, so it's always ≥ 2 — a lone
+/// "& 1 more character" can't occur (3 roles fit the full list).
+fn format_role_list(prefix: &str, roles: &[String]) -> Option<String> {
+    if roles.is_empty() {
+        return None;
+    }
+    let joined = match roles.len() {
+        1 => roles[0].clone(),
+        2 => format!("{} & {}", roles[0], roles[1]),
+        3 => format!("{}, {}, & {}", roles[0], roles[1], roles[2]),
+        n => format!("{}, {}, & {} more characters", roles[0], roles[1], n - 2),
+    };
+    Some(format!("{prefix} {joined}"))
+}
+
+/// Strips "(voice)" markers and tidies the whitespace left behind.
+fn strip_voice_marker(role: &str) -> String {
+    let stripped = role.replace("(voice)", "").replace("(Voice)", "");
+    let mut out = String::with_capacity(stripped.len());
+    let mut prev_space = false;
+    for ch in stripped.chars() {
+        let is_space = ch == ' ';
+        if !(is_space && prev_space) {
+            out.push(ch);
+        }
+        prev_space = is_space;
+    }
+    out.trim().trim_end_matches('/').trim().to_string()
 }
 
 #[tauri::command]
@@ -2513,19 +2747,177 @@ pub async fn get_entries_for_person(
         }
     }
 
+    // Director / creator credits, summarized at the highest level that applies:
+    // whole movie/show -> "director"/"creator"; every episode of N seasons ->
+    // "director of N seasons"; scattered episodes -> "director of N episodes".
+    // (There is no season-level director storage — season directors were fanned
+    // out to episodes at apply time, so full-season coverage is derived.)
+    let movie_dirs: std::collections::HashSet<i64> =
+        sqlx::query_as::<_, (i64,)>("SELECT movie_id FROM movie_director WHERE person_id = ?")
+            .bind(person_id)
+            .fetch_all(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|(id,)| id)
+            .collect();
+    let creators: std::collections::HashSet<i64> =
+        sqlx::query_as::<_, (i64,)>("SELECT show_id FROM show_creator WHERE person_id = ?")
+            .bind(person_id)
+            .fetch_all(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|(id,)| id)
+            .collect();
+    // Per season the person directed in: (show, episodes in season, episodes they directed).
+    let season_cov: Vec<(i64, i64, i64)> = sqlx::query_as(
+        "SELECT s.show_id, \
+                (SELECT COUNT(*) FROM episode e2 WHERE e2.season_id = s.id) AS total, \
+                COUNT(*) AS directed \
+         FROM season s \
+         JOIN episode e ON e.season_id = s.id \
+         JOIN episode_director ed ON ed.episode_id = e.id \
+         WHERE ed.person_id = ? \
+         GROUP BY s.id",
+    )
+    .bind(person_id)
+    .fetch_all(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    let season_totals: std::collections::HashMap<i64, i64> =
+        sqlx::query_as::<_, (i64, i64)>("SELECT show_id, COUNT(*) FROM season GROUP BY show_id")
+            .fetch_all(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .collect();
+    // show -> (fully-directed seasons, directed episodes in partial seasons)
+    let mut show_dir: std::collections::HashMap<i64, (i64, i64)> = std::collections::HashMap::new();
+    for (show_id, total, directed) in season_cov {
+        let e = show_dir.entry(show_id).or_default();
+        if total > 0 && directed >= total {
+            e.0 += 1;
+        } else {
+            e.1 += directed;
+        }
+    }
+
+    let director_credit = |id: i64| -> Option<String> {
+        if movie_dirs.contains(&id) {
+            return Some("director".to_string());
+        }
+        // Creator is a show-level credit — it overrides any lower directing credit.
+        if creators.contains(&id) {
+            return Some("creator".to_string());
+        }
+        let &(full, partial_eps) = show_dir.get(&id)?;
+        let total_seasons = season_totals.get(&id).copied().unwrap_or(0);
+        if full > 0 && full == total_seasons {
+            Some("director".to_string())
+        } else if full > 0 {
+            // Higher level wins: full seasons suppress stray episode credits.
+            Some(format!("director of {} season{}", full, if full == 1 { "" } else { "s" }))
+        } else if partial_eps > 0 {
+            Some(format!("director of {} episode{}", partial_eps, if partial_eps == 1 { "" } else { "s" }))
+        } else {
+            None
+        }
+    };
+
+    // Composer credits — same shape as directing: whole movie/show ->
+    // "composer"; full-season episode coverage -> "composer of N seasons";
+    // scattered episodes -> "composer of N episodes".
+    let movie_comps: std::collections::HashSet<i64> =
+        sqlx::query_as::<_, (i64,)>("SELECT movie_id FROM movie_composer WHERE person_id = ?")
+            .bind(person_id)
+            .fetch_all(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|(id,)| id)
+            .collect();
+    let show_comps: std::collections::HashSet<i64> =
+        sqlx::query_as::<_, (i64,)>("SELECT show_id FROM show_composer WHERE person_id = ?")
+            .bind(person_id)
+            .fetch_all(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|(id,)| id)
+            .collect();
+    let comp_season_cov: Vec<(i64, i64, i64)> = sqlx::query_as(
+        "SELECT s.show_id, \
+                (SELECT COUNT(*) FROM episode e2 WHERE e2.season_id = s.id) AS total, \
+                COUNT(*) AS composed \
+         FROM season s \
+         JOIN episode e ON e.season_id = s.id \
+         JOIN episode_composer ec ON ec.episode_id = e.id \
+         WHERE ec.person_id = ? \
+         GROUP BY s.id",
+    )
+    .bind(person_id)
+    .fetch_all(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    let mut show_comp: std::collections::HashMap<i64, (i64, i64)> = std::collections::HashMap::new();
+    for (show_id, total, composed) in comp_season_cov {
+        let e = show_comp.entry(show_id).or_default();
+        if total > 0 && composed >= total {
+            e.0 += 1;
+        } else {
+            e.1 += composed;
+        }
+    }
+
+    let composer_credit = |id: i64| -> Option<String> {
+        if movie_comps.contains(&id) || show_comps.contains(&id) {
+            return Some("composer".to_string());
+        }
+        let &(full, partial_eps) = show_comp.get(&id)?;
+        let total_seasons = season_totals.get(&id).copied().unwrap_or(0);
+        if full > 0 && full == total_seasons {
+            Some("composer".to_string())
+        } else if full > 0 {
+            Some(format!("composer of {} season{}", full, if full == 1 { "" } else { "s" }))
+        } else if partial_eps > 0 {
+            Some(format!("composer of {} episode{}", partial_eps, if partial_eps == 1 { "" } else { "s" }))
+        } else {
+            None
+        }
+    };
+
     let entries: Vec<MediaEntry> = rows
         .into_iter()
         .map(|(id, title, year, end_year, folder_path, parent_id, entry_type, selected_cover, tmdb_id)| {
             let covers = covers_map.remove(&folder_path).unwrap_or_default();
-            let role_display = roles_by_entry.get(&id).map(|roles| {
-                // "as X" / "as X & Y" / "as X, Y & Z"
-                let joined = match roles.len() {
-                    1 => roles[0].clone(),
-                    2 => format!("{} & {}", roles[0], roles[1]),
-                    _ => format!("{} & {}", roles[..roles.len() - 1].join(", "), roles[roles.len() - 1]),
-                };
-                format!("as {joined}")
-            });
+            // Voiced characters are their own group ("voices …") separate from
+            // played ones ("as …"); director/creator credit comes last:
+            // "as Walter White · voices 3 characters · director of 2 episodes".
+            let mut acting: Vec<String> = Vec::new();
+            let mut voiced: Vec<String> = Vec::new();
+            if let Some(roles) = roles_by_entry.get(&id) {
+                for r in roles {
+                    if r.contains("(voice)") || r.contains("(Voice)") {
+                        let cleaned = strip_voice_marker(r);
+                        if !cleaned.is_empty() && !voiced.contains(&cleaned) {
+                            voiced.push(cleaned);
+                        }
+                    } else if !acting.contains(r) {
+                        acting.push(r.clone());
+                    }
+                }
+            }
+            let parts: Vec<String> = [
+                format_role_list("as", &acting),
+                format_role_list("voices", &voiced),
+                director_credit(id),
+                composer_credit(id),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            let role_display = if parts.is_empty() { None } else { Some(parts.join(" · ")) };
             MediaEntry {
                 id,
                 title,
@@ -3747,13 +4139,42 @@ pub struct RatingInfo {
     pub value: String,
 }
 
-async fn fetch_omdb(client: &reqwest::Client, key: &str, imdb_id: &str) -> Option<Vec<(String, String)>> {
+enum OmdbOutcome {
+    Found(Vec<(String, String)>),
+    /// OMDB has no entry for this id — a normal result, not an error.
+    NotFound,
+}
+
+/// Classified OMDB fetch: fatal conditions (rejected key, quota, network) are
+/// Err with a user-facing message so callers can stop and report instead of
+/// mistaking them for "this title has no ratings".
+async fn fetch_omdb(
+    client: &reqwest::Client,
+    key: &str,
+    imdb_id: &str,
+) -> Result<OmdbOutcome, String> {
     let url = format!("https://www.omdbapi.com/?i={imdb_id}&apikey={key}");
-    let resp = client.get(&url).send().await.ok()?;
-    if !resp.status().is_success() {
-        return None;
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|_| "Couldn't reach OMDB — check your connection.".to_string())?;
+    // OMDB sends a JSON Error body even on 401s — classify by it, not status.
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|_| "OMDB returned an unreadable response.".to_string())?;
+    if let Some(err) = body.get("Error").and_then(|v| v.as_str()) {
+        let lower = err.to_lowercase();
+        if lower.contains("limit") {
+            return Err("OMDB daily request limit reached — try again tomorrow.".into());
+        }
+        if lower.contains("api key") {
+            return Err("OMDB rejected the API key — check Settings.".into());
+        }
+        // "Incorrect IMDb ID." / "Movie not found!" and friends.
+        return Ok(OmdbOutcome::NotFound);
     }
-    let body: serde_json::Value = resp.json().await.ok()?;
     let mut out = Vec::new();
     if let Some(r) = body.get("imdbRating").and_then(|v| v.as_str()) {
         if r != "N/A" && !r.is_empty() {
@@ -3776,7 +4197,7 @@ async fn fetch_omdb(client: &reqwest::Client, key: &str, imdb_id: &str) -> Optio
             }
         }
     }
-    Some(out)
+    Ok(OmdbOutcome::Found(out))
 }
 
 /// Cached ratings only — never fetches. Fetching is always explicit, via
@@ -3838,29 +4259,69 @@ pub async fn fetch_ratings(
     .fetch_optional(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
-    let Some((title, year, imdb_id, rt_id)) = movie else {
-        return Err("Ratings are only supported for movies right now.".into());
+    // Shows: imdb_id lives on the show row; the start year is derived from the
+    // earliest episode air date; the RT slug caches in the rt_slug side table.
+    let (title, year, imdb_id, rt_id, is_show) = if let Some((t, y, i, r)) = movie {
+        (t, y, i, r, false)
+    } else {
+        let show: Option<(String, Option<String>)> =
+            sqlx::query_as("SELECT title, imdb_id FROM show WHERE id = ?")
+                .bind(entry_id)
+                .fetch_optional(&state.app_db)
+                .await
+                .map_err(|e| e.to_string())?;
+        let Some((t, i)) = show else {
+            return Err("Ratings are only supported for movies and TV shows.".into());
+        };
+        let y: Option<String> = sqlx::query_scalar(
+            "SELECT MIN(SUBSTR(e.release_date, 1, 4)) FROM episode e \
+             JOIN season s ON e.season_id = s.id \
+             WHERE s.show_id = ? AND e.release_date IS NOT NULL",
+        )
+        .bind(entry_id)
+        .fetch_optional(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?
+        .flatten();
+        let slug: Option<String> = sqlx::query_scalar("SELECT slug FROM rt_slug WHERE entry_id = ?")
+            .bind(entry_id)
+            .fetch_optional(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+        (t, y, i, slug, true)
     };
 
     let client = reqwest::Client::new();
     let mut found: Vec<RatingInfo> = Vec::new();
 
-    // OMDB: IMDb + Metacritic + RT critic score.
-    if let Some(imdb) = imdb_id.filter(|i| !i.trim().is_empty()) {
-        if let Some(omdb) = fetch_omdb(&client, key.trim(), imdb.trim()).await {
-            for (source, value) in omdb {
-                if !found.iter().any(|r| r.source == source) {
-                    found.push(RatingInfo { source, value });
+    // OMDB: IMDb + Metacritic + RT critic score. Fatal problems (bad key,
+    // quota, network) return Err BEFORE the cache is touched, so a failed
+    // re-fetch never destroys previously stored ratings.
+    let has_imdb = imdb_id.as_deref().is_some_and(|i| !i.trim().is_empty());
+    let mut omdb_confirmed = false;
+    if let Some(imdb) = imdb_id.as_deref().filter(|i| !i.trim().is_empty()) {
+        match fetch_omdb(&client, key.trim(), imdb.trim()).await? {
+            OmdbOutcome::Found(list) => {
+                omdb_confirmed = true;
+                for (source, value) in list {
+                    if !found.iter().any(|r| r.source == source) {
+                        found.push(RatingInfo { source, value });
+                    }
                 }
             }
+            // Confirmed absent — that's an answer, and it's cacheable.
+            OmdbOutcome::NotFound => omdb_confirmed = true,
         }
     }
 
     // Rotten Tomatoes audience score (scraper) — opt-in on top of OMDB.
     if rt_enabled {
-        if let Some(scores) =
+        let scores = if is_show {
+            crate::rt::fetch_tv_scores(&client, &title, year.as_deref(), rt_id.as_deref()).await
+        } else {
             crate::rt::fetch_movie_scores(&client, &title, year.as_deref(), rt_id.as_deref()).await
-        {
+        };
+        if let Some(scores) = scores {
             if let Some(a) = scores.audience {
                 found.push(RatingInfo {
                     source: "rotten_tomatoes_audience".into(),
@@ -3868,22 +4329,50 @@ pub async fn fetch_ratings(
                 });
             }
             // Self-heal: remember the slug so future fetches skip discovery. The
-            // user can overwrite it in Edit mode if the scraper matched wrong.
-            let _ = sqlx::query(
-                "UPDATE movie SET rotten_tomatoes_id = ? WHERE id = ? AND (rotten_tomatoes_id IS NULL OR rotten_tomatoes_id = '')",
-            )
-            .bind(&scores.slug)
-            .bind(entry_id)
-            .execute(&state.app_db)
-            .await;
+            // user can overwrite a movie's in Edit mode if the scraper matched wrong.
+            if is_show {
+                let _ = sqlx::query("INSERT OR IGNORE INTO rt_slug (entry_id, slug) VALUES (?, ?)")
+                    .bind(entry_id)
+                    .bind(&scores.slug)
+                    .execute(&state.app_db)
+                    .await;
+            } else {
+                let _ = sqlx::query(
+                    "UPDATE movie SET rotten_tomatoes_id = ? WHERE id = ? AND (rotten_tomatoes_id IS NULL OR rotten_tomatoes_id = '')",
+                )
+                .bind(&scores.slug)
+                .bind(entry_id)
+                .execute(&state.app_db)
+                .await;
+            }
         }
     }
 
+    // No IMDb id means OMDB never ran — unless the RT scrape still found
+    // something, the actionable answer is "match the title first", not
+    // "no ratings exist". (Erroring also leaves any cached ratings intact.)
+    if !omdb_confirmed && found.is_empty() {
+        if !has_imdb {
+            return Err("No IMDb ID — match to TMDB first.".into());
+        }
+        return Err("Ratings lookup failed.".into());
+    }
+
+    // Replace the cache — only reachable after a confirmed OMDB answer (or an
+    // RT-only success). An empty confirmed result stores the 'none' sentinel:
+    // "fetch attempted, nothing found", distinguishable from never-fetched.
     sqlx::query("DELETE FROM rating WHERE entry_id = ?")
         .bind(entry_id)
         .execute(&state.app_db)
         .await
         .map_err(|e| e.to_string())?;
+    if found.is_empty() {
+        sqlx::query("INSERT OR REPLACE INTO rating (entry_id, source, value) VALUES (?, 'none', '')")
+            .bind(entry_id)
+            .execute(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     for r in &found {
         sqlx::query("INSERT OR REPLACE INTO rating (entry_id, source, value) VALUES (?, ?, ?)")
             .bind(entry_id)
@@ -5482,6 +5971,7 @@ async fn sync_cached_images_for_entry(
 ) -> Result<(), String> {
     let source_dir = source_base.join(entry_rel_path).join(image_type_dir);
     let cache_dir = cache_base.join(entry_rel_path).join(image_type_dir);
+    let thumb_dir = cache_base.join(entry_rel_path).join(format!("{}_thumb", image_type_dir));
 
     // Get current files on disk
     let mut disk_files: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -5513,6 +6003,7 @@ async fn sync_cached_images_for_entry(
     for (filename, cached_path) in &db_rows {
         if !disk_files.contains(filename) {
             let _ = std::fs::remove_file(cached_path);
+            let _ = std::fs::remove_file(thumb_dir.join(filename));
             sqlx::query(
                 "DELETE FROM cached_images WHERE library_id = ? AND entry_folder_path = ? AND image_type = ? AND source_filename = ? AND origin = ?",
             )
@@ -5529,11 +6020,20 @@ async fn sync_cached_images_for_entry(
 
     // Copy new files
     let _ = std::fs::create_dir_all(&cache_dir);
+    let _ = std::fs::create_dir_all(&thumb_dir);
     for filename in &disk_files {
         if !db_files.contains(filename) {
             let source = source_dir.join(filename);
             let cached = cache_dir.join(filename);
             if std::fs::copy(&source, &cached).is_ok() {
+                // Thumbnail too — the grid loads covers_thumb/<file> directly,
+                // so a cover without one renders broken until something
+                // re-caches it (this was the scan path's job only, leaving
+                // app-added covers thumb-less).
+                if let Ok(img) = image::open(&cached) {
+                    let thumb = img.thumbnail(600, 900);
+                    let _ = thumb.save(thumb_dir.join(filename));
+                }
                 sqlx::query(
                     "INSERT OR REPLACE INTO cached_images (library_id, entry_folder_path, image_type, source_filename, cached_path, origin) VALUES (?, ?, ?, ?, ?, ?)",
                 )
@@ -6688,6 +7188,9 @@ pub struct TmdbBulkTargets {
     pub webisodes: Vec<BulkWebisodeTarget>,
     /// Every movie in the library — the ratings pass targets all of them.
     pub all_movies: Vec<BulkMovieTarget>,
+    /// Every show in the library — the ratings pass covers these too (year is
+    /// the earliest episode air year, used for RT slug discovery).
+    pub all_shows: Vec<BulkMovieTarget>,
 }
 
 /// Everything the bulk-match dialog needs to show counts and drive the run:
@@ -6754,6 +7257,20 @@ pub async fn get_tmdb_bulk_targets(
     .await
     .map_err(|e| e.to_string())?;
 
+    let all_shows: Vec<(i64, String, Option<String>)> = sqlx::query_as(
+        "SELECT sh.id, sh.title, \
+                (SELECT MIN(SUBSTR(e.release_date, 1, 4)) FROM episode e \
+                 JOIN season s ON e.season_id = s.id \
+                 WHERE s.show_id = sh.id AND e.release_date IS NOT NULL) \
+         FROM show sh JOIN media_entry me ON me.id = sh.id \
+         WHERE me.library_id = ? \
+         ORDER BY sh.sort_title COLLATE NOCASE",
+    )
+    .bind(&library_id)
+    .fetch_all(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+
     Ok(TmdbBulkTargets {
         movies: movies
             .into_iter()
@@ -6785,6 +7302,14 @@ pub async fn get_tmdb_bulk_targets(
             .map(|(show_id, extra_count)| BulkWebisodeTarget { show_id, extra_count })
             .collect(),
         all_movies: all_movies
+            .into_iter()
+            .map(|(id, title, year)| BulkMovieTarget {
+                id,
+                title,
+                year: year.filter(|y| !y.is_empty()),
+            })
+            .collect(),
+        all_shows: all_shows
             .into_iter()
             .map(|(id, title, year)| BulkMovieTarget {
                 id,
