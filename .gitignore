@@ -37,3 +37,7 @@ src-tauri/lib/*.dll
 src-tauri/lib/*.so
 src-tauri/lib/*.so.*
 src-tauri/lib/*.dylib
+
+# External reference repos: ignore the cloned repos themselves, but keep the
+# manifest + sync script so they can be re-cloned (run external-refs/sync.sh).
+/external-refs/*/
