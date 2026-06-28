@@ -80,8 +80,10 @@ function App() {
   const peopleModeRef = useRef<Map<string, "top" | "all">>(new Map());
   // Cache: viewCacheKey(view) -> playlists
   const playlistsCacheRef = useRef<Map<string, PlaylistSummary[]>>(new Map());
-  // Scroll position cache: "libraryId:parentId" -> scrollTop
-  const scrollCacheRef = useRef<Map<string, number>>(new Map());
+  // Scroll position cache: scroll-key -> { pixel fallback, plus an element anchor
+  // (the card at the viewport top + its offset) so restore survives content-
+  // visibility height-estimation drift that a raw scrollTop can't.
+  const scrollCacheRef = useRef<Map<string, { scrollTop: number; anchorId: string | null; anchorDelta: number }>>(new Map());
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   // Cache: cover file path -> blob URL of its thumbnail
   const thumbCacheRef = useRef<Map<string, string>>(new Map());
@@ -262,10 +264,26 @@ function App() {
   }, []);
 
   const saveScrollPosition = useCallback(() => {
-    if (!selectedLibrary || !scrollContainerRef.current) return;
+    const container = scrollContainerRef.current;
+    if (!selectedLibrary || !container) return;
     const parentId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
     const key = `${selectedLibrary.id}:${scrollKindFor(activeView)}:${parentId}`;
-    scrollCacheRef.current.set(key, scrollContainerRef.current.scrollTop);
+    // Anchor to the card currently at the top of the viewport so restore can
+    // re-find it by id. A raw scrollTop drifts on the way back because off-screen
+    // cards above are height-estimated (content-visibility) and never render to
+    // correct themselves, so the saved pixel no longer points at the same card.
+    const cTop = container.getBoundingClientRect().top;
+    let anchorId: string | null = null;
+    let anchorDelta = 0;
+    for (const el of container.querySelectorAll<HTMLElement>("[data-flip-id]")) {
+      const r = el.getBoundingClientRect();
+      if (r.bottom > cTop + 1) {
+        anchorId = el.dataset.flipId ?? null;
+        anchorDelta = r.top - cTop;
+        break;
+      }
+    }
+    scrollCacheRef.current.set(key, { scrollTop: container.scrollTop, anchorId, anchorDelta });
   }, [selectedLibrary, breadcrumbs, activeView, scrollKindFor]);
 
   // restoreScrollPosition: apply the saved scroll for a (library, view-kind, parent) triple,
@@ -273,17 +291,34 @@ function App() {
   // don't leak scroll between views (library-root at parentId=null is distinct from movies-only at parentId=null).
   const restoreScrollPosition = useCallback((libraryId: string, kind: string, parentId: number | null) => {
     const key = `${libraryId}:${kind}:${parentId}`;
-    const saved = scrollCacheRef.current.get(key) ?? 0;
-    if (scrollContainerRef.current) {
-      // Double rAF: first waits for React commit, second waits for layout/paint
-      requestAnimationFrame(() => {
-        requestAnimationFrame(() => {
-          if (scrollContainerRef.current) {
-            scrollContainerRef.current.scrollTop = saved;
-          }
-        });
-      });
-    }
+    const saved = scrollCacheRef.current.get(key);
+    if (!scrollContainerRef.current) return;
+    // Re-align the anchored card to where it sat when we left. As content-
+    // visibility cards above it finish laying out they can nudge it, so settle
+    // over a few frames until the adjustment stops (or we give up). Falls back to
+    // the raw scrollTop when there's no anchor (e.g. non-grid views).
+    const applyAnchor = (): { aligned: boolean; delta: number } => {
+      const c = scrollContainerRef.current;
+      if (!c) return { aligned: true, delta: 0 };
+      if (!saved) { c.scrollTop = 0; return { aligned: true, delta: 0 }; }
+      if (!saved.anchorId) { c.scrollTop = saved.scrollTop; return { aligned: true, delta: 0 }; }
+      const el = c.querySelector<HTMLElement>(`[data-flip-id="${window.CSS.escape(saved.anchorId)}"]`);
+      if (!el) { c.scrollTop = saved.scrollTop; return { aligned: false, delta: Infinity }; }
+      const before = c.scrollTop;
+      const cTop = c.getBoundingClientRect().top;
+      const elTop = el.getBoundingClientRect().top;
+      c.scrollTop += (elTop - cTop) - saved.anchorDelta;
+      return { aligned: true, delta: Math.abs(c.scrollTop - before) };
+    };
+    let attempts = 0;
+    const settle = () => {
+      if (!scrollContainerRef.current) return;
+      const { aligned, delta } = applyAnchor();
+      attempts++;
+      if (attempts < 8 && (!aligned || delta > 1)) requestAnimationFrame(settle);
+    };
+    // Double rAF: first waits for React commit, second for layout/paint.
+    requestAnimationFrame(() => requestAnimationFrame(settle));
   }, []);
 
   const resetScrollToTop = useCallback(() => {
@@ -1249,6 +1284,23 @@ function App() {
   const moveEntry = useCallback(
     async (entryId: number, newParentId: number | null, insertBeforeId: number | null, anchor?: { id: number; viewportTop: number }) => {
       if (!selectedLibrary) return;
+      // When dropping INTO a collection, keep that collection pinned to exactly
+      // where it sat at drop — every frame, from now until just after the reload
+      // settles. The reload is async (two IPC round-trips), and during that gap
+      // the scroll can otherwise drift to the source row (auto-scroll settling /
+      // the moved card leaving the grid / FLIP), which shows as a flash before
+      // the final position lands. Re-pinning each frame corrects it pre-paint.
+      let pinning = anchor != null;
+      const pinAnchor = () => {
+        const c = scrollContainerRef.current;
+        if (!c || !anchor) return;
+        const el = c.querySelector<HTMLElement>(`[data-flip-id="${window.CSS.escape(String(anchor.id))}"]`);
+        if (!el) return;
+        const curTop = el.getBoundingClientRect().top - c.getBoundingClientRect().top;
+        if (Math.abs(curTop - anchor.viewportTop) > 0.5) c.scrollTop += curTop - anchor.viewportTop;
+      };
+      const pinLoop = () => { if (pinning) { pinAnchor(); requestAnimationFrame(pinLoop); } };
+      if (pinning) requestAnimationFrame(pinLoop);
       try {
         await invoke("move_entry", {
           libraryId: selectedLibrary.id,
@@ -1256,7 +1308,7 @@ function App() {
           newParentId,
           insertBeforeId,
         });
-        // Save scroll before reload
+        // Save scroll before reload (fallback for non-anchored moves)
         const scrollTop = scrollContainerRef.current?.scrollTop ?? 0;
         invalidateCache(selectedLibrary.id);
         const parentId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
@@ -1276,27 +1328,19 @@ function App() {
         setSortMode(res.sort_mode);
         setSelectedPresetId(res.selected_preset_id);
         setPresets(res.presets);
-        // Restore scroll after React paints. When the move was a drop INTO a
-        // collection, pin that collection to the same viewport offset it had at
-        // drop time (it may have shifted as the moved item left the grid) instead
-        // of restoring the raw scrollTop — which would snap back toward the source
-        // row when the two were far apart.
-        requestAnimationFrame(() => {
-          requestAnimationFrame(() => {
-            const container = scrollContainerRef.current;
-            if (!container) return;
-            if (anchor) {
-              const el = container.querySelector<HTMLElement>(`[data-flip-id="${window.CSS.escape(String(anchor.id))}"]`);
-              if (el) {
-                const curTop = el.getBoundingClientRect().top - container.getBoundingClientRect().top;
-                container.scrollTop += curTop - anchor.viewportTop;
-                return;
-              }
-            }
-            container.scrollTop = scrollTop;
-          });
-        });
+        if (pinning) {
+          // Let the reloaded grid paint, then stop pinning shortly after.
+          requestAnimationFrame(() => requestAnimationFrame(() => {
+            window.setTimeout(() => { pinning = false; }, 150);
+          }));
+        } else {
+          // Non-anchored move (e.g. move-up zone): just restore the raw scroll.
+          requestAnimationFrame(() => requestAnimationFrame(() => {
+            if (scrollContainerRef.current) scrollContainerRef.current.scrollTop = scrollTop;
+          }));
+        }
       } catch (e) {
+        pinning = false;
         console.error("Failed to move entry:", e);
         toast.error(String(e));
       }

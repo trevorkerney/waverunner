@@ -1,10 +1,13 @@
 # TODO
 
-## bugs / needs fixing
+## test on prod
+
+check for choppy dnd animations when reordering media entries
 
 dropping media into a collection (when the media is far from the collection scroll-wise) currently jumps back to where the media was, as opposed to staying where the collection is. the scroll should stay where the collection is.
 
-sometimes after creating a collection, moving media into it, changing the sort method to custom, reordering some movies, maybe renaming some, and going back out of the collection, the scroll is not where the collection is but a bit below or above it. this happens fairly often when doing things along the lines of the process described above. Actually I'm now noticing it sometimes happens when simply clicking into a collection and then going back out by clicking the first breadcrumb.
+
+## bugs / needs fixing
 
 playlist grid page and individual playlist grid pages are outdated. needs updating with new features seen in other grid pages (virtualization, animation improvements, subtitles showing num of movies and shows + release date range, reordering media still causes cover image warping, etc.)
 
