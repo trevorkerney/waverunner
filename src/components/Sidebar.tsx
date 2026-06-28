@@ -200,8 +200,16 @@ export function Sidebar({
                             toast.loading(event.payload, { id: toastId });
                           });
                           try {
-                            await invoke("rescan_library", { libraryId: lib.id });
-                            toast.success("Rescan complete", { id: toastId });
+                            const warnings = await invoke<string[]>("rescan_library", { libraryId: lib.id });
+                            if (warnings.length > 0) {
+                              toast.warning(`Rescan complete — ${warnings.length} item${warnings.length === 1 ? "" : "s"} skipped`, {
+                                id: toastId,
+                                description: warnings.slice(0, 5).join("  •  ") + (warnings.length > 5 ? `  •  +${warnings.length - 5} more` : ""),
+                                duration: 8000,
+                              });
+                            } else {
+                              toast.success("Rescan complete", { id: toastId });
+                            }
                             onLibraryRescanned();
                           } catch (err) {
                             toast.error(String(err), { id: toastId });

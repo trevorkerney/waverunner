@@ -539,8 +539,25 @@ function App() {
           entries: fresh, sort_mode: fresh_sort,
           selected_preset_id: null, presets: [],
         });
+      } else if (view.kind === "playlist-detail") {
+        // A playlist grid renders media-link entries; their cover pool comes from
+        // the same cached_images source as the library grid, so a cover added on a
+        // detail page must refresh here too — otherwise the link entry keeps its
+        // stale `covers` array and the new cover never appears as an option.
+        const res = await invoke<PlaylistContents>("get_playlist_contents", {
+          playlistId: view.playlistId,
+          parentCollectionId: view.collectionId,
+        });
+        fresh = res.entries;
+        fresh_sort = res.sort_mode;
+        fresh_selected_preset_id = res.selected_preset_id;
+        fresh_presets = res.presets;
+        viewEntriesCacheRef.current.set(viewCacheKey(view), {
+          entries: fresh, sort_mode: fresh_sort,
+          selected_preset_id: fresh_selected_preset_id, presets: fresh_presets,
+        });
       } else {
-        return; // people-list / playlists don't render a media entry grid
+        return; // people-list doesn't render a media entry grid
       }
       await preloadCovers(fresh);
       setEntries(fresh);
@@ -1230,7 +1247,7 @@ function App() {
   );
 
   const moveEntry = useCallback(
-    async (entryId: number, newParentId: number | null, insertBeforeId: number | null) => {
+    async (entryId: number, newParentId: number | null, insertBeforeId: number | null, anchor?: { id: number; viewportTop: number }) => {
       if (!selectedLibrary) return;
       try {
         await invoke("move_entry", {
@@ -1259,12 +1276,24 @@ function App() {
         setSortMode(res.sort_mode);
         setSelectedPresetId(res.selected_preset_id);
         setPresets(res.presets);
-        // Restore scroll after React paints
+        // Restore scroll after React paints. When the move was a drop INTO a
+        // collection, pin that collection to the same viewport offset it had at
+        // drop time (it may have shifted as the moved item left the grid) instead
+        // of restoring the raw scrollTop — which would snap back toward the source
+        // row when the two were far apart.
         requestAnimationFrame(() => {
           requestAnimationFrame(() => {
-            if (scrollContainerRef.current) {
-              scrollContainerRef.current.scrollTop = scrollTop;
+            const container = scrollContainerRef.current;
+            if (!container) return;
+            if (anchor) {
+              const el = container.querySelector<HTMLElement>(`[data-flip-id="${window.CSS.escape(String(anchor.id))}"]`);
+              if (el) {
+                const curTop = el.getBoundingClientRect().top - container.getBoundingClientRect().top;
+                container.scrollTop += curTop - anchor.viewportTop;
+                return;
+              }
             }
+            container.scrollTop = scrollTop;
           });
         });
       } catch (e) {
@@ -1276,30 +1305,29 @@ function App() {
   );
 
   const createCollection = useCallback(
-    async (name: string) => {
-      if (!selectedLibrary) return;
+    async (name: string): Promise<number | null> => {
+      if (!selectedLibrary) return null;
       try {
         const parentId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
-        await invoke("create_collection", {
+        const newId = await invoke<number>("create_collection", {
           libraryId: selectedLibrary.id,
           name,
           parentId,
         });
         invalidateCache(selectedLibrary.id, parentId);
-        // Preserve current scroll across the reload. Without this the restore
-        // falls through to a stale (or zero) saved value, and any side-effect
-        // scroll (focus return from the dialog, dnd-kit mount re-layout, etc.)
-        // can land the viewport wherever the new entry happens to sit in the
-        // DOM — which in the user's case was at the ASCII-sorted tail when the
-        // name was lowercase. Keeping the current scroll numerically stable
-        // makes it case-insensitive by construction.
-        saveScrollPosition();
-        await loadEntries(selectedLibrary, parentId, breadcrumbs);
+        // Refresh the grid in place (no clear-and-reload) so the new collection
+        // slides into its sorted slot while the existing cards animate down past
+        // it via FLIP, instead of the whole grid flashing. In-place refresh also
+        // leaves scroll untouched, so a lowercase name can't yank the viewport to
+        // the ASCII-sorted tail (the bug the old saveScrollPosition guarded).
+        await refreshGridInPlace();
+        return newId;
       } catch (e) {
         toast.error(String(e));
+        return null;
       }
     },
-    [selectedLibrary, breadcrumbs, invalidateCache, loadEntries, saveScrollPosition]
+    [selectedLibrary, breadcrumbs, invalidateCache, refreshGridInPlace]
   );
 
   // Collections only — movies/shows mirror the filesystem and leave via rescan.
@@ -1789,6 +1817,13 @@ function App() {
               for (let i = 0; i < breadcrumbs.length - 1; i++) {
                 invalidateCache(selectedLibrary.id, breadcrumbs[i]?.id ?? null);
               }
+              // Aggregate views (movies-only, shows-only, playlists) also reference
+              // this entry and cache its cover pool, but they aren't ancestors — and
+              // a filtered-view detail page may have no ancestor crumb at all, so the
+              // loop above can skip them entirely. Explicitly drop the library's
+              // view-entry caches so a newly added cover/metadata shows up next time
+              // any of them is opened (e.g. the same movie referenced in a playlist).
+              invalidateCache(selectedLibrary.id, breadcrumbs[breadcrumbs.length - 1]?.id ?? null);
               // Also refresh the in-memory grid entries behind the detail page so
               // derived fields (year, end_year, covers, season_display) update when
               // the user hits back — cache invalidation alone only helps on view-switch.

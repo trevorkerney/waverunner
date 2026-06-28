@@ -2,54 +2,7 @@
 
 ## bugs / needs fixing
 
-Rescan is not robust: a single DB error aborts the ENTIRE rescan instead of being isolated per show/season/episode, so one bad item breaks the whole sync and everything sequenced after it silently never updates.
-
-Root cause confirmed in prod (the "(code 2067) UNIQUE constraint failed: episode.season_id, episode.episode_number" error): Family Guy S07 had two video files for the same episode — an alternate "Bale Scene" cut and a "Commentary Audio Track" cut of S07E07 — and both parse to episode number 7. Episodes are inserted with a plain INSERT (commands.rs ~5402) and the table has UNIQUE(season_id, episode_number), so the second file throws the constraint error and the `?` propagation kills the whole rescan. This is why Family Guy S08-S20 were empty (the pass died at S07 before reaching them) and why removing Black Mirror / The Ranch never helped — they were never the culprit; the duplicate was always in Family Guy. It was the only collision in the whole library. (Immediate unblock: delete one of the two S07E07 files and rescan — it self-heals.)
-
-Fix needed:
-- Error isolation: a failed episode/season/show should log a warning and continue the rescan, not abort it. (Highest-value fix — turns a library-wide break into one skipped item.)
-- Graceful duplicate handling: two files mapping to the same (season, episode_number) must not crash. Decision needed — keep one + warn (simple), or eventually support multiple versions/cuts per episode (bigger feature, schema change; relevant since people deliberately keep alternate cuts/commentary).
-- Surface skipped/duplicate items back to the user (ties into the "warn about episodes without episode numbers" item under new features).
-
-Separate, larger follow-up (the original "detect file/folder/file renames and sync accordingly" ask): sync is currently keyed on path, so a rename reads as delete + re-add and loses metadata (TMDB match, etc.). True rename/move detection needs content hashing or fuzzy matching — out of scope for the robustness fix above.
-
-Also likely a casualty of this same abort bug — verify these resolve once rescan completes cleanly: Invincible S4 episodes out of order, and any other "missing season / missing episodes" symptoms for shows added after the rescan started failing.
-
----
-
-It seems when I rescan to import tv shows brought in after the initial scan, episode numbers and seasons display out of order (not increasing like they should be). Confirmed on Family Guy and Invincible S4 — both added after the library was already created.
-
-Root cause: everything sorts by the `sort_order` column, but that's only assigned meaningfully by the INITIAL scan, which sorts the folders/files by parsed number before numbering them (scan_video_dir: season_dirs.sort_by ~6378, episode_files.sort_by ~6417). The RESCAN doesn't sort at all — disk_seasons and disk_episodes are HashSets, iterated in nondeterministic order, and each new item is stamped sort_order = MAX(existing)+1. So shows present at library creation are ordered correctly; shows added later via rescan get effectively random sort_order, scrambling both seasons and episodes.
-
-Not just cosmetic: get_show_episodes (the flat list used for playback/autoplay) orders by `s.sort_order, ..., e.sort_order` FIRST, so a rescan-added show also AUTOPLAYS its episodes in scrambled order — a functional bug, not just display.
-
-Fix: stop trusting sort_order for seasons/episodes (they have a canonical numeric order) and order by the actual number, with NULL-numbered items (Specials / unnumbered episodes) falling last and sort_order as the final tiebreaker. Three queries — get_show_seasons (ORDER BY season_number IS NULL, season_number, sort_order), get_season_episodes (ORDER BY episode_number IS NULL, episode_number, sort_order), and get_show_episodes (ORDER BY s.season_number IS NULL, s.season_number, e.episode_number IS NULL, e.episode_number, e.sort_order). This fixes all existing scrambled data instantly with no re-import and is robust to any insertion order. (Sorting the rescan's batch instead is insufficient — incrementally added seasons still append after the existing max, e.g. add S04 then S01 later and S01 still lands after S04.)
-
----
-
-Uncap the TMDB cast import. Cast is currently sliced to the first 20 billed in every match path — single movie match (TmdbMatchDialog extractCast), single show match (TmdbShowMatchDialog extractCast), bulk/library match (TmdbBulkMatchDialog castOf, covers movie/show/season), and the inline "Populate season from TMDB" (MainContent ~2526). The cap silently drops deep-billed but real roles — e.g. Ty Simpkins as Harley Keener, billed 72nd of 105 in Avengers Endgame, never gets imported. Import the full cast in TMDB billing order instead. (Tradeoff to accept/watch: more cast = more Person rows = bigger people pages — may eventually want a character-name/credited filter rather than a flat cap.)
-
-Once uncapped, the cast band on movie/show detail pages can get very long, so it needs a visual cutoff: show the first couple rows with a "View all" button that expands the full list (and collapses again).
-
----
-
-covers on playlist entries dont get new additions it seems. when i add a cover to a movie through TMDB under the all/movies/tv sidebar pages, that cover is not an option from within a playlist where that movie is referenced. While the entries in the playlists' covers should be independent from their main ones under all/movies/tv, the selection should be from the same pool.
-
-'specials' needs to be added to the list of folders that are counted as extras. Right now 'specials' is being counted as a season on Black Mirror.
-
-when matching library to TMDb, the text in the modal above the progress bar for seasons and episodes should say something like "Season 2 - Game of Thrones" and "Season 2 episodes - Game of Thrones" instead of just "Season 2" and "Season 2 episodes"
-
-make sure TMDB matches (individual AND library) always use year (if exists) when trying to find match
-
-question TMDb match confidence algorithm. seems like sometimes the "ambiguous" matches aren't always that ambiguous but pretty obvious (star wars, terminator 2)
-
-adding collections causes a flash instead of the new collection falling into the grid from somewhere (could be from cursor location, or top, use judgement here). It should fall in and 'animatedly' move the grid down past it like how deleting entries causes the grid to 'animatedly' move back up towards where it was
-
-maybe find a solution to custom sort not having a scrubber resulting in there being more space horizontally, causing a jump when switching to and from custom sort. could just have more padding or an empty element taking the space of the scrubber
-
-Need to be able to add ratings and raters (IMDb id, RT id, TMDB id, etc) info in edit media menu within media detail view
-
-dropping media into a collection (especially when the media is far from the collection based on however the grid is sorted) currently jumps back to where the media was, as opposed to staying where the collection is. the scroll should stay where the collection is.
+dropping media into a collection (when the media is far from the collection scroll-wise) currently jumps back to where the media was, as opposed to staying where the collection is. the scroll should stay where the collection is.
 
 sometimes after creating a collection, moving media into it, changing the sort method to custom, reordering some movies, maybe renaming some, and going back out of the collection, the scroll is not where the collection is but a bit below or above it. this happens fairly often when doing things along the lines of the process described above. Actually I'm now noticing it sometimes happens when simply clicking into a collection and then going back out by clicking the first breadcrumb.
 
@@ -66,6 +19,12 @@ i accidentally put a tv show (with 1 season) in the TV directory and without a s
 movie covers and backdrops downloaded from TMDB or anywhere through the app SHOULD save to the users source folder, if setting enabled (default on)
 
 add a way for users to switch audio (and video?) track within the player (bug because we should've had this by now)
+
+rescanning (when done) seems to place the user in All view while keeping whatever they were on before highlighted in the sidebar.
+
+scan and rescan need to detect double (and even triple, MAYBE MORE IDK) episodes like when a file is named something like S01E01-E02 - one example is "Courage the Cowardly Dog". These should combine both episodes' metadata into the episode
+
+
 
 
 ## changes / small new features
@@ -119,11 +78,15 @@ The model: an interactive title is ONE linear video file with every branch conca
 
 ---
 
-The format — Netflix's `interactiveVideoMoments`, the de-facto community standard (adopting it means existing ripped content works on day one). Two JSON files split the work and you need BOTH:
+INTERACTIVE PLAYER
+
+The format — Netflix's `interactiveVideoMoments` (the one internal format Netflix used for all its interactive titles; see the "standard — scope" note below for what "standard" does and doesn't mean here). Adopting it means the ripped content people actually have works on day one. Two JSON files split the work and you need BOTH:
 - manifest.json = the segment skeleton: every segment's startTimeMs/endTimeMs in the video, defaultNext + a weighted `next` map, interactionZones (when choices are clickable), initialSegment, viewableId. Times ALL segments, including pure pass-through ones. (Bandersnatch: 250 segments.)
 - info.json = the interactivity layer: momentsBySegment (choices, plus tutorials/notifications, each with its own on-screen startMs/endMs), preconditions (boolean/arithmetic expression trees over state: eql/lt/gt/and/or/not/sum/mult), segmentGroups (conditional routing when a segment ends), stateHistory (persistent + global vars — persistent = Bandersnatch's "remembers your choices"), playerControls. Only lists segments that have a moment (Bandersnatch: 208).
 - a choice = { text, segmentId (target to jump to), impressionData (state changes to apply on selection) }.
 - why both: manifest times every segment (info omits pass-through ones); info has the choice/condition/state logic manifest lacks.
+
+Standard — scope (so this isn't overstated): interactiveVideoMoments is the de-facto standard ONLY within the narrow niche of Netflix-style branching video and the community that preserves/emulates it. Netflix made the prominent interactive titles (Bandersnatch, Minecraft Story Mode, etc.) all in this one internal format; the community reverse-engineered it; and all the circulating content + tooling (Interactive-Player/Maker, the archives) standardized on it. It is NOT an open/published spec and NOT a universal interactive-media standard — Netflix never published it; it just got reverse-engineered. Interactive video broadly is fragmented with no shared interchange format: Eko (commercial platform, own format), H5P (open-source, education), Twine (interactive fiction — text/HTML, not video), FMV games like Late Shift (bespoke per-game engines), DVD/Blu-ray seamless branching (old disc-spec feature), deprecated YouTube annotations — each a proprietary island. So adopting this format buys compatibility with the existing preserved-Netflix content (the right target, because that's where the content actually is), NOT interoperability with the broader interactive-media world (which doesn't interoperate anyway).
 
 What waverunner needs to build (4 pieces):
 1. Format reader — parse manifest + info into Rust structs (mirror Interactive-Player's Models.cs).
@@ -131,7 +94,12 @@ What waverunner needs to build (4 pieces):
 3. Choice-overlay UI — a timed countdown decision overlay in React, rendered in waverunner's own style from each choice's `text` (no need for Netflix's sprite assets).
 4. Seek-based playback driver — libmpv seeks to a segment's startTimeMs, plays, watches for the choice window, applies the pick (or defaultNext on timeout), seeks to the next segment. Same loop as the reference player.
 
-Where the content comes from: community preservation archives / Discords (e.g. "Netflix Interactive Archive"). Two artifacts that MUST be a matched pair — the metadata's absolute-ms timestamps are authored against one specific video encode, so a mismatched video + metadata makes choices fire at the wrong times: (a) the internal video (all branches concatenated; ~5h17m for Bandersnatch), (b) the metadata (manifest.json + info.json). The sprite PNGs/fonts in the packs are cosmetic; direct.json is just a pointer to the video path. Minimal user-supplied set = video + manifest.json + info.json.
+Where the content comes from: community preservation archives / Discords (e.g. "Netflix Interactive Archive"). Two artifacts that MUST be a matched pair — the metadata's absolute-ms timestamps are authored against one specific video encode, so a mismatched video + metadata makes choices fire at the wrong times: (a) the internal video (all branches concatenated; ~5h17m for Bandersnatch), (b) the metadata (manifest.json + info.json). The sprite PNGs/fonts in the packs are cosmetic (see the assets-layer note below); direct.json is just a pointer to the video path. Minimal user-supplied set = video + manifest.json + info.json.
+
+The assets layer (purely cosmetic — waverunner does NOT need it): beyond the video + JSON, a real Netflix interactive also has a UI-asset layer, mirrored from Netflix's CDN at assets.nflxext.com/ffe/oui/interactive/<title>/<asset_type>/<platform>/<date>/ (a full mirror across all titles is ~16k files / 787MB; Bandersnatch is the `bs/` folder, ~68 files / 11MB). Two kinds:
+- UI art (choicepoint sprites + inline_tutorial/tooltip + playercontrols) = the visual styling of the choice overlay drawn ON TOP of the video during a decision: the button/underline graphics and their default→focused→selected states, the countdown timer bar, the "Get ready to click!" tutorial prompts, the player-control icons. For Bandersnatch the option TEXT itself comes from info.json — these PNGs are only the decorative chrome around it. info.json references them by URL (e.g. assets.nflxext.com/ffe/oui/interactive/general/inline_tutorial/x2/.../cursor_2x.png), and the .intpak the Interactive-Player extracts is essentially Bandersnatch's `bs/` assets repackaged (the ~150 segment-coded PNGs that land next to your video on install).
+- Sounds (per-title <title>/audio/.../m4a or shared general/audio/m4a, .m4a files) = short UI sound EFFECTS the player mixes OVER the film's own audio during interactive moments — NOT part of the movie's soundtrack. Named: sfx_appears (choices pop on), sfx_focus (moving between options), sfx_select (committing a choice), sfx_timeout (timer expires with no pick), sfx_tutorial (the prompt), plus shared reengagement_notification ("still watching?").
+waverunner renders its own choice buttons/timer from the info.json `text` and uses its own (or no) sound cues, so none of this art/audio is required — it's only relevant if you ever want to mimic the authentic Netflix look-and-feel. Same copyright footing as the rest: Netflix's assets, fine to keep locally for study, never bundle/redistribute.
 
 User workflow once supported: get the internal video + matching manifest/info from the same source → drop both into a folder for the title in the library → rescan (waverunner detects the JSON next to the video and flags the folder as an interactive title — new entry type/flag) → press Play, which runs the interactive engine instead of linear playback.
 

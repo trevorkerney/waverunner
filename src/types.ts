@@ -296,6 +296,7 @@ export interface ShowDetail {
   id: number;
   tmdb_id: string | null;
   imdb_id: string | null;
+  rotten_tomatoes_id: string | null;
   plot: string | null;
   tagline: string | null;
   maturity_rating: string | null;
@@ -362,6 +363,13 @@ export interface TmdbTvDetail {
   content_ratings: { results: { iso_3166_1: string; rating: string }[] } | null;
   external_ids: { imdb_id: string | null } | null;
   images: { posters: TmdbImage[]; backdrops: TmdbImage[] } | null;
+  seasons: TmdbSeasonStub[];
+}
+
+export interface TmdbSeasonStub {
+  season_number: number;
+  name: string;
+  episode_count: number;
 }
 
 export interface TmdbSeasonDetail {
@@ -438,6 +446,7 @@ export interface BulkMovieTarget {
 export interface BulkShowTarget {
   id: number;
   title: string;
+  year: string | null;
   tmdb_id: string | null;
 }
 

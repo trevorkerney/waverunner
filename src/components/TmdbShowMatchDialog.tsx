@@ -56,9 +56,10 @@ function extractCreators(tmdb: TmdbTvDetail): PersonUpdateInfo[] {
   return tmdb.created_by.map((c) => ({ name: c.name, tmdb_id: c.id, profile_path: c.profile_path }));
 }
 
-function extractCast(tmdb: TmdbTvDetail, limit = 20): CastUpdateInfo[] {
+function extractCast(tmdb: TmdbTvDetail): CastUpdateInfo[] {
   if (!tmdb.credits?.cast) return [];
-  return tmdb.credits.cast.slice(0, limit).map((c) => ({
+  // Full cast — no cap (see TmdbMatchDialog).
+  return tmdb.credits.cast.map((c) => ({
     name: c.name,
     role: c.character ?? null,
     tmdb_id: c.id,

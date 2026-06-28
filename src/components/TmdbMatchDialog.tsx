@@ -68,9 +68,11 @@ function extractDirectors(tmdb: TmdbMovieDetail): PersonUpdateInfo[] {
     .map((c) => ({ name: c.name, tmdb_id: c.id, profile_path: c.profile_path }));
 }
 
-function extractCast(tmdb: TmdbMovieDetail, limit = 20): CastUpdateInfo[] {
+function extractCast(tmdb: TmdbMovieDetail): CastUpdateInfo[] {
   if (!tmdb.credits?.cast) return [];
-  return tmdb.credits.cast.slice(0, limit).map((c) => ({
+  // Full cast in TMDB billing order — no cap (a flat top-20 dropped real but
+  // deep-billed roles, e.g. Harley Keener at 72/105 in Endgame).
+  return tmdb.credits.cast.map((c) => ({
     name: c.name,
     role: c.character ?? null,
     tmdb_id: c.id,

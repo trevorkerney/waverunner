@@ -34,9 +34,10 @@ const COMPOSER_JOBS = ["Composer", "Original Music Composer"];
 
 // ── Field mapping (mirrors the single-entry match dialogs, all fields on) ──
 
-function castOf(credits: { cast?: { id: number; name: string; character?: string | null; profile_path?: string | null }[] } | null | undefined, limit = 20): CastUpdateInfo[] {
+function castOf(credits: { cast?: { id: number; name: string; character?: string | null; profile_path?: string | null }[] } | null | undefined): CastUpdateInfo[] {
   if (!credits?.cast) return [];
-  return credits.cast.slice(0, limit).map((c) => ({
+  // Full cast — no cap (see TmdbMatchDialog). Applies to movies, shows, seasons.
+  return credits.cast.map((c) => ({
     name: c.name,
     role: c.character ?? null,
     tmdb_id: c.id,
@@ -137,11 +138,15 @@ function confidentMovieMatch(
 function confidentShowMatch(
   results: TmdbTvSearchResult[],
   title: string,
+  year: string | null,
 ): TmdbTvSearchResult | null {
-  // Shows carry no local year, so the same single-exact-match rule applies
-  // (e.g. "The Office" US vs UK must be picked by hand).
   const want = normalizeTitle(title);
   const exact = results.slice(0, 5).filter((r) => normalizeTitle(r.name) === want);
+  if (year) {
+    // First-air-year disambiguates same-title shows (e.g. "The Office" US vs UK).
+    return exact.find((r) => yearsClose(r.first_air_date, year)) ?? null;
+  }
+  // Without a year, only trust a single exact title match.
   return exact.length === 1 ? exact[0] : null;
 }
 
@@ -359,8 +364,11 @@ export function TmdbBulkMatchDialog({
     let ratingsAborted: string | null = null;
     // Live tmdb ids for shows: pre-matched ones plus those matched this run.
     const showTmdb = new Map<number, number>();
+    // Show titles, so the season/episode progress labels can name the show.
+    const showTitle = new Map<number, string>();
     for (const sh of targets.shows) {
       if (sh.tmdb_id) showTmdb.set(sh.id, Number(sh.tmdb_id));
+      showTitle.set(sh.id, sh.title);
     }
 
     const totalSteps =
@@ -413,15 +421,15 @@ export function TmdbBulkMatchDialog({
           try {
             const results = await invoke<TmdbTvSearchResult[]>("search_tmdb_show", {
               query: sh.title,
-              year: null,
+              year: sh.year,
             });
             if (results.length === 0) {
-              noResult.push({ title: sh.title, year: null });
+              noResult.push({ title: sh.title, year: sh.year });
               continue;
             }
-            const pick = confidentShowMatch(results, sh.title);
+            const pick = confidentShowMatch(results, sh.title, sh.year);
             if (!pick) {
-              review.push({ kind: "show", id: sh.id, title: sh.title, year: null });
+              review.push({ kind: "show", id: sh.id, title: sh.title, year: sh.year });
               continue;
             }
             const detail = await invoke<TmdbTvDetail>("get_tmdb_show_detail", {
@@ -443,7 +451,8 @@ export function TmdbBulkMatchDialog({
       if (doSeasons && !cancelRef.current) {
         for (const se of eligibleSeasons) {
           if (cancelRef.current) break;
-          tick(`Season ${se.season_number}`);
+          const title = showTitle.get(se.show_id);
+          tick(title ? `Season ${se.season_number} - ${title}` : `Season ${se.season_number}`);
           const tmdbId = showTmdb.get(se.show_id);
           if (tmdbId == null) {
             skippedSeasonIds.add(se.id);
@@ -468,7 +477,8 @@ export function TmdbBulkMatchDialog({
       if (doEpisodes && !cancelRef.current) {
         for (const se of eligibleSeasons) {
           if (cancelRef.current) break;
-          tick(`Season ${se.season_number} episodes`);
+          const title = showTitle.get(se.show_id);
+          tick(title ? `Season ${se.season_number} episodes - ${title}` : `Season ${se.season_number} episodes`);
           const tmdbId = showTmdb.get(se.show_id);
           if (tmdbId == null) {
             skippedSeasonIds.add(se.id);

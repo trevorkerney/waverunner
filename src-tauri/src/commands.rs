@@ -761,6 +761,32 @@ pub async fn delete_library(
     Ok(())
 }
 
+/// Card subtitle for a show, e.g. "season 3" / "seasons 1–6" / "5 seasons".
+/// Counts ONLY real seasons (season_number > 0); Specials (Season 0) are never
+/// folded into the headline — mirrors Plex/Jellyfin. A show with nothing but
+/// specials reads "specials". Expects `mef` (media_entry_full) in scope; used by
+/// get_entries and search_entries.
+const SEASON_DISPLAY_EXPR: &str = "\
+    CASE WHEN mef.entry_type = 'show' THEN \
+      (SELECT CASE \
+        WHEN SUM(CASE WHEN s.season_number > 0 THEN 1 ELSE 0 END) = 0 THEN \
+          CASE \
+            WHEN SUM(CASE WHEN s.season_number = 0 THEN 1 ELSE 0 END) > 0 THEN 'specials' \
+            WHEN COUNT(*) = 0 THEN NULL \
+            WHEN COUNT(*) = 1 THEN '1 season' \
+            ELSE COUNT(*) || ' seasons' \
+          END \
+        WHEN SUM(CASE WHEN s.season_number > 0 THEN 1 ELSE 0 END) = 1 \
+          THEN 'season ' || MAX(CASE WHEN s.season_number > 0 THEN s.season_number END) \
+        WHEN SUM(CASE WHEN s.season_number > 0 THEN 1 ELSE 0 END) = \
+             (MAX(CASE WHEN s.season_number > 0 THEN s.season_number END) \
+              - MIN(CASE WHEN s.season_number > 0 THEN s.season_number END) + 1) \
+          THEN 'seasons ' || MIN(CASE WHEN s.season_number > 0 THEN s.season_number END) \
+               || '\u{2013}' || MAX(CASE WHEN s.season_number > 0 THEN s.season_number END) \
+        ELSE SUM(CASE WHEN s.season_number > 0 THEN 1 ELSE 0 END) || ' seasons' \
+      END FROM season s WHERE s.show_id = mef.id) \
+    END";
+
 #[tauri::command]
 pub async fn get_entries(
     state: tauri::State<'_, AppState>,
@@ -920,17 +946,7 @@ pub async fn get_entries(
                    ELSE NULL \
                  END as tmdb_id, \
                  (SELECT COUNT(*) FROM media_entry c WHERE c.parent_id = mef.id) as child_count, \
-                 CASE WHEN mef.entry_type = 'show' THEN \
-                   (SELECT CASE \
-                     WHEN COUNT(*) = 0 THEN NULL \
-                     WHEN COUNT(*) = 1 AND MIN(s.season_number) IS NOT NULL THEN 'season ' || MIN(s.season_number) \
-                     WHEN COUNT(*) = 1 THEN '1 season' \
-                     WHEN COUNT(s.season_number) = COUNT(*) \
-                       AND COUNT(*) = (MAX(s.season_number) - MIN(s.season_number) + 1) \
-                       THEN 'seasons ' || MIN(s.season_number) || '\u{2013}' || MAX(s.season_number) \
-                     ELSE COUNT(*) || ' seasons' \
-                   END FROM season s WHERE s.show_id = mef.id) \
-                 END as season_display \
+                 {SEASON_DISPLAY_EXPR} as season_display \
                  FROM media_entry_full mef"
             );
             // When entry_type_filter is set, return a flat list across the whole library
@@ -1150,18 +1166,7 @@ pub async fn search_entries(
                   WHEN mef.entry_type = 'collection' THEN \
                     NULLIF((SELECT MAX(yr) FROM ({collection_child_years})), (SELECT MIN(yr) FROM ({collection_child_years}))) \
                 END");
-            let season_display_expr = "\
-                CASE WHEN mef.entry_type = 'show' THEN \
-                  (SELECT CASE \
-                    WHEN COUNT(*) = 0 THEN NULL \
-                    WHEN COUNT(*) = 1 AND MIN(s.season_number) IS NOT NULL THEN 'season ' || MIN(s.season_number) \
-                    WHEN COUNT(*) = 1 THEN '1 season' \
-                    WHEN COUNT(s.season_number) = COUNT(*) \
-                      AND COUNT(*) = (MAX(s.season_number) - MIN(s.season_number) + 1) \
-                      THEN 'seasons ' || MIN(s.season_number) || '\u{2013}' || MAX(s.season_number) \
-                    ELSE COUNT(*) || ' seasons' \
-                  END FROM season s WHERE s.show_id = mef.id) \
-                END";
+            let season_display_expr = SEASON_DISPLAY_EXPR;
             let query_str = match parent_id {
                 Some(_) => format!("\
                     WITH RECURSIVE descendants(id) AS ( \
@@ -2241,7 +2246,11 @@ pub async fn get_show_seasons(
     show_id: i64,
 ) -> Result<Vec<SeasonInfo>, String> {
     let rows: Vec<(i64, String, Option<i64>, i64)> = sqlx::query_as(
-        "SELECT id, title, season_number, sort_order FROM season WHERE show_id = ? ORDER BY sort_order",
+        // Order by the real season number, but force Specials (Season 0) to sort AFTER
+        // the numbered seasons (Plex/Jellyfin convention), and any NULL-numbered season
+        // last of all. sort_order is the final tiebreaker — it's only meaningfully
+        // assigned by the initial scan, so rescan-added shows would otherwise scramble.
+        "SELECT id, title, season_number, sort_order FROM season WHERE show_id = ? ORDER BY season_number IS NULL, season_number = 0, season_number, sort_order",
     )
     .bind(show_id)
     .fetch_all(&state.app_db)
@@ -2266,7 +2275,8 @@ pub async fn get_season_episodes(
     season_id: i64,
 ) -> Result<Vec<EpisodeInfo>, String> {
     let rows: Vec<(i64, String, Option<i64>, String, i64, Option<String>, Option<i64>, Option<String>)> = sqlx::query_as(
-        "SELECT id, title, episode_number, file_path, sort_order, plot, runtime, release_date FROM episode WHERE season_id = ? ORDER BY sort_order",
+        // Order by real episode number (unnumbered episodes last, sort_order tiebreaker) — see get_show_seasons.
+        "SELECT id, title, episode_number, file_path, sort_order, plot, runtime, release_date FROM episode WHERE season_id = ? ORDER BY episode_number IS NULL, episode_number, sort_order",
     )
     .bind(season_id)
     .fetch_all(&state.app_db)
@@ -2297,7 +2307,7 @@ pub async fn get_show_episodes(
         "SELECT e.id, s.id, s.season_number, e.episode_number, e.title, e.file_path \
          FROM episode e JOIN season s ON e.season_id = s.id \
          WHERE s.show_id = ? \
-         ORDER BY s.sort_order, s.season_number, e.sort_order, e.episode_number",
+         ORDER BY s.season_number IS NULL, s.season_number = 0, s.season_number, e.episode_number IS NULL, e.episode_number, e.sort_order",
     )
     .bind(show_id)
     .fetch_all(&state.app_db)
@@ -4386,6 +4396,95 @@ pub async fn fetch_ratings(
     Ok(found)
 }
 
+/// Manually set rating values for an entry. Each source with a non-empty value is
+/// upserted; an empty value clears that source. Shares the `rating` table with
+/// `fetch_ratings` (no origin flag — see TODO), so a later "Get ratings" run will
+/// overwrite these for any source it returns.
+#[tauri::command]
+pub async fn set_manual_ratings(
+    state: tauri::State<'_, AppState>,
+    entry_id: i64,
+    ratings: Vec<RatingInfo>,
+) -> Result<(), String> {
+    for r in &ratings {
+        let value = r.value.trim();
+        if value.is_empty() {
+            sqlx::query("DELETE FROM rating WHERE entry_id = ? AND source = ?")
+                .bind(entry_id)
+                .bind(&r.source)
+                .execute(&state.app_db)
+                .await
+                .map_err(|e| e.to_string())?;
+        } else {
+            sqlx::query("INSERT OR REPLACE INTO rating (entry_id, source, value) VALUES (?, ?, ?)")
+                .bind(entry_id)
+                .bind(&r.source)
+                .bind(value)
+                .execute(&state.app_db)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// Manually set the IMDb / Rotten Tomatoes ids for an entry. Writes to whichever
+/// table owns it: movie columns, or the show row + the `rt_slug` side table
+/// (shows have no RT column of their own). Empty/blank clears the id.
+#[tauri::command]
+pub async fn set_rater_ids(
+    state: tauri::State<'_, AppState>,
+    entry_id: i64,
+    imdb_id: Option<String>,
+    rt_id: Option<String>,
+) -> Result<(), String> {
+    let norm = |s: Option<String>| s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let imdb = norm(imdb_id);
+    let rt = norm(rt_id);
+
+    let is_movie: Option<(i64,)> = sqlx::query_as("SELECT id FROM movie WHERE id = ?")
+        .bind(entry_id)
+        .fetch_optional(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if is_movie.is_some() {
+        sqlx::query("UPDATE movie SET imdb_id = ?, rotten_tomatoes_id = ? WHERE id = ?")
+            .bind(&imdb)
+            .bind(&rt)
+            .bind(entry_id)
+            .execute(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    sqlx::query("UPDATE show SET imdb_id = ? WHERE id = ?")
+        .bind(&imdb)
+        .bind(entry_id)
+        .execute(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+    match rt {
+        Some(slug) => {
+            sqlx::query("INSERT OR REPLACE INTO rt_slug (entry_id, slug) VALUES (?, ?)")
+                .bind(entry_id)
+                .bind(&slug)
+                .execute(&state.app_db)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        None => {
+            sqlx::query("DELETE FROM rt_slug WHERE entry_id = ?")
+                .bind(entry_id)
+                .execute(&state.app_db)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
 // ---------- Extras ----------
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -4913,7 +5012,7 @@ pub async fn create_collection(
     library_id: String,
     name: String,
     parent_id: Option<i64>,
-) -> Result<(), String> {
+) -> Result<i64, String> {
     let (format, _paths, _default_sort_mode) = get_library_meta(&state.app_db, &library_id).await?;
     if format != "video" {
         return Err("Collections are only supported for video libraries".to_string());
@@ -4969,7 +5068,7 @@ pub async fn create_collection(
         .await
         .map_err(|e| e.to_string())?;
 
-    Ok(())
+    Ok(entry_id)
 }
 
 #[tauri::command]
@@ -5067,7 +5166,7 @@ pub async fn rescan_library(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     library_id: String,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     let (format, _paths, _default_sort_mode) = get_library_meta(&state.app_db, &library_id).await?;
     let lib_paths = _paths;
 
@@ -5075,13 +5174,15 @@ pub async fn rescan_library(
     std::fs::create_dir_all(&cache_base).map_err(|e| e.to_string())?;
 
     let base_paths: Vec<PathBuf> = lib_paths.iter().map(|p| PathBuf::from(p)).collect();
-    match format.as_str() {
+    // Returns per-item warnings (skipped episodes/seasons/shows). A bad item no
+    // longer aborts the whole rescan — it's logged here and surfaced to the user.
+    let warnings = match format.as_str() {
         "video" => rescan_video_library(&app, &state.app_db, &library_id, &base_paths, &cache_base).await?,
         "music" => rescan_music_library(&app, &state.app_db, &library_id, &base_paths, &cache_base).await?,
         _ => return Err(format!("Unsupported library format: {}", format)),
-    }
+    };
 
-    Ok(())
+    Ok(warnings)
 }
 
 async fn rescan_video_library(
@@ -5090,8 +5191,13 @@ async fn rescan_video_library(
     library_id: &str,
     base_paths: &[PathBuf],
     cache_base: &Path,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     use std::collections::{HashSet, HashMap};
+
+    // Collected per-item failures (skipped episodes/seasons/shows). Isolating
+    // failures here means one bad file (e.g. a duplicate episode number) no
+    // longer aborts the entire rescan.
+    let mut warnings: Vec<String> = Vec::new();
 
     // Get entry_type_id mappings
     let movie_type_id: (i64,) =
@@ -5167,76 +5273,85 @@ async fn rescan_video_library(
 
         let _ = app.emit("scan-progress", &folder_name);
 
-        let (title, year) = parse_folder_name(&folder_name);
-        let sort_title = generate_sort_title(&title, "en");
-        let is_show = disk_kinds.get(rel_path).copied().unwrap_or(false);
+        // Per-entry isolation: a failure adding one new movie/show is recorded
+        // and skipped, not propagated up to abort the whole rescan.
+        let res: Result<(), String> = async {
+            let (title, year) = parse_folder_name(&folder_name);
+            let sort_title = generate_sort_title(&title, "en");
+            let is_show = disk_kinds.get(rel_path).copied().unwrap_or(false);
 
-        let max_order: Option<(i32,)> = sqlx::query_as(
-            "SELECT COALESCE(MAX(sort_order), -1) FROM media_entry_full WHERE parent_id IS NULL AND library_id = ?",
-        )
-        .bind(library_id)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| e.to_string())?;
-        let sort_order = max_order.map(|(v,)| v + 1).unwrap_or(0);
-
-        if is_show {
-            let result = sqlx::query(
-                "INSERT INTO media_entry (library_id, parent_id, entry_type_id) VALUES (?, NULL, ?)",
+            let max_order: Option<(i32,)> = sqlx::query_as(
+                "SELECT COALESCE(MAX(sort_order), -1) FROM media_entry_full WHERE parent_id IS NULL AND library_id = ?",
             )
             .bind(library_id)
-            .bind(show_type_id.0)
-            .execute(pool)
+            .fetch_optional(pool)
             .await
             .map_err(|e| e.to_string())?;
+            let sort_order = max_order.map(|(v,)| v + 1).unwrap_or(0);
 
-            let entry_id = result.last_insert_rowid();
-            sqlx::query("INSERT INTO show (id, title, folder_path, sort_title, sort_order) VALUES (?, ?, ?, ?, ?)")
-                .bind(entry_id)
-                .bind(&title)
-                .bind(rel_path)
-                .bind(&sort_title)
-                .bind(sort_order)
+            if is_show {
+                let result = sqlx::query(
+                    "INSERT INTO media_entry (library_id, parent_id, entry_type_id) VALUES (?, NULL, ?)",
+                )
+                .bind(library_id)
+                .bind(show_type_id.0)
                 .execute(pool)
                 .await
                 .map_err(|e| e.to_string())?;
 
-            cache_entry_images(pool, library_id, cache_base, base_path, rel_path)
-                .await
-                .map_err(|e| e.to_string())?;
-            sync_extras_for_entry(pool, entry_id, base_path, rel_path)
-                .await
-                .map_err(|e| e.to_string())?;
+                let entry_id = result.last_insert_rowid();
+                sqlx::query("INSERT INTO show (id, title, folder_path, sort_title, sort_order) VALUES (?, ?, ?, ?, ?)")
+                    .bind(entry_id)
+                    .bind(&title)
+                    .bind(rel_path)
+                    .bind(&sort_title)
+                    .bind(sort_order)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
 
-            // Don't recurse into seasons here — they'll be handled in the season rescan below
-        } else {
-            let result = sqlx::query(
-                "INSERT INTO media_entry (library_id, parent_id, entry_type_id) VALUES (?, NULL, ?)",
-            )
-            .bind(library_id)
-            .bind(movie_type_id.0)
-            .execute(pool)
-            .await
-            .map_err(|e| e.to_string())?;
+                cache_entry_images(pool, library_id, cache_base, base_path, rel_path)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                sync_extras_for_entry(pool, entry_id, base_path, rel_path)
+                    .await
+                    .map_err(|e| e.to_string())?;
 
-            let entry_id = result.last_insert_rowid();
-            sqlx::query("INSERT INTO movie (id, title, folder_path, sort_title, sort_order, release_date) VALUES (?, ?, ?, ?, ?, ?)")
-                .bind(entry_id)
-                .bind(&title)
-                .bind(rel_path)
-                .bind(&sort_title)
-                .bind(sort_order)
-                .bind(&year)
+                // Don't recurse into seasons here — they'll be handled in the season rescan below
+            } else {
+                let result = sqlx::query(
+                    "INSERT INTO media_entry (library_id, parent_id, entry_type_id) VALUES (?, NULL, ?)",
+                )
+                .bind(library_id)
+                .bind(movie_type_id.0)
                 .execute(pool)
                 .await
                 .map_err(|e| e.to_string())?;
 
-            cache_entry_images(pool, library_id, cache_base, base_path, rel_path)
-                .await
-                .map_err(|e| e.to_string())?;
-            sync_extras_for_entry(pool, entry_id, base_path, rel_path)
-                .await
-                .map_err(|e| e.to_string())?;
+                let entry_id = result.last_insert_rowid();
+                sqlx::query("INSERT INTO movie (id, title, folder_path, sort_title, sort_order, release_date) VALUES (?, ?, ?, ?, ?, ?)")
+                    .bind(entry_id)
+                    .bind(&title)
+                    .bind(rel_path)
+                    .bind(&sort_title)
+                    .bind(sort_order)
+                    .bind(&year)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                cache_entry_images(pool, library_id, cache_base, base_path, rel_path)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                sync_extras_for_entry(pool, entry_id, base_path, rel_path)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(e) = res {
+            warnings.push(format!("Skipped new entry '{}': {}", rel_path, e));
         }
     }
 
@@ -5248,10 +5363,17 @@ async fn rescan_video_library(
         .collect();
     for (entry_id, rel_path) in &existing_entries {
         if let Some(base) = path_to_base.get(rel_path) {
-            sync_entry_images(pool, library_id, cache_base, base, rel_path).await?;
-            sync_extras_for_entry(pool, *entry_id, base, rel_path)
-                .await
-                .map_err(|e| e.to_string())?;
+            let res: Result<(), String> = async {
+                sync_entry_images(pool, library_id, cache_base, base, rel_path).await?;
+                sync_extras_for_entry(pool, *entry_id, base, rel_path)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(())
+            }
+            .await;
+            if let Err(e) = res {
+                warnings.push(format!("Image/extras sync failed for '{}': {}", rel_path, e));
+            }
         }
     }
 
@@ -5265,93 +5387,27 @@ async fn rescan_video_library(
     .map_err(|e| e.to_string())?;
 
     for (show_id, show_rel) in &all_shows {
-        // Resolve which base this show belongs to
-        let show_base = path_to_base.get(show_rel)
-            .or_else(|| {
-                // For existing entries not in path_to_base, find which base contains it
-                base_paths.iter().find(|b| b.join(show_rel).exists())
-            })
-            .ok_or_else(|| format!("Cannot resolve base path for show: {}", show_rel))?;
-        let show_path = show_base.join(show_rel);
+        // Each show's season/episode sync is isolated: structural failures (can't
+        // resolve/read the show folder, can't query its seasons) skip just this
+        // show; a bad season skips that season; a bad episode file (e.g. a
+        // duplicate (season,episode_number)) skips that one file. Everything else
+        // still syncs. Warnings bubble up to the user.
+        let show_res: Result<Vec<String>, String> = async {
+            let mut w: Vec<String> = Vec::new();
 
-        let disk_seasons: HashSet<String> = std::fs::read_dir(&show_path)
-            .map_err(|e| e.to_string())?
-            .filter_map(|e| e.ok())
-            .filter(|e| is_scannable_dir(e))
-            .map(|e| {
-                e.path()
-                    .strip_prefix(show_base)
-                    .unwrap_or(&e.path())
-                    .to_string_lossy()
-                    .to_string()
-            })
-            .collect();
+            // Resolve which base this show belongs to
+            let show_base = path_to_base.get(show_rel)
+                .or_else(|| {
+                    // For existing entries not in path_to_base, find which base contains it
+                    base_paths.iter().find(|b| b.join(show_rel).exists())
+                })
+                .ok_or_else(|| format!("cannot resolve base path"))?;
+            let show_path = show_base.join(show_rel);
 
-        let db_seasons: Vec<(i64, String)> =
-            sqlx::query_as("SELECT id, folder_path FROM season WHERE show_id = ?")
-                .bind(show_id)
-                .fetch_all(pool)
-                .await
-                .map_err(|e| e.to_string())?;
-
-        // Delete removed seasons
-        for (id, path) in &db_seasons {
-            if !disk_seasons.contains(path) {
-                sqlx::query("DELETE FROM season WHERE id = ?")
-                    .bind(id)
-                    .execute(pool)
-                    .await
-                    .map_err(|e| e.to_string())?;
-            }
-        }
-
-        let existing_season_paths: HashSet<String> = db_seasons.iter().map(|(_, p)| p.clone()).collect();
-
-        // Add new seasons
-        for rel_path in &disk_seasons {
-            if existing_season_paths.contains(rel_path) {
-                continue;
-            }
-            let full_path = show_base.join(rel_path);
-            let name = full_path.file_name().unwrap_or_default().to_string_lossy().to_string();
-            let (season_title, season_number) = parse_season_folder_name(&name);
-
-            let max_order: Option<(i32,)> =
-                sqlx::query_as("SELECT COALESCE(MAX(sort_order), -1) FROM season WHERE show_id = ?")
-                    .bind(show_id)
-                    .fetch_optional(pool)
-                    .await
-                    .map_err(|e| e.to_string())?;
-            let sort_order = max_order.map(|(v,)| v + 1).unwrap_or(0);
-
-            sqlx::query(
-                "INSERT INTO season (show_id, title, season_number, folder_path, sort_order) VALUES (?, ?, ?, ?, ?)",
-            )
-            .bind(show_id)
-            .bind(&season_title)
-            .bind(season_number)
-            .bind(rel_path)
-            .bind(sort_order)
-            .execute(pool)
-            .await
-            .map_err(|e| e.to_string())?;
-        }
-
-        // Episodes for each season
-        let all_seasons: Vec<(i64, String)> =
-            sqlx::query_as("SELECT id, folder_path FROM season WHERE show_id = ?")
-                .bind(show_id)
-                .fetch_all(pool)
-                .await
-                .map_err(|e| e.to_string())?;
-
-        for (season_id, season_rel) in &all_seasons {
-            let season_path = show_base.join(season_rel);
-
-            let disk_episodes: HashSet<String> = std::fs::read_dir(&season_path)
+            let disk_seasons: HashSet<String> = std::fs::read_dir(&show_path)
                 .map_err(|e| e.to_string())?
                 .filter_map(|e| e.ok())
-                .filter(|e| is_media_file(&e.path(), VIDEO_EXTENSIONS))
+                .filter(|e| is_scannable_dir(e))
                 .map(|e| {
                     e.path()
                         .strip_prefix(show_base)
@@ -5361,60 +5417,192 @@ async fn rescan_video_library(
                 })
                 .collect();
 
-            let db_episodes: Vec<(i64, String)> =
-                sqlx::query_as("SELECT id, file_path FROM episode WHERE season_id = ?")
-                    .bind(season_id)
+            let db_seasons: Vec<(i64, String)> =
+                sqlx::query_as("SELECT id, folder_path FROM season WHERE show_id = ?")
+                    .bind(show_id)
                     .fetch_all(pool)
                     .await
                     .map_err(|e| e.to_string())?;
 
-            for (id, path) in &db_episodes {
-                if !disk_episodes.contains(path) {
-                    sqlx::query("DELETE FROM episode WHERE id = ?")
+            // Delete removed seasons (a failed delete is non-fatal)
+            for (id, path) in &db_seasons {
+                if !disk_seasons.contains(path) {
+                    if let Err(e) = sqlx::query("DELETE FROM season WHERE id = ?")
                         .bind(id)
                         .execute(pool)
                         .await
-                        .map_err(|e| e.to_string())?;
+                    {
+                        w.push(format!("Failed to remove deleted season '{}': {}", path, e));
+                    }
                 }
             }
 
-            let existing_ep_paths: HashSet<String> = db_episodes.iter().map(|(_, p)| p.clone()).collect();
+            let existing_season_paths: HashSet<String> = db_seasons.iter().map(|(_, p)| p.clone()).collect();
 
-            for rel_path in &disk_episodes {
-                if existing_ep_paths.contains(rel_path) {
+            // Add new seasons (one bad season doesn't abort the show)
+            for rel_path in &disk_seasons {
+                if existing_season_paths.contains(rel_path) {
                     continue;
                 }
-                let file_name = std::path::Path::new(rel_path)
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
-                let (ep_title, ep_number) = parse_episode_filename(&file_name);
+                let full_path = show_base.join(rel_path);
+                let name = full_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                let (season_title, season_number) = parse_season_folder_name(&name);
 
                 let max_order: Option<(i32,)> =
-                    sqlx::query_as("SELECT COALESCE(MAX(sort_order), -1) FROM episode WHERE season_id = ?")
-                        .bind(season_id)
+                    sqlx::query_as("SELECT COALESCE(MAX(sort_order), -1) FROM season WHERE show_id = ?")
+                        .bind(show_id)
                         .fetch_optional(pool)
                         .await
                         .map_err(|e| e.to_string())?;
                 let sort_order = max_order.map(|(v,)| v + 1).unwrap_or(0);
 
-                sqlx::query(
-                    "INSERT INTO episode (season_id, title, episode_number, file_path, sort_order) VALUES (?, ?, ?, ?, ?)",
+                if let Err(e) = sqlx::query(
+                    "INSERT INTO season (show_id, title, season_number, folder_path, sort_order) VALUES (?, ?, ?, ?, ?)",
                 )
-                .bind(season_id)
-                .bind(&ep_title)
-                .bind(ep_number)
+                .bind(show_id)
+                .bind(&season_title)
+                .bind(season_number)
                 .bind(rel_path)
                 .bind(sort_order)
                 .execute(pool)
                 .await
-                .map_err(|e| e.to_string())?;
+                {
+                    w.push(format!("Skipped season '{}': {}", rel_path, e));
+                }
             }
+
+            // Reconcile already-stored seasons whose folder now parses to a
+            // different number/title than what's saved — e.g. a 'Specials' folder
+            // recorded as a NULL-numbered season before the parser mapped it to
+            // Season 0. season_number/title are purely folder-derived, so this is
+            // safe to overwrite; the WHERE guard skips rows that haven't changed.
+            for (id, rel_path) in &db_seasons {
+                if !disk_seasons.contains(rel_path) {
+                    continue; // deleted above
+                }
+                let full_path = show_base.join(rel_path);
+                let name = full_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                let (season_title, season_number) = parse_season_folder_name(&name);
+                if let Err(e) = sqlx::query(
+                    "UPDATE season SET season_number = ?, title = ? WHERE id = ? AND (season_number IS NOT ? OR title IS NOT ?)",
+                )
+                .bind(season_number)
+                .bind(&season_title)
+                .bind(id)
+                .bind(season_number)
+                .bind(&season_title)
+                .execute(pool)
+                .await
+                {
+                    w.push(format!("Failed to reconcile season '{}': {}", rel_path, e));
+                }
+            }
+
+            // Episodes for each season
+            let all_seasons: Vec<(i64, String)> =
+                sqlx::query_as("SELECT id, folder_path FROM season WHERE show_id = ?")
+                    .bind(show_id)
+                    .fetch_all(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+            for (season_id, season_rel) in &all_seasons {
+                let season_path = show_base.join(season_rel);
+
+                // Per-season structural failures skip just this season
+                let disk_episodes: HashSet<String> = match std::fs::read_dir(&season_path) {
+                    Ok(rd) => rd
+                        .filter_map(|e| e.ok())
+                        .filter(|e| is_media_file(&e.path(), VIDEO_EXTENSIONS))
+                        .map(|e| {
+                            e.path()
+                                .strip_prefix(show_base)
+                                .unwrap_or(&e.path())
+                                .to_string_lossy()
+                                .to_string()
+                        })
+                        .collect(),
+                    Err(e) => {
+                        w.push(format!("Skipped season '{}': {}", season_rel, e));
+                        continue;
+                    }
+                };
+
+                let db_episodes: Vec<(i64, String)> =
+                    match sqlx::query_as("SELECT id, file_path FROM episode WHERE season_id = ?")
+                        .bind(season_id)
+                        .fetch_all(pool)
+                        .await
+                    {
+                        Ok(r) => r,
+                        Err(e) => {
+                            w.push(format!("Skipped season '{}': {}", season_rel, e));
+                            continue;
+                        }
+                    };
+
+                for (id, path) in &db_episodes {
+                    if !disk_episodes.contains(path) {
+                        if let Err(e) = sqlx::query("DELETE FROM episode WHERE id = ?")
+                            .bind(id)
+                            .execute(pool)
+                            .await
+                        {
+                            w.push(format!("Failed to remove deleted episode: {}", e));
+                        }
+                    }
+                }
+
+                let existing_ep_paths: HashSet<String> = db_episodes.iter().map(|(_, p)| p.clone()).collect();
+
+                for rel_path in &disk_episodes {
+                    if existing_ep_paths.contains(rel_path) {
+                        continue;
+                    }
+                    let file_name = std::path::Path::new(rel_path)
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
+                    let (ep_title, ep_number) = parse_episode_filename(&file_name);
+
+                    let max_order: Option<(i32,)> =
+                        sqlx::query_as("SELECT COALESCE(MAX(sort_order), -1) FROM episode WHERE season_id = ?")
+                            .bind(season_id)
+                            .fetch_optional(pool)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                    let sort_order = max_order.map(|(v,)| v + 1).unwrap_or(0);
+
+                    // THE fix: a duplicate (season_id, episode_number) — or any
+                    // other insert failure — skips just this file with a warning
+                    // instead of `?`-aborting the entire rescan.
+                    if let Err(e) = sqlx::query(
+                        "INSERT INTO episode (season_id, title, episode_number, file_path, sort_order) VALUES (?, ?, ?, ?, ?)",
+                    )
+                    .bind(season_id)
+                    .bind(&ep_title)
+                    .bind(ep_number)
+                    .bind(rel_path)
+                    .bind(sort_order)
+                    .execute(pool)
+                    .await
+                    {
+                        w.push(format!("Skipped episode file '{}': {}", file_name, e));
+                    }
+                }
+            }
+            Ok(w)
+        }
+        .await;
+
+        match show_res {
+            Ok(w) => warnings.extend(w),
+            Err(e) => warnings.push(format!("Skipped show '{}': {}", show_rel, e)),
         }
     }
 
-    Ok(())
+    Ok(warnings)
 }
 
 async fn rescan_music_library(
@@ -5423,7 +5611,7 @@ async fn rescan_music_library(
     library_id: &str,
     base_paths: &[PathBuf],
     cache_base: &Path,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     use std::collections::{HashSet, HashMap};
 
     let artist_type_id: (i64,) =
@@ -5746,7 +5934,7 @@ async fn rescan_music_library(
         .map_err(|e| e.to_string())?;
     }
 
-    Ok(())
+    Ok(Vec::new())
 }
 
 /// Walk a library root collecting entry folders, classified with the same rules as
@@ -6433,7 +6621,10 @@ async fn scan_video_dir(
                     .to_string_lossy()
                     .to_string();
 
-                sqlx::query(
+                // Non-fatal: a duplicate (season_id, episode_number) — e.g. two
+                // files that parse to the same SxxExx — skips just that file and
+                // logs it, instead of aborting the whole library creation.
+                if let Err(e) = sqlx::query(
                     "INSERT INTO episode (season_id, title, episode_number, file_path, sort_order) VALUES (?, ?, ?, ?, ?)",
                 )
                 .bind(season_id)
@@ -6442,7 +6633,10 @@ async fn scan_video_dir(
                 .bind(&ep_rel)
                 .bind(k as i32)
                 .execute(pool)
-                .await?;
+                .await
+                {
+                    eprintln!("scan: skipped episode file '{}': {}", ep_name, e);
+                }
             }
         }
 
@@ -6522,6 +6716,11 @@ fn is_media_file(path: &std::path::Path, extensions: &[&str]) -> bool {
 
 fn parse_season_folder_name(name: &str) -> (String, Option<i32>) {
     let lower = name.to_lowercase();
+    // "Specials" is the Plex/Jellyfin convention for Season 0. ("season 0"/"s0"/
+    // "s00" already fall through to Some(0) via the numeric paths below.)
+    if lower.trim() == "specials" {
+        return (name.to_string(), Some(0));
+    }
     if let Some(rest) = lower.strip_prefix("season ") {
         if let Ok(n) = rest.trim().parse::<i32>() {
             return (name.to_string(), Some(n));
@@ -6797,6 +6996,9 @@ pub struct ShowDetail {
     pub id: i64,
     pub tmdb_id: Option<String>,
     pub imdb_id: Option<String>,
+    /// RT slug for the show, mirrored from the `rt_slug` side table (the show
+    /// row predates ratings and has no column of its own).
+    pub rotten_tomatoes_id: Option<String>,
     pub plot: Option<String>,
     pub tagline: Option<String>,
     pub maturity_rating: Option<String>,
@@ -6970,10 +7172,18 @@ pub async fn get_show_detail(
 
     let background = entry_background(&state.app_db, show_id).await?;
 
+    let rotten_tomatoes_id: Option<String> =
+        sqlx::query_scalar("SELECT slug FROM rt_slug WHERE entry_id = ?")
+            .bind(show_id)
+            .fetch_optional(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+
     Ok(ShowDetail {
         id: show_id,
         tmdb_id,
         imdb_id,
+        rotten_tomatoes_id,
         plot,
         tagline,
         maturity_rating,
@@ -7160,6 +7370,9 @@ pub struct BulkMovieTarget {
 pub struct BulkShowTarget {
     pub id: i64,
     pub title: String,
+    /// Earliest episode year — used to disambiguate the TMDB search the same way
+    /// movie year does (e.g. "The Office" US vs UK).
+    pub year: Option<String>,
     /// Already-matched shows carry their tmdb_id so season/episode passes can
     /// cover them even when the "shows" checkbox is off.
     pub tmdb_id: Option<String>,
@@ -7212,8 +7425,12 @@ pub async fn get_tmdb_bulk_targets(
     .await
     .map_err(|e| e.to_string())?;
 
-    let shows: Vec<(i64, String, Option<String>)> = sqlx::query_as(
-        "SELECT s.id, s.title, CAST(s.tmdb_id AS TEXT) \
+    let shows: Vec<(i64, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT s.id, s.title, \
+                (SELECT MIN(SUBSTR(e.release_date, 1, 4)) FROM episode e \
+                 JOIN season se ON e.season_id = se.id \
+                 WHERE se.show_id = s.id AND e.release_date IS NOT NULL), \
+                CAST(s.tmdb_id AS TEXT) \
          FROM show s JOIN media_entry me ON me.id = s.id \
          WHERE me.library_id = ? \
          ORDER BY s.sort_title COLLATE NOCASE",
@@ -7282,9 +7499,10 @@ pub async fn get_tmdb_bulk_targets(
             .collect(),
         shows: shows
             .into_iter()
-            .map(|(id, title, tmdb_id)| BulkShowTarget {
+            .map(|(id, title, year, tmdb_id)| BulkShowTarget {
                 id,
                 title,
+                year: year.filter(|y| !y.is_empty()),
                 tmdb_id: tmdb_id.filter(|t| !t.is_empty()),
             })
             .collect(),

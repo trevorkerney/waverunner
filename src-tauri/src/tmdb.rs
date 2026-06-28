@@ -248,6 +248,18 @@ pub struct TmdbTvDetail {
     pub content_ratings: Option<TmdbContentRatings>,
     pub external_ids: Option<TmdbExternalIds>,
     pub images: Option<TmdbImages>,
+    /// Season list straight from the tv-detail response (includes Season 0 /
+    /// "Specials"). Used to drive the "fetch from a specific TMDB episode" picker.
+    #[serde(default)]
+    pub seasons: Vec<TmdbSeasonStub>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TmdbSeasonStub {
+    pub season_number: i64,
+    pub name: String,
+    #[serde(default)]
+    pub episode_count: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

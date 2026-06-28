@@ -101,6 +101,7 @@ import { SortPresetSaveDialog } from "@/components/SortPresetSaveDialog";
 import { TmdbMatchDialog } from "@/components/TmdbMatchDialog";
 import { TmdbShowMatchDialog } from "@/components/TmdbShowMatchDialog";
 import { TmdbImageBrowserDialog } from "@/components/TmdbImageBrowserDialog";
+import { TmdbEpisodeSourceDialog } from "@/components/TmdbEpisodeSourceDialog";
 import { BackgroundSelectDialog } from "@/components/BackgroundSelectDialog";
 import rtCriticsIcon from "@/assets/ratings/rt-critics.svg";
 import rtAudienceIcon from "@/assets/ratings/rt-audience.svg";
@@ -206,8 +207,8 @@ interface MainContentProps {
     coverPath: string,
     opts?: { playlistCollection?: boolean },
   ) => Promise<void>;
-  onMoveEntry: (entryId: number, newParentId: number | null, insertBeforeId: number | null) => Promise<void>;
-  onCreateCollection: (name: string) => Promise<void>;
+  onMoveEntry: (entryId: number, newParentId: number | null, insertBeforeId: number | null, anchor?: { id: number; viewportTop: number }) => Promise<void>;
+  onCreateCollection: (name: string) => Promise<number | null>;
   onDeleteEntry: (entryId: number) => Promise<void>;
   onRescan: () => void;
   onEntryChanged: () => void;
@@ -333,6 +334,29 @@ export function MainContent({
     }
     return null;
   }, [selectedEntry, loading, isSearching, filteredEntries, sortMode]);
+
+  // Whether a jump rail applies to THIS entry set in *any* scrubbable mode (≥2
+  // letters or ≥2 decades) — deliberately independent of the current sort. The
+  // rail floats (absolute), so the only thing that changes the grid width is the
+  // reserved right gutter; keying it off this (not `gridScrubber`) keeps the
+  // gutter stable when toggling custom sort, which never shows a rail, so the
+  // grid no longer reflows on the switch. Views with no grid rail at all
+  // (detail/loading/search) reserve nothing.
+  const scrubberApplies = useMemo(() => {
+    if (selectedEntry || loading || isSearching) return false;
+    const letters = new Set<string>();
+    for (const e of filteredEntries) {
+      letters.add(letterForTitle(e.title));
+      if (letters.size >= 2) return true;
+    }
+    const decades = new Set<string>();
+    for (const e of filteredEntries) {
+      if (!e.year || e.year.length < 4) continue;
+      decades.add(`${e.year.slice(0, 3)}0`);
+      if (decades.size >= 2) return true;
+    }
+    return false;
+  }, [selectedEntry, loading, isSearching, filteredEntries]);
 
   const jumpToGridEntry = useCallback(
     (label: string) => {
@@ -498,9 +522,53 @@ export function MainContent({
           animated++;
         }
       }
+      // Brand-new cards (no prior position) fall into place: a brief slide-down
+      // + fade so an added collection reads as "dropping in" while the existing
+      // cards shift past it. Gated on a non-empty prior list so the initial
+      // populate of a view doesn't animate every card.
+      if (prevKeys.length > 0) {
+        for (const child of children) {
+          const key = child.dataset.flipId;
+          if (!key || prev.has(key)) continue; // movers handled above; only new cards here
+          child.animate(
+            [
+              { transform: "translateY(-12px) scale(0.96)", opacity: 0 },
+              { transform: "translateY(0px) scale(1)", opacity: 1 },
+            ],
+            { duration: 280, easing: "cubic-bezier(0.2, 0, 0, 1)", fill: "backwards" },
+          );
+        }
+      }
     }
     flipPositionsRef.current = next;
   });
+
+  // Creating a collection scrolls it into view if it sorted below the fold, so
+  // there's feedback (and the fall-in animation is seen) instead of it silently
+  // appearing off-screen. We stash the new id, then scroll once the refreshed
+  // grid actually contains the card.
+  const [pendingNewCollectionId, setPendingNewCollectionId] = useState<number | null>(null);
+  const handleCreateCollection = useCallback(async (name: string) => {
+    const id = await onCreateCollection(name);
+    if (id != null) setPendingNewCollectionId(id);
+  }, [onCreateCollection]);
+  useEffect(() => {
+    if (pendingNewCollectionId == null) return;
+    if (!filteredEntries.some((e) => e.id === pendingNewCollectionId)) return;
+    setPendingNewCollectionId(null);
+    const container = scrollContainerRef.current;
+    const el = gridRef.current?.querySelector<HTMLElement>(
+      `[data-flip-id="${window.CSS.escape(String(pendingNewCollectionId))}"]`,
+    );
+    if (!container || !el) return;
+    // Only scroll when it's not already fully in view — no jolt when the new
+    // collection sorts into the visible region.
+    const elRect = el.getBoundingClientRect();
+    const cRect = container.getBoundingClientRect();
+    if (elRect.top < cRect.top || elRect.bottom > cRect.bottom) {
+      el.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  }, [pendingNewCollectionId, filteredEntries, scrollContainerRef]);
 
   const handleDragEnd = useCallback(
     async (event: DragEndEvent) => {
@@ -614,7 +682,15 @@ export function MainContent({
         const targetId = Number(overId.replace("collection-", ""));
         if (targetId !== entryId) {
           beginAbsorb(over, active.id);
-          await onMoveEntry(entryId, targetId, null);
+          // Pin the scroll to the collection we just dropped onto: record where its
+          // card sits in the viewport now, so the post-move reload can keep it there
+          // instead of snapping back to the (possibly far-away) source row.
+          const container = scrollContainerRef.current;
+          const targetEl = gridRef.current?.querySelector<HTMLElement>(`[data-flip-id="${window.CSS.escape(String(targetId))}"]`);
+          const anchor = container && targetEl
+            ? { id: targetId, viewportTop: targetEl.getBoundingClientRect().top - container.getBoundingClientRect().top }
+            : undefined;
+          await onMoveEntry(entryId, targetId, null, anchor);
         }
       } else {
         // Sortable reorder (over.id is the numeric entry id from useSortable)
@@ -890,7 +966,7 @@ export function MainContent({
       {/* Content. The jump rail floats inside the right edge (the scrollbar keeps
           the page edge); content gets extra right padding so it never sits under it. */}
       <div className="relative flex min-h-0 flex-1">
-      <div ref={scrollContainerRef} className={`min-w-0 flex-1 overflow-y-auto overflow-x-hidden p-4 ${gridScrubber ? "pr-10" : ""}`}>
+      <div ref={scrollContainerRef} className={`min-w-0 flex-1 overflow-y-auto overflow-x-hidden p-4 ${scrubberApplies ? "pr-10" : ""}`}>
       {selectedEntry ? (
         selectedEntry.entry_type === "show"
           ? <ShowDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getCoverUrl={getCoverUrl} getFullCoverUrl={getFullCoverUrl} onEntryChanged={onEntryChanged} onTitleChanged={onTitleChanged} onChangeCover={() => openCoverDialog(selectedEntry, "select")} onAddCover={() => onAddCover(selectedEntry.id)} onDeleteCover={() => openCoverDialog(selectedEntry, "delete")} onPlayEpisode={onPlayEpisode} onPlayFile={onPlayFile} onNavigateToPerson={onNavigateToPerson} />
@@ -1029,8 +1105,16 @@ export function MainContent({
                   toast.loading(event.payload, { id: toastId });
                 });
                 try {
-                  await invoke("rescan_library", { libraryId: selectedLibrary.id });
-                  toast.success("Rescan complete", { id: toastId });
+                  const warnings = await invoke<string[]>("rescan_library", { libraryId: selectedLibrary.id });
+                  if (warnings.length > 0) {
+                    toast.warning(`Rescan complete — ${warnings.length} item${warnings.length === 1 ? "" : "s"} skipped`, {
+                      id: toastId,
+                      description: warnings.slice(0, 5).join("  •  ") + (warnings.length > 5 ? `  •  +${warnings.length - 5} more` : ""),
+                      duration: 8000,
+                    });
+                  } else {
+                    toast.success("Rescan complete", { id: toastId });
+                  }
                   onRescan();
                 } catch (err) {
                   toast.error(String(err), { id: toastId });
@@ -1062,7 +1146,7 @@ export function MainContent({
               placeholder="Collection name"
               onKeyDown={(e) => {
                 if (e.key === "Enter" && newCollectionName.trim()) {
-                  onCreateCollection(newCollectionName.trim());
+                  handleCreateCollection(newCollectionName.trim());
                   setNewCollectionOpen(false);
                 }
               }}
@@ -1076,7 +1160,7 @@ export function MainContent({
             <Button
               disabled={!newCollectionName.trim()}
               onClick={() => {
-                onCreateCollection(newCollectionName.trim());
+                handleCreateCollection(newCollectionName.trim());
                 setNewCollectionOpen(false);
               }}
             >
@@ -1775,6 +1859,32 @@ const RATING_ICONS: Record<string, string> = {
   metacritic: metacriticIcon,
 };
 
+// Manual rating editor. Free-text values ("8.5", "85%") matching how ratings are
+// fetched/stored/displayed. Order = how they read top-to-bottom in the form.
+const RATING_EDIT_SOURCES = ["imdb", "rotten_tomatoes", "rotten_tomatoes_audience", "metacritic"] as const;
+
+function ratingsToDraft(ratings: RatingInfo[]): Record<string, string> {
+  const d: Record<string, string> = {};
+  for (const s of RATING_EDIT_SOURCES) d[s] = ratings.find((r) => r.source === s)?.value ?? "";
+  return d;
+}
+
+function draftToRatings(draft: Record<string, string>): RatingInfo[] {
+  return RATING_EDIT_SOURCES.map((s) => ({ source: s, value: (draft[s] ?? "").trim() }));
+}
+
+/** Shared rating-value inputs for the movie/show edit forms. */
+function RatingsEditFields({ draft, onChange }: { draft: Record<string, string>; onChange: (source: string, value: string) => void }) {
+  return (
+    <div className="flex flex-col gap-3 rounded-md border border-dashed p-3">
+      <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Ratings</p>
+      {RATING_EDIT_SOURCES.map((s) => (
+        <EditField key={s} label={RATING_LABELS[s] ?? s} value={draft[s] ?? ""} onChange={(v) => onChange(s, v)} />
+      ))}
+    </div>
+  );
+}
+
 /** The hero ratings row shared by movie and show detail pages. */
 function RatingsLine({ ratings }: { ratings: RatingInfo[] }) {
   if (ratings.length === 0) return null;
@@ -1832,6 +1942,66 @@ function CastCard({
         <span className="-mt-0.5 w-full text-[11px] leading-tight text-muted-foreground line-clamp-2">{person.role}</span>
       )}
     </button>
+  );
+}
+
+/** Full-width cast grid (movie + show detail pages). Cast is now uncapped, so
+ *  it collapses to ~2 rows with a "View all" toggle. The visible-when-collapsed
+ *  count is derived from the measured column count so it's always whole rows. */
+function CastBand({
+  cast,
+  onNavigateToPerson,
+}: {
+  cast: CastInfo[];
+  onNavigateToPerson?: (person: PersonInfo, role: PersonRole) => void;
+}) {
+  const CAST_MIN_W = 108; // matches the grid's minmax min
+  const CAST_GAP_X = 4; // gap-x-1
+  const COLLAPSED_ROWS = 2;
+  const [expanded, setExpanded] = useState(false);
+  const [cols, setCols] = useState(1);
+  const gridRef = useRef<HTMLDivElement | null>(null);
+
+  useLayoutEffect(() => {
+    const el = gridRef.current;
+    if (!el) return;
+    const update = () =>
+      setCols(Math.max(1, Math.floor((el.clientWidth + CAST_GAP_X) / (CAST_MIN_W + CAST_GAP_X))));
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  const collapsedCount = cols * COLLAPSED_ROWS;
+  const overflow = cast.length > collapsedCount;
+  const shown = expanded || !overflow ? cast : cast.slice(0, collapsedCount);
+
+  return (
+    <div className="flex min-w-0 flex-col gap-1.5">
+      <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Cast</p>
+      <div
+        ref={gridRef}
+        className="grid gap-x-1 gap-y-3"
+        style={{ gridTemplateColumns: "repeat(auto-fill, minmax(108px, 1fr))" }}
+      >
+        {shown.map((c) => (
+          <CastCard
+            key={c.id}
+            person={c}
+            onClick={() => onNavigateToPerson?.({ id: c.id, name: c.name, image_path: c.image_path }, "actor")}
+          />
+        ))}
+      </div>
+      {overflow && (
+        <button
+          onClick={() => setExpanded((v) => !v)}
+          className="mt-0.5 w-fit text-xs font-medium text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+        >
+          {expanded ? "show less" : `...view all ${cast.length} cast members`}
+        </button>
+      )}
+    </div>
   );
 }
 
@@ -1954,7 +2124,9 @@ function EntryDetailPage({
     }
   }, [entry.id]);
 
+  const [ratingsDraft, setRatingsDraft] = useState<Record<string, string>>({});
   const startEditing = () => {
+    setRatingsDraft(ratingsToDraft(ratings));
     setDraft({
       title: entry.title,
       release_date: detail?.release_date ?? entry.year ?? "",
@@ -1982,7 +2154,9 @@ function EntryDetailPage({
         entryId: entry.id,
         detail: draft,
       });
+      await invoke("set_manual_ratings", { entryId: entry.id, ratings: draftToRatings(ratingsDraft) });
       await loadDetail();
+      setRatings(await invoke<RatingInfo[]>("get_ratings", { entryId: entry.id }).catch(() => [] as RatingInfo[]));
       if (draft.title && draft.title !== entry.title) {
         onTitleChanged(entry.id, draft.title);
       }
@@ -2216,6 +2390,7 @@ function EntryDetailPage({
             <EditField label="TMDB ID" value={draft.tmdb_id ?? ""} onChange={(v) => updateDraft("tmdb_id", v || null)} />
             <EditField label="IMDB ID" value={draft.imdb_id ?? ""} onChange={(v) => updateDraft("imdb_id", v || null)} />
             <EditField label="Rotten Tomatoes ID" value={draft.rotten_tomatoes_id ?? ""} onChange={(v) => updateDraft("rotten_tomatoes_id", v || null)} />
+            <RatingsEditFields draft={ratingsDraft} onChange={(s, v) => setRatingsDraft((p) => ({ ...p, [s]: v }))} />
             <PeopleListEdit label="Cast" items={draft.cast ?? []} onChange={(items) => updateDraft("cast", items)} secondaryField="role" secondaryLabel="Role" />
           </div>
         )}
@@ -2251,26 +2426,7 @@ function EntryDetailPage({
       {detail && !editing && (detail.cast.length > 0 || detail.studios.length > 0 || detail.tmdb_id || detail.imdb_id || detail.rotten_tomatoes_id) && (
         <div className="flex w-full min-w-0 flex-col gap-5">
           {detail.cast.length > 0 && (
-            <div className="flex min-w-0 flex-col gap-1.5">
-              <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Cast</p>
-              <div
-                className="grid gap-x-1 gap-y-3"
-                style={{ gridTemplateColumns: "repeat(auto-fill, minmax(108px, 1fr))" }}
-              >
-                {detail.cast.map((c) => (
-                  <CastCard
-                    key={c.id}
-                    person={c}
-                    onClick={() =>
-                      onNavigateToPerson?.(
-                        { id: c.id, name: c.name, image_path: c.image_path },
-                        "actor",
-                      )
-                    }
-                  />
-                ))}
-              </div>
-            </div>
+            <CastBand cast={detail.cast} onNavigateToPerson={onNavigateToPerson} />
           )}
 
           {(detail.studios.length > 0 || detail.tmdb_id || detail.imdb_id || detail.rotten_tomatoes_id) && (
@@ -2523,7 +2679,7 @@ function ShowDetailPage({
       const fields: TmdbSeasonFieldSelection = {};
       if (tmdbSeason.overview) fields.plot = tmdbSeason.overview;
       if (tmdbSeason.credits?.cast && tmdbSeason.credits.cast.length > 0) {
-        fields.cast = tmdbSeason.credits.cast.slice(0, 20).map((c) => ({
+        fields.cast = tmdbSeason.credits.cast.map((c) => ({
           name: c.name,
           role: c.character ?? null,
           tmdb_id: c.id,
@@ -2584,14 +2740,20 @@ function ShowDetailPage({
     }
   }, [detail, selectedSeason, selectedLibrary.id, onEntryChanged, reloadEpisodes]);
 
-  const handleEpisodeTmdb = useCallback(async (ep: EpisodeInfo) => {
-    if (!detail?.tmdb_id || !selectedSeason || selectedSeason.season_number == null || ep.episode_number == null) return;
+  // `source` overrides which TMDB season/episode the metadata is pulled FROM,
+  // for the case where TMDB files content differently than the local layout
+  // (e.g. a special the user keeps in Specials but TMDB lists inline). The local
+  // episode is untouched structurally — only its metadata fields get written.
+  const handleEpisodeTmdb = useCallback(async (ep: EpisodeInfo, source?: { season: number; episode: number }) => {
+    const srcSeason = source?.season ?? selectedSeason?.season_number ?? null;
+    const srcEpisode = source?.episode ?? ep.episode_number ?? null;
+    if (!detail?.tmdb_id || srcSeason == null || srcEpisode == null) return;
     setEpisodeTmdbLoading(ep.id);
     try {
       const tmdbEp = await invoke<TmdbEpisodeDetail>("get_tmdb_episode_detail", {
         tmdbId: Number(detail.tmdb_id),
-        seasonNumber: selectedSeason.season_number,
-        episodeNumber: ep.episode_number,
+        seasonNumber: srcSeason,
+        episodeNumber: srcEpisode,
       });
       const fields: TmdbEpisodeFieldSelection = {};
       if (tmdbEp.name) fields.title = tmdbEp.name;
@@ -2620,7 +2782,9 @@ function ShowDetailPage({
         episodeId: ep.id,
         fields,
       });
-      toast.success(`Episode ${ep.episode_number} metadata populated`);
+      toast.success(source
+        ? `Populated from TMDB S${srcSeason} E${srcEpisode}`
+        : `Episode ${ep.episode_number} metadata populated`);
       loadEpisodeDetail(ep.id);
       reloadEpisodes();
       onEntryChanged();
@@ -2631,10 +2795,18 @@ function ShowDetailPage({
     }
   }, [detail, selectedSeason, loadEpisodeDetail, onEntryChanged, reloadEpisodes]);
 
+  // "Fetch from a specific TMDB episode" — pick which TMDB episode to pull from.
+  const [tmdbSourceFor, setTmdbSourceFor] = useState<EpisodeInfo | null>(null);
+  const openTmdbSource = useCallback((ep: EpisodeInfo) => setTmdbSourceFor(ep), []);
+
+  const [showRaterDraft, setShowRaterDraft] = useState<{ imdb_id: string; rt_id: string }>({ imdb_id: "", rt_id: "" });
+  const [ratingsDraft, setRatingsDraft] = useState<Record<string, string>>({});
   const startEditShow = useCallback(() => {
     if (!detail) return;
     setSeasonEditing(false);
     setEditingEpisodeId(null);
+    setShowRaterDraft({ imdb_id: detail.imdb_id ?? "", rt_id: detail.rotten_tomatoes_id ?? "" });
+    setRatingsDraft(ratingsToDraft(ratings));
     setShowDraft({
       plot: detail.plot ?? "",
       tagline: detail.tagline ?? "",
@@ -2647,7 +2819,7 @@ function ShowDetailPage({
       keywords: [...detail.keywords],
     });
     setShowEditing(true);
-  }, [detail]);
+  }, [detail, ratings]);
 
   const saveShow = useCallback(async () => {
     setShowSaving(true);
@@ -2656,7 +2828,14 @@ function ShowDetailPage({
         showId: entry.id,
         fields: showDraft,
       });
+      await invoke("set_rater_ids", {
+        entryId: entry.id,
+        imdbId: showRaterDraft.imdb_id.trim() || null,
+        rtId: showRaterDraft.rt_id.trim() || null,
+      });
+      await invoke("set_manual_ratings", { entryId: entry.id, ratings: draftToRatings(ratingsDraft) });
       await loadDetail();
+      setRatings(await invoke<RatingInfo[]>("get_ratings", { entryId: entry.id }).catch(() => [] as RatingInfo[]));
       onEntryChanged();
       setShowEditing(false);
     } catch (e) {
@@ -2664,7 +2843,7 @@ function ShowDetailPage({
     } finally {
       setShowSaving(false);
     }
-  }, [selectedLibrary.id, entry.id, showDraft, loadDetail, onEntryChanged]);
+  }, [selectedLibrary.id, entry.id, showDraft, showRaterDraft, ratingsDraft, loadDetail, onEntryChanged]);
 
   const startEditSeason = useCallback(() => {
     if (!seasonDetail) return;
@@ -2822,12 +3001,22 @@ function ShowDetailPage({
                   {detail.maturity_rating}
                 </span>
               )}
-              {seasons.length > 0 && (
-                <>
-                  <span className="text-muted-foreground/50">·</span>
-                  <span>{seasons.length} {seasons.length === 1 ? "season" : "seasons"}</span>
-                </>
-              )}
+              {seasons.length > 0 && (() => {
+                // Match the grid subtitle: count real seasons only (Specials = 0 is
+                // never folded into the headline). A specials-only show reads "Specials".
+                const real = seasons.filter((s) => s.season_number != null && s.season_number > 0).length;
+                const label = real > 0
+                  ? `${real} ${real === 1 ? "season" : "seasons"}`
+                  : seasons.some((s) => s.season_number === 0)
+                    ? "Specials"
+                    : `${seasons.length} ${seasons.length === 1 ? "season" : "seasons"}`;
+                return (
+                  <>
+                    <span className="text-muted-foreground/50">·</span>
+                    <span>{label}</span>
+                  </>
+                );
+              })()}
             </div>
             {detail?.tagline && (
               <p className="mt-2 italic text-muted-foreground">{detail.tagline}</p>
@@ -2913,6 +3102,9 @@ function ShowDetailPage({
             <PeopleListEdit label="Cast" items={showDraft.cast ?? []} onChange={(items) => setShowDraft((p) => ({ ...p, cast: items }))} secondaryField="role" secondaryLabel="Role" />
             <EditField label="Studios (comma-separated)" value={(showDraft.studios ?? []).join(", ")} onChange={(v) => setShowDraft((p) => ({ ...p, studios: v.split(",").map((s) => s.trim()).filter(Boolean) }))} />
             <EditField label="Keywords (comma-separated)" value={(showDraft.keywords ?? []).join(", ")} onChange={(v) => setShowDraft((p) => ({ ...p, keywords: v.split(",").map((s) => s.trim()).filter(Boolean) }))} />
+            <EditField label="IMDB ID" value={showRaterDraft.imdb_id} onChange={(v) => setShowRaterDraft((p) => ({ ...p, imdb_id: v }))} />
+            <EditField label="Rotten Tomatoes ID" value={showRaterDraft.rt_id} onChange={(v) => setShowRaterDraft((p) => ({ ...p, rt_id: v }))} />
+            <RatingsEditFields draft={ratingsDraft} onChange={(s, v) => setRatingsDraft((p) => ({ ...p, [s]: v }))} />
             <div className="flex gap-2">
               <Button size="sm" variant="outline" onClick={() => setShowEditing(false)} disabled={showSaving}>Cancel</Button>
               <Button size="sm" onClick={saveShow} disabled={showSaving}>{showSaving ? "Saving..." : "Save"}</Button>
@@ -2967,7 +3159,7 @@ function ShowDetailPage({
                         : "bg-secondary text-secondary-foreground hover:bg-accent"
                     }`}
                   >
-                    {s.season_number != null ? `Season ${s.season_number}` : s.title}
+                    {s.season_number === 0 ? "Specials" : s.season_number != null ? `Season ${s.season_number}` : s.title}
                   </button>
                 );
               })}
@@ -3087,6 +3279,13 @@ function ShowDetailPage({
                           <Film size={14} />
                           {episodeTmdbLoading === ep.id ? "Loading..." : "Fetch from TMDB"}
                         </ContextMenuItem>
+                        <ContextMenuItem
+                          onClick={() => openTmdbSource(ep)}
+                          disabled={!hasTmdb || episodeTmdbLoading === ep.id}
+                        >
+                          <Film size={14} />
+                          Fetch from a specific TMDB episode…
+                        </ContextMenuItem>
                       </ContextMenuContent>
                     </ContextMenu>
                     {/* Expanded panel slides open via the 0fr→1fr grid-rows trick; loaded
@@ -3189,6 +3388,13 @@ function ShowDetailPage({
                             <Film size={14} />
                             {episodeTmdbLoading === ep.id ? "Loading..." : "Fetch from TMDB"}
                           </ContextMenuItem>
+                          <ContextMenuItem
+                            onClick={() => openTmdbSource(ep)}
+                            disabled={!hasTmdb || episodeTmdbLoading === ep.id}
+                          >
+                            <Film size={14} />
+                            Fetch from a specific TMDB episode…
+                          </ContextMenuItem>
                         </ContextMenuContent>
                       </ContextMenu>
                     )}
@@ -3228,26 +3434,7 @@ function ShowDetailPage({
       {detail && !showEditing && (detail.cast.length > 0 || detail.studios.length > 0 || detail.tmdb_id || detail.imdb_id) && (
         <div className="flex w-full min-w-0 flex-col gap-5">
           {detail.cast.length > 0 && (
-            <div className="flex min-w-0 flex-col gap-1.5">
-              <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Cast</p>
-              <div
-                className="grid gap-x-1 gap-y-3"
-                style={{ gridTemplateColumns: "repeat(auto-fill, minmax(108px, 1fr))" }}
-              >
-                {detail.cast.map((c) => (
-                  <CastCard
-                    key={c.id}
-                    person={c}
-                    onClick={() =>
-                      onNavigateToPerson?.(
-                        { id: c.id, name: c.name, image_path: c.image_path },
-                        "actor",
-                      )
-                    }
-                  />
-                ))}
-              </div>
-            </div>
+            <CastBand cast={detail.cast} onNavigateToPerson={onNavigateToPerson} />
           )}
           {(detail.studios.length > 0 || detail.tmdb_id || detail.imdb_id) && (
             <p className="text-xs text-muted-foreground/70">
@@ -3317,6 +3504,15 @@ function ShowDetailPage({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <TmdbEpisodeSourceDialog
+        open={tmdbSourceFor != null}
+        onOpenChange={(o) => { if (!o) setTmdbSourceFor(null); }}
+        tmdbId={detail?.tmdb_id != null ? Number(detail.tmdb_id) : null}
+        defaultSeason={selectedSeason?.season_number ?? null}
+        defaultEpisode={tmdbSourceFor?.episode_number ?? null}
+        onFetch={(season, episode) => { if (tmdbSourceFor) handleEpisodeTmdb(tmdbSourceFor, { season, episode }); }}
+      />
     </div>
   );
 }

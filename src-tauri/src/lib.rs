@@ -126,6 +126,8 @@ pub fn run() {
             commands::get_tmdb_bulk_targets,
             commands::get_ratings,
             commands::fetch_ratings,
+            commands::set_manual_ratings,
+            commands::set_rater_ids,
             commands::get_backgrounds,
             commands::set_selected_background,
             commands::set_person_favorite,
