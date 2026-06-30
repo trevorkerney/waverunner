@@ -268,6 +268,22 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                   </div>
                 </div>
               </div>
+              <div>
+                <h3 className="mb-4 text-sm font-semibold">Artwork</h3>
+                <div className="flex items-center justify-between gap-4">
+                  <div>
+                    <p className="text-sm">Save artwork to source folders</p>
+                    <p className="text-xs text-muted-foreground">
+                      When downloading covers and backdrops from TMDB, save them into the media
+                      folder's covers/ and backdrops/ subfolders so they travel with your files.
+                    </p>
+                  </div>
+                  <Switch
+                    checked={settings["save_artwork_to_source"] !== "false"}
+                    onCheckedChange={(v) => setSetting("save_artwork_to_source", v ? "true" : "false")}
+                  />
+                </div>
+              </div>
             </div>
           )}
         </div>

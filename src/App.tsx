@@ -10,7 +10,7 @@ import { Toaster } from "@/components/ui/sonner";
 import { toast } from "sonner";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { Library, MediaEntry, EntriesResponse, BreadcrumbItem, ViewSpec, PersonInfo, PersonSummary, PersonRole, PlaylistSummary, PlaylistContents, SortPreset } from "@/types";
+import { Library, MediaEntry, EntriesResponse, BreadcrumbItem, ViewSpec, PersonInfo, PersonSummary, PersonRole, PlaylistSummary, PlaylistsResponse, PlaylistContents, SortPreset } from "@/types";
 import { viewCacheKey, scopeKeyFor } from "@/lib/complications";
 
 function App() {
@@ -31,6 +31,7 @@ function App() {
   const [selectedPresetId, setSelectedPresetId] = useState<number | null>(null);
   const [presets, setPresets] = useState<SortPreset[]>([]);
   const [coverSize, setCoverSize] = useState(200);
+  const coverSizeTimerRef = useRef<number | null>(null);
   const [search, setSearch] = useState("");
   const [searchResults, setSearchResults] = useState<MediaEntry[] | null>(null);
   const [selectedEntry, setSelectedEntry] = useState<MediaEntry | null>(null);
@@ -75,15 +76,19 @@ function App() {
   const viewEntriesCacheRef = useRef<Map<string, { entries: MediaEntry[]; sort_mode: string; selected_preset_id: number | null; presets: SortPreset[] }>>(new Map());
   // Cache: viewCacheKey(view) -> people (people-list views)
   const peopleCacheRef = useRef<Map<string, PersonSummary[]>>(new Map());
-  // Top-100/All mode per people view. Navigation (back/breadcrumb) restores it;
-  // sidebar clicks delete the entry so a fresh visit always lands on Top 100.
+  // Top-100/All mode per people view (keyed by viewCacheKey). Persisted to the settings
+  // table (`people_mode:{key}`) and hydrated on mount, so the choice is remembered across
+  // navigation and restarts.
   const peopleModeRef = useRef<Map<string, "top" | "all">>(new Map());
-  // Cache: viewCacheKey(view) -> playlists
-  const playlistsCacheRef = useRef<Map<string, PlaylistSummary[]>>(new Map());
+  // Cache: viewCacheKey(view) -> playlists + the list scope's preset state
+  const playlistsCacheRef = useRef<Map<string, { playlists: PlaylistSummary[]; presets: SortPreset[]; selectedPresetId: number | null }>>(new Map());
   // Scroll position cache: scroll-key -> { pixel fallback, plus an element anchor
   // (the card at the viewport top + its offset) so restore survives content-
   // visibility height-estimation drift that a raw scrollTop can't.
   const scrollCacheRef = useRef<Map<string, { scrollTop: number; anchorId: string | null; anchorDelta: number }>>(new Map());
+  // Sort mode for the playlists-list view ("alpha" | "custom"). Held in a ref so
+  // loadView reads it without a dep; the toolbar's sort dropdown drives it.
+  const playlistsSortModeRef = useRef("custom");
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   // Cache: cover file path -> blob URL of its thumbnail
   const thumbCacheRef = useRef<Map<string, string>>(new Map());
@@ -186,9 +191,9 @@ function App() {
     let cancelled = false;
     libraries.forEach(async (lib) => {
       try {
-        const pls = await invoke<PlaylistSummary[]>("get_playlists", { libraryId: lib.id });
+        const res = await invoke<PlaylistsResponse>("get_playlists", { libraryId: lib.id });
         if (!cancelled) {
-          setSidebarPlaylists((prev) => ({ ...prev, [lib.id]: pls }));
+          setSidebarPlaylists((prev) => ({ ...prev, [lib.id]: res.playlists }));
         }
       } catch {
         // swallow — sidebar just renders with no playlist children for that library
@@ -256,6 +261,51 @@ function App() {
     }, 200);
     return () => clearTimeout(timer);
   }, [search, selectedLibrary, breadcrumbs, activeView, preloadCovers]);
+
+  // Load the persisted playlists-list sort mode for the selected library.
+  useEffect(() => {
+    if (!selectedLibrary) return;
+    invoke<Record<string, string>>("get_settings")
+      .then((s) => {
+        playlistsSortModeRef.current = s[`playlists_sort_mode:${selectedLibrary.id}`] === "alpha" ? "alpha" : "custom";
+      })
+      .catch(() => {});
+  }, [selectedLibrary]);
+
+  // The cover-size slider is global (shared by every grid) and persisted in the settings
+  // table so it survives restarts. Load once on mount; `changeCoverSize` (below) writes
+  // changes back, debounced so dragging the slider doesn't hammer the DB.
+  useEffect(() => {
+    invoke<Record<string, string>>("get_settings")
+      .then((s) => {
+        const v = parseInt(s["cover_size"] ?? "", 10);
+        if (!Number.isNaN(v)) setCoverSize(v);
+      })
+      .catch(() => {});
+  }, []);
+
+  const changeCoverSize = useCallback((size: number) => {
+    setCoverSize(size);
+    if (coverSizeTimerRef.current) clearTimeout(coverSizeTimerRef.current);
+    coverSizeTimerRef.current = window.setTimeout(() => {
+      invoke("set_setting", { key: "cover_size", value: String(size) }).catch(() => {});
+    }, 300);
+  }, []);
+
+  // Hydrate the per-view people Top-100/All mode from settings on mount, so a saved choice
+  // is in the ref before the user navigates into a people view. (viewCacheKey already
+  // embeds the library id, so a single global read covers every library.)
+  useEffect(() => {
+    invoke<Record<string, string>>("get_settings")
+      .then((s) => {
+        for (const [k, v] of Object.entries(s)) {
+          if (k.startsWith("people_mode:") && (v === "top" || v === "all")) {
+            peopleModeRef.current.set(k.slice("people_mode:".length), v);
+          }
+        }
+      })
+      .catch(() => {});
+  }, []);
 
   // Scroll-key "kind": role lists must not share a slot (Actors vs Composers
   // both have kind people-list and parentId null).
@@ -391,8 +441,11 @@ function App() {
         const cached = playlistsCacheRef.current.get(key);
         setEntries([]);
         setPeople(null);
+        setSortMode(playlistsSortModeRef.current);
         if (cached) {
-          setPlaylists(cached);
+          setPlaylists(cached.playlists);
+          setPresets(cached.presets);
+          setSelectedPresetId(cached.selectedPresetId);
           setBreadcrumbs(breadcrumb);
           return;
         }
@@ -400,12 +453,19 @@ function App() {
         setPlaylists(null);
         setLoading(true);
         try {
-          const res = await invoke<PlaylistSummary[]>("get_playlists", {
+          const res = await invoke<PlaylistsResponse>("get_playlists", {
             libraryId: view.libraryId,
+            sortMode: playlistsSortModeRef.current,
           });
-          await preloadImages(res.map((pl) => pl.selected_cover));
-          playlistsCacheRef.current.set(key, res);
-          setPlaylists(res);
+          await preloadImages(res.playlists.map((pl) => pl.selected_cover));
+          playlistsCacheRef.current.set(key, {
+            playlists: res.playlists,
+            presets: res.presets,
+            selectedPresetId: res.selected_preset_id,
+          });
+          setPlaylists(res.playlists);
+          setPresets(res.presets);
+          setSelectedPresetId(res.selected_preset_id);
         } catch (e) {
           console.error("Failed to load playlists:", e);
         } finally {
@@ -638,10 +698,6 @@ function App() {
       // Sidebar view switches intentionally discard scroll — they always land at the top.
       // Don't save outgoing scroll; pass restoreScroll=false so loadView resets to 0.
       // Also clear the forward stack so mouse-forward can't cross into a stale view's history.
-      if (view.kind === "people-all" || view.kind === "people-list") {
-        // Sidebar clicks land on Top 100; only back/breadcrumb navigation remembers.
-        peopleModeRef.current.delete(viewCacheKey(view));
-      }
       setActiveView(view);
       setSelectedEntry(null);
       setSearch("");
@@ -1059,8 +1115,8 @@ function App() {
     invalidateCache(libraryId);
     (async () => {
       try {
-        const pls = await invoke<PlaylistSummary[]>("get_playlists", { libraryId });
-        setSidebarPlaylists((prev) => ({ ...prev, [libraryId]: pls }));
+        const res = await invoke<PlaylistsResponse>("get_playlists", { libraryId });
+        setSidebarPlaylists((prev) => ({ ...prev, [libraryId]: res.playlists }));
       } catch {
         // swallow
       }
@@ -1077,6 +1133,22 @@ function App() {
   const changeSortMode = useCallback(
     async (mode: string) => {
       if (!selectedLibrary) return;
+      // Capture the current scroll BEFORE the reload. Library-root restores scroll
+      // on an in-place sort refresh; without a fresh save it would restore a stale
+      // value (the "jumps ~15-20% down" bug). Saving now means re-clicking the same
+      // sort is a no-op and a real sort change keeps your top item in view.
+      saveScrollPosition();
+
+      // Playlists-LIST view: only alpha / custom (custom = manual sort_order). Held
+      // in a ref; drop the cache and re-fetch so get_playlists re-sorts.
+      if (activeView?.kind === "playlists") {
+        playlistsSortModeRef.current = mode === "alpha" ? "alpha" : "custom";
+        setSortMode(playlistsSortModeRef.current);
+        invoke("set_setting", { key: `playlists_sort_mode:${selectedLibrary.id}`, value: playlistsSortModeRef.current }).catch(() => {});
+        playlistsCacheRef.current.delete(viewCacheKey(activeView));
+        loadView(activeView, null, breadcrumbs, true, true);
+        return;
+      }
 
       // Playlist-detail has its own per-level sort_mode storage (playlist root vs nested collection)
       // and a limited vocabulary ("custom" | "alpha"). Route there instead of set_sort_mode.
@@ -1125,7 +1197,7 @@ function App() {
         console.error("Failed to set sort mode:", e);
       }
     },
-    [selectedLibrary, activeView, breadcrumbs, loadEntries, loadView, invalidateCache]
+    [selectedLibrary, activeView, breadcrumbs, loadEntries, loadView, invalidateCache, saveScrollPosition]
   );
 
   const updateSortOrder = useCallback(
@@ -1206,6 +1278,13 @@ function App() {
       if (!scopeKey) return;
       try {
         await invoke("set_selected_preset", { scopeKey, presetId });
+        if (presetId !== null) {
+          // Selecting a preset switches the scope into custom sort (the backend does the same) —
+          // otherwise an "alpha" scope would hard-override the preset and ignore it. Mirror it
+          // locally so the reload runs in custom; the playlists-LIST reads its mode from a ref.
+          setSortMode("custom");
+          if (activeView.kind === "playlists") playlistsSortModeRef.current = "custom";
+        }
         invalidateCache(activeView.libraryId, parentId);
         loadView(activeView, parentId, breadcrumbs, true, true);
       } catch (e) {
@@ -1223,8 +1302,10 @@ function App() {
       if (!scopeKey) return;
       // Shape the items list based on the scope: library scopes → {kind:"entry",id}; playlist
       // scopes → {kind:"link",id} for media_link rows and {kind:"collection",id} for nested
-      // playlist_collection rows.
-      const items = activeView.kind === "playlist-detail"
+      // playlist_collection rows; the playlists-LIST → {kind:"playlist",id} in current order.
+      const items = activeView.kind === "playlists"
+        ? (playlists ?? []).map((p) => ({ kind: "playlist", id: p.id }))
+        : activeView.kind === "playlist-detail"
         ? entries.map((e) =>
             e.link_id != null
               ? { kind: "link", id: e.link_id }
@@ -1236,7 +1317,7 @@ function App() {
       invalidateCache(activeView.libraryId, parentId);
       loadView(activeView, parentId, breadcrumbs, true, true);
     },
-    [activeView, breadcrumbs, entries, invalidateCache, loadView]
+    [activeView, breadcrumbs, entries, playlists, invalidateCache, loadView]
   );
 
   const deletePreset = useCallback(
@@ -1818,7 +1899,7 @@ function App() {
           loading={loading}
           breadcrumbs={breadcrumbs}
           coverSize={coverSize}
-          onCoverSizeChange={setCoverSize}
+          onCoverSizeChange={changeCoverSize}
           search={search}
           onSearchChange={setSearch}
           onNavigate={navigateTo}
@@ -1831,7 +1912,9 @@ function App() {
           }
           onPeopleModeChange={(mode) => {
             if (activeView && (activeView.kind === "people-all" || activeView.kind === "people-list")) {
-              peopleModeRef.current.set(viewCacheKey(activeView), mode);
+              const key = viewCacheKey(activeView);
+              peopleModeRef.current.set(key, mode);
+              invoke("set_setting", { key: `people_mode:${key}`, value: mode }).catch(() => {});
             }
           }}
           onNavigateToPlaylist={navigateToPlaylist}

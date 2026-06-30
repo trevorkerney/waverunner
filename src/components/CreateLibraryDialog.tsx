@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -44,7 +44,9 @@ export function CreateLibraryDialog({
   onCreated,
 }: CreateLibraryDialogProps) {
   const [name, setName] = useState("");
-  const [paths, setPaths] = useState<string[]>([""]);
+  // Folders are tagged by kind: movies vs TV shows. At least one across both is required.
+  const [moviePaths, setMoviePaths] = useState<string[]>([""]);
+  const [showPaths, setShowPaths] = useState<string[]>([""]);
   const [format, setFormat] = useState("video");
   // Only 'local' is implemented; 'server' (Jellyfin/Plex/Emby client mode) is
   // shown disabled so the direction is visible in the UI.
@@ -64,30 +66,16 @@ export function CreateLibraryDialog({
     return () => { unlisten.then((fn) => fn()); };
   }, [creating]);
 
-  function updatePath(index: number, value: string) {
-    setPaths((prev) => prev.map((p, i) => (i === index ? value : p)));
+  // Fill the name from the first browsed folder if the user hasn't named the library yet.
+  function maybeAutoName(folder: string) {
+    if (name) return;
+    const parts = folder.replace(/\\/g, "/").split("/");
+    setName(parts[parts.length - 1] || "");
   }
 
-  function addPath() {
-    setPaths((prev) => [...prev, ""]);
-  }
-
-  function removePath(index: number) {
-    setPaths((prev) => prev.filter((_, i) => i !== index));
-  }
-
-  async function browsePath(index: number) {
-    const selected = await open({ directory: true, multiple: false });
-    if (selected) {
-      updatePath(index, selected as string);
-      if (!name && index === 0) {
-        const parts = (selected as string).replace(/\\/g, "/").split("/");
-        setName(parts[parts.length - 1] || "");
-      }
-    }
-  }
-
-  const validPaths = paths.filter((p) => p.trim() !== "");
+  const validMoviePaths = moviePaths.filter((p) => p.trim() !== "");
+  const validShowPaths = showPaths.filter((p) => p.trim() !== "");
+  const totalValidPaths = validMoviePaths.length + validShowPaths.length;
 
   async function handleCancel() {
     try {
@@ -112,18 +100,23 @@ export function CreateLibraryDialog({
 
   function resetForm() {
     setName("");
-    setPaths([""]);
+    setMoviePaths([""]);
+    setShowPaths([""]);
     setFormat("video");
     setSource("local");
   }
 
   async function handleCreate() {
-    if (!name || validPaths.length === 0 || creatingGlobal) return;
+    if (!name || totalValidPaths === 0 || creatingGlobal) return;
     setCreating(true);
     creatingGlobal = true;
     setScanProgress("");
     try {
-      await invoke("create_library", { name, paths: validPaths, format, source });
+      const paths = [
+        ...validMoviePaths.map((path) => ({ path, kind: "movie" })),
+        ...validShowPaths.map((path) => ({ path, kind: "show" })),
+      ];
+      await invoke("create_library", { name, paths, format, source });
       if (toastIdRef.current != null) {
         toast.success(`Library "${name}" created`, { id: toastIdRef.current, duration: 4000, action: undefined });
         toastIdRef.current = null;
@@ -245,33 +238,18 @@ export function CreateLibraryDialog({
               </TooltipProvider>
             </ToggleGroup>
           </div>
-          <div className="grid gap-3">
-            <Label>Folders</Label>
-            <div className="grid gap-2">
-              {paths.map((p, i) => (
-                <div key={i} className="flex gap-2">
-                  <Input
-                    value={p}
-                    onChange={(e) => updatePath(i, e.target.value)}
-                    placeholder="Select a folder..."
-                    className="flex-1"
-                  />
-                  <Button variant="outline" onClick={() => browsePath(i)} className="h-9 w-9 shrink-0 p-0">
-                    <FolderOpen size={16} />
-                  </Button>
-                  {paths.length > 1 && (
-                    <Button variant="outline" onClick={() => removePath(i)} className="h-9 w-9 shrink-0 p-0">
-                      <X size={16} />
-                    </Button>
-                  )}
-                </div>
-              ))}
-              <Button variant="ghost" size="sm" onClick={addPath} className="justify-start gap-1.5 text-muted-foreground">
-                <Plus size={14} />
-                Add folder
-              </Button>
-            </div>
-          </div>
+          <FolderSection
+            label="Movie folders"
+            paths={moviePaths}
+            setPaths={setMoviePaths}
+            onAutoName={maybeAutoName}
+          />
+          <FolderSection
+            label="TV Show folders"
+            paths={showPaths}
+            setPaths={setShowPaths}
+            onAutoName={maybeAutoName}
+          />
         </div>
         <DialogFooter className="px-4 mx-0 -mb-4">
           {creating ? (
@@ -289,7 +267,7 @@ export function CreateLibraryDialog({
               <Button variant="outline" onClick={() => onOpenChange(false)}>
                 Cancel
               </Button>
-              <Button onClick={handleCreate} disabled={!name || validPaths.length === 0}>
+              <Button onClick={handleCreate} disabled={!name || totalValidPaths === 0}>
                 Create
               </Button>
             </>
@@ -297,5 +275,65 @@ export function CreateLibraryDialog({
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  );
+}
+
+/** A repeatable folder picker for one media kind (movies or shows). */
+function FolderSection({
+  label,
+  paths,
+  setPaths,
+  onAutoName,
+}: {
+  label: string;
+  paths: string[];
+  setPaths: Dispatch<SetStateAction<string[]>>;
+  onAutoName: (folder: string) => void;
+}) {
+  function updatePath(index: number, value: string) {
+    setPaths((prev) => prev.map((p, i) => (i === index ? value : p)));
+  }
+  function addPath() {
+    setPaths((prev) => [...prev, ""]);
+  }
+  function removePath(index: number) {
+    setPaths((prev) => prev.filter((_, i) => i !== index));
+  }
+  async function browsePath(index: number) {
+    const selected = await open({ directory: true, multiple: false });
+    if (selected) {
+      updatePath(index, selected as string);
+      onAutoName(selected as string);
+    }
+  }
+
+  return (
+    <div className="grid gap-3">
+      <Label>{label}</Label>
+      <div className="grid gap-2">
+        {paths.map((p, i) => (
+          <div key={i} className="flex gap-2">
+            <Input
+              value={p}
+              onChange={(e) => updatePath(i, e.target.value)}
+              placeholder="Select a folder..."
+              className="flex-1"
+            />
+            <Button variant="outline" onClick={() => browsePath(i)} className="h-9 w-9 shrink-0 p-0">
+              <FolderOpen size={16} />
+            </Button>
+            {paths.length > 1 && (
+              <Button variant="outline" onClick={() => removePath(i)} className="h-9 w-9 shrink-0 p-0">
+                <X size={16} />
+              </Button>
+            )}
+          </div>
+        ))}
+        <Button variant="ghost" size="sm" onClick={addPath} className="justify-start gap-1.5 text-muted-foreground">
+          <Plus size={14} />
+          Add folder
+        </Button>
+      </div>
+    </div>
   );
 }

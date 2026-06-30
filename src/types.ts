@@ -102,6 +102,18 @@ export interface PlaylistSummary {
   title: string;
   selected_cover: string | null;
   covers: string[];
+  movie_count: number;
+  show_count: number;
+  year: string | null;
+  end_year: string | null;
+}
+
+// Result of `get_playlists` — the playlists plus the saved presets / selected preset
+// for the playlists-LIST sort scope (drives the toolbar's preset dropdown).
+export interface PlaylistsResponse {
+  playlists: PlaylistSummary[];
+  presets: SortPreset[];
+  selected_preset_id: number | null;
 }
 
 // Result of `get_playlist_contents`. Entries are a mix of linked media
@@ -151,7 +163,7 @@ export interface MovieDetail {
   studios: string[];
   keywords: string[];
   /** Backdrop for the detail-page hero (selected, or first cached). */
-  background: string | null;
+  backdrop: string | null;
 }
 
 export interface CastUpdateInfo {
@@ -178,6 +190,8 @@ export interface EpisodeInfo {
   id: number;
   title: string;
   episode_number: number | null;
+  /** Last episode covered by a multi-episode file ("S01E01-E02" → 2); null otherwise. */
+  episode_number_end: number | null;
   file_path: string;
   sort_order: number;
   /** Shown inline in the episode list (clamped) — full detail loads on expand. */
@@ -253,7 +267,7 @@ export interface TmdbMovieDetail {
 export interface TmdbImageDownload {
   file_path: string;
   size: string;
-  image_type: "cover" | "background";
+  image_type: "cover" | "backdrop";
 }
 
 export interface TmdbFieldSelection {
@@ -309,7 +323,7 @@ export interface ShowDetail {
   /** Sum of every episode's runtime — null unless ALL episodes have one. */
   total_runtime: number | null;
   /** Backdrop for the detail-page hero (selected, or first cached). */
-  background: string | null;
+  backdrop: string | null;
 }
 
 export interface SeasonDetailLocal {
@@ -324,6 +338,7 @@ export interface EpisodeDetailLocal {
   id: number;
   title: string;
   episode_number: number | null;
+  episode_number_end: number | null;
   release_date: string | null;
   plot: string | null;
   runtime: number | null;

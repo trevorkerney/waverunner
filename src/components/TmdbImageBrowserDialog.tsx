@@ -145,7 +145,7 @@ export function TmdbImageBrowserDialog({
           images.push({
             file_path: backdrops[Number(idx)].file_path,
             size: sel.size,
-            image_type: "background",
+            image_type: "backdrop",
           });
         }
       }

@@ -9,38 +9,38 @@ import {
 } from "@/components/ui/dialog";
 import { Spinner } from "@/components/ui/spinner";
 
-interface BackgroundSelectDialogProps {
+interface BackdropSelectDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   entryId: number;
-  /** The backdrop currently shown on the hero (detail.background). */
+  /** The backdrop currently shown on the hero (detail.backdrop). */
   current: string | null;
   /** Fired after a new backdrop is selected so the page can reload. */
   onChanged: () => void;
 }
 
-export function BackgroundSelectDialog({
+export function BackdropSelectDialog({
   open,
   onOpenChange,
   entryId,
   current,
   onChanged,
-}: BackgroundSelectDialogProps) {
+}: BackdropSelectDialogProps) {
   const [loading, setLoading] = useState(false);
-  const [backgrounds, setBackgrounds] = useState<string[]>([]);
+  const [backdrops, setBackdrops] = useState<string[]>([]);
 
   useEffect(() => {
     if (!open) return;
     setLoading(true);
-    invoke<string[]>("get_backgrounds", { entryId })
-      .then(setBackgrounds)
+    invoke<string[]>("get_backdrops", { entryId })
+      .then(setBackdrops)
       .catch((e) => toast.error(String(e)))
       .finally(() => setLoading(false));
   }, [open, entryId]);
 
   const select = async (path: string) => {
     try {
-      await invoke("set_selected_background", { entryId, path });
+      await invoke("set_selected_backdrop", { entryId, path });
       onChanged();
       onOpenChange(false);
     } catch (e) {
@@ -52,23 +52,23 @@ export function BackgroundSelectDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-h-[80vh] w-[720px] max-w-[90vw] overflow-y-auto">
         <DialogHeader>
-          <DialogTitle>Select Background</DialogTitle>
+          <DialogTitle>Select Backdrop</DialogTitle>
         </DialogHeader>
         {loading && (
           <div className="flex justify-center py-10">
             <Spinner className="size-6" />
           </div>
         )}
-        {!loading && backgrounds.length === 0 && (
+        {!loading && backdrops.length === 0 && (
           <p className="py-6 text-sm text-muted-foreground">
             No backdrops yet. Right-click the cover and use "Browse TMDB images"
-            to download some, or drop images into a "backgrounds" folder inside
+            to download some, or drop images into a "backdrops" folder inside
             the media folder and rescan.
           </p>
         )}
-        {!loading && backgrounds.length > 0 && (
+        {!loading && backdrops.length > 0 && (
           <div className="grid grid-cols-2 gap-3">
-            {backgrounds.map((path) => (
+            {backdrops.map((path) => (
               <button
                 key={path}
                 onClick={() => select(path)}

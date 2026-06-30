@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
-import { Search, Star, User } from "lucide-react";
+import { ListFilter, Search, Star, User } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import {
   ContextMenu,
@@ -8,6 +8,12 @@ import {
   ContextMenuContent,
   ContextMenuItem,
 } from "@/components/ui/context-menu";
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+} from "@/components/ui/dropdown-menu";
 import { ScrubberRail } from "@/components/ScrubberRail";
 import type { CharacterMatch, PersonRole, PersonSummary } from "@/types";
 
@@ -45,8 +51,8 @@ interface PeoplePageProps {
   /** For the character-name search (it's a backend query). */
   libraryId: string;
   role: PersonRole;
-  /** Mode to land on — the parent remembers it per view across navigation
-   *  (and resets it on sidebar clicks). The component is keyed per view. */
+  /** Mode to land on — the parent remembers it per view (persisted to settings),
+   *  so it survives navigation and restarts. The component is keyed per view. */
   initialMode: "top" | "all";
   onModeChange: (mode: "top" | "all") => void;
   onSelectPerson: (person: PersonSummary) => void;
@@ -229,7 +235,7 @@ export function PeoplePage({ people, libraryId, role, initialMode, onModeChange,
 
   return (
     <>
-      {/* Toolbar: search (always searches ALL people) + Top/All toggle */}
+      {/* Toolbar: search (always searches ALL people) + Top/All selector */}
       <div className="flex items-center gap-3 border-b border-border px-4 py-2">
         <div className="relative flex-1">
           <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground" />
@@ -244,25 +250,26 @@ export function PeoplePage({ people, libraryId, role, initialMode, onModeChange,
           />
         </div>
         {hasTop && !searching && (
-          <div className="flex rounded-md border border-input p-0.5">
-            {(["top", "all"] as const).map((m) => (
-              <button
-                key={m}
-                onClick={() => {
-                  setMode(m);
-                  onModeChange(m);
-                  resetScroll();
-                }}
-                className={`rounded-[5px] px-2.5 py-1 text-xs transition-colors ${
-                  effectiveMode === m
-                    ? "bg-accent font-medium text-accent-foreground"
-                    : "text-muted-foreground hover:text-foreground"
-                }`}
-              >
-                {m === "top" ? `Top ${TOP_N}` : "All"}
-              </button>
-            ))}
-          </div>
+          <DropdownMenu>
+            <DropdownMenuTrigger className="flex h-8 items-center gap-1.5 rounded-md border border-input bg-background px-2.5 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground">
+              <ListFilter size={12} />
+              {mode === "top" ? `Top ${TOP_N}` : "All"}
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              {(["top", "all"] as const).map((m) => (
+                <DropdownMenuItem
+                  key={m}
+                  onClick={() => {
+                    setMode(m);
+                    onModeChange(m);
+                    resetScroll();
+                  }}
+                >
+                  {m === "top" ? `Top ${TOP_N}` : "All"}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
         )}
       </div>
 

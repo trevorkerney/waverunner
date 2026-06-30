@@ -22,7 +22,6 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
         "CREATE TABLE IF NOT EXISTS library (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
-            paths TEXT NOT NULL,
             format TEXT NOT NULL,
             -- source: where the library's content comes from. 'local' reads folders from
             -- disk; future values ('jellyfin', 'plex', ...) act as a client for a media
@@ -39,6 +38,21 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             movies_only_selected_preset_id INTEGER,
             shows_only_selected_preset_id INTEGER,
             creating INTEGER NOT NULL DEFAULT 0
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // A library's source folders, each tagged movie/show so the scanner classifies by the
+    // folder's kind instead of guessing from structure. Replaces the old library.paths JSON blob.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS library_path (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            library_id TEXT NOT NULL,
+            path TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK (kind IN ('movie', 'show', 'music')),
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE
         )",
     )
     .execute(&pool)
@@ -388,6 +402,10 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             season_id INTEGER NOT NULL,
             title TEXT NOT NULL DEFAULT 'Episode',
             episode_number INTEGER,
+            -- For multi-episode files (e.g. \"S01E01-E02\"): the LAST episode number covered.
+            -- NULL for ordinary single episodes. episode_number stays the FIRST number, so the
+            -- UNIQUE(season_id, episode_number) constraint and number-based sorting still work.
+            episode_number_end INTEGER,
             file_path TEXT NOT NULL,
             release_date TEXT,
             plot TEXT,
@@ -723,9 +741,9 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     // ── Selected backdrop per entry ───────────────────────────────────
     // Separate table (not a column on movie/show) so it needs no ALTER
     // migrations and covers any entry type that grows a backdrop later.
-    // The path references cached_images.cached_path with image_type='background'.
+    // The path references cached_images.cached_path with image_type='backdrop'.
     sqlx::query(
-        "CREATE TABLE IF NOT EXISTS selected_background (
+        "CREATE TABLE IF NOT EXISTS selected_backdrop (
             entry_id INTEGER PRIMARY KEY,
             path TEXT NOT NULL,
             FOREIGN KEY (entry_id) REFERENCES media_entry(id) ON DELETE CASCADE

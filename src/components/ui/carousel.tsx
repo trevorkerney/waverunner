@@ -184,8 +184,12 @@ function CarouselPrevious({
       size={size}
       className={cn(
         "absolute touch-manipulation rounded-full",
+        // Center with auto-margins, NOT -translate-y-1/2: the Button's
+        // active:translate-y-px press effect also writes translateY, which would
+        // clobber the centering and make the button jump out from under the cursor
+        // on press (top-of-button clicks then never register).
         orientation === "horizontal"
-          ? "top-1/2 -left-12 -translate-y-1/2"
+          ? "inset-y-0 -left-12 my-auto"
           : "-top-12 left-1/2 -translate-x-1/2 rotate-90",
         className
       )}
@@ -214,8 +218,10 @@ function CarouselNext({
       size={size}
       className={cn(
         "absolute touch-manipulation rounded-full",
+        // See CarouselPrevious: auto-margin centering avoids the active-press
+        // translateY clobbering the vertical centering.
         orientation === "horizontal"
-          ? "top-1/2 -right-12 -translate-y-1/2"
+          ? "inset-y-0 -right-12 my-auto"
           : "-bottom-12 left-1/2 -translate-x-1/2 rotate-90",
         className
       )}

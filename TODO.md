@@ -9,25 +9,16 @@ dropping media into a collection (when the media is far from the collection scro
 
 ## bugs / needs fixing
 
-playlist grid page and individual playlist grid pages are outdated. needs updating with new features seen in other grid pages (virtualization, animation improvements, subtitles showing num of movies and shows + release date range, reordering media still causes cover image warping, etc.)
-
-sometimes the sidebar doesn't always seem to properly take the user to the page it represents. ive noticed a couple times where i'll go from movies to all and it still just shows movies. other instances similar to this have also happened.
-
-people pages top100/all toggle should just be a selection like sorting options on media grid pages, not a toggle. same functionality too - the selection should be remembered
-
-add (copy SVGs from RT site) splat (critic) and spilled popcorn (audience) icons for RT reviews under 60% (or whatever RT's number is)
-
-i accidentally put a tv show (with 1 season) in the TV directory and without a season folder. the episodes were directly in the tv show folder. waverunner treated it like a movie 
-
-movie covers and backdrops downloaded from TMDB or anywhere through the app SHOULD save to the users source folder, if setting enabled (default on)
-
 add a way for users to switch audio (and video?) track within the player (bug because we should've had this by now)
 
 rescanning (when done) seems to place the user in All view while keeping whatever they were on before highlighted in the sidebar.
 
-scan and rescan need to detect double (and even triple, MAYBE MORE IDK) episodes like when a file is named something like S01E01-E02 - one example is "Courage the Cowardly Dog". These should combine both episodes' metadata into the episode
+pages SOMETIMES fade in when clicking them for the first time after the loader. sometimes pages load in and then some unknown (it happens too fast to tell) number of media covers drop in and shifts all the other media entries around them.
 
 
+### later
+
+sometimes the sidebar doesn't always seem to properly take the user to the page it represents. ive noticed a couple times where i'll go from movies to all and it still just shows movies. other instances similar to this have also happened.
 
 
 ## changes / small new features

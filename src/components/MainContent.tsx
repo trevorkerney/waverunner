@@ -102,9 +102,11 @@ import { TmdbMatchDialog } from "@/components/TmdbMatchDialog";
 import { TmdbShowMatchDialog } from "@/components/TmdbShowMatchDialog";
 import { TmdbImageBrowserDialog } from "@/components/TmdbImageBrowserDialog";
 import { TmdbEpisodeSourceDialog } from "@/components/TmdbEpisodeSourceDialog";
-import { BackgroundSelectDialog } from "@/components/BackgroundSelectDialog";
+import { BackdropSelectDialog } from "@/components/BackdropSelectDialog";
 import rtCriticsIcon from "@/assets/ratings/rt-critics.svg";
 import rtAudienceIcon from "@/assets/ratings/rt-audience.svg";
+import rtCriticsRottenIcon from "@/assets/ratings/rt-critics-rotten.svg";
+import rtAudienceRottenIcon from "@/assets/ratings/rt-audience-rotten.svg";
 import imdbIcon from "@/assets/ratings/imdb.svg";
 import metacriticIcon from "@/assets/ratings/metacritic.svg";
 import { PeoplePage } from "@/components/PeopleGrid";
@@ -836,6 +838,17 @@ export function MainContent({
         onNavigateToPlaylist={onNavigateToPlaylist}
         onPlaylistChanged={onPlaylistChanged}
         getFullCoverUrl={getFullCoverUrl}
+        search={search}
+        onSearchChange={onSearchChange}
+        coverSize={coverSize}
+        onCoverSizeChange={onCoverSizeChange}
+        sortMode={sortMode}
+        onSortModeChange={onSortModeChange}
+        presets={presets}
+        selectedPresetId={selectedPresetId}
+        onChangePreset={onChangePreset}
+        onSavePreset={onSavePreset}
+        onDeletePreset={onDeletePreset}
       />
     );
   }
@@ -1017,11 +1030,13 @@ export function MainContent({
               <div
                 ref={gridRef}
                 // gap-2.5: cards carry 8px of their own padding per side, so the
-                // visible cover-to-cover distance is gap + 16px.
+                // visible cover-to-cover distance is gap + 16px. Cards span two
+                // implicit rows and subgrid onto them, so every cover in a row
+                // shares one (bottom-aligned) track and every title the next —
+                // covers keep their natural heights but their bottoms line up.
                 className="grid gap-2.5"
                 style={{
                   gridTemplateColumns: `repeat(auto-fill, minmax(${coverSize}px, 1fr))`,
-                  alignItems: "center",
                   justifyItems: "center",
                 }}
               >
@@ -1427,17 +1442,17 @@ function SortableCoverCard({
             onClick={() => !isRenaming && !isDragging && onNavigate(entry)}
           />
         }
-        className={`group flex flex-col items-center gap-2 rounded-md p-2 text-left ${
+        className={`group grid justify-items-center rounded-md p-2 text-left ${
           isDragging || pendingRemoval ? "pointer-events-none opacity-0" : ""
         } ${isOver && isDragActive ? "ring-2 ring-primary ring-offset-2 ring-offset-background" : ""}`}
-        style={{ ...style, maxWidth: size }}
+        style={{ ...style, maxWidth: size, gridRow: "span 2", gridTemplateRows: "subgrid" }}
       >
         {/* content-visibility lives on the cover box, NOT the card root: it brings
             paint containment, and on the root it would clip the hover lift (the
             cover translates above the card's padding). Here the clip box is the
             already-overflow-hidden cover and transforms along with the hover. */}
         <div
-          className="relative overflow-hidden rounded-[3px] bg-muted shadow-md ring-1 ring-foreground/10 transition-[translate,scale] duration-200 group-hover:-translate-y-1 group-hover:scale-[1.04] group-hover:shadow-xl group-hover:ring-foreground/25"
+          className="relative self-end overflow-hidden rounded-[3px] bg-muted shadow-md ring-1 ring-foreground/10 transition-[translate,scale] duration-200 group-hover:-translate-y-1 group-hover:scale-[1.04] group-hover:shadow-xl group-hover:ring-foreground/25"
           style={{
             width: size - 16,
             // Skips layout/paint/decode for offscreen covers; estimates a 2:3 poster.
@@ -1859,6 +1874,22 @@ const RATING_ICONS: Record<string, string> = {
   metacritic: metacriticIcon,
 };
 
+// RT shows a "rotten" mark below 60%: a green splat for critics, a tipped-over green
+// popcorn for the audience. Above that it's the regular fresh tomato/popcorn. Other
+// sources never swap. parseInt copes with values like "85%" or "85".
+const RT_ROTTEN_ICONS: Record<string, string> = {
+  rotten_tomatoes: rtCriticsRottenIcon,
+  rotten_tomatoes_audience: rtAudienceRottenIcon,
+};
+function ratingIconFor(source: string, value: string): string | undefined {
+  const rotten = RT_ROTTEN_ICONS[source];
+  if (rotten) {
+    const pct = parseInt(value, 10);
+    if (!Number.isNaN(pct) && pct < 60) return rotten;
+  }
+  return RATING_ICONS[source];
+}
+
 // Manual rating editor. Free-text values ("8.5", "85%") matching how ratings are
 // fetched/stored/displayed. Order = how they read top-to-bottom in the form.
 const RATING_EDIT_SOURCES = ["imdb", "rotten_tomatoes", "rotten_tomatoes_audience", "metacritic"] as const;
@@ -1895,7 +1926,7 @@ function RatingsLine({ ratings }: { ratings: RatingInfo[] }) {
     <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
       {RATING_ORDER.filter((s) => ratings.some((r) => r.source === s)).map((source) => {
         const r = ratings.find((x) => x.source === source)!;
-        const icon = RATING_ICONS[source];
+        const icon = ratingIconFor(source, r.value);
         const label = RATING_LABELS[source] ?? source;
         return (
           <span key={source} className="flex items-center gap-1" title={label}>
@@ -2082,10 +2113,10 @@ function EntryDetailPage({
         }),
       ]);
       // Decode the hero backdrop before the gate opens so it paints with the page.
-      if (d?.background) {
+      if (d?.backdrop) {
         try {
           const img = new Image();
-          img.src = convertFileSrc(d.background);
+          img.src = convertFileSrc(d.backdrop);
           await img.decode();
         } catch { /* paint will decode it instead */ }
       }
@@ -2191,11 +2222,11 @@ function EntryDetailPage({
     <div className="relative isolate flex flex-wrap gap-8 p-6">
       {/* Hero backdrop: real backdrop art when one is downloaded; otherwise the
           cover blurred and washed out. Both fade into the page background. */}
-      {(detail?.background || coverSrc) && (
+      {(detail?.backdrop || coverSrc) && (
         // -inset-x-4/-top-4 cancel the scroll container's p-4 so the wash reaches the section borders.
         <div aria-hidden className="pointer-events-none absolute -inset-x-4 -top-4 -z-10 h-[490px] overflow-hidden">
-          {detail?.background ? (
-            <img src={convertFileSrc(detail.background)} alt="" className="absolute inset-0 h-full w-full object-cover opacity-15" />
+          {detail?.backdrop ? (
+            <img src={convertFileSrc(detail.backdrop)} alt="" className="absolute inset-0 h-full w-full object-cover opacity-15" />
           ) : (
             // Oversized by the blur radius (64px) on every side so the blur's
             // transparent falloff lands outside the visible box.
@@ -2472,11 +2503,11 @@ function EntryDetailPage({
           onDownloaded={() => { loadDetail(); onEntryChanged(); }}
         />
       )}
-      <BackgroundSelectDialog
+      <BackdropSelectDialog
         open={backgroundDialogOpen}
         onOpenChange={setBackgroundDialogOpen}
         entryId={entry.id}
-        current={detail?.background ?? null}
+        current={detail?.backdrop ?? null}
         onChanged={loadDetail}
       />
     </div>
@@ -2620,10 +2651,10 @@ function ShowDetailPage({
         }
       }
       // Decode the hero backdrop before the gate opens so it paints with the page.
-      if (d?.background) {
+      if (d?.backdrop) {
         try {
           const img = new Image();
-          img.src = convertFileSrc(d.background);
+          img.src = convertFileSrc(d.backdrop);
           await img.decode();
         } catch { /* paint will decode it instead */ }
       }
@@ -2934,11 +2965,11 @@ function ShowDetailPage({
     <div className="relative isolate flex flex-wrap gap-8 p-6">
       {/* Hero backdrop: real backdrop art when one is downloaded; otherwise the
           cover blurred and washed out. Both fade into the page background. */}
-      {(detail?.background || coverSrc) && (
+      {(detail?.backdrop || coverSrc) && (
         // -inset-x-4/-top-4 cancel the scroll container's p-4 so the wash reaches the section borders.
         <div aria-hidden className="pointer-events-none absolute -inset-x-4 -top-4 -z-10 h-[490px] overflow-hidden">
-          {detail?.background ? (
-            <img src={convertFileSrc(detail.background)} alt="" className="absolute inset-0 h-full w-full object-cover opacity-15" />
+          {detail?.backdrop ? (
+            <img src={convertFileSrc(detail.backdrop)} alt="" className="absolute inset-0 h-full w-full object-cover opacity-15" />
           ) : (
             // Oversized by the blur radius (64px) on every side so the blur's
             // transparent falloff lands outside the visible box.
@@ -3235,8 +3266,12 @@ function ShowDetailPage({
                         }
                       >
                       {isExpanded ? <ChevronDown size={14} className="mt-1 shrink-0 text-muted-foreground" /> : <ChevronRight size={14} className="mt-1 shrink-0 text-muted-foreground" />}
-                      <span className="mt-0.5 w-8 shrink-0 text-right text-sm text-muted-foreground">
-                        {ep.episode_number != null ? ep.episode_number : "–"}
+                      <span className="mt-0.5 w-10 shrink-0 whitespace-nowrap text-right text-sm tabular-nums text-muted-foreground">
+                        {ep.episode_number != null
+                          ? (ep.episode_number_end != null && ep.episode_number_end > ep.episode_number
+                              ? `${ep.episode_number}-${ep.episode_number_end}`
+                              : ep.episode_number)
+                          : "–"}
                       </span>
                       <div className="min-w-0 flex-1">
                         <div className="flex items-baseline gap-2">
@@ -3480,11 +3515,11 @@ function ShowDetailPage({
           onDownloaded={() => { loadDetail(); onEntryChanged(); }}
         />
       )}
-      <BackgroundSelectDialog
+      <BackdropSelectDialog
         open={backgroundDialogOpen}
         onOpenChange={setBackgroundDialogOpen}
         entryId={entry.id}
-        current={detail?.background ?? null}
+        current={detail?.backdrop ?? null}
         onChanged={loadDetail}
       />
 
@@ -3717,6 +3752,17 @@ function PlaylistsView({
   onNavigateToPlaylist,
   onPlaylistChanged,
   getFullCoverUrl,
+  search,
+  onSearchChange,
+  coverSize,
+  onCoverSizeChange,
+  sortMode,
+  onSortModeChange,
+  presets,
+  selectedPresetId,
+  onChangePreset,
+  onSavePreset,
+  onDeletePreset,
 }: {
   libraryId: string;
   playlists: PlaylistSummary[] | null;
@@ -3726,10 +3772,22 @@ function PlaylistsView({
   onNavigateToPlaylist: (p: PlaylistSummary) => void;
   onPlaylistChanged: (libraryId: string) => void;
   getFullCoverUrl: (filePath: string) => string;
+  search: string;
+  onSearchChange: (search: string) => void;
+  coverSize: number;
+  onCoverSizeChange: (size: number) => void;
+  sortMode: string;
+  onSortModeChange: (mode: string) => void;
+  presets: SortPreset[];
+  selectedPresetId: number | null;
+  onChangePreset: (presetId: number | null) => Promise<void> | void;
+  onSavePreset: (name: string, overwrite: boolean) => Promise<void>;
+  onDeletePreset: (presetId: number) => Promise<void> | void;
 }) {
   const [createOpen, setCreateOpen] = useState(false);
   const [renameTarget, setRenameTarget] = useState<PlaylistSummary | null>(null);
   const [coverDialog, setCoverDialog] = useState<{ playlist: PlaylistSummary; mode: "select" | "delete" } | null>(null);
+  const [savePresetOpen, setSavePresetOpen] = useState(false);
 
   async function handleDelete(p: PlaylistSummary) {
     if (!window.confirm(`Delete playlist "${p.title}"? The linked media will not be deleted.`)) return;
@@ -3777,9 +3835,97 @@ function PlaylistsView({
       }
     : null;
 
+  // Optimistic local order during a drag-reorder; reset whenever a fresh list
+  // arrives from the backend (which will already reflect the persisted order).
+  const [localOrder, setLocalOrder] = useState<PlaylistSummary[] | null>(null);
+  useEffect(() => { setLocalOrder(null); }, [playlists]);
+  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 8 } }));
+
+  const ordered = localOrder ?? playlists;
+  const q = search.trim().toLowerCase();
+  const visible = ordered ? (q ? ordered.filter((p) => p.title.toLowerCase().includes(q)) : ordered) : null;
+  // Reorder only makes sense in custom sort with no active search filter.
+  const dragEnabled = sortMode === "custom" && !q;
+
+  const handleDragEnd = (event: DragEndEvent) => {
+    const { active, over } = event;
+    if (!over || active.id === over.id || !ordered) return;
+    const oldIndex = ordered.findIndex((p) => p.id === active.id);
+    const newIndex = ordered.findIndex((p) => p.id === over.id);
+    if (oldIndex === -1 || newIndex === -1) return;
+    const reordered = [...ordered];
+    const [moved] = reordered.splice(oldIndex, 1);
+    reordered.splice(newIndex, 0, moved);
+    setLocalOrder(reordered);
+    invoke("reorder_playlists", { libraryId, ids: reordered.map((p) => p.id) })
+      .then(() => onPlaylistChanged(libraryId))
+      .catch((e) => toast.error(String(e)));
+  };
+
   return (
     <main className="flex flex-1 flex-col overflow-hidden bg-background">
       {breadcrumbBar}
+      {/* Search + Sort + Size — parity with the library grid's toolbar. */}
+      {!loading && (
+        <div className="flex items-center gap-3 border-b border-border px-4 py-2">
+          <div className="relative flex-1">
+            <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground" />
+            <Input value={search} onChange={(e) => onSearchChange(e.target.value)} placeholder="Search..." className="h-8 pl-8 text-sm" />
+          </div>
+          <div className="flex items-center gap-1.5">
+            <DropdownMenu>
+              <DropdownMenuTrigger className="flex h-8 items-center gap-1.5 rounded-md border border-input bg-background px-2.5 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground">
+                <ArrowUpDown size={12} />
+                {(() => {
+                  // A selected preset shows its name; the underlying sort_mode is still "custom".
+                  if (selectedPresetId != null) {
+                    const p = presets.find((p) => p.id === selectedPresetId);
+                    if (p) return p.name;
+                  }
+                  return sortMode === "alpha" ? "A–Z" : "Custom";
+                })()}
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem onClick={() => onSortModeChange("alpha")}>Alphabetical</DropdownMenuItem>
+                <DropdownMenuItem onClick={() => { onSortModeChange("custom"); onChangePreset(null); }}>Custom</DropdownMenuItem>
+                {presets.length > 0 && <DropdownMenuSeparator />}
+                {presets.map((p) => (
+                  <DropdownMenuItem
+                    key={p.id}
+                    onClick={() => onChangePreset(p.id)}
+                    className="flex items-center justify-between gap-2"
+                  >
+                    <span className="truncate">{p.name}</span>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (window.confirm(`Delete preset "${p.name}"?`)) onDeletePreset(p.id);
+                      }}
+                      className="text-muted-foreground hover:text-destructive"
+                      aria-label={`Delete preset ${p.name}`}
+                    >
+                      <Trash2 size={12} />
+                    </button>
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
+            {/* Save-preset: pristine custom sort with playlists to save. */}
+            {sortMode === "custom" && selectedPresetId === null && (playlists?.length ?? 0) > 0 && (
+              <button
+                onClick={() => setSavePresetOpen(true)}
+                className="flex h-6 w-6 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+                title="Save current order as a preset"
+              >
+                <Save size={14} />
+              </button>
+            )}
+          </div>
+          <div className="flex w-32 items-center gap-2">
+            <Slider value={[coverSize]} onValueChange={(v) => onCoverSizeChange(Array.isArray(v) ? v[0] : v)} min={100} max={400} step={10} className="w-full" />
+          </div>
+        </div>
+      )}
       <ContextMenu>
         <ContextMenuTrigger render={<div ref={scrollContainerRef} className="flex-1 overflow-y-auto" />}>
           {loading && (
@@ -3790,25 +3936,34 @@ function PlaylistsView({
           {!loading && playlists && playlists.length === 0 && (
             <p className="p-4 text-sm text-muted-foreground">No playlists yet. Right-click here to create one.</p>
           )}
-          {!loading && playlists && playlists.length > 0 && (
-            <div
-              className="grid gap-4 p-4"
-              style={{ gridTemplateColumns: "repeat(auto-fill, minmax(160px, 1fr))" }}
-            >
-              {playlists.map((pl) => (
-                <PlaylistCard
-                  key={pl.id}
-                  playlist={pl}
-                  onClick={() => onNavigateToPlaylist(pl)}
+          {!loading && visible && visible.length === 0 && playlists && playlists.length > 0 && (
+            <p className="p-4 text-sm text-muted-foreground">No results</p>
+          )}
+          {!loading && visible && visible.length > 0 && (
+            <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
+              <SortableContext items={visible.map((p) => p.id)} strategy={rectSortingStrategy}>
+                <div
+                  className="grid gap-4 p-4"
+                  style={{ gridTemplateColumns: `repeat(auto-fill, minmax(${coverSize}px, 1fr))`, justifyItems: "center" }}
+                >
+                  {visible.map((pl) => (
+                    <PlaylistCard
+                      key={pl.id}
+                      playlist={pl}
+                      coverSize={coverSize}
+                      sortable={dragEnabled}
+                      onClick={() => onNavigateToPlaylist(pl)}
                   onRename={() => setRenameTarget(pl)}
                   onDelete={() => handleDelete(pl)}
                   onCreatePeer={() => setCreateOpen(true)}
                   onAddCover={() => handleAddCover(pl)}
-                  onChangeCover={() => setCoverDialog({ playlist: pl, mode: "select" })}
-                  onDeleteCover={() => setCoverDialog({ playlist: pl, mode: "delete" })}
-                />
-              ))}
-            </div>
+                      onChangeCover={() => setCoverDialog({ playlist: pl, mode: "select" })}
+                      onDeleteCover={() => setCoverDialog({ playlist: pl, mode: "delete" })}
+                    />
+                  ))}
+                </div>
+              </SortableContext>
+            </DndContext>
           )}
         </ContextMenuTrigger>
         <ContextMenuContent>
@@ -3867,12 +4022,19 @@ function PlaylistsView({
           getCoverUrl={getFullCoverUrl}
         />
       )}
+      <SortPresetSaveDialog
+        open={savePresetOpen}
+        onOpenChange={setSavePresetOpen}
+        onSave={onSavePreset}
+      />
     </main>
   );
 }
 
 function PlaylistCard({
   playlist,
+  coverSize,
+  sortable,
   onClick,
   onRename,
   onDelete,
@@ -3882,6 +4044,8 @@ function PlaylistCard({
   onDeleteCover,
 }: {
   playlist: PlaylistSummary;
+  coverSize: number;
+  sortable: boolean;
   onClick: () => void;
   onRename: () => void;
   onDelete: () => void;
@@ -3890,15 +4054,27 @@ function PlaylistCard({
   onChangeCover: () => void;
   onDeleteCover: () => void;
 }) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: playlist.id, disabled: !sortable });
   const coverSrc = playlist.selected_cover ? convertFileSrc(playlist.selected_cover) : null;
+  // Subtitle mirrors the library grid: "N movies and M shows · 2008–2014".
+  const countPart = [
+    playlist.movie_count > 0 ? (playlist.movie_count === 1 ? "1 movie" : `${playlist.movie_count} movies`) : null,
+    playlist.show_count > 0 ? (playlist.show_count === 1 ? "1 show" : `${playlist.show_count} shows`) : null,
+  ].filter(Boolean).join(" and ");
+  const yearPart = playlist.year ? `${playlist.year}${playlist.end_year ? `–${playlist.end_year}` : ""}` : null;
+  const subtitle = [countPart || null, yearPart].filter(Boolean).join(", ");
   return (
     <ContextMenu>
       <ContextMenuTrigger
         render={
           <button
-            onClick={onClick}
+            ref={setNodeRef}
+            {...attributes}
+            {...listeners}
+            style={{ width: coverSize, maxWidth: "100%", ...(sortable ? { transform: CSS.Transform.toString(transform), transition } : {}) }}
+            onClick={() => { if (!isDragging) onClick(); }}
             onContextMenu={(e) => e.stopPropagation()}
-            className="group flex flex-col gap-2 rounded-md text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            className={`group flex flex-col gap-2 rounded-md p-2 text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-ring ${isDragging ? "opacity-50" : ""}`}
           />
         }
       >
@@ -3911,7 +4087,10 @@ function PlaylistCard({
             </div>
           )}
         </div>
-        <p className="line-clamp-2 px-1 text-sm font-medium">{playlist.title}</p>
+        <div className="px-1">
+          <p className="line-clamp-2 text-sm font-medium">{playlist.title}</p>
+          {subtitle && <p className="text-xs text-muted-foreground">{subtitle}</p>}
+        </div>
       </ContextMenuTrigger>
       <ContextMenuContent>
         <ContextMenuItem onClick={onRename}>

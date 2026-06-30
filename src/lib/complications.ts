@@ -93,7 +93,7 @@ export function scopeKeyFor(view: ViewSpec, parentId: number | null): string | n
       return view.collectionId !== null
         ? `pl-coll:${view.collectionId}`
         : `pl-root:${view.playlistId}`;
-    case "playlists":
+    case "playlists":      return `playlists:${view.libraryId}`;
     case "people-all":
     case "people-list":
     case "person-detail":

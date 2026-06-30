@@ -11,7 +11,7 @@ import {
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { CreatePlaylistDialog } from "@/components/CreatePlaylistDialog";
-import type { PlaylistSummary } from "@/types";
+import type { PlaylistSummary, PlaylistsResponse } from "@/types";
 
 interface AddToPlaylistDialogProps {
   open: boolean;
@@ -43,8 +43,8 @@ export function AddToPlaylistDialog({
     setLoading(true);
     (async () => {
       try {
-        const res = await invoke<PlaylistSummary[]>("get_playlists", { libraryId });
-        if (!cancelled) setPlaylists(res);
+        const res = await invoke<PlaylistsResponse>("get_playlists", { libraryId });
+        if (!cancelled) setPlaylists(res.playlists);
       } catch (e) {
         if (!cancelled) toast.error(String(e));
       } finally {
