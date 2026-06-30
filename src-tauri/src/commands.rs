@@ -5610,18 +5610,27 @@ pub async fn rescan_library(
     state: tauri::State<'_, AppState>,
     library_id: String,
 ) -> Result<Vec<String>, String> {
-    let (format, _paths, _default_sort_mode) = get_library_meta(&state.app_db, &library_id).await?;
-    let lib_paths = _paths;
+    let (format, lib_paths, _default_sort_mode) = get_library_meta(&state.app_db, &library_id).await?;
 
     let cache_base = state.app_data_dir.join("cache").join(&library_id);
     std::fs::create_dir_all(&cache_base).map_err(|e| e.to_string())?;
 
-    let base_paths: Vec<PathBuf> = lib_paths.iter().map(|p| PathBuf::from(p)).collect();
     // Returns per-item warnings (skipped episodes/seasons/shows). A bad item no
     // longer aborts the whole rescan — it's logged here and surfaced to the user.
     let warnings = match format.as_str() {
-        "video" => rescan_video_library(&app, &state.app_db, &library_id, &base_paths, &cache_base).await?,
-        "music" => rescan_music_library(&app, &state.app_db, &library_id, &base_paths, &cache_base).await?,
+        "video" => {
+            // Video rescan classifies by each folder's movie/show tag, so pull the typed paths.
+            let typed = get_library_typed_paths(&state.app_db, &library_id).await?;
+            let typed_bases: Vec<(PathBuf, ScanKind)> = typed
+                .iter()
+                .map(|lp| (PathBuf::from(&lp.path), if lp.kind == "show" { ScanKind::Show } else { ScanKind::Movie }))
+                .collect();
+            rescan_video_library(&app, &state.app_db, &library_id, &typed_bases, &cache_base).await?
+        }
+        "music" => {
+            let base_paths: Vec<PathBuf> = lib_paths.iter().map(PathBuf::from).collect();
+            rescan_music_library(&app, &state.app_db, &library_id, &base_paths, &cache_base).await?
+        }
         _ => return Err(format!("Unsupported library format: {}", format)),
     };
 
@@ -5632,7 +5641,7 @@ async fn rescan_video_library(
     app: &tauri::AppHandle,
     pool: &sqlx::SqlitePool,
     library_id: &str,
-    base_paths: &[PathBuf],
+    base_paths: &[(PathBuf, ScanKind)],
     cache_base: &Path,
 ) -> Result<Vec<String>, String> {
     use std::collections::{HashSet, HashMap};
@@ -5658,9 +5667,9 @@ async fn rescan_video_library(
     // and never come from disk.
     let mut disk_kinds: HashMap<String, bool> = HashMap::new(); // rel_path -> is_show
     let mut path_to_base: HashMap<String, PathBuf> = HashMap::new();
-    for base_path in base_paths {
+    for (base_path, kind) in base_paths {
         let mut kinds_for_base: HashMap<String, bool> = HashMap::new();
-        collect_video_entries(base_path, base_path, &mut kinds_for_base)
+        collect_video_entries(base_path, base_path, *kind, &mut kinds_for_base)
             .map_err(|e| e.to_string())?;
         for p in kinds_for_base.keys() {
             path_to_base.insert(p.clone(), base_path.clone());
@@ -5678,14 +5687,18 @@ async fn rescan_video_library(
     .await
     .map_err(|e| e.to_string())?;
 
-    let db_paths: HashSet<String> = db_rows.iter().map(|(_, p, _, _)| p.clone()).collect();
-
-    // Delete entries whose folders disappeared from disk
+    // Delete entries whose folders vanished from disk, OR whose folder's tag no longer matches
+    // their type (a movie now under a show-tagged folder, or vice versa). A reclassification is a
+    // delete here + a re-add as the correct kind below.
     let to_delete: Vec<(i64, String)> = db_rows
         .iter()
-        .filter(|(_, p, _, _)| !disk_paths.contains(p))
+        .filter(|(_, p, _, et)| {
+            !disk_paths.contains(p)
+                || disk_kinds.get(p).copied().unwrap_or(false) != (et.as_str() == "show")
+        })
         .map(|(id, p, _, _)| (*id, p.clone()))
         .collect();
+    let deleted_paths: HashSet<String> = to_delete.iter().map(|(_, p)| p.clone()).collect();
 
     for (id, rel_path) in &to_delete {
         delete_cached_images_for_entry(pool, library_id, cache_base, rel_path).await?;
@@ -5696,11 +5709,18 @@ async fn rescan_video_library(
             .map_err(|e| e.to_string())?;
     }
 
-    // Add new disk entries, anchored at the library root (collection membership is
-    // virtual and only ever assigned by the user).
+    // Paths still represented by a surviving DB entry (on disk, correct kind).
+    let surviving_paths: HashSet<String> = db_rows
+        .iter()
+        .filter(|(_, p, _, _)| !deleted_paths.contains(p))
+        .map(|(_, p, _, _)| p.clone())
+        .collect();
+
+    // Add disk folders not covered by a surviving entry (brand-new or just-reclassified),
+    // anchored at the library root (collection membership is virtual and user-assigned only).
     let mut new_paths: Vec<String> = disk_paths
         .iter()
-        .filter(|p| !db_paths.contains(*p))
+        .filter(|p| !surviving_paths.contains(*p))
         .cloned()
         .collect();
     new_paths.sort();
@@ -5801,7 +5821,7 @@ async fn rescan_video_library(
     // Sync cached images + extras for existing entries
     let existing_entries: Vec<(i64, String)> = db_rows
         .iter()
-        .filter(|(_, p, _, _)| disk_paths.contains(p))
+        .filter(|(_, p, _, _)| surviving_paths.contains(p))
         .map(|(id, p, _, _)| (*id, p.clone()))
         .collect();
     for (entry_id, rel_path) in &existing_entries {
@@ -5842,132 +5862,154 @@ async fn rescan_video_library(
             let show_base = path_to_base.get(show_rel)
                 .or_else(|| {
                     // For existing entries not in path_to_base, find which base contains it
-                    base_paths.iter().find(|b| b.join(show_rel).exists())
+                    base_paths.iter().find(|(b, _)| b.join(show_rel).exists()).map(|(b, _)| b)
                 })
                 .ok_or_else(|| format!("cannot resolve base path"))?;
             let show_path = show_base.join(show_rel);
 
-            let disk_seasons: HashSet<String> = std::fs::read_dir(&show_path)
+            // Season subdirs that parse as a season (covers/extras already excluded by
+            // is_scannable_dir; a non-season folder like "Bonus" is ignored).
+            let season_dirs: Vec<(String, i32, String)> = std::fs::read_dir(&show_path)
                 .map_err(|e| e.to_string())?
                 .filter_map(|e| e.ok())
                 .filter(|e| is_scannable_dir(e))
-                .map(|e| {
-                    e.path()
-                        .strip_prefix(show_base)
-                        .unwrap_or(&e.path())
-                        .to_string_lossy()
-                        .to_string()
+                .filter_map(|e| {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    let (title, num) = parse_season_folder_name(&name);
+                    num.map(|n| {
+                        let rel = e.path().strip_prefix(show_base).unwrap_or(&e.path()).to_string_lossy().to_string();
+                        (rel, n, title)
+                    })
                 })
                 .collect();
 
-            let db_seasons: Vec<(i64, String)> =
-                sqlx::query_as("SELECT id, folder_path FROM season WHERE show_id = ?")
+            // Loose episode files directly in the show folder (flat show, no season subfolders).
+            let loose_files: Vec<String> = std::fs::read_dir(&show_path)
+                .map_err(|e| e.to_string())?
+                .filter_map(|e| e.ok())
+                .filter(|e| is_media_file(&e.path(), VIDEO_EXTENSIONS))
+                .map(|e| e.path().strip_prefix(show_base).unwrap_or(&e.path()).to_string_lossy().to_string())
+                .collect();
+
+            // Flat iff no season folders but there ARE loose episodes — mirrors the create-time
+            // scanner. Otherwise reconcile by season folder (this branch also handles empty shows).
+            let is_flat = season_dirs.is_empty() && !loose_files.is_empty();
+
+            let db_seasons: Vec<(i64, String, Option<i64>)> =
+                sqlx::query_as("SELECT id, folder_path, season_number FROM season WHERE show_id = ?")
                     .bind(show_id)
                     .fetch_all(pool)
                     .await
                     .map_err(|e| e.to_string())?;
 
-            // Delete removed seasons (a failed delete is non-fatal)
-            for (id, path) in &db_seasons {
-                if !disk_seasons.contains(path) {
-                    if let Err(e) = sqlx::query("DELETE FROM season WHERE id = ?")
-                        .bind(id)
-                        .execute(pool)
-                        .await
-                    {
-                        w.push(format!("Failed to remove deleted season '{}': {}", path, e));
+            if is_flat {
+                // Synthesized seasons (folder_path == the show folder), one per filename season number.
+                use std::collections::BTreeMap;
+                let mut groups: BTreeMap<i32, ()> = BTreeMap::new();
+                for f in &loose_files {
+                    let fname = std::path::Path::new(f.as_str()).file_name().unwrap_or_default().to_string_lossy().to_string();
+                    groups.insert(parse_season_number(&fname).unwrap_or(1), ());
+                }
+                // Drop db seasons that aren't a valid flat season (wrong folder, or a number with no
+                // loose files anymore — e.g. a show that switched from season folders to flat).
+                for (id, fp, num) in &db_seasons {
+                    let keep = fp == show_rel && (*num).map_or(false, |n| groups.contains_key(&(n as i32)));
+                    if !keep {
+                        if let Err(e) = sqlx::query("DELETE FROM season WHERE id = ?").bind(id).execute(pool).await {
+                            w.push(format!("Failed to remove season: {}", e));
+                        }
+                    }
+                }
+                let existing_nums: HashSet<i32> = db_seasons.iter()
+                    .filter(|(_, fp, _)| fp == show_rel)
+                    .filter_map(|(_, _, num)| num.map(|n| n as i32))
+                    .collect();
+                let mut next_order = db_seasons.len() as i32;
+                for num in groups.keys() {
+                    if existing_nums.contains(num) { continue; }
+                    let title = if *num == 0 { "Specials".to_string() } else { format!("Season {}", num) };
+                    if let Err(e) = sqlx::query(
+                        "INSERT INTO season (show_id, title, season_number, folder_path, sort_order) VALUES (?, ?, ?, ?, ?)",
+                    )
+                    .bind(show_id).bind(&title).bind(num).bind(show_rel).bind(next_order)
+                    .execute(pool).await {
+                        w.push(format!("Skipped season {}: {}", num, e));
+                    }
+                    next_order += 1;
+                }
+            } else {
+                // Foldered show (or empty): reconcile seasons by folder_path. A stale flat season
+                // (folder_path == show folder) isn't among season_dirs, so it's correctly removed.
+                let disk_season_paths: HashSet<String> = season_dirs.iter().map(|(rel, _, _)| rel.clone()).collect();
+                for (id, path, _) in &db_seasons {
+                    if !disk_season_paths.contains(path) {
+                        if let Err(e) = sqlx::query("DELETE FROM season WHERE id = ?").bind(id).execute(pool).await {
+                            w.push(format!("Failed to remove deleted season '{}': {}", path, e));
+                        }
+                    }
+                }
+                let existing_season_paths: HashSet<String> = db_seasons.iter().map(|(_, p, _)| p.clone()).collect();
+                for (rel, num, title) in &season_dirs {
+                    if existing_season_paths.contains(rel) {
+                        // Reconcile number/title in case the folder was renamed (e.g. NULL → Specials).
+                        if let Err(e) = sqlx::query(
+                            "UPDATE season SET season_number = ?, title = ? WHERE show_id = ? AND folder_path = ? AND (season_number IS NOT ? OR title IS NOT ?)",
+                        )
+                        .bind(num).bind(title).bind(show_id).bind(rel).bind(num).bind(title)
+                        .execute(pool).await {
+                            w.push(format!("Failed to reconcile season '{}': {}", rel, e));
+                        }
+                        continue;
+                    }
+                    let max_order: Option<(i32,)> =
+                        sqlx::query_as("SELECT COALESCE(MAX(sort_order), -1) FROM season WHERE show_id = ?")
+                            .bind(show_id).fetch_optional(pool).await.map_err(|e| e.to_string())?;
+                    let sort_order = max_order.map(|(v,)| v + 1).unwrap_or(0);
+                    if let Err(e) = sqlx::query(
+                        "INSERT INTO season (show_id, title, season_number, folder_path, sort_order) VALUES (?, ?, ?, ?, ?)",
+                    )
+                    .bind(show_id).bind(title).bind(num).bind(rel).bind(sort_order)
+                    .execute(pool).await {
+                        w.push(format!("Skipped season '{}': {}", rel, e));
                     }
                 }
             }
 
-            let existing_season_paths: HashSet<String> = db_seasons.iter().map(|(_, p)| p.clone()).collect();
-
-            // Add new seasons (one bad season doesn't abort the show)
-            for rel_path in &disk_seasons {
-                if existing_season_paths.contains(rel_path) {
-                    continue;
-                }
-                let full_path = show_base.join(rel_path);
-                let name = full_path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                let (season_title, season_number) = parse_season_folder_name(&name);
-
-                let max_order: Option<(i32,)> =
-                    sqlx::query_as("SELECT COALESCE(MAX(sort_order), -1) FROM season WHERE show_id = ?")
-                        .bind(show_id)
-                        .fetch_optional(pool)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                let sort_order = max_order.map(|(v,)| v + 1).unwrap_or(0);
-
-                if let Err(e) = sqlx::query(
-                    "INSERT INTO season (show_id, title, season_number, folder_path, sort_order) VALUES (?, ?, ?, ?, ?)",
-                )
-                .bind(show_id)
-                .bind(&season_title)
-                .bind(season_number)
-                .bind(rel_path)
-                .bind(sort_order)
-                .execute(pool)
-                .await
-                {
-                    w.push(format!("Skipped season '{}': {}", rel_path, e));
-                }
-            }
-
-            // Reconcile already-stored seasons whose folder now parses to a
-            // different number/title than what's saved — e.g. a 'Specials' folder
-            // recorded as a NULL-numbered season before the parser mapped it to
-            // Season 0. season_number/title are purely folder-derived, so this is
-            // safe to overwrite; the WHERE guard skips rows that haven't changed.
-            for (id, rel_path) in &db_seasons {
-                if !disk_seasons.contains(rel_path) {
-                    continue; // deleted above
-                }
-                let full_path = show_base.join(rel_path);
-                let name = full_path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                let (season_title, season_number) = parse_season_folder_name(&name);
-                if let Err(e) = sqlx::query(
-                    "UPDATE season SET season_number = ?, title = ? WHERE id = ? AND (season_number IS NOT ? OR title IS NOT ?)",
-                )
-                .bind(season_number)
-                .bind(&season_title)
-                .bind(id)
-                .bind(season_number)
-                .bind(&season_title)
-                .execute(pool)
-                .await
-                {
-                    w.push(format!("Failed to reconcile season '{}': {}", rel_path, e));
-                }
-            }
-
             // Episodes for each season
-            let all_seasons: Vec<(i64, String)> =
-                sqlx::query_as("SELECT id, folder_path FROM season WHERE show_id = ?")
+            let all_seasons: Vec<(i64, String, Option<i64>)> =
+                sqlx::query_as("SELECT id, folder_path, season_number FROM season WHERE show_id = ?")
                     .bind(show_id)
                     .fetch_all(pool)
                     .await
                     .map_err(|e| e.to_string())?;
 
-            for (season_id, season_rel) in &all_seasons {
-                let season_path = show_base.join(season_rel);
-
-                // Per-season structural failures skip just this season
-                let disk_episodes: HashSet<String> = match std::fs::read_dir(&season_path) {
-                    Ok(rd) => rd
-                        .filter_map(|e| e.ok())
-                        .filter(|e| is_media_file(&e.path(), VIDEO_EXTENSIONS))
-                        .map(|e| {
-                            e.path()
-                                .strip_prefix(show_base)
-                                .unwrap_or(&e.path())
-                                .to_string_lossy()
-                                .to_string()
-                        })
-                        .collect(),
-                    Err(e) => {
-                        w.push(format!("Skipped season '{}': {}", season_rel, e));
-                        continue;
+            for (season_id, season_rel, season_num) in &all_seasons {
+                // A flat season's folder IS the show folder; its episodes are the loose files whose
+                // filename season matches. A foldered season reads its own folder.
+                let disk_episodes: HashSet<String> = if season_rel == show_rel {
+                    let want = (*season_num).unwrap_or(1) as i32;
+                    loose_files.iter().filter(|f| {
+                        let fname = std::path::Path::new(f.as_str()).file_name().unwrap_or_default().to_string_lossy().to_string();
+                        parse_season_number(&fname).unwrap_or(1) == want
+                    }).cloned().collect()
+                } else {
+                    let season_path = show_base.join(season_rel);
+                    match std::fs::read_dir(&season_path) {
+                        Ok(rd) => rd
+                            .filter_map(|e| e.ok())
+                            .filter(|e| is_media_file(&e.path(), VIDEO_EXTENSIONS))
+                            .map(|e| {
+                                e.path()
+                                    .strip_prefix(show_base)
+                                    .unwrap_or(&e.path())
+                                    .to_string_lossy()
+                                    .to_string()
+                            })
+                            .collect(),
+                        Err(e) => {
+                            w.push(format!("Skipped season '{}': {}", season_rel, e));
+                            continue;
+                        }
                     }
                 };
 
@@ -6385,9 +6427,14 @@ async fn rescan_music_library(
 /// the initial scan: season-pattern subdirs → show, video files → movie, anything
 /// else is a container to recurse through. Show and movie folders are not descended
 /// into (their interiors — seasons, extras — are not entries).
+/// Walk a base folder of a known `kind`, recording each entry's rel_path -> is_show. Classification
+/// follows the folder's tag, not structure: under a Movie base a folder with video is a movie; under
+/// a Show base a folder with season subdirs OR loose episode files is a show (flat shows included).
+/// Folders that are neither are containers and get recursed through.
 fn collect_video_entries(
     base: &PathBuf,
     dir: &PathBuf,
+    kind: ScanKind,
     out: &mut std::collections::HashMap<String, bool>, // rel_path -> is_show
 ) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
@@ -6404,21 +6451,28 @@ fn collect_video_entries(
             let (_, num) = parse_season_folder_name(&e.file_name().to_string_lossy());
             num.is_some()
         });
+        let has_video = std::fs::read_dir(&path)?
+            .filter_map(|e| e.ok())
+            .any(|e| is_media_file(&e.path(), VIDEO_EXTENSIONS));
         let rel = path
             .strip_prefix(base)
             .unwrap_or(&path)
             .to_string_lossy()
             .to_string();
-        if has_season {
-            out.insert(rel, true);
-        } else {
-            let has_video = std::fs::read_dir(&path)?
-                .filter_map(|e| e.ok())
-                .any(|e| is_media_file(&e.path(), VIDEO_EXTENSIONS));
-            if has_video {
-                out.insert(rel, false);
-            } else {
-                collect_video_entries(base, &path, out)?;
+        match kind {
+            ScanKind::Show => {
+                if has_season || has_video {
+                    out.insert(rel, true); // foldered or flat show
+                } else {
+                    collect_video_entries(base, &path, kind, out)?; // container of shows
+                }
+            }
+            ScanKind::Movie => {
+                if has_video {
+                    out.insert(rel, false); // movie
+                } else {
+                    collect_video_entries(base, &path, kind, out)?; // container of movies
+                }
             }
         }
     }

@@ -9,7 +9,7 @@ mod win_maximize_fix;
 
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use sqlx::SqlitePool;
 use tauri::Manager;
 
@@ -17,7 +17,7 @@ pub struct AppState {
     pub app_data_dir: PathBuf,
     pub app_db: SqlitePool,
     pub cancel_creation: AtomicBool,
-    pub player: Mutex<Option<player::PlayerInner>>,
+    pub player: Mutex<Option<Arc<player::PlayerInner>>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

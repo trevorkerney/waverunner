@@ -10,6 +10,7 @@ import {
   X,
   Subtitles,
   AudioLines,
+  Clapperboard,
 } from "lucide-react";
 import { Switch } from "../ui/switch";
 import {
@@ -215,6 +216,29 @@ export function ControlsOverlay({
               />
               Autoplay
             </label>
+          )}
+
+          {/* Video tracks (rare — only when a file carries more than one) */}
+          {state.videoTracks.length > 1 && (
+            <DropdownMenu>
+              <DropdownMenuTrigger className="text-white/80 hover:text-white transition-colors">
+                  <Clapperboard className="h-5 w-5" />
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="bg-black/90 border-white/20">
+                {state.videoTracks.map((track) => (
+                  <DropdownMenuItem
+                    key={track.id}
+                    onClick={() => actions.setVideoTrack(track.id)}
+                    className={`text-white/80 hover:text-white ${
+                      track.selected ? "text-white font-medium" : ""
+                    }`}
+                  >
+                    {track.title || track.lang || `Track ${track.id}`}
+                    {track.selected && " *"}
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
           )}
 
           {/* Audio tracks */}

@@ -9,23 +9,11 @@ dropping media into a collection (when the media is far from the collection scro
 
 ## bugs / needs fixing
 
-add a way for users to switch audio (and video?) track within the player (bug because we should've had this by now)
-
-rescanning (when done) seems to place the user in All view while keeping whatever they were on before highlighted in the sidebar.
-
-pages SOMETIMES fade in when clicking them for the first time after the loader. sometimes pages load in and then some unknown (it happens too fast to tell) number of media covers drop in and shifts all the other media entries around them.
-
-
-### later
-
-sometimes the sidebar doesn't always seem to properly take the user to the page it represents. ive noticed a couple times where i'll go from movies to all and it still just shows movies. other instances similar to this have also happened.
 
 
 ## changes / small new features
 
 export media covers zip
-
-sometimes media is stored on drives that arent fully active all the time. for instance when you start a movie, the drive will spin up and waverunner sorta freezes for a sec while it starts up (i say sorta because it doesn't fully freeze, buttons just stop working), then it loads and starts playing. I'd like to look into solving that issue and making waverunner fully responsive for the couple seconds the disk is booting up. The user should be able to click pause/play, shrink screen to sidebar, stop playback, etc mid drive startup
 
 I want a little thumbnail showing the frame at the hovered spot when cursor is hovering seek bar
 

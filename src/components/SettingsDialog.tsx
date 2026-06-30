@@ -11,6 +11,7 @@ import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
+import { Slider } from "@/components/ui/slider";
 import { Settings, Download, Eye, EyeOff } from "lucide-react";
 
 interface SettingsDialogProps {
@@ -73,6 +74,13 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
       setUpdateStatus("error");
     }
   }, []);
+
+  // Default playback volume (0–100), defaulting to 50 when unset.
+  const defaultVolume = (() => {
+    const raw = settings["default_volume"];
+    const n = raw == null ? NaN : parseInt(raw, 10);
+    return Number.isNaN(n) ? 50 : Math.max(0, Math.min(100, n));
+  })();
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -180,6 +188,30 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                         Check
                       </Button>
                     )}
+                  </div>
+                </div>
+              </div>
+              <div>
+                <h3 className="mb-4 text-sm font-semibold">Playback</h3>
+                <div className="flex items-center justify-between gap-4">
+                  <div>
+                    <p className="text-sm">Default volume</p>
+                    <p className="text-xs text-muted-foreground">
+                      Volume new videos start at. Adjustments during playback carry across episodes.
+                    </p>
+                  </div>
+                  <div className="flex w-44 shrink-0 items-center gap-3">
+                    <Slider
+                      value={[defaultVolume]}
+                      onValueChange={(v) => setSetting("default_volume", String(Array.isArray(v) ? v[0] : v))}
+                      min={0}
+                      max={100}
+                      step={5}
+                      className="flex-1"
+                    />
+                    <span className="w-9 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
+                      {defaultVolume}%
+                    </span>
                   </div>
                 </div>
               </div>

@@ -14,6 +14,7 @@ export interface PlayerState {
   muted: boolean;
   audioTracks: PlayerTrack[];
   subtitleTracks: PlayerTrack[];
+  videoTracks: PlayerTrack[];
   isFullscreen: boolean;
   isMinimized: boolean;
   loading: boolean;
@@ -41,6 +42,7 @@ export interface PlayerActions {
   toggleMute: () => Promise<void>;
   setAudioTrack: (id: number) => Promise<void>;
   setSubtitleTrack: (id: number) => Promise<void>;
+  setVideoTrack: (id: number) => Promise<void>;
   toggleSubtitles: () => Promise<void>;
   toggleFullscreen: () => Promise<void>;
   toggleMinimize: () => Promise<void>;
@@ -59,6 +61,7 @@ const initialState: PlayerState = {
   muted: false,
   audioTracks: [],
   subtitleTracks: [],
+  videoTracks: [],
   isFullscreen: false,
   isMinimized: false,
   loading: false,
@@ -113,6 +116,7 @@ export function usePlayer(): [PlayerState, PlayerActions] {
         ...prev,
         audioTracks: tracks.filter((t) => t.type === "audio"),
         subtitleTracks: tracks.filter((t) => t.type === "sub"),
+        videoTracks: tracks.filter((t) => t.type === "video"),
       }));
     } catch {
       // Player might not be ready yet
@@ -235,6 +239,21 @@ export function usePlayer(): [PlayerState, PlayerActions] {
     };
   }, [state.isActive, refreshTracksInternal, handleNaturalEnd]);
 
+  // Apply the user's configured default volume (settings, default 50%) at the start of a
+  // freshly-opened video. Not used for in-player next/prev/auto-next, so a binge keeps
+  // whatever volume you set.
+  const applyStartupVolume = useCallback(async () => {
+    try {
+      const settings = await invoke<Record<string, string>>("get_settings");
+      const raw = parseInt(settings["default_volume"] ?? "", 10);
+      const vol = Number.isNaN(raw) ? 50 : Math.max(0, Math.min(100, raw));
+      await invoke("set_player_property", { name: "volume", value: vol.toString() });
+      setState((prev) => ({ ...prev, volume: vol, muted: false }));
+    } catch {
+      // Player not ready or settings unreadable — leave volume as-is.
+    }
+  }, []);
+
   const play = useCallback(async (path: string, title: string) => {
     const wasActive = stateRef.current.isActive;
     setState((prev) => ({
@@ -250,11 +269,12 @@ export function usePlayer(): [PlayerState, PlayerActions] {
         await invoke("init_player", { titlebarHeight: TITLEBAR_HEIGHT });
       }
       await invoke("play_file", { path });
+      await applyStartupVolume();
     } catch (e) {
       setState((prev) => ({ ...prev, loading: false, isActive: wasActive, isPlaying: false }));
       throw e;
     }
-  }, []);
+  }, [applyStartupVolume]);
 
   const playEpisode = useCallback(async (args: PlayEpisodeArgs) => {
     const { libraryId, showId, showTitle, startEpisodeId } = args;
@@ -296,11 +316,12 @@ export function usePlayer(): [PlayerState, PlayerActions] {
         await invoke("init_player", { titlebarHeight: TITLEBAR_HEIGHT });
       }
       await invoke("play_file", { path });
+      await applyStartupVolume();
     } catch (e) {
       setState((prev) => ({ ...prev, loading: false, isActive: wasActive }));
       throw e;
     }
-  }, []);
+  }, [applyStartupVolume]);
 
   const playNextEpisode = useCallback(async () => {
     const ctx = stateRef.current.context;
@@ -384,6 +405,10 @@ export function usePlayer(): [PlayerState, PlayerActions] {
 
   const setSubtitleTrack = useCallback(async (id: number) => {
     await invoke("set_player_property", { name: "sid", value: id.toString() });
+  }, []);
+
+  const setVideoTrack = useCallback(async (id: number) => {
+    await invoke("set_player_property", { name: "vid", value: id.toString() });
   }, []);
 
   const toggleSubtitles = useCallback(async () => {
@@ -479,6 +504,7 @@ export function usePlayer(): [PlayerState, PlayerActions] {
     toggleMute,
     setAudioTrack,
     setSubtitleTrack,
+    setVideoTrack,
     toggleSubtitles,
     toggleFullscreen,
     toggleMinimize,

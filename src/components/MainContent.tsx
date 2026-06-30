@@ -98,6 +98,7 @@ import { Library, MediaEntry, BreadcrumbItem, MovieDetail, MovieDetailUpdate, Se
 import { scopeKeyFor, viewCacheKey } from "@/lib/complications";
 import { ExtrasDialog } from "@/components/ExtrasDialog";
 import { SortPresetSaveDialog } from "@/components/SortPresetSaveDialog";
+import { playDropIn } from "@/lib/dropIn";
 import { TmdbMatchDialog } from "@/components/TmdbMatchDialog";
 import { TmdbShowMatchDialog } from "@/components/TmdbShowMatchDialog";
 import { TmdbImageBrowserDialog } from "@/components/TmdbImageBrowserDialog";
@@ -215,6 +216,7 @@ interface MainContentProps {
   onRescan: () => void;
   onEntryChanged: () => void;
   getCoverUrl: (filePath: string) => string;
+  getCoverAspect: (filePath: string) => number | undefined;
   getFullCoverUrl: (filePath: string) => string;
   scrollContainerRef: RefObject<HTMLDivElement | null>;
   onPlayFile?: (path: string, title: string) => void;
@@ -263,6 +265,7 @@ export function MainContent({
   onRescan,
   onEntryChanged,
   getCoverUrl,
+  getCoverAspect,
   getFullCoverUrl,
   scrollContainerRef,
   onPlayFile,
@@ -452,6 +455,9 @@ export function MainContent({
   const flipPositionsRef = useRef<Map<string, { x: number; y: number; w: number; h: number }>>(new Map());
   const flipKeysRef = useRef<string[]>([]);
   const wasDraggingRef = useRef(false);
+  // Tracks the view whose cards last played the page load-in, so it fires once per
+  // navigation rather than on every in-view re-render.
+  const loadedInViewRef = useRef<string | null>(null);
   // Cover resizes are animated by CSS width transitions on the cards themselves;
   // FLIP sits those renders out (it would fight the transition).
   const prevCoverSizeRef = useRef(coverSize);
@@ -460,6 +466,9 @@ export function MainContent({
   // flying across the grid. Rebaseline without animating on those renders.
   const navKey = `${activeView ? viewCacheKey(activeView) : "none"}|${breadcrumbs[breadcrumbs.length - 1]?.id ?? "root"}|${isSearching ? "s" : ""}`;
   const prevNavKeyRef = useRef(navKey);
+  // Page load-in key: changes when the view or parent collection changes (but NOT on search
+  // toggle or in-place refreshes), so the "drop in" plays once per page you navigate to.
+  const loadInKey = `${activeView ? viewCacheKey(activeView) : "none"}|${breadcrumbs[breadcrumbs.length - 1]?.id ?? "root"}`;
 
   useLayoutEffect(() => {
     const grid = gridRef.current;
@@ -486,6 +495,25 @@ export function MainContent({
       keys.push(key);
       next.set(key, { x: child.offsetLeft, y: child.offsetTop, w: child.offsetWidth, h: child.offsetHeight });
     }
+
+    // ── Page load-in ──────────────────────────────────────────────────
+    // The first time a view shows its cards (you navigated here, cache hit or miss),
+    // every card drops in — slide-down + scale + fade. This is the look the first
+    // spinner→grid reveal has; here it's made to fire consistently on every navigation
+    // instead of only when the FLIP timing happened to line up. Rebaseline + bail so the
+    // list-change FLIP below doesn't also run on this render.
+    if (
+      keys.length > 0 &&
+      loadedInViewRef.current !== loadInKey &&
+      !dragging && !justDropped && !resized
+    ) {
+      loadedInViewRef.current = loadInKey;
+      flipKeysRef.current = keys;
+      flipPositionsRef.current = next;
+      playDropIn(children.filter((c) => c.dataset.flipId));
+      return;
+    }
+
     // Only animate when the list composition/order actually changed. Positions can
     // also drift between renders without any list change (cover images finish
     // loading and grow their cards, window resizes) — the baseline is stale then,
@@ -1065,6 +1093,7 @@ export function MainContent({
                     }}
                     deletingId={deletingId}
                     getCoverUrl={getCoverUrl}
+                    getCoverAspect={getCoverAspect}
                     isDragActive={dragId != null}
                     pendingRemoval={pendingRemovalId != null && pendingRemovalId === sortableIdFor(entry)}
                     sortMode={sortMode}
@@ -1325,6 +1354,7 @@ function SortableCoverCard({
   onDeletePlaylistCollection,
   sortableId,
   getCoverUrl,
+  getCoverAspect,
   isDragActive,
   sortMode,
   deletingId,
@@ -1348,6 +1378,7 @@ function SortableCoverCard({
    *  media_entry ids. Library views can omit this and the card falls back to entry.id. */
   sortableId?: string | number;
   getCoverUrl: (filePath: string) => string;
+  getCoverAspect: (filePath: string) => number | undefined;
   isDragActive: boolean;
   sortMode: string;
   deletingId: number | null;
@@ -1429,6 +1460,9 @@ function SortableCoverCard({
 
   const coverPath = getDisplayCover(entry);
   const coverSrc = coverPath ? getCoverUrl(coverPath) : null;
+  // If the cover's real aspect was captured during preload, reserve the exact box height
+  // up front so the card doesn't resize when the image paints (no row shift).
+  const coverAspect = coverPath ? getCoverAspect(coverPath) : undefined;
 
   return (
     <ContextMenu>
@@ -1453,12 +1487,22 @@ function SortableCoverCard({
             already-overflow-hidden cover and transforms along with the hover. */}
         <div
           className="relative self-end overflow-hidden rounded-[3px] bg-muted shadow-md ring-1 ring-foreground/10 transition-[translate,scale] duration-200 group-hover:-translate-y-1 group-hover:scale-[1.04] group-hover:shadow-xl group-hover:ring-foreground/25"
-          style={{
-            width: size - 16,
-            // Skips layout/paint/decode for offscreen covers; estimates a 2:3 poster.
-            contentVisibility: "auto",
-            containIntrinsicSize: `${size - 16}px ${Math.round((size - 16) * 1.5)}px`,
-          }}
+          style={
+            coverAspect
+              ? {
+                  // Known aspect → reserve the exact box so the image can't shift the row on load.
+                  width: size - 16,
+                  aspectRatio: String(coverAspect),
+                  contentVisibility: "auto",
+                  containIntrinsicSize: `${size - 16}px ${Math.round((size - 16) / coverAspect)}px`,
+                }
+              : {
+                  width: size - 16,
+                  // Skips layout/paint/decode for offscreen covers; estimates a 2:3 poster.
+                  contentVisibility: "auto",
+                  containIntrinsicSize: `${size - 16}px ${Math.round((size - 16) * 1.5)}px`,
+                }
+          }
         >
           {coverSrc ? (
             <img
@@ -1475,8 +1519,10 @@ function SortableCoverCard({
                   img.src = convertFileSrc(coverPath);
                 }
               }}
-              className="pointer-events-none w-full"
-              style={{ maxHeight: size * 2 }}
+              // With a reserved box the image fills it exactly (real aspect → no crop);
+              // otherwise it keeps its natural height.
+              className={coverAspect ? "pointer-events-none h-full w-full object-cover" : "pointer-events-none w-full"}
+              style={coverAspect ? undefined : { maxHeight: size * 2 }}
               draggable={false}
             />
           ) : (
@@ -3788,6 +3834,17 @@ function PlaylistsView({
   const [renameTarget, setRenameTarget] = useState<PlaylistSummary | null>(null);
   const [coverDialog, setCoverDialog] = useState<{ playlist: PlaylistSummary; mode: "select" | "delete" } | null>(null);
   const [savePresetOpen, setSavePresetOpen] = useState(false);
+  // Play the page load-in (drop-in) on the cards the first time they appear, matching the
+  // library grid. Fires once per mount (i.e. per navigation to the playlists list).
+  const gridRef = useRef<HTMLDivElement | null>(null);
+  const didLoadInRef = useRef(false);
+  useLayoutEffect(() => {
+    if (didLoadInRef.current) return;
+    const grid = gridRef.current;
+    if (!grid || grid.children.length === 0) return;
+    didLoadInRef.current = true;
+    playDropIn(grid.children);
+  });
 
   async function handleDelete(p: PlaylistSummary) {
     if (!window.confirm(`Delete playlist "${p.title}"? The linked media will not be deleted.`)) return;
@@ -3943,6 +4000,7 @@ function PlaylistsView({
             <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
               <SortableContext items={visible.map((p) => p.id)} strategy={rectSortingStrategy}>
                 <div
+                  ref={gridRef}
                   className="grid gap-4 p-4"
                   style={{ gridTemplateColumns: `repeat(auto-fill, minmax(${coverSize}px, 1fr))`, justifyItems: "center" }}
                 >

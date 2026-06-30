@@ -92,6 +92,10 @@ function App() {
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   // Cache: cover file path -> blob URL of its thumbnail
   const thumbCacheRef = useRef<Map<string, string>>(new Map());
+  // Decoded cover aspect ratios (w/h), captured during preload so the grid can reserve the
+  // exact cover height up front — otherwise a non-2:3 cover resizes its subgrid row on load
+  // and shoves neighbours around ("covers drop in and shift").
+  const coverAspectRef = useRef<Map<string, number>>(new Map());
 
   function toThumbPath(coverPath: string): string {
     // coverPath: .../covers/filename.jpg -> .../covers_thumb/filename.jpg
@@ -134,15 +138,22 @@ function App() {
           thumbCacheRef.current.set(cover, url);
         }
         // Decode up front so the grid paints with covers already rasterized —
-        // a bare <img> decodes lazily, making covers pop in one by one.
+        // a bare <img> decodes lazily, making covers pop in one by one. Capture the
+        // real aspect ratio while we're here so the grid reserves exact space.
         try {
           const img = new Image();
           img.src = url;
           await img.decode();
+          if (img.naturalWidth && img.naturalHeight) {
+            coverAspectRef.current.set(cover, img.naturalWidth / img.naturalHeight);
+          }
         } catch { /* paint will decode it instead */ }
       })
     );
   }, []);
+
+  // Real cover aspect ratio (w/h) if it was decoded during preload, else undefined.
+  const getCoverAspect = useCallback((filePath: string) => coverAspectRef.current.get(filePath), []);
 
   // Same idea for non-entry grids (people faces, playlist covers): fetch and
   // decode before the grid swaps in, so it appears fully formed.
@@ -1965,6 +1976,7 @@ function App() {
             }
           }}
           getCoverUrl={getCoverUrl}
+          getCoverAspect={getCoverAspect}
           getFullCoverUrl={getFullCoverUrl}
           scrollContainerRef={scrollContainerRef}
           onPlayFile={handlePlayFile}

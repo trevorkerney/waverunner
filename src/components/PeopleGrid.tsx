@@ -15,6 +15,7 @@ import {
   DropdownMenuItem,
 } from "@/components/ui/dropdown-menu";
 import { ScrubberRail } from "@/components/ScrubberRail";
+import { playDropIn } from "@/lib/dropIn";
 import type { CharacterMatch, PersonRole, PersonSummary } from "@/types";
 
 // People pages hold thousands of entries, so the grid is virtualized: rows are
@@ -220,6 +221,17 @@ export function PeoplePage({ people, libraryId, role, initialMode, onModeChange,
     return () => ro.disconnect();
   }, [scrollContainerRef]);
 
+  // Page load-in: drop the initial on-screen face cards in, once, when the page first lays
+  // out (the component is keyed per people view, so this re-arms on each navigation here).
+  const didLoadInRef = useRef(false);
+  useLayoutEffect(() => {
+    if (didLoadInRef.current || viewport.width === 0) return;
+    const cards = scrollContainerRef.current?.querySelectorAll<HTMLElement>("[data-person-card]");
+    if (!cards || cards.length === 0) return;
+    didLoadInRef.current = true;
+    playDropIn(cards);
+  });
+
   // ── Scrubber ──────────────────────────────────────────────────────────────
   const showScrubber = effectiveMode === "all" && letters.length > 1;
 
@@ -365,6 +377,7 @@ function PersonCard({
         render={
           <button
             onClick={onClick}
+            data-person-card=""
             style={{ height: CARD_H }}
             className="group flex flex-col items-center gap-2 overflow-hidden rounded-md p-2 text-center transition-colors hover:bg-accent/40 focus:bg-accent/60 focus:outline-none"
           />
