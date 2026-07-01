@@ -10,7 +10,7 @@ import { Toaster } from "@/components/ui/sonner";
 import { toast } from "sonner";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { Library, MediaEntry, EntriesResponse, BreadcrumbItem, ViewSpec, PersonInfo, PersonSummary, PersonRole, PlaylistSummary, PlaylistsResponse, PlaylistContents, SortPreset } from "@/types";
+import { Library, MediaEntry, EntriesResponse, BreadcrumbItem, ViewSpec, PersonInfo, PersonSummary, PersonRole, PlaylistSummary, PlaylistsResponse, PlaylistContents, SortPreset, LibraryCounts, GenreSummary } from "@/types";
 import { viewCacheKey, scopeKeyFor } from "@/lib/complications";
 
 function App() {
@@ -18,6 +18,11 @@ function App() {
   // Playlists per-library for the sidebar tree (each library's "Playlists" node shows its
   // playlists as children). Refreshed on libraries change + any onPlaylistChanged.
   const [sidebarPlaylists, setSidebarPlaylists] = useState<Record<string, PlaylistSummary[]>>({});
+  // Per-library counts shown on sidebar nodes (movies/shows/people). Refreshed on
+  // libraries change and after rescans.
+  const [sidebarCounts, setSidebarCounts] = useState<Record<string, LibraryCounts>>({});
+  // Per-library genre lists shown as children of the "Genres" sidebar node.
+  const [sidebarGenres, setSidebarGenres] = useState<Record<string, GenreSummary[]>>({});
   const [activeView, setActiveView] = useState<ViewSpec | null>(null);
   const selectedLibrary = activeView
     ? libraries.find((l) => l.id === activeView.libraryId) ?? null
@@ -25,6 +30,7 @@ function App() {
   const [entries, setEntries] = useState<MediaEntry[]>([]);
   const [people, setPeople] = useState<PersonSummary[] | null>(null);
   const [playlists, setPlaylists] = useState<PlaylistSummary[] | null>(null);
+  const [genres, setGenres] = useState<GenreSummary[] | null>(null);
   const [breadcrumbs, setBreadcrumbs] = useState<BreadcrumbItem[]>([]);
   const [forwardStack, setForwardStack] = useState<BreadcrumbItem[]>([]);
   const [sortMode, setSortMode] = useState("alpha");
@@ -82,6 +88,8 @@ function App() {
   const peopleModeRef = useRef<Map<string, "top" | "all">>(new Map());
   // Cache: viewCacheKey(view) -> playlists + the list scope's preset state
   const playlistsCacheRef = useRef<Map<string, { playlists: PlaylistSummary[]; presets: SortPreset[]; selectedPresetId: number | null }>>(new Map());
+  // Cache: libraryId -> genre list (so re-clicking Genres doesn't re-fetch/flash).
+  const genresCacheRef = useRef<Map<string, GenreSummary[]>>(new Map());
   // Scroll position cache: scroll-key -> { pixel fallback, plus an element anchor
   // (the card at the viewport top + its offset) so restore survives content-
   // visibility height-estimation drift that a raw scrollTop can't.
@@ -196,6 +204,21 @@ function App() {
     loadLibraries();
   }, [loadLibraries]);
 
+  // Dev only: React 19's development build emits a performance.measure() for
+  // every component render (the browser "React" performance track). During
+  // playback the app re-renders several times a second, so these pile up in the
+  // performance buffer — which force-GC can't reclaim (native perf entries) —
+  // and eventually OOM the dev webview. Periodically flush it. Production React
+  // emits none of these, so this is unnecessary (and a no-op) there.
+  useEffect(() => {
+    if (!import.meta.env.DEV) return;
+    const id = setInterval(() => {
+      performance.clearMeasures();
+      performance.clearMarks();
+    }, 3000);
+    return () => clearInterval(id);
+  }, []);
+
   // Populate sidebar playlist children whenever the libraries list changes. Failures per
   // library are silently ignored — the Playlists sidebar node just won't show children.
   useEffect(() => {
@@ -212,6 +235,36 @@ function App() {
     });
     return () => { cancelled = true; };
   }, [libraries]);
+
+  // Fetch the counts for one library and merge them into the sidebar map.
+  const refreshCountsFor = useCallback(async (libraryId: string) => {
+    try {
+      const counts = await invoke<LibraryCounts>("get_library_counts", { libraryId });
+      setSidebarCounts((prev) => ({ ...prev, [libraryId]: counts }));
+    } catch {
+      // swallow — sidebar nodes just render without counts for that library
+    }
+  }, []);
+
+  // Fetch the genre list for one library (for the "Genres" node's children).
+  const refreshGenresFor = useCallback(async (libraryId: string) => {
+    try {
+      const res = await invoke<GenreSummary[]>("get_genres_in_library", { libraryId });
+      setSidebarGenres((prev) => ({ ...prev, [libraryId]: res }));
+    } catch {
+      // swallow — the Genres node just renders without children for that library
+    }
+  }, []);
+
+  // Populate sidebar counts + genres whenever the libraries list changes.
+  useEffect(() => {
+    libraries.forEach((lib) => {
+      if (lib.format === "video") {
+        refreshCountsFor(lib.id);
+        refreshGenresFor(lib.id);
+      }
+    });
+  }, [libraries, refreshCountsFor, refreshGenresFor]);
 
   // Auto-update on launch
   useEffect(() => {
@@ -318,10 +371,16 @@ function App() {
       .catch(() => {});
   }, []);
 
-  // Scroll-key "kind": role lists must not share a slot (Actors vs Composers
-  // both have kind people-list and parentId null).
+  // Scroll-key "kind": must uniquely identify a view so distinct pages don't share
+  // a scroll slot (Actors vs Composers; two different people/genres/playlists).
   const scrollKindFor = useCallback((view: ViewSpec | null): string => {
-    return view?.kind === "people-list" ? `people-list:${view.role}` : view?.kind ?? "library-root";
+    switch (view?.kind) {
+      case "people-list":     return `people-list:${view.role}`;
+      case "person-detail":   return `person-detail:${view.role}:${view.personId}`;
+      case "genre-detail":    return `genre-detail:${view.genre}`;
+      case "playlist-detail": return `playlist-detail:${view.playlistId}:${view.collectionId ?? "root"}`;
+      default:                return view?.kind ?? "library-root";
+    }
   }, []);
 
   const saveScrollPosition = useCallback(() => {
@@ -404,12 +463,45 @@ function App() {
       // so the user doesn't see an empty flash while the fetch runs.
       inPlace: boolean = false,
     ) => {
+      // Genres produce their own result type. (Display is intentionally basic for now — iterating.)
+      if (view.kind === "genres") {
+        setEntries([]);
+        setPeople(null);
+        setPlaylists(null);
+        const cached = genresCacheRef.current.get(view.libraryId);
+        if (cached) {
+          setGenres(cached);
+          setBreadcrumbs(breadcrumb);
+          if (restoreScroll) restoreScrollPosition(view.libraryId, scrollKindFor(view), breadcrumb[breadcrumb.length - 1]?.id ?? null);
+          else resetScrollToTop();
+          return;
+        }
+        setBreadcrumbs(breadcrumb);
+        setGenres(null);
+        setLoading(true);
+        try {
+          const res = await invoke<GenreSummary[]>("get_genres_in_library", {
+            libraryId: view.libraryId,
+          });
+          genresCacheRef.current.set(view.libraryId, res);
+          setGenres(res);
+          if (restoreScroll) restoreScrollPosition(view.libraryId, scrollKindFor(view), breadcrumb[breadcrumb.length - 1]?.id ?? null);
+          else resetScrollToTop();
+        } catch (e) {
+          console.error("Failed to load genres:", e);
+        } finally {
+          setLoading(false);
+        }
+        return;
+      }
+
       // people-list / people-all and playlists produce their own result types; everything else lands as MediaEntry[].
       if (view.kind === "people-list" || view.kind === "people-all") {
         const key = viewCacheKey(view);
         const cached = peopleCacheRef.current.get(key);
         setEntries([]);
         setPlaylists(null);
+        setGenres(null);
         if (cached) {
           setPeople(cached);
           setBreadcrumbs(breadcrumb);
@@ -452,12 +544,15 @@ function App() {
         const cached = playlistsCacheRef.current.get(key);
         setEntries([]);
         setPeople(null);
+        setGenres(null);
         setSortMode(playlistsSortModeRef.current);
         if (cached) {
           setPlaylists(cached.playlists);
           setPresets(cached.presets);
           setSelectedPresetId(cached.selectedPresetId);
           setBreadcrumbs(breadcrumb);
+          if (restoreScroll) restoreScrollPosition(view.libraryId, scrollKindFor(view), breadcrumb[breadcrumb.length - 1]?.id ?? null);
+          else resetScrollToTop();
           return;
         }
         setBreadcrumbs(breadcrumb);
@@ -477,6 +572,8 @@ function App() {
           setPlaylists(res.playlists);
           setPresets(res.presets);
           setSelectedPresetId(res.selected_preset_id);
+          if (restoreScroll) restoreScrollPosition(view.libraryId, scrollKindFor(view), breadcrumb[breadcrumb.length - 1]?.id ?? null);
+          else resetScrollToTop();
         } catch (e) {
           console.error("Failed to load playlists:", e);
         } finally {
@@ -488,6 +585,7 @@ function App() {
       // All remaining views populate `entries`.
       setPeople(null);
       setPlaylists(null);
+      setGenres(null);
 
       // library-root keeps the legacy parent-keyed cache so existing invalidate/update calls still work.
       const useRootCache = view.kind === "library-root";
@@ -503,8 +601,8 @@ function App() {
         setSelectedPresetId(cached.selected_preset_id);
         setPresets(cached.presets);
         setBreadcrumbs(breadcrumb);
-        if (restoreScroll && useRootCache) restoreScrollPosition(view.libraryId, view.kind, parentId);
-        else if (!restoreScroll) resetScrollToTop();
+        if (restoreScroll) restoreScrollPosition(view.libraryId, scrollKindFor(view), breadcrumb[breadcrumb.length - 1]?.id ?? null);
+        else resetScrollToTop();
         return;
       }
 
@@ -547,10 +645,20 @@ function App() {
             break;
           }
           case "person-detail": {
+            // Always show the person's ENTIRE filmography, not just the works
+            // relevant to the page they were clicked from (Actors/D&C/Composers).
             entries = await invoke<MediaEntry[]>("get_entries_for_person", {
               libraryId: view.libraryId,
               personId: view.personId,
-              role: view.role,
+              role: "all",
+            });
+            sort_mode = "alpha";
+            break;
+          }
+          case "genre-detail": {
+            entries = await invoke<MediaEntry[]>("get_entries_for_genre", {
+              libraryId: view.libraryId,
+              genre: view.genre,
             });
             sort_mode = "alpha";
             break;
@@ -573,8 +681,8 @@ function App() {
         setSortMode(sort_mode);
         setSelectedPresetId(selected_preset_id);
         setPresets(view_presets);
-        if (restoreScroll && useRootCache) restoreScrollPosition(view.libraryId, view.kind, parentId);
-        else if (!restoreScroll) resetScrollToTop();
+        if (restoreScroll) restoreScrollPosition(view.libraryId, scrollKindFor(view), breadcrumb[breadcrumb.length - 1]?.id ?? null);
+        else resetScrollToTop();
       } catch (e) {
         console.error("Failed to load view:", e);
       } finally {
@@ -724,6 +832,7 @@ function App() {
           : kind === "shows-only" ? "TV"
           : kind === "people-all" || kind === "people-list" || kind === "person-detail" ? "People"
           : kind === "playlists" || kind === "playlist-detail" ? "Playlists"
+          : kind === "genres" ? "Genres"
           : "";
         return section ? `${libLabel} - ${section}` : libLabel;
       };
@@ -748,6 +857,12 @@ function App() {
         chain = [
           { id: null, title: rootLabel("playlists"), view: playlistsRoot },
           { id: view.playlistId, title: view.playlistName, view },
+        ];
+      } else if (view.kind === "genre-detail") {
+        const genresRoot: ViewSpec = { kind: "genres", libraryId: view.libraryId };
+        chain = [
+          { id: null, title: rootLabel("genres"), view: genresRoot },
+          { id: null, title: view.genre, view },
         ];
       } else {
         chain = [{ id: null, title: rootLabel(view.kind), view }];
@@ -800,6 +915,10 @@ function App() {
           });
         }
         return crumbs;
+      }
+      if (v?.kind === "genre-detail") {
+        // Genre grids sit under the Genres root (like playlists under Playlists).
+        return [{ id: null, title: `${libLabel} - Genres`, view: { kind: "genres", libraryId }, synthetic: true }];
       }
       if (v) return []; // other view kinds are already chain roots
       // Detail crumbs root under their type's section (TV > Breaking Bad reads
@@ -878,6 +997,7 @@ function App() {
   const navigateToPlaylist = useCallback(
     (playlist: PlaylistSummary) => {
       if (!selectedLibrary) return;
+      saveScrollPosition(); // remember the Playlists list scroll for the return trip
       const view: ViewSpec = {
         kind: "playlist-detail",
         libraryId: selectedLibrary.id,
@@ -895,9 +1015,18 @@ function App() {
       setForwardStack([]);
       loadView(view, null, newBreadcrumbs, false);
     },
-    [selectedLibrary, breadcrumbs, loadView]
+    [selectedLibrary, breadcrumbs, loadView, saveScrollPosition]
   );
 
+  // Drill from the Genres view into a genre's filtered grid. selectView builds
+  // the "Genres > <genre>" breadcrumb chain (see its genre-detail case).
+  const navigateToGenre = useCallback(
+    (libraryId: string, genre: string) => {
+      saveScrollPosition(); // remember the Genres list scroll for the return trip
+      selectView({ kind: "genre-detail", libraryId, genre });
+    },
+    [selectView, saveScrollPosition]
+  );
 
   const navigateTo = useCallback(
     (entry: MediaEntry) => {
@@ -1006,7 +1135,7 @@ function App() {
       // Popping out of a movie/show detail page within the current view's grid.
       setSelectedEntry(null);
       setBreadcrumbs(newBreadcrumbs);
-      restoreScrollPosition(selectedLibrary.id, activeView?.kind ?? "library-root", newLast.id);
+      restoreScrollPosition(selectedLibrary.id, scrollKindFor(activeView), newLast.id);
     } else if (newLast.entry) {
       // Popping back onto a movie/show detail page (e.g. from a cast member's page).
       // Restore the detail page + owning view, and quietly reload the grid behind it.
@@ -1066,6 +1195,7 @@ function App() {
       for (const key of playlistsCacheRef.current.keys()) {
         if (key.startsWith(prefix)) playlistsCacheRef.current.delete(key);
       }
+      genresCacheRef.current.delete(libraryId);
     } else if (libraryId != null) {
       // Invalidate everything for this library across all view caches.
       const prefix = `${libraryId}:`;
@@ -1081,11 +1211,13 @@ function App() {
       for (const key of playlistsCacheRef.current.keys()) {
         if (key.startsWith(prefix)) playlistsCacheRef.current.delete(key);
       }
+      genresCacheRef.current.delete(libraryId);
     } else {
       entryCacheRef.current.clear();
       viewEntriesCacheRef.current.clear();
       peopleCacheRef.current.clear();
       playlistsCacheRef.current.clear();
+      genresCacheRef.current.clear();
     }
   }, []);
 
@@ -1820,25 +1952,25 @@ function App() {
         <Sidebar
           libraries={libraries}
           selectedLibrary={selectedLibrary}
-          // Sidebar highlight: a GENUINE chain root (the user really started there —
-          // All, People, a role list…) stays lit while drilling within it. When the
-          // root is synthetic (loop collapse / detail reset re-rooted the chain),
-          // highlight what's on screen instead: the open entry's section, or the
-          // person's role list. Playlist-detail passes through unchanged — individual
-          // playlists have their own sidebar nodes and a node-level matcher.
+          // Sidebar highlight follows the CURRENT page (the last breadcrumb):
+          //  1. A movie/show detail highlights its home section (Movies/TV) by type.
+          //  2. A person detail highlights their role list (People when all-roles, since
+          //     a person can hold several roles and has no single child list).
+          //  3. Any grid (a section root, a role list, a specific playlist/genre) is
+          //     itself the node to light up.
           activeView={(() => {
             if (!activeView) return activeView;
-            if (activeView.kind === "playlist-detail") return activeView;
-            const root = breadcrumbs[0];
-            if (root?.view && !root.synthetic) return root.view;
-            if (selectedEntry?.entry_type === "movie") return { kind: "movies-only", libraryId: activeView.libraryId };
-            if (selectedEntry?.entry_type === "show") return { kind: "shows-only", libraryId: activeView.libraryId };
+            if (selectedEntry?.entry_type === "movie" || selectedEntry?.entry_type === "show") {
+              return selectedEntry.entry_type === "movie"
+                ? { kind: "movies-only", libraryId: activeView.libraryId }
+                : { kind: "shows-only", libraryId: activeView.libraryId };
+            }
             if (activeView.kind === "person-detail") {
               return activeView.role === "all"
                 ? { kind: "people-all", libraryId: activeView.libraryId }
                 : { kind: "people-list", libraryId: activeView.libraryId, role: activeView.role };
             }
-            return root?.view ?? activeView;
+            return activeView;
           })()}
           onSelectLibrary={selectLibrary}
           onSelectView={selectView}
@@ -1893,10 +2025,15 @@ function App() {
               // Silent in-place refresh — no loading flash; the grid (and any
               // open detail page's backing grid) quietly picks up new metadata.
               refreshGridInPlace();
+              // Counts and genres may have changed after a rescan.
+              refreshCountsFor(selectedLibrary.id);
+              refreshGenresFor(selectedLibrary.id);
             }
           }}
           onPlaylistChanged={handlePlaylistChanged}
           sidebarPlaylists={sidebarPlaylists}
+          sidebarCounts={sidebarCounts}
+          sidebarGenres={sidebarGenres}
           playerState={playerState}
           playerActions={playerActions}
         />
@@ -1904,6 +2041,7 @@ function App() {
           entries={entries}
           people={people}
           playlists={playlists}
+          genres={genres}
           activeView={activeView}
           searchResults={searchResults}
           selectedEntry={selectedEntry}
@@ -1929,6 +2067,7 @@ function App() {
             }
           }}
           onNavigateToPlaylist={navigateToPlaylist}
+          onSelectGenre={navigateToGenre}
           onPlaylistChanged={handlePlaylistChanged}
           onBreadcrumbClick={navigateBreadcrumb}
           selectedLibrary={selectedLibrary}

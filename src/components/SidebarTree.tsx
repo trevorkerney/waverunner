@@ -3,10 +3,12 @@ import {
   ChevronRight,
   Circle,
   Clapperboard,
+  Drama,
   Film,
   Library,
   ListMusic,
   Music2,
+  Tag,
   Tv,
   User,
   Users,
@@ -22,10 +24,12 @@ import { viewCacheKey } from "@/lib/complications";
 
 const ICON_MAP: Record<string, LucideIcon> = {
   Clapperboard,
+  Drama,
   Film,
   Library,
   ListMusic,
   Music2,
+  Tag,
   Tv,
   User,
   Users,
@@ -33,6 +37,16 @@ const ICON_MAP: Record<string, LucideIcon> = {
 
 function getIcon(name: string): LucideIcon {
   return ICON_MAP[name] ?? Circle;
+}
+
+// Compact count for the sidebar: 999 stays, 1500 -> "1.5K", 14600 -> "14.6K".
+// Trailing ".0" is dropped (1000 -> "1K"). Millions get "M" for completeness.
+function formatCount(n: number): string {
+  if (n < 1000) return String(n);
+  const unit = n < 1_000_000 ? "K" : "M";
+  const scaled = n < 1_000_000 ? n / 1000 : n / 1_000_000;
+  const rounded = Math.round(scaled * 10) / 10;
+  return `${rounded % 1 === 0 ? rounded.toFixed(0) : rounded.toFixed(1)}${unit}`;
 }
 
 interface SidebarTreeProps {
@@ -70,7 +84,7 @@ interface TreeNodeProps {
 }
 
 function TreeNode({ node, activeView, onSelectView, renderNodeMenu, depth }: TreeNodeProps) {
-  const [expanded, setExpanded] = useState(true);
+  const [expanded, setExpanded] = useState(!node.defaultCollapsed);
   const Icon = getIcon(node.iconName);
   const hasChildren = (node.children?.length ?? 0) > 0;
   // Playlist sidebar entries stay highlighted while the user drills into nested
@@ -91,9 +105,10 @@ function TreeNode({ node, activeView, onSelectView, renderNodeMenu, depth }: Tre
 
   const handleClick = () => {
     if (node.view) {
+      // Navigate only — expand/collapse is exclusively the chevron's job.
       onSelectView(node.view);
-      if (hasChildren) setExpanded(true);
     } else if (hasChildren) {
+      // Non-navigable parent (no view): clicking the row is the only way to toggle.
       setExpanded((v) => !v);
     }
   };
@@ -137,7 +152,12 @@ function TreeNode({ node, activeView, onSelectView, renderNodeMenu, depth }: Tre
       <span className="flex h-5 flex-shrink-0 items-center">
         <Icon size={14} />
       </span>
-      <span className="min-w-0 flex-1 break-words">{node.label}</span>
+      <span className="min-w-0 flex-1 break-words">
+        {node.label}
+        {node.count != null && (
+          <span className="text-sidebar-foreground/40"> ({formatCount(node.count)})</span>
+        )}
+      </span>
     </button>
   );
 

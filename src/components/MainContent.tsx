@@ -94,7 +94,7 @@ import {
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
-import { Library, MediaEntry, BreadcrumbItem, MovieDetail, MovieDetailUpdate, SeasonInfo, EpisodeInfo, ShowDetail, SeasonDetailLocal, EpisodeDetailLocal, TmdbSeasonDetail, TmdbEpisodeDetail, TmdbShowFieldSelection, TmdbSeasonFieldSelection, TmdbEpisodeFieldSelection, CastUpdateInfo, CastInfo, RatingInfo, ViewSpec, PersonInfo, PersonSummary, PersonRole, PlaylistSummary, SortPreset } from "@/types";
+import { Library, MediaEntry, BreadcrumbItem, MovieDetail, MovieDetailUpdate, SeasonInfo, EpisodeInfo, ShowDetail, SeasonDetailLocal, EpisodeDetailLocal, TmdbSeasonDetail, TmdbEpisodeDetail, TmdbShowFieldSelection, TmdbSeasonFieldSelection, TmdbEpisodeFieldSelection, CastUpdateInfo, CastInfo, RatingInfo, ViewSpec, PersonInfo, PersonSummary, PersonRole, PlaylistSummary, GenreSummary, SortPreset } from "@/types";
 import { scopeKeyFor, viewCacheKey } from "@/lib/complications";
 import { ExtrasDialog } from "@/components/ExtrasDialog";
 import { SortPresetSaveDialog } from "@/components/SortPresetSaveDialog";
@@ -130,6 +130,16 @@ function letterForTitle(title: string): string {
   }
   const c = t.charAt(0).toUpperCase();
   return c >= "A" && c <= "Z" ? c : "#";
+}
+
+// Granularity of the date jump rail. Smaller = finer markers (1 = every year,
+// 5 = half-decades). Buckets a 4-digit year string to its group's start year.
+const YEAR_RAIL_STEP = 5;
+function yearBucket(year: string | null | undefined): string | null {
+  if (!year || year.length < 4) return null;
+  const y = parseInt(year.slice(0, 4), 10);
+  if (Number.isNaN(y)) return null;
+  return String(Math.floor(y / YEAR_RAIL_STEP) * YEAR_RAIL_STEP);
 }
 
 function getDisplayCover(entry: MediaEntry): string | null {
@@ -170,6 +180,8 @@ interface MainContentProps {
   entries: MediaEntry[];
   people: PersonSummary[] | null;
   playlists: PlaylistSummary[] | null;
+  genres: GenreSummary[] | null;
+  onSelectGenre: (libraryId: string, genre: string) => void;
   activeView: ViewSpec | null;
   searchResults: MediaEntry[] | null;
   selectedEntry: MediaEntry | null;
@@ -227,6 +239,8 @@ export function MainContent({
   entries,
   people,
   playlists,
+  genres,
+  onSelectGenre,
   activeView,
   searchResults,
   selectedEntry,
@@ -323,19 +337,18 @@ export function MainContent({
       return { labels, find: (l: string) => filteredEntries.find((e) => letterForTitle(e.title) === l) };
     }
     if (sortMode === "date" || sortMode === "year") {
-      // Decades in encounter order so the rail follows the sort direction.
+      // Year buckets (YEAR_RAIL_STEP) in encounter order so the rail follows the sort direction.
       const labels: string[] = [];
       const seen = new Set<string>();
       for (const e of filteredEntries) {
-        if (!e.year || e.year.length < 4) continue;
-        const dec = `${e.year.slice(0, 3)}0`;
-        if (!seen.has(dec)) {
-          seen.add(dec);
-          labels.push(dec);
+        const b = yearBucket(e.year);
+        if (b && !seen.has(b)) {
+          seen.add(b);
+          labels.push(b);
         }
       }
       if (labels.length < 2) return null;
-      return { labels, find: (l: string) => filteredEntries.find((e) => e.year?.slice(0, 3) === l.slice(0, 3)) };
+      return { labels, find: (l: string) => filteredEntries.find((e) => yearBucket(e.year) === l) };
     }
     return null;
   }, [selectedEntry, loading, isSearching, filteredEntries, sortMode]);
@@ -354,11 +367,11 @@ export function MainContent({
       letters.add(letterForTitle(e.title));
       if (letters.size >= 2) return true;
     }
-    const decades = new Set<string>();
+    const buckets = new Set<string>();
     for (const e of filteredEntries) {
-      if (!e.year || e.year.length < 4) continue;
-      decades.add(`${e.year.slice(0, 3)}0`);
-      if (decades.size >= 2) return true;
+      const b = yearBucket(e.year);
+      if (b) buckets.add(b);
+      if (buckets.size >= 2) return true;
     }
     return false;
   }, [selectedEntry, loading, isSearching, filteredEntries]);
@@ -481,6 +494,12 @@ export function MainContent({
     prevNavKeyRef.current = navKey;
     if (!grid) {
       flipPositionsRef.current = new Map();
+      // The grid isn't mounted. On a non-grid VIEW (people / genres list / playlists
+      // list) — not a detail page — forget the last loaded-in grid so returning to
+      // ANY grid, including the one we left, replays the drop-in. A detail page keeps
+      // a grid-kind activeView + selectedEntry, so we leave the marker intact and
+      // back-from-detail stays still, as before.
+      if (!selectedEntry) loadedInViewRef.current = null;
       return;
     }
     const children = Array.from(grid.children) as HTMLElement[];
@@ -850,6 +869,37 @@ export function MainContent({
             onToggleFavorite={onTogglePersonFavorite}
             scrollContainerRef={scrollContainerRef}
           />
+        )}
+      </main>
+    );
+  }
+
+  if (activeView?.kind === "genres") {
+    // Intentionally basic — placement first, we'll iterate on the look.
+    return (
+      <main className="flex flex-1 flex-col overflow-hidden bg-background">
+        {breadcrumbBar}
+        {loading && (
+          <div className="flex flex-1 items-center justify-center">
+            <Spinner className="size-6" />
+          </div>
+        )}
+        {!loading && genres && genres.length === 0 && (
+          <p className="p-4 text-sm text-muted-foreground">No genres found.</p>
+        )}
+        {!loading && genres && genres.length > 0 && (
+          <div ref={scrollContainerRef} className="flex flex-wrap content-start gap-2 overflow-y-auto p-4">
+            {genres.map((g) => (
+              <button
+                key={g.name}
+                onClick={() => onSelectGenre(activeView.libraryId, g.name)}
+                className="flex items-center gap-2 rounded-md border bg-card px-3 py-2 text-sm transition-colors hover:bg-accent hover:text-accent-foreground"
+              >
+                <span>{g.name}</span>
+                <span className="text-xs text-muted-foreground">{g.count}</span>
+              </button>
+            ))}
+          </div>
         )}
       </main>
     );

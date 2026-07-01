@@ -8,7 +8,9 @@ import { TITLEBAR_HEIGHT } from "../components/Titlebar";
 export interface PlayerState {
   isActive: boolean;
   isPlaying: boolean;
-  currentTime: number;
+  // NOTE: the high-frequency playback position is intentionally NOT here — it
+  // lives in an isolated store (subscribePosition/getPosition) so position
+  // ticks don't re-render the whole app. Read it with useSyncExternalStore.
   duration: number;
   volume: number;
   muted: boolean;
@@ -38,11 +40,19 @@ export interface PlayerActions {
   togglePause: () => Promise<void>;
   seek: (seconds: number) => Promise<void>;
   seekAbsolute: (seconds: number) => Promise<void>;
+  /** Isolated playback-position store — subscribe for live currentTime without
+   *  re-rendering the rest of the app on every tick. */
+  subscribePosition: (cb: () => void) => () => void;
+  getPosition: () => number;
   setVolume: (vol: number) => Promise<void>;
+  setVolumeLive: (vol: number) => Promise<void>;
   toggleMute: () => Promise<void>;
   setAudioTrack: (id: number) => Promise<void>;
   setSubtitleTrack: (id: number) => Promise<void>;
   setVideoTrack: (id: number) => Promise<void>;
+  prepareThumbnails: () => Promise<boolean>;
+  getThumbnail: (time: number) => Promise<ArrayBuffer | null>;
+  endThumbnails: () => Promise<void>;
   toggleSubtitles: () => Promise<void>;
   toggleFullscreen: () => Promise<void>;
   toggleMinimize: () => Promise<void>;
@@ -55,7 +65,6 @@ export interface PlayerActions {
 const initialState: PlayerState = {
   isActive: false,
   isPlaying: false,
-  currentTime: 0,
   duration: 0,
   volume: 100,
   muted: false,
@@ -88,11 +97,31 @@ export function usePlayer(): [PlayerState, PlayerActions] {
   stateRef.current = state;
 
   const unlistenRefs = useRef<UnlistenFn[]>([]);
+  // Path of the file currently loaded — used to start the seek-bar thumbnailer.
+  const currentPathRef = useRef<string | null>(null);
   const draggingRef = useRef<"seek" | "volume" | null>(null);
   const lastUserSeek = useRef(0);
   const lastUserVolume = useRef(0);
   const lastNonZeroVolume = useRef(100);
   const SUPPRESS_MS = 300;
+
+  // Isolated playback-position store. mpv reports the position several times a
+  // second; routing that through React state would re-render the entire app on
+  // every tick. Instead it lives here and only components that read it (the seek
+  // bar / time label, via useSyncExternalStore) re-render.
+  const positionRef = useRef(0);
+  const positionListeners = useRef(new Set<() => void>());
+  const setPosition = useCallback((t: number) => {
+    positionRef.current = t;
+    positionListeners.current.forEach((cb) => cb());
+  }, []);
+  const subscribePosition = useCallback((cb: () => void) => {
+    positionListeners.current.add(cb);
+    return () => {
+      positionListeners.current.delete(cb);
+    };
+  }, []);
+  const getPosition = useCallback(() => positionRef.current, []);
 
   // Load persisted autoPlayNext
   useEffect(() => {
@@ -116,7 +145,9 @@ export function usePlayer(): [PlayerState, PlayerActions] {
         ...prev,
         audioTracks: tracks.filter((t) => t.type === "audio"),
         subtitleTracks: tracks.filter((t) => t.type === "sub"),
-        videoTracks: tracks.filter((t) => t.type === "video"),
+        // Exclude attached-picture streams (embedded covers/backdrops) — they
+        // report as video tracks but aren't real selectable video.
+        videoTracks: tracks.filter((t) => t.type === "video" && !t.albumart),
       }));
     } catch {
       // Player might not be ready yet
@@ -137,6 +168,8 @@ export function usePlayer(): [PlayerState, PlayerActions] {
         libraryId: ctx.libraryId,
         episodeId: ep.episodeId,
       });
+      currentPathRef.current = path;
+      setPosition(0);
       setState((prev) => ({
         ...prev,
         loading: true,
@@ -149,7 +182,7 @@ export function usePlayer(): [PlayerState, PlayerActions] {
       setState((prev) => ({ ...prev, loading: false }));
       throw e;
     }
-  }, []);
+  }, [setPosition]);
 
   // Natural end of the current file. With keep-open=yes mpv signals this via
   // the eof-reached property (END_FILE does not fire), pausing on the last frame.
@@ -187,11 +220,15 @@ export function usePlayer(): [PlayerState, PlayerActions] {
             if (value === true) handleNaturalEnd();
             return;
           }
+          if (name === "time-pos") {
+            // Goes to the isolated store, NOT React state, so this high-frequency
+            // update doesn't re-render the app.
+            if (draggingRef.current === "seek" || Date.now() - lastUserSeek.current < SUPPRESS_MS) return;
+            setPosition((value as number) ?? 0);
+            return;
+          }
           setState((prev) => {
             switch (name) {
-              case "time-pos":
-                if (draggingRef.current === "seek" || Date.now() - lastUserSeek.current < SUPPRESS_MS) return prev;
-                return { ...prev, currentTime: (value as number) ?? 0 };
               case "duration":
                 return { ...prev, duration: (value as number) ?? 0 };
               case "pause":
@@ -237,7 +274,7 @@ export function usePlayer(): [PlayerState, PlayerActions] {
       unlistenRefs.current.forEach((fn) => fn());
       unlistenRefs.current = [];
     };
-  }, [state.isActive, refreshTracksInternal, handleNaturalEnd]);
+  }, [state.isActive, refreshTracksInternal, handleNaturalEnd, setPosition]);
 
   // Apply the user's configured default volume (settings, default 50%) at the start of a
   // freshly-opened video. Not used for in-player next/prev/auto-next, so a binge keeps
@@ -256,6 +293,8 @@ export function usePlayer(): [PlayerState, PlayerActions] {
 
   const play = useCallback(async (path: string, title: string) => {
     const wasActive = stateRef.current.isActive;
+    currentPathRef.current = path;
+    setPosition(0);
     setState((prev) => ({
       ...prev,
       loading: true,
@@ -274,7 +313,7 @@ export function usePlayer(): [PlayerState, PlayerActions] {
       setState((prev) => ({ ...prev, loading: false, isActive: wasActive, isPlaying: false }));
       throw e;
     }
-  }, [applyStartupVolume]);
+  }, [applyStartupVolume, setPosition]);
 
   const playEpisode = useCallback(async (args: PlayEpisodeArgs) => {
     const { libraryId, showId, showTitle, startEpisodeId } = args;
@@ -297,11 +336,13 @@ export function usePlayer(): [PlayerState, PlayerActions] {
       libraryId,
       episodeId: ep.episodeId,
     });
+    currentPathRef.current = path;
 
     const title = episodeTitle(showTitle, ep);
     const ctx: PlayerContext = { kind: "episode", libraryId, showId, showTitle, episodes, index };
 
     const wasActive = stateRef.current.isActive;
+    setPosition(0);
     setState((prev) => ({
       ...prev,
       loading: true,
@@ -321,7 +362,7 @@ export function usePlayer(): [PlayerState, PlayerActions] {
       setState((prev) => ({ ...prev, loading: false, isActive: wasActive }));
       throw e;
     }
-  }, [applyStartupVolume]);
+  }, [applyStartupVolume, setPosition]);
 
   const playNextEpisode = useCallback(async () => {
     const ctx = stateRef.current.context;
@@ -344,24 +385,24 @@ export function usePlayer(): [PlayerState, PlayerActions] {
 
   const seek = useCallback(async (seconds: number) => {
     lastUserSeek.current = Date.now();
-    setState((prev) => ({
-      ...prev,
-      currentTime: Math.max(0, Math.min(prev.duration, prev.currentTime + seconds)),
-    }));
+    const dur = stateRef.current.duration;
+    setPosition(Math.max(0, Math.min(dur, positionRef.current + seconds)));
     await invoke("player_command", {
       cmd: "seek",
       args: [seconds.toString(), "relative"],
     });
-  }, []);
+  }, [setPosition]);
 
   const seekAbsolute = useCallback(async (seconds: number) => {
     lastUserSeek.current = Date.now();
-    setState((prev) => ({ ...prev, currentTime: seconds }));
+    setPosition(seconds);
+    // `exact` forces a precise (non-keyframe) seek so we land on the same frame
+    // the hover thumbnail shows, which also seeks with `absolute+exact`.
     await invoke("player_command", {
       cmd: "seek",
-      args: [seconds.toString(), "absolute"],
+      args: [seconds.toString(), "absolute+exact"],
     });
-  }, []);
+  }, [setPosition]);
 
   const setVolume = useCallback(async (vol: number) => {
     lastUserVolume.current = Date.now();
@@ -379,6 +420,16 @@ export function usePlayer(): [PlayerState, PlayerActions] {
     if (vol > 0 && wasMuted) {
       await invoke("player_command", { cmd: "cycle", args: ["mute"] });
     }
+  }, []);
+
+  // Live volume update while dragging: push to mpv so audio follows immediately,
+  // but DON'T touch global React state — otherwise the whole app tree re-renders
+  // on every pixel and the thumb lags. The slider's thumb is driven by a
+  // component-local drag value; `setVolume` commits to global state on release.
+  const setVolumeLive = useCallback(async (vol: number) => {
+    lastUserVolume.current = Date.now();
+    if (vol > 0) lastNonZeroVolume.current = vol;
+    await invoke("set_player_property", { name: "volume", value: vol.toString() });
   }, []);
 
   const toggleMute = useCallback(async () => {
@@ -409,6 +460,36 @@ export function usePlayer(): [PlayerState, PlayerActions] {
 
   const setVideoTrack = useCallback(async (id: number) => {
     await invoke("set_player_property", { name: "vid", value: id.toString() });
+  }, []);
+
+  // Seek-bar thumbnails. The second decoder is spun up lazily on first hover
+  // (prepareThumbnails) and torn down once hovering stops (endThumbnails), so
+  // it only consumes RAM while actively scrubbing.
+  const prepareThumbnails = useCallback(async (): Promise<boolean> => {
+    const path = currentPathRef.current;
+    if (!path) return false;
+    try {
+      await invoke("thumbnailer_start", { path });
+      return true;
+    } catch {
+      return false;
+    }
+  }, []);
+
+  const getThumbnail = useCallback(async (time: number): Promise<ArrayBuffer | null> => {
+    try {
+      return await invoke<ArrayBuffer>("thumbnail_at", { time });
+    } catch {
+      return null;
+    }
+  }, []);
+
+  const endThumbnails = useCallback(async () => {
+    try {
+      await invoke("thumbnailer_stop");
+    } catch {
+      // ignore
+    }
   }, []);
 
   const toggleSubtitles = useCallback(async () => {
@@ -476,6 +557,12 @@ export function usePlayer(): [PlayerState, PlayerActions] {
   }, []);
 
   const close = useCallback(async () => {
+    currentPathRef.current = null;
+    try {
+      await invoke("thumbnailer_stop");
+    } catch {
+      // ignore
+    }
     try {
       await invoke("destroy_player");
     } catch {
@@ -485,8 +572,9 @@ export function usePlayer(): [PlayerState, PlayerActions] {
     if (await appWindow.isFullscreen()) {
       await appWindow.setFullscreen(false);
     }
+    setPosition(0);
     setState((prev) => ({ ...initialState, autoPlayNext: prev.autoPlayNext }));
-  }, []);
+  }, [setPosition]);
 
   const setDragging = useCallback((field: "seek" | "volume" | null) => {
     draggingRef.current = field;
@@ -500,11 +588,17 @@ export function usePlayer(): [PlayerState, PlayerActions] {
     togglePause,
     seek,
     seekAbsolute,
+    subscribePosition,
+    getPosition,
     setVolume,
+    setVolumeLive,
     toggleMute,
     setAudioTrack,
     setSubtitleTrack,
     setVideoTrack,
+    prepareThumbnails,
+    getThumbnail,
+    endThumbnails,
     toggleSubtitles,
     toggleFullscreen,
     toggleMinimize,

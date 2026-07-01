@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { PlayerState, PlayerActions } from "../../hooks/usePlayer";
 import { Slider } from "../ui/slider";
 import {
@@ -47,6 +47,103 @@ export function ControlsOverlay({
   const [seekDragValue, setSeekDragValue] = useState<number | null>(null);
   const seekDragRef = useRef<number | null>(null);
   const [hoverRatio, setHoverRatio] = useState<number | null>(null);
+  // Local volume drag value, so dragging only re-renders this overlay (not the
+  // whole app) and the thumb tracks the cursor. Mirrors the seek bar.
+  const [volumeDragValue, setVolumeDragValue] = useState<number | null>(null);
+  const volumeDragRef = useRef<number | null>(null);
+
+  // Live playback position from the isolated store — subscribing here means
+  // only this overlay re-renders on position ticks, not the whole app.
+  const currentTime = useSyncExternalStore(actions.subscribePosition, actions.getPosition);
+
+  // --- Seek-bar thumbnail preview ------------------------------------------
+  const [thumbUrl, setThumbUrl] = useState<string | null>(null);
+  const thumbUrlRef = useRef<string | null>(null);
+  const preparedRef = useRef(false);        // second decoder is up and ready
+  const inFlightRef = useRef(false);         // a frame request is outstanding
+  const pendingTimeRef = useRef<number | null>(null); // latest time while busy
+  const lastBucketRef = useRef<number | null>(null);  // de-dupe per second
+  const hoverTimeRef = useRef<number | null>(null);   // most recent hovered time
+  const settleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const teardownTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const showThumb = useCallback((buf: ArrayBuffer | null) => {
+    if (!buf) return;
+    const url = URL.createObjectURL(new Blob([buf], { type: "image/jpeg" }));
+    if (thumbUrlRef.current) URL.revokeObjectURL(thumbUrlRef.current);
+    thumbUrlRef.current = url;
+    setThumbUrl(url);
+  }, []);
+
+  // Request a frame, coalescing rapid hover movement into one in-flight call
+  // plus a single trailing request for the most recent position.
+  const pumpThumb = useCallback(
+    async (time: number) => {
+      if (!preparedRef.current) return;
+      if (inFlightRef.current) {
+        pendingTimeRef.current = time;
+        return;
+      }
+      inFlightRef.current = true;
+      const buf = await actions.getThumbnail(time);
+      showThumb(buf);
+      inFlightRef.current = false;
+      if (pendingTimeRef.current != null) {
+        const next = pendingTimeRef.current;
+        pendingTimeRef.current = null;
+        pumpThumb(next);
+      }
+    },
+    [actions, showThumb]
+  );
+
+  const handleSeekEnter = useCallback(() => {
+    if (teardownTimerRef.current) {
+      clearTimeout(teardownTimerRef.current);
+      teardownTimerRef.current = null;
+    }
+    actions.prepareThumbnails().then((ok) => {
+      preparedRef.current = ok;
+      // Show a frame for where the cursor already is, even if it hasn't moved
+      // since the decoder finished spinning up.
+      if (ok && hoverTimeRef.current != null) {
+        lastBucketRef.current = Math.round(hoverTimeRef.current * 4);
+        pumpThumb(hoverTimeRef.current);
+      }
+    });
+  }, [actions, pumpThumb]);
+
+  const handleSeekLeaveThumb = useCallback(() => {
+    setThumbUrl(null);
+    if (thumbUrlRef.current) {
+      URL.revokeObjectURL(thumbUrlRef.current);
+      thumbUrlRef.current = null;
+    }
+    lastBucketRef.current = null;
+    hoverTimeRef.current = null;
+    if (settleTimerRef.current) {
+      clearTimeout(settleTimerRef.current);
+      settleTimerRef.current = null;
+    }
+    // Tear the decoder down after a short idle so a quick re-entry (or just
+    // brushing past the bar) doesn't thrash the second mpv instance.
+    if (teardownTimerRef.current) clearTimeout(teardownTimerRef.current);
+    teardownTimerRef.current = setTimeout(() => {
+      preparedRef.current = false;
+      actions.endThumbnails();
+    }, 2500);
+  }, [actions]);
+
+  // Clean up the object URL, pending teardown, and decoder on unmount.
+  useEffect(() => {
+    return () => {
+      if (teardownTimerRef.current) clearTimeout(teardownTimerRef.current);
+      if (settleTimerRef.current) clearTimeout(settleTimerRef.current);
+      if (thumbUrlRef.current) URL.revokeObjectURL(thumbUrlRef.current);
+      if (preparedRef.current) actions.endThumbnails();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const handleSeekDrag = useCallback(
     (value: number | readonly number[]) => {
@@ -61,7 +158,12 @@ export function ControlsOverlay({
 
   const handleSeekCommit = useCallback(() => {
     if (seekDragRef.current !== null) {
-      actions.seekAbsolute(seekDragRef.current);
+      // Seek to the exact time the preview used (same source as the thumbnail),
+      // not base-ui's separately-mapped slider value — otherwise the two can
+      // land on adjacent frames. Fall back to the slider value if we somehow
+      // have no hovered time.
+      const target = hoverTimeRef.current ?? seekDragRef.current;
+      actions.seekAbsolute(target);
       seekDragRef.current = null;
       setSeekDragValue(null);
     }
@@ -71,11 +173,22 @@ export function ControlsOverlay({
   const handleVolume = useCallback(
     (value: number | readonly number[]) => {
       const v = Array.isArray(value) ? value[0] : value;
-      actions.setVolume(v);
+      volumeDragRef.current = v;
+      setVolumeDragValue(v);
+      actions.setVolumeLive(v); // audio follows now; global state commits on release
       onInteraction();
     },
     [actions, onInteraction]
   );
+
+  const commitVolume = useCallback(() => {
+    if (volumeDragRef.current !== null) {
+      actions.setVolume(volumeDragRef.current);
+      volumeDragRef.current = null;
+      setVolumeDragValue(null);
+    }
+    actions.setDragging(null);
+  }, [actions]);
 
   const handleMuteClick = useCallback(() => {
     actions.toggleMute();
@@ -125,14 +238,35 @@ export function ControlsOverlay({
         <div
           className="relative mb-2"
           onPointerUp={handleSeekCommit}
+          onPointerEnter={handleSeekEnter}
           onPointerLeave={() => {
             setHoverRatio(null);
             handleSeekCommit();
+            handleSeekLeaveThumb();
           }}
           onPointerMove={(e) => {
             const rect = e.currentTarget.getBoundingClientRect();
-            const r = (e.clientX - rect.left) / rect.width;
-            setHoverRatio(Math.max(0, Math.min(1, r)));
+            const r = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+            setHoverRatio(r);
+            if (state.duration > 0) {
+              const t = r * state.duration;
+              hoverTimeRef.current = t;
+              // Refresh ~4x/sec of content so the preview tracks the cursor
+              // closely; coalescing keeps at most one decode in flight.
+              const bucket = Math.round(t * 4);
+              if (preparedRef.current && bucket !== lastBucketRef.current) {
+                lastBucketRef.current = bucket;
+                pumpThumb(t);
+              }
+              // When the cursor settles, fetch the exact rest frame so the
+              // preview matches precisely where a click will land.
+              if (settleTimerRef.current) clearTimeout(settleTimerRef.current);
+              settleTimerRef.current = setTimeout(() => {
+                if (preparedRef.current && hoverTimeRef.current != null) {
+                  pumpThumb(hoverTimeRef.current);
+                }
+              }, 150);
+            }
           }}
           onKeyDownCapture={(e) => {
             // The slider thumb is a native <input type="range">. Arrow keys
@@ -156,7 +290,7 @@ export function ControlsOverlay({
           }}
         >
           <Slider
-            value={[seekDragValue ?? state.currentTime]}
+            value={[seekDragValue ?? currentTime]}
             min={0}
             max={state.duration || 1}
             onValueChange={handleSeekDrag}
@@ -166,6 +300,14 @@ export function ControlsOverlay({
               className="pointer-events-none absolute left-0 top-1/2 h-1 -translate-y-1/2 rounded-full bg-white/25"
               style={{ width: `${hoverRatio * 100}%` }}
             />
+          )}
+          {hoverRatio !== null && thumbUrl && (
+            <div
+              className="pointer-events-none absolute bottom-full mb-3 w-40 -translate-x-1/2 overflow-hidden rounded-md border border-white/20 bg-black shadow-lg"
+              style={{ left: `${hoverRatio * 100}%` }}
+            >
+              <img src={thumbUrl} alt="" className="block w-full" />
+            </div>
           )}
         </div>
 
@@ -185,20 +327,25 @@ export function ControlsOverlay({
           <div
             className="w-24"
             onPointerDown={() => actions.setDragging("volume")}
-            onPointerUp={() => actions.setDragging(null)}
-            onPointerLeave={() => actions.setDragging(null)}
+            onPointerUp={commitVolume}
+            onPointerLeave={commitVolume}
           >
             <Slider
-              value={[state.muted ? 0 : state.volume]}
+              value={[volumeDragValue ?? (state.muted ? 0 : state.volume)]}
               min={0}
               max={100}
               onValueChange={handleVolume}
             />
           </div>
 
-          {/* Time */}
+          {/* Time — shows the hovered position while scrubbing the bar,
+              otherwise the live playback position. */}
           <span className="text-white/80 text-xs tabular-nums select-none">
-            {formatTime(seekDragValue ?? state.currentTime)} / {formatTime(state.duration)}
+            {formatTime(
+              seekDragValue ??
+                (hoverRatio != null ? hoverRatio * state.duration : currentTime)
+            )}{" "}
+            / {formatTime(state.duration)}
           </span>
 
           {/* Spacer */}

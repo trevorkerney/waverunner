@@ -18,6 +18,7 @@ pub struct AppState {
     pub app_db: SqlitePool,
     pub cancel_creation: AtomicBool,
     pub player: Mutex<Option<Arc<player::PlayerInner>>>,
+    pub thumbnailer: Mutex<Option<player::Thumbnailer>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -49,6 +50,7 @@ pub fn run() {
                 app_db,
                 cancel_creation: AtomicBool::new(false),
                 player: Mutex::new(None),
+                thumbnailer: Mutex::new(None),
             });
 
             if cfg!(debug_assertions) {
@@ -144,6 +146,9 @@ pub fn run() {
             commands::get_episode_file_path,
             commands::get_show_episodes,
             commands::get_people_in_library,
+            commands::get_library_counts,
+            commands::get_genres_in_library,
+            commands::get_entries_for_genre,
             commands::get_entries_for_person,
             commands::get_playlists,
             commands::reorder_playlists,
@@ -180,6 +185,9 @@ pub fn run() {
             player::player_command,
             player::set_player_property,
             player::get_player_tracks,
+            player::thumbnailer_start,
+            player::thumbnail_at,
+            player::thumbnailer_stop,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

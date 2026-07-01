@@ -1,24 +1,41 @@
-import type { ComplicationNode, Library, PlaylistSummary, ViewSpec } from "@/types";
+import type { ComplicationNode, GenreSummary, Library, LibraryCounts, PlaylistSummary, ViewSpec } from "@/types";
 
 export function getComplicationsForLibrary(
   library: Library,
   playlists: PlaylistSummary[] = [],
+  counts?: LibraryCounts,
+  genres?: GenreSummary[],
 ): ComplicationNode[] {
   switch (library.format) {
     case "video":
-      return videoComplications(library.id, playlists);
+      return videoComplications(library.id, playlists, counts, genres);
     default:
       return [];
   }
 }
 
-function videoComplications(libraryId: string, playlists: PlaylistSummary[]): ComplicationNode[] {
+function videoComplications(
+  libraryId: string,
+  playlists: PlaylistSummary[],
+  counts?: LibraryCounts,
+  genres?: GenreSummary[],
+): ComplicationNode[] {
+  // Each genre appears as a child of "Genres" (already alphabetized by the
+  // backend), showing its movie/show count and drilling into a filtered grid.
+  const genreChildren: ComplicationNode[] = (genres ?? []).map((g) => ({
+    id: `genre.${g.name}`,
+    label: g.name,
+    iconName: "Tag",
+    count: g.count,
+    view: { kind: "genre-detail", libraryId, genre: g.name },
+  }));
   // Each user-created playlist appears as a child of the "Playlists" node so users can
   // jump directly into one from the sidebar. Collapsing "Playlists" hides them.
   const playlistChildren: ComplicationNode[] = playlists.map((p) => ({
     id: `playlist.${p.id}`,
     label: p.title,
     iconName: "ListMusic",
+    count: p.movie_count + p.show_count,
     view: {
       kind: "playlist-detail",
       libraryId,
@@ -33,27 +50,39 @@ function videoComplications(libraryId: string, playlists: PlaylistSummary[]): Co
       id: "all",
       label: "All",
       iconName: "Library",
+      count: counts ? counts.movies + counts.shows : undefined,
       view: { kind: "library-root", libraryId },
       children: [
-        { id: "all.movies", label: "Movies", iconName: "Film", view: { kind: "movies-only", libraryId } },
-        { id: "all.shows",  label: "TV",     iconName: "Tv",   view: { kind: "shows-only",  libraryId } },
+        { id: "all.movies", label: "Movies", iconName: "Film", count: counts?.movies, view: { kind: "movies-only", libraryId } },
+        { id: "all.shows",  label: "TV",     iconName: "Tv",   count: counts?.shows,  view: { kind: "shows-only",  libraryId } },
       ],
     },
     {
       id: "people",
       label: "People",
       iconName: "Users",
+      count: counts?.people,
       view: { kind: "people-all", libraryId },
       children: [
-        { id: "people.actors",    label: "Actors",                iconName: "User",         view: { kind: "people-list", libraryId, role: "actor" } },
-        { id: "people.directors", label: "Directors & Creators", iconName: "Clapperboard", view: { kind: "people-list", libraryId, role: "director_creator" } },
-        { id: "people.composers", label: "Composers",             iconName: "Music2",       view: { kind: "people-list", libraryId, role: "composer" } },
+        { id: "people.actors",    label: "Actors",                iconName: "User",         count: counts?.actors,             view: { kind: "people-list", libraryId, role: "actor" } },
+        { id: "people.directors", label: "Directors & Creators", iconName: "Clapperboard", count: counts?.directors_creators, view: { kind: "people-list", libraryId, role: "director_creator" } },
+        { id: "people.composers", label: "Composers",             iconName: "Music2",       count: counts?.composers,          view: { kind: "people-list", libraryId, role: "composer" } },
       ],
+    },
+    {
+      id: "genres",
+      label: "Genres",
+      iconName: "Drama",
+      count: counts?.genres,
+      view: { kind: "genres", libraryId },
+      children: genreChildren,
+      defaultCollapsed: true,
     },
     {
       id: "playlists",
       label: "Playlists",
       iconName: "ListMusic",
+      count: playlists.length,
       view: { kind: "playlists", libraryId },
       children: playlistChildren,
     },
@@ -70,6 +99,8 @@ export function viewCacheKey(view: ViewSpec): string {
     case "playlists":           return `${view.libraryId}:playlists`;
     case "people-all":         return `${view.libraryId}:people:all`;
     case "people-list":        return `${view.libraryId}:people:${view.role}`;
+    case "genres":             return `${view.libraryId}:genres`;
+    case "genre-detail":       return `${view.libraryId}:genre:${view.genre}`;
     case "person-detail":      return `${view.libraryId}:person:${view.role}:${view.personId}`;
     case "playlist-detail":    return `${view.libraryId}:playlist:${view.playlistId}:${view.collectionId ?? "root"}`;
   }
@@ -97,6 +128,8 @@ export function scopeKeyFor(view: ViewSpec, parentId: number | null): string | n
     case "people-all":
     case "people-list":
     case "person-detail":
+    case "genres":
+    case "genre-detail":
       return null;
   }
 }

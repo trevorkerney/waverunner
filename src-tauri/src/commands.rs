@@ -2432,60 +2432,250 @@ pub async fn get_show_episodes(
 // where eid is a movie.id or show.id. The result is suitable as a CTE prefix for both
 // get_people_in_library (group by person) and get_entries_for_person (filter by person).
 // Validated against a known set so the resulting SQL is safe to splice into a query string.
-fn role_works_cte(role: &str) -> Result<&'static str, String> {
+// The inner UNION query mapping person_id -> distinct (kind, eid) works for a role.
+// Split out from role_works_cte so callers can name it themselves (e.g. combine a
+// role-specific filter set with the all-roles counting set in one query).
+fn role_works_body(role: &str) -> Result<&'static str, String> {
     match role {
         "actor" => Ok(
-            "WITH role_works AS ( \
-               SELECT person_id, 'movie' AS kind, movie_id AS eid FROM movie_cast \
-               UNION SELECT person_id, 'show', show_id FROM show_cast \
-               UNION SELECT sec.person_id, 'show', ss.show_id \
-                       FROM season_cast sec JOIN season ss ON sec.season_id = ss.id \
-               UNION SELECT ec.person_id, 'show', ss.show_id \
-                       FROM episode_cast ec \
-                       JOIN episode e ON ec.episode_id = e.id \
-                       JOIN season ss ON e.season_id = ss.id \
-             )"
+            "SELECT person_id, 'movie' AS kind, movie_id AS eid FROM movie_cast \
+             UNION SELECT person_id, 'show', show_id FROM show_cast \
+             UNION SELECT sec.person_id, 'show', ss.show_id \
+                     FROM season_cast sec JOIN season ss ON sec.season_id = ss.id \
+             UNION SELECT ec.person_id, 'show', ss.show_id \
+                     FROM episode_cast ec \
+                     JOIN episode e ON ec.episode_id = e.id \
+                     JOIN season ss ON e.season_id = ss.id"
         ),
         "director_creator" => Ok(
-            "WITH role_works AS ( \
-               SELECT person_id, 'movie' AS kind, movie_id AS eid FROM movie_director \
-               UNION SELECT person_id, 'show', show_id FROM show_creator \
-               UNION SELECT ed.person_id, 'show', ss.show_id \
-                       FROM episode_director ed \
-                       JOIN episode e ON ed.episode_id = e.id \
-                       JOIN season ss ON e.season_id = ss.id \
-             )"
+            "SELECT person_id, 'movie' AS kind, movie_id AS eid FROM movie_director \
+             UNION SELECT person_id, 'show', show_id FROM show_creator \
+             UNION SELECT ed.person_id, 'show', ss.show_id \
+                     FROM episode_director ed \
+                     JOIN episode e ON ed.episode_id = e.id \
+                     JOIN season ss ON e.season_id = ss.id"
         ),
         "composer" => Ok(
-            "WITH role_works AS ( \
-               SELECT person_id, 'movie' AS kind, movie_id AS eid FROM movie_composer \
-               UNION SELECT person_id, 'show', show_id FROM show_composer \
-             )"
+            "SELECT person_id, 'movie' AS kind, movie_id AS eid FROM movie_composer \
+             UNION SELECT person_id, 'show', show_id FROM show_composer"
         ),
-        // Union of every role — used by the top-level "People" sidebar node and for
-        // person-detail pages reached from there (shows all works, regardless of role).
+        // Union of every role — used by the top-level "People" sidebar node, for
+        // person-detail pages (they show all works regardless of role), and for the
+        // total work count shown on the role-specific people pages.
         "all" => Ok(
-            "WITH role_works AS ( \
-               SELECT person_id, 'movie' AS kind, movie_id AS eid FROM movie_cast \
-               UNION SELECT person_id, 'show', show_id FROM show_cast \
-               UNION SELECT sec.person_id, 'show', ss.show_id \
-                       FROM season_cast sec JOIN season ss ON sec.season_id = ss.id \
-               UNION SELECT ec.person_id, 'show', ss.show_id \
-                       FROM episode_cast ec \
-                       JOIN episode e ON ec.episode_id = e.id \
-                       JOIN season ss ON e.season_id = ss.id \
-               UNION SELECT person_id, 'movie', movie_id FROM movie_director \
-               UNION SELECT person_id, 'show', show_id FROM show_creator \
-               UNION SELECT ed.person_id, 'show', ss.show_id \
-                       FROM episode_director ed \
-                       JOIN episode e ON ed.episode_id = e.id \
-                       JOIN season ss ON e.season_id = ss.id \
-               UNION SELECT person_id, 'movie', movie_id FROM movie_composer \
-               UNION SELECT person_id, 'show', show_id FROM show_composer \
-             )"
+            "SELECT person_id, 'movie' AS kind, movie_id AS eid FROM movie_cast \
+             UNION SELECT person_id, 'show', show_id FROM show_cast \
+             UNION SELECT sec.person_id, 'show', ss.show_id \
+                     FROM season_cast sec JOIN season ss ON sec.season_id = ss.id \
+             UNION SELECT ec.person_id, 'show', ss.show_id \
+                     FROM episode_cast ec \
+                     JOIN episode e ON ec.episode_id = e.id \
+                     JOIN season ss ON e.season_id = ss.id \
+             UNION SELECT person_id, 'movie', movie_id FROM movie_director \
+             UNION SELECT person_id, 'show', show_id FROM show_creator \
+             UNION SELECT ed.person_id, 'show', ss.show_id \
+                     FROM episode_director ed \
+                     JOIN episode e ON ed.episode_id = e.id \
+                     JOIN season ss ON e.season_id = ss.id \
+             UNION SELECT person_id, 'movie', movie_id FROM movie_composer \
+             UNION SELECT person_id, 'show', show_id FROM show_composer"
         ),
         other => Err(format!("Invalid role: {}", other)),
     }
+}
+
+fn role_works_cte(role: &str) -> Result<String, String> {
+    Ok(format!("WITH role_works AS ( {} )", role_works_body(role)?))
+}
+
+/// One genre used in a library, with how many movies/shows carry it.
+#[derive(serde::Serialize)]
+pub struct GenreSummary {
+    pub name: String,
+    pub count: i64,
+}
+
+/// Distinct genres across the library's movies and shows, alphabetised, each
+/// with a count of works that carry it.
+#[tauri::command]
+pub async fn get_genres_in_library(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+) -> Result<Vec<GenreSummary>, String> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT g.name, COUNT(*) AS cnt \
+         FROM genre g \
+         JOIN ( \
+             SELECT genre_id, movie_id AS eid FROM movie_genre \
+             UNION ALL \
+             SELECT genre_id, show_id AS eid FROM show_genre \
+         ) gx ON gx.genre_id = g.id \
+         JOIN media_entry me ON me.id = gx.eid AND me.library_id = ? \
+         GROUP BY g.id \
+         ORDER BY g.name COLLATE NOCASE ASC",
+    )
+    .bind(&library_id)
+    .fetch_all(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .map(|(name, count)| GenreSummary { name, count })
+        .collect())
+}
+
+/// Flat list of every movie/show in the library carrying `genre`, for the
+/// genre drill-down grid. Mirrors the get_entries_for_person shape (alpha sort,
+/// season_display so shows read right), minus the credit logic.
+#[tauri::command]
+pub async fn get_entries_for_genre(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    genre: String,
+) -> Result<Vec<MediaEntry>, String> {
+    let mut covers_map = get_all_cached_covers(&state.app_db, &library_id)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let show_episode_years = "\
+        SELECT SUBSTR(e.release_date, 1, 4) as yr FROM episode e \
+          JOIN season s ON e.season_id = s.id \
+          WHERE s.show_id = mef.id AND e.release_date IS NOT NULL";
+    let season_display_expr = SEASON_DISPLAY_EXPR;
+    let query = format!(
+        "SELECT mef.id, mef.title, \
+           CASE \
+             WHEN mef.entry_type = 'movie' THEN SUBSTR(mef.release_date, 1, 4) \
+             WHEN mef.entry_type = 'show' THEN (SELECT MIN(yr) FROM ({show_episode_years})) \
+           END AS year, \
+           CASE \
+             WHEN mef.entry_type = 'show' THEN \
+               NULLIF((SELECT MAX(yr) FROM ({show_episode_years})), (SELECT MIN(yr) FROM ({show_episode_years}))) \
+           END AS end_year, \
+           mef.folder_path, mef.parent_id, mef.entry_type, mef.selected_cover, \
+           CASE \
+             WHEN mef.entry_type = 'movie' THEN (SELECT tmdb_id FROM movie WHERE id = mef.id) \
+             WHEN mef.entry_type = 'show' THEN (SELECT CAST(tmdb_id AS TEXT) FROM show WHERE id = mef.id) \
+             ELSE NULL \
+           END AS tmdb_id, \
+           {season_display_expr} as season_display \
+         FROM media_entry_full mef \
+         WHERE mef.library_id = ? AND mef.id IN ( \
+             SELECT mg.movie_id FROM movie_genre mg JOIN genre g ON mg.genre_id = g.id WHERE g.name = ? \
+             UNION \
+             SELECT sg.show_id FROM show_genre sg JOIN genre g ON sg.genre_id = g.id WHERE g.name = ? \
+         ) \
+         ORDER BY mef.sort_title COLLATE NOCASE ASC"
+    );
+
+    let rows: Vec<(i64, String, Option<String>, Option<String>, String, Option<i64>, String, Option<String>, Option<String>, Option<String>)> =
+        sqlx::query_as(&query)
+            .bind(&library_id)
+            .bind(&genre)
+            .bind(&genre)
+            .fetch_all(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+
+    let entries: Vec<MediaEntry> = rows
+        .into_iter()
+        .map(|(id, title, year, end_year, folder_path, parent_id, entry_type, selected_cover, tmdb_id, season_display)| {
+            let covers = covers_map.remove(&folder_path).unwrap_or_default();
+            MediaEntry {
+                id,
+                title,
+                year,
+                end_year,
+                folder_path,
+                parent_id,
+                entry_type,
+                covers,
+                selected_cover,
+                child_count: 0,
+                season_display,
+                collection_display: None,
+                role_display: None,
+                tmdb_id,
+                link_id: None,
+            }
+        })
+        .collect();
+
+    Ok(entries)
+}
+
+/// Counts shown in parentheses on the sidebar nodes. Movies/shows are
+/// library-scoped; the people counts mirror the (global) people views exactly,
+/// so the number matches the list you land on when you click the node.
+#[derive(serde::Serialize)]
+pub struct LibraryCounts {
+    pub movies: i64,
+    pub shows: i64,
+    pub genres: i64,
+    pub people: i64,
+    pub actors: i64,
+    pub directors_creators: i64,
+    pub composers: i64,
+}
+
+/// Distinct people contributing in `role`, mirroring `get_people_in_library`.
+async fn count_people_in_role(db: &SqlitePool, role: &str) -> Result<i64, String> {
+    let cte = role_works_cte(role)?;
+    let query = format!("{cte} SELECT COUNT(DISTINCT rw.person_id) FROM role_works rw");
+    let (n,): (i64,) = sqlx::query_as(&query)
+        .fetch_one(db)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(n)
+}
+
+#[tauri::command]
+pub async fn get_library_counts(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+) -> Result<LibraryCounts, String> {
+    let db = &state.app_db;
+
+    let count_entries = "SELECT COUNT(*) FROM media_entry me \
+         JOIN media_entry_type met ON me.entry_type_id = met.id \
+         WHERE me.library_id = ? AND met.name = ?";
+    let (movies,): (i64,) = sqlx::query_as(count_entries)
+        .bind(&library_id)
+        .bind("movie")
+        .fetch_one(db)
+        .await
+        .map_err(|e| e.to_string())?;
+    let (shows,): (i64,) = sqlx::query_as(count_entries)
+        .bind(&library_id)
+        .bind("show")
+        .fetch_one(db)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Distinct genres carried by this library's movies/shows — matches the
+    // count of rows the Genres view shows.
+    let (genres,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(DISTINCT gx.genre_id) FROM ( \
+             SELECT genre_id, movie_id AS eid FROM movie_genre \
+             UNION ALL \
+             SELECT genre_id, show_id AS eid FROM show_genre \
+         ) gx \
+         JOIN media_entry me ON me.id = gx.eid AND me.library_id = ?",
+    )
+    .bind(&library_id)
+    .fetch_one(db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(LibraryCounts {
+        movies,
+        shows,
+        genres,
+        people: count_people_in_role(db, "all").await?,
+        actors: count_people_in_role(db, "actor").await?,
+        directors_creators: count_people_in_role(db, "director_creator").await?,
+        composers: count_people_in_role(db, "composer").await?,
+    })
 }
 
 async fn get_library_meta(
@@ -2511,19 +2701,23 @@ pub async fn get_people_in_library(
     library_id: String,
     role: String,
 ) -> Result<Vec<PersonSummary>, String> {
-    let cte = role_works_cte(&role)?;
+    // Filter to people who have a credit in this role, but count their TOTAL works
+    // across every role — so e.g. an actor who directed one episode still shows on
+    // the Directors page with his full career count, not just "1".
+    let filter_body = role_works_body(&role)?;
+    let all_body = role_works_body("all")?;
     let (format, _paths, _default_sort_mode) = get_library_meta(&state.app_db, &library_id).await?;
     if format != "video" {
         return Err("People browsing is only supported for video libraries".to_string());
     }
 
     let query = format!(
-        "{cte} \
-         SELECT p.id, p.name, p.image_path, COUNT(*) AS work_count, \
+        "WITH filter_works AS ( {filter_body} ), all_works AS ( {all_body} ) \
+         SELECT p.id, p.name, p.image_path, \
+                (SELECT COUNT(*) FROM all_works aw WHERE aw.person_id = p.id) AS work_count, \
                 EXISTS(SELECT 1 FROM favorite_person fp WHERE fp.person_id = p.id) AS favorite \
          FROM person p \
-         JOIN role_works rw ON rw.person_id = p.id \
-         GROUP BY p.id \
+         WHERE EXISTS (SELECT 1 FROM filter_works fw WHERE fw.person_id = p.id) \
          ORDER BY p.name COLLATE NOCASE ASC"
     );
 

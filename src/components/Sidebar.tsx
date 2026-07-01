@@ -26,7 +26,7 @@ import { PlayerDock } from "@/components/player/PlayerDock";
 import { PlayerState, PlayerActions } from "@/hooks/usePlayer";
 import { SidebarTree } from "@/components/SidebarTree";
 import { getComplicationsForLibrary } from "@/lib/complications";
-import type { ComplicationNode, PlaylistSummary } from "@/types";
+import type { ComplicationNode, GenreSummary, LibraryCounts, PlaylistSummary } from "@/types";
 import { Library, ViewSpec } from "@/types";
 
 const MIN_WIDTH = 180;
@@ -50,6 +50,10 @@ interface SidebarProps {
   onPlaylistChanged: (libraryId: string) => void;
   /** Per-library playlists to show as children of the "Playlists" sidebar node. */
   sidebarPlaylists: Record<string, PlaylistSummary[]>;
+  /** Per-library counts shown dimmed on sidebar nodes. */
+  sidebarCounts: Record<string, LibraryCounts>;
+  /** Per-library genre lists shown as children of the "Genres" node. */
+  sidebarGenres: Record<string, GenreSummary[]>;
   playerState: PlayerState;
   playerActions: PlayerActions;
 }
@@ -66,6 +70,8 @@ export function Sidebar({
   onLibraryRenamed,
   onPlaylistChanged,
   sidebarPlaylists,
+  sidebarCounts,
+  sidebarGenres,
   playerState,
   playerActions,
 }: SidebarProps) {
@@ -157,15 +163,8 @@ export function Sidebar({
                     <ContextMenuTrigger
                       render={
                         <button
-                          onClick={() => {
-                            onSelectLibrary(lib);
-                            setCollapsedLibs((prev) => {
-                              if (!prev.has(lib.id)) return prev;
-                              const next = new Set(prev);
-                              next.delete(lib.id);
-                              return next;
-                            });
-                          }}
+                          // Navigate only — expand/collapse is the chevron's job.
+                          onClick={() => onSelectLibrary(lib)}
                         />
                       }
                       className={`flex w-full items-start gap-1 py-1.5 pr-2 pl-1 text-left text-sm font-medium transition-colors ${
@@ -238,7 +237,7 @@ export function Sidebar({
                   </ContextMenu>
                   {expanded && (
                     <SidebarTree
-                      nodes={getComplicationsForLibrary(lib, sidebarPlaylists[lib.id] ?? [])}
+                      nodes={getComplicationsForLibrary(lib, sidebarPlaylists[lib.id] ?? [], sidebarCounts[lib.id], sidebarGenres[lib.id])}
                       activeView={isSelected ? activeView : null}
                       onSelectView={(view) => {
                         onSelectView(view);

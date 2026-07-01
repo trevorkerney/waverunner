@@ -18,6 +18,10 @@ export function PlayerDock({ state, actions }: PlayerDockProps) {
   const titleTextRef = useRef<HTMLSpanElement | null>(null);
   const titleTrackRef = useRef<HTMLDivElement | null>(null);
   const [overflow, setOverflow] = useState(false);
+  // Local volume drag value — keeps the thumb tracking the cursor without
+  // re-rendering the whole app on every move (see ControlsOverlay).
+  const [volumeDragValue, setVolumeDragValue] = useState<number | null>(null);
+  const volumeDragRef = useRef<number | null>(null);
 
   // Measure overflow
   useEffect(() => {
@@ -65,7 +69,18 @@ export function PlayerDock({ state, actions }: PlayerDockProps) {
 
   const handleVolume = (value: number | readonly number[]) => {
     const v = Array.isArray(value) ? value[0] : value;
-    actions.setVolume(v);
+    volumeDragRef.current = v;
+    setVolumeDragValue(v);
+    actions.setVolumeLive(v);
+  };
+
+  const commitVolume = () => {
+    if (volumeDragRef.current !== null) {
+      actions.setVolume(volumeDragRef.current);
+      volumeDragRef.current = null;
+      setVolumeDragValue(null);
+    }
+    actions.setDragging(null);
   };
 
   const handleMuteClick = () => {
@@ -180,11 +195,11 @@ export function PlayerDock({ state, actions }: PlayerDockProps) {
           <div
             className="pointer-events-auto w-16"
             onPointerDown={() => actions.setDragging("volume")}
-            onPointerUp={() => actions.setDragging(null)}
-            onPointerLeave={() => actions.setDragging(null)}
+            onPointerUp={commitVolume}
+            onPointerLeave={commitVolume}
           >
             <Slider
-              value={[state.muted ? 0 : state.volume]}
+              value={[volumeDragValue ?? (state.muted ? 0 : state.volume)]}
               min={0}
               max={100}
               onValueChange={handleVolume}

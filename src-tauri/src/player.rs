@@ -30,25 +30,7 @@ pub fn init_player(window: tauri::WebviewWindow, state: State<'_, AppState>, tit
     }
 
     // Build list of directories to search for libmpv
-    let mut search_dirs: Vec<std::path::PathBuf> = Vec::new();
-
-    // 1. Tauri resource dir (where `resources` config copies files in production)
-    if let Ok(res) = window.app_handle().path().resource_dir() {
-        search_dirs.push(res.join("lib"));
-    }
-
-    // 2. Next to the executable (common for bundled apps)
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
-            search_dirs.push(exe_dir.to_path_buf());
-            search_dirs.push(exe_dir.join("lib"));
-        }
-    }
-
-    // 3. Source lib/ dir (for dev mode: src-tauri/lib/)
-    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    search_dirs.push(manifest_dir.join("lib"));
-
+    let search_dirs = libmpv_search_dirs(window.app_handle());
     let dir_refs: Vec<&std::path::Path> = search_dirs.iter().map(|p| p.as_path()).collect();
     let mpv = MpvHandle::new(&dir_refs)?;
 
@@ -202,6 +184,12 @@ pub async fn get_player_tracks(state: State<'_, AppState>) -> Result<String, Str
             let selected = mpv.get_property_string(&format!("{prefix}/selected"))
                 .map(|s| s == "yes")
                 .unwrap_or(false);
+            // Attached-picture streams (embedded cover art / backdrops / posters)
+            // show up as "video" tracks; mpv flags them so we can hide them from
+            // the video-track picker.
+            let albumart = mpv.get_property_string(&format!("{prefix}/albumart"))
+                .map(|s| s == "yes")
+                .unwrap_or(false);
 
             tracks.push(serde_json::json!({
                 "id": id.parse::<i64>().unwrap_or(0),
@@ -209,6 +197,7 @@ pub async fn get_player_tracks(state: State<'_, AppState>) -> Result<String, Str
                 "title": title,
                 "lang": lang,
                 "selected": selected,
+                "albumart": albumart,
             }));
         }
 
@@ -244,6 +233,219 @@ where
     tauri::async_runtime::spawn_blocking(move || f(&inner.mpv))
         .await
         .map_err(|e| e.to_string())?
+}
+
+/// Directories to probe for libmpv, in priority order. Shared by the player
+/// and the thumbnailer.
+fn libmpv_search_dirs(app: &AppHandle) -> Vec<std::path::PathBuf> {
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    // 1. Tauri resource dir (where `resources` config copies files in production)
+    if let Ok(res) = app.path().resource_dir() {
+        dirs.push(res.join("lib"));
+    }
+    // 2. Next to the executable (common for bundled apps)
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            dirs.push(exe_dir.to_path_buf());
+            dirs.push(exe_dir.join("lib"));
+        }
+    }
+    // 3. Source lib/ dir (for dev mode: src-tauri/lib/)
+    dirs.push(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("lib"));
+    dirs
+}
+
+// ---------------------------------------------------------------------------
+// Seek-bar thumbnail preview
+// ---------------------------------------------------------------------------
+//
+// A second, headless libmpv instance (vo=null, no audio) used only to grab the
+// frame under the cursor while hovering the seek bar. It is created lazily
+// (first hover) and torn down after the user stops hovering, so the extra
+// decoder costs RAM *only* during active scrubbing — never while just watching.
+
+// Real mpv_event_id values. NOTE: the shared `mpv::event_id` module has several
+// incorrect constants (it works for the main player only because PROPERTY_CHANGE
+// is right); use the correct values here.
+const EV_FILE_LOADED: u32 = 8;
+const EV_PLAYBACK_RESTART: u32 = 21;
+
+struct ThumbReq {
+    time: f64,
+    resp: std::sync::mpsc::Sender<Result<Vec<u8>, String>>,
+}
+
+/// Handle to the live thumbnailer worker. Dropping it closes the request
+/// channel, which ends the worker loop and destroys its mpv instance.
+pub struct Thumbnailer {
+    /// The file this instance is loaded with — lets us reuse it across hovers
+    /// and rebuild only when the playing file changes.
+    pub path: String,
+    req_tx: std::sync::mpsc::Sender<ThumbReq>,
+}
+
+impl Thumbnailer {
+    fn request(&self, time: f64) -> Result<std::sync::mpsc::Receiver<Result<Vec<u8>, String>>, String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.req_tx
+            .send(ThumbReq { time, resp: tx })
+            .map_err(|_| "thumbnailer stopped".to_string())?;
+        Ok(rx)
+    }
+}
+
+/// Build and load a headless mpv tuned for cheap single-frame grabs.
+fn build_thumb_mpv(dirs: &[std::path::PathBuf], path: &str) -> Result<MpvHandle, String> {
+    let dir_refs: Vec<&std::path::Path> = dirs.iter().map(|p| p.as_path()).collect();
+    let mpv = MpvHandle::new(&dir_refs)?;
+
+    // Lean, decode-only configuration. Errors on individual options are
+    // non-fatal — defaults are acceptable.
+    for (k, v) in [
+        ("vo", "null"),                  // decode but discard frames (no window)
+        ("ao", "null"),                  // no audio device
+        ("aid", "no"),                   // don't even select an audio track
+        ("sid", "no"),                   // skip subtitles
+        ("hwdec", "no"),                 // keep frames in system memory for screenshots
+        ("vf", "scale=480:-2"),          // pre-scale; final downscale happens in Rust
+        ("keep-open", "yes"),
+        ("idle", "yes"),
+        ("pause", "yes"),
+        ("cache", "no"),                 // minimise RAM
+        ("demuxer-max-bytes", "32MiB"),  // bound the demuxer buffer
+        ("osc", "no"),
+        ("osd-level", "0"),
+        ("screenshot-format", "jpg"),
+    ] {
+        let _ = mpv.set_option_string(k, v);
+    }
+
+    mpv.initialize()?;
+    mpv.command(&["loadfile", path])?;
+    Ok(mpv)
+}
+
+/// Block (up to `budget`) until mpv emits the given event id. Returns whether
+/// the event was seen. Uses a short blocking poll so it doesn't busy-spin.
+fn wait_for_event(mpv: &MpvHandle, want: u32, budget: std::time::Duration) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        if start.elapsed() >= budget {
+            return false;
+        }
+        let ev = mpv.wait_event(0.05);
+        if ev.event_id == want {
+            return true;
+        }
+        if ev.event_id == mpv::event_id::SHUTDOWN {
+            return false;
+        }
+    }
+}
+
+/// Seek to `time` and return a small JPEG of that frame.
+fn grab_frame(mpv: &MpvHandle, time: f64, tmp: &std::path::Path) -> Result<Vec<u8>, String> {
+    // `exact` forces a precise seek (decode up to the exact frame) so the
+    // preview matches where the main player lands — it does a precise absolute
+    // seek too. `keyframes` would snap to an earlier keyframe and look "behind".
+    mpv.command(&["seek", &format!("{time:.3}"), "absolute+exact"])?;
+    // Wait for the seek to settle so the screenshot captures the new frame,
+    // not the one we were parked on. Exact seeks decode further, so allow more.
+    wait_for_event(mpv, EV_PLAYBACK_RESTART, std::time::Duration::from_millis(2000));
+
+    let tmp_s = tmp.to_string_lossy().to_string();
+    mpv.command(&["screenshot-to-file", &tmp_s, "video"])?;
+
+    let raw = std::fs::read(tmp).map_err(|e| e.to_string())?;
+    // Normalise to a small, predictable payload regardless of source resolution.
+    let img = image::load_from_memory(&raw).map_err(|e| e.to_string())?;
+    let thumb = img.resize(320, u32::MAX, image::imageops::FilterType::Triangle);
+    let mut out = std::io::Cursor::new(Vec::new());
+    thumb
+        .write_to(&mut out, image::ImageFormat::Jpeg)
+        .map_err(|e| e.to_string())?;
+    Ok(out.into_inner())
+}
+
+/// Owns the headless mpv and answers frame requests until the channel closes.
+fn thumbnailer_worker(
+    mpv: MpvHandle,
+    tmp: std::path::PathBuf,
+    rx: std::sync::mpsc::Receiver<ThumbReq>,
+) {
+    // Wait for the initial load so the first seek has a timeline to seek within.
+    wait_for_event(&mpv, EV_FILE_LOADED, std::time::Duration::from_secs(10));
+
+    while let Ok(mut req) = rx.recv() {
+        // Coalesce: if the user moved on while we were busy, skip to the most
+        // recent request and short-circuit the stale ones.
+        while let Ok(newer) = rx.try_recv() {
+            let _ = req.resp.send(Err("superseded".to_string()));
+            req = newer;
+        }
+        let res = grab_frame(&mpv, req.time, &tmp);
+        let _ = req.resp.send(res);
+    }
+    // Channel closed (Thumbnailer dropped) → mpv terminates as it drops here.
+}
+
+/// Start (or reuse) the thumbnailer for `path`. Called on first seek-bar hover.
+#[tauri::command]
+pub async fn thumbnailer_start(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<(), String> {
+    {
+        let guard = state.thumbnailer.lock().map_err(|e| e.to_string())?;
+        if guard.as_ref().map(|t| t.path == path).unwrap_or(false) {
+            return Ok(()); // already running for this file
+        }
+    }
+    // Tear down any existing instance first so we never hold two decoders.
+    {
+        *state.thumbnailer.lock().map_err(|e| e.to_string())? = None;
+    }
+
+    let dirs = libmpv_search_dirs(&app);
+    let tmp = state.app_data_dir.join("thumb-preview.jpg");
+    let build_path = path.clone();
+    let mpv = tauri::async_runtime::spawn_blocking(move || build_thumb_mpv(&dirs, &build_path))
+        .await
+        .map_err(|e| e.to_string())??;
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || thumbnailer_worker(mpv, tmp, rx));
+
+    *state.thumbnailer.lock().map_err(|e| e.to_string())? = Some(Thumbnailer { path, req_tx: tx });
+    Ok(())
+}
+
+/// Grab the frame at `time` (seconds) as a JPEG. Returns raw bytes so the
+/// frontend receives an ArrayBuffer rather than a bloated JSON number array.
+#[tauri::command]
+pub async fn thumbnail_at(
+    state: State<'_, AppState>,
+    time: f64,
+) -> Result<tauri::ipc::Response, String> {
+    let rx = {
+        let guard = state.thumbnailer.lock().map_err(|e| e.to_string())?;
+        let t = guard
+            .as_ref()
+            .ok_or_else(|| "thumbnailer not started".to_string())?;
+        t.request(time)?
+    };
+    let bytes = tauri::async_runtime::spawn_blocking(move || rx.recv().map_err(|e| e.to_string())?)
+        .await
+        .map_err(|e| e.to_string())??;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+/// Destroy the thumbnailer (frees the second decoder). Called after hovering ends.
+#[tauri::command]
+pub async fn thumbnailer_stop(state: State<'_, AppState>) -> Result<(), String> {
+    *state.thumbnailer.lock().map_err(|e| e.to_string())? = None;
+    Ok(())
 }
 
 /// Extract the native window handle as a string mpv understands for `wid`.
@@ -292,6 +494,15 @@ fn event_loop(app: &AppHandle, inner: Arc<PlayerInner>) {
     // this loop drops its Arc (after `destroy_player` flips the shutdown flag),
     // which also avoids tearing down the ctx while we're mid `wait_event`.
 
+    // mpv fires `time-pos` many times per second during playback. Forwarding
+    // every one to the webview floods the IPC bridge and re-renders the UI
+    // dozens of times a second — wasteful, and over a long session the churn
+    // grows the WebView2 renderer's memory unbounded. Throttle to ~5/sec; the
+    // time label only shows whole seconds and the bar moves sub-pixel/sec, so
+    // there's no visible difference.
+    let mut last_timepos_emit: Option<std::time::Instant> = None;
+    const TIMEPOS_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
     loop {
         if inner.shutdown.load(Ordering::SeqCst) {
             break;
@@ -315,6 +526,17 @@ fn event_loop(app: &AppHandle, inner: Arc<PlayerInner>) {
                     }
                     let name =
                         unsafe { CStr::from_ptr(prop.name).to_string_lossy().into_owned() };
+                    // Rate-limit the high-frequency time-pos stream; let every
+                    // other property (pause, duration, eof, …) through at once.
+                    if name == "time-pos" {
+                        let now = std::time::Instant::now();
+                        if last_timepos_emit
+                            .is_some_and(|t| now.duration_since(t) < TIMEPOS_MIN_INTERVAL)
+                        {
+                            continue;
+                        }
+                        last_timepos_emit = Some(now);
+                    }
                     let value = property_value_to_json(prop);
                     let _ = app.emit(
                         "mpv-property-change",

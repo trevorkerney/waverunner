@@ -74,6 +74,8 @@ export type ViewSpec =
   | { kind: "shows-only";         libraryId: string }
   | { kind: "people-all";         libraryId: string }
   | { kind: "people-list";        libraryId: string; role: PersonRole }
+  | { kind: "genres";             libraryId: string }
+  | { kind: "genre-detail";       libraryId: string; genre: string }
   | { kind: "person-detail";      libraryId: string; personId: number; role: PersonRole; personName: string; personImage: string | null }
   | { kind: "playlists";           libraryId: string }
   | { kind: "playlist-detail";    libraryId: string; playlistId: number; playlistName: string; collectionId: number | null };
@@ -85,6 +87,27 @@ export interface ComplicationNode {
   iconName: string;
   view: ViewSpec | null;
   children?: ComplicationNode[];
+  /** Item count shown dimmed in parentheses after the label, when known. */
+  count?: number;
+  /** Start with children collapsed (default is expanded). */
+  defaultCollapsed?: boolean;
+}
+
+// One genre with a count of works carrying it (get_genres_in_library).
+export interface GenreSummary {
+  name: string;
+  count: number;
+}
+
+// Per-library sidebar counts (get_library_counts).
+export interface LibraryCounts {
+  movies: number;
+  shows: number;
+  genres: number;
+  people: number;
+  actors: number;
+  directors_creators: number;
+  composers: number;
 }
 
 // Returned by get_people_in_library.
@@ -539,4 +562,7 @@ export interface PlayerTrack {
   title: string | null;
   lang: string | null;
   selected: boolean;
+  /** True for attached-picture streams (embedded cover art / backdrops) that
+   *  masquerade as video tracks — excluded from the video-track picker. */
+  albumart: boolean;
 }
