@@ -43,24 +43,46 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
   const [showToken, setShowToken] = useState(false);
   const [showOmdbKey, setShowOmdbKey] = useState(false);
 
+  // Staged-but-unsaved changes. Values only reach the settings table when the
+  // user clicks Save; Cancel (or closing the dialog any other way) discards.
+  const [draft, setDraft] = useState<SettingsMap>({});
+  // What the controls display: saved settings with staged changes overlaid.
+  const view: SettingsMap = { ...settings, ...draft };
+  const dirty = Object.entries(draft).some(([k, v]) => (settings[k] ?? "") !== v);
+
   useEffect(() => {
     if (!open) return;
     invoke<SettingsMap>("get_settings").then(setSettings).catch(console.error);
     invoke<string>("get_app_version").then(setAppVersion).catch(console.error);
     setUpdateStatus("idle");
+    setDraft({});
   }, [open]);
 
-  const setSetting = useCallback(
-    async (key: string, value: string) => {
-      try {
-        await invoke("set_setting", { key, value });
-        setSettings((prev) => ({ ...prev, [key]: value }));
-      } catch (e) {
-        toast.error(String(e));
-      }
-    },
-    []
-  );
+  const stageSetting = useCallback((key: string, value: string) => {
+    setDraft((prev) => ({ ...prev, [key]: value }));
+  }, []);
+
+  const saveAll = useCallback(async () => {
+    try {
+      const changed = Object.entries(draft).filter(([k, v]) => (settings[k] ?? "") !== v);
+      await Promise.all(changed.map(([key, value]) => invoke("set_setting", { key, value })));
+      setSettings((prev) => ({ ...prev, ...draft }));
+      setDraft({});
+      onOpenChange(false);
+      if (changed.length > 0) toast.success("Settings saved");
+    } catch (e) {
+      toast.error(String(e));
+    }
+  }, [draft, settings, onOpenChange]);
+
+  // Discard staged changes; if subtitle styling was being live-previewed on a
+  // player, put the saved values back.
+  const discard = useCallback(() => {
+    if (Object.keys(draft).some((k) => k.startsWith("sub_"))) {
+      void applySubtitleStyleToPlayer(settings);
+    }
+    setDraft({});
+  }, [draft, settings]);
 
   const checkForUpdates = useCallback(async () => {
     setUpdateStatus("checking");
@@ -84,35 +106,43 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 
   // Default playback volume (0–100), defaulting to 50 when unset.
   const defaultVolume = (() => {
-    const raw = settings["default_volume"];
+    const raw = view["default_volume"];
     const n = raw == null ? NaN : parseInt(raw, 10);
     return Number.isNaN(n) ? 50 : Math.max(0, Math.min(100, n));
   })();
 
-  // Subtitle styling: persist + live-apply to an active player in one step
+  // Subtitle styling: stage + live-preview on an active player in one step
   // (applySubtitleStyleToPlayer ignores the rejection when no player is open).
+  // Save makes the preview stick; Cancel reverts it.
   const setSubtitleSetting = useCallback(
     (key: SubtitleSettingKey, value: string) => {
-      void setSetting(key, value);
-      void applySubtitleStyleToPlayer({ ...settings, [key]: value });
+      stageSetting(key, value);
+      void applySubtitleStyleToPlayer({ ...settings, ...draft, [key]: value });
     },
-    [setSetting, settings],
+    [stageSetting, settings, draft],
   );
 
   const resetSubtitleStyle = useCallback(() => {
-    for (const [k, v] of Object.entries(SUBTITLE_DEFAULTS)) void setSetting(k, v);
-    void applySubtitleStyleToPlayer({ ...settings, ...SUBTITLE_DEFAULTS });
-  }, [setSetting, settings]);
+    setDraft((prev) => ({ ...prev, ...SUBTITLE_DEFAULTS }));
+    void applySubtitleStyleToPlayer({ ...settings, ...draft, ...SUBTITLE_DEFAULTS });
+  }, [settings, draft]);
 
-  const sub = (k: SubtitleSettingKey) => subtitleSetting(settings, k);
+  const sub = (k: SubtitleSettingKey) => subtitleSetting(view, k);
   const subNum = (k: SubtitleSettingKey, fallback: number) => {
     const n = parseFloat(sub(k));
     return Number.isNaN(n) ? fallback : n;
   };
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="flex h-[576px] w-[1024px] gap-0 overflow-hidden p-0">
+    <Dialog
+      open={open}
+      onOpenChange={(o) => {
+        if (!o) discard();
+        onOpenChange(o);
+      }}
+    >
+      {/* Rows: sidebar+content, then a full-width Save/Cancel footer. */}
+      <DialogContent className="grid h-[576px] w-[1024px] grid-cols-[11rem_1fr] grid-rows-[minmax(0,1fr)_auto] gap-0 overflow-hidden p-0">
         {/* Sidebar */}
         <div className="flex w-44 shrink-0 flex-col border-r bg-muted/30 p-2">
           <p className="mb-2 px-2 pt-1 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
@@ -140,7 +170,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
         </div>
 
         {/* Content */}
-        <div className="flex-1 overflow-y-auto p-6">
+        <div className="overflow-y-auto p-6">
           {activeCategory === "general" && (
             <div className="flex flex-col gap-6">
               <div>
@@ -154,9 +184,9 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                       </p>
                     </div>
                     <Switch
-                      checked={settings["auto_update"] !== "false"}
+                      checked={view["auto_update"] !== "false"}
                       onCheckedChange={(checked) =>
-                        setSetting("auto_update", checked ? "true" : "false")
+                        stageSetting("auto_update", checked ? "true" : "false")
                       }
                     />
                   </div>
@@ -168,8 +198,8 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                       </p>
                     </div>
                     <Select
-                      value={settings["release_channel"] || "stable"}
-                      onValueChange={(v) => setSetting("release_channel", v ?? "prerelease")}
+                      value={view["release_channel"] || "stable"}
+                      onValueChange={(v) => stageSetting("release_channel", v ?? "prerelease")}
                     >
                       <SelectTrigger className="w-36">
                         <SelectValue />
@@ -232,9 +262,9 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                       <div className="relative flex-1">
                         <Input
                           type={showToken ? "text" : "password"}
-                          value={settings["tmdb_api_token"] || ""}
+                          value={view["tmdb_api_token"] || ""}
                           onChange={(e) =>
-                            setSetting("tmdb_api_token", e.target.value)
+                            stageSetting("tmdb_api_token", e.target.value)
                           }
                           placeholder="Enter your TMDB API read access token"
                           className="pr-9"
@@ -262,20 +292,20 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                       </p>
                     </div>
                     <Switch
-                      checked={settings["omdb_enabled"] === "true"}
+                      checked={view["omdb_enabled"] === "true"}
                       onCheckedChange={(v) => {
-                        setSetting("omdb_enabled", v ? "true" : "false");
+                        stageSetting("omdb_enabled", v ? "true" : "false");
                         // The RT scraper rides along with OMDB fetches; it can't be on alone.
-                        if (!v) setSetting("rt_scraper_enabled", "false");
+                        if (!v) stageSetting("rt_scraper_enabled", "false");
                       }}
                     />
                   </div>
-                  {settings["omdb_enabled"] === "true" && (
+                  {view["omdb_enabled"] === "true" && (
                     <div className="relative">
                       <Input
                         type={showOmdbKey ? "text" : "password"}
-                        value={settings["omdb_api_key"] || ""}
-                        onChange={(e) => setSetting("omdb_api_key", e.target.value)}
+                        value={view["omdb_api_key"] || ""}
+                        onChange={(e) => stageSetting("omdb_api_key", e.target.value)}
                         placeholder="Enter your OMDB API key"
                         className="pr-9"
                       />
@@ -289,7 +319,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                     </div>
                   )}
                   <div className="flex items-center justify-between gap-4">
-                    <div className={settings["omdb_enabled"] === "true" ? "" : "opacity-50"}>
+                    <div className={view["omdb_enabled"] === "true" ? "" : "opacity-50"}>
                       <p className="text-sm">Rotten Tomatoes audience score</p>
                       <p className="text-xs text-muted-foreground">
                         Scraped from the RT website alongside OMDB fetches — no key needed.
@@ -297,9 +327,9 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                       </p>
                     </div>
                     <Switch
-                      checked={settings["rt_scraper_enabled"] === "true"}
-                      disabled={settings["omdb_enabled"] !== "true"}
-                      onCheckedChange={(v) => setSetting("rt_scraper_enabled", v ? "true" : "false")}
+                      checked={view["rt_scraper_enabled"] === "true"}
+                      disabled={view["omdb_enabled"] !== "true"}
+                      onCheckedChange={(v) => stageSetting("rt_scraper_enabled", v ? "true" : "false")}
                     />
                   </div>
                 </div>
@@ -315,8 +345,8 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                     </p>
                   </div>
                   <Switch
-                    checked={settings["save_artwork_to_source"] !== "false"}
-                    onCheckedChange={(v) => setSetting("save_artwork_to_source", v ? "true" : "false")}
+                    checked={view["save_artwork_to_source"] !== "false"}
+                    onCheckedChange={(v) => stageSetting("save_artwork_to_source", v ? "true" : "false")}
                   />
                 </div>
               </div>
@@ -336,7 +366,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                   <div className="flex w-44 shrink-0 items-center gap-3">
                     <Slider
                       value={[defaultVolume]}
-                      onValueChange={(v) => setSetting("default_volume", String(Array.isArray(v) ? v[0] : v))}
+                      onValueChange={(v) => stageSetting("default_volume", String(Array.isArray(v) ? v[0] : v))}
                       min={0}
                       max={100}
                       step={5}
@@ -395,7 +425,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                       </p>
                     </div>
                     <Input
-                      value={settings["sub_font"] ?? ""}
+                      value={view["sub_font"] ?? ""}
                       onChange={(e) => setSubtitleSetting("sub_font", e.target.value)}
                       placeholder="Player default"
                       className="w-44 shrink-0"
@@ -496,6 +526,26 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
               </div>
             </div>
           )}
+        </div>
+        {/* Footer */}
+        <div className="col-span-2 flex items-center gap-2 border-t px-4 py-3">
+          {dirty && (
+            <span className="text-xs text-muted-foreground">Unsaved changes</span>
+          )}
+          <div className="ml-auto flex gap-2">
+            <Button
+              variant="outline"
+              onClick={() => {
+                discard();
+                onOpenChange(false);
+              }}
+            >
+              Cancel
+            </Button>
+            <Button onClick={saveAll} disabled={!dirty}>
+              Save
+            </Button>
+          </div>
         </div>
       </DialogContent>
     </Dialog>

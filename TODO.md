@@ -30,8 +30,6 @@ watch history, resume where left off button, make play say play from beginning i
 
 save cover sets. users should be able to save a set of media covers so that they can easily switch all media covers in a library to the saved set. 
 
-settings system where changes are all set at once on save button click, instead of on settings exit
-
 add warnings about tv episodes without episode numbers (they will likely play out of order)
 
 need to consider some sort of ability to queue up things for the player. TV show autoplay should probably take this system into heavy consideration. Users should be able to queue playlists. Users should be able to queue up individual movies in context menus at their whim. On the player and maybe not on the player, the user should be able to view the queue and manipulate it in a dialog or sidebar or something
