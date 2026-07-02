@@ -3219,12 +3219,24 @@ function ShowDetailPage({
             )}
             <RatingsLine ratings={ratings} />
           </div>
-          {extrasCount > 0 && (
-            <Button size="sm" variant="outline" className="shrink-0" onClick={() => setExtrasOpen(true)}>
-              <Clapperboard size={14} />
-              Extras ({extrasCount})
-            </Button>
-          )}
+          <div className="flex shrink-0 gap-2">
+            {extrasCount > 0 && (
+              <Button size="sm" variant="outline" onClick={() => setExtrasOpen(true)}>
+                <Clapperboard size={14} />
+                Extras ({extrasCount})
+              </Button>
+            )}
+            {showEditing && (
+              <>
+                <Button size="sm" variant="outline" onClick={() => setShowEditing(false)} disabled={showSaving}>
+                  Cancel
+                </Button>
+                <Button size="sm" onClick={saveShow} disabled={showSaving}>
+                  {showSaving ? "Saving..." : "Save"}
+                </Button>
+              </>
+            )}
+          </div>
         </div>
 
         {/* Show metadata */}
@@ -3301,10 +3313,6 @@ function ShowDetailPage({
             <EditField label="IMDB ID" value={showRaterDraft.imdb_id} onChange={(v) => setShowRaterDraft((p) => ({ ...p, imdb_id: v }))} />
             <EditField label="Rotten Tomatoes ID" value={showRaterDraft.rt_id} onChange={(v) => setShowRaterDraft((p) => ({ ...p, rt_id: v }))} />
             <RatingsEditFields draft={ratingsDraft} onChange={(s, v) => setRatingsDraft((p) => ({ ...p, [s]: v }))} />
-            <div className="flex gap-2">
-              <Button size="sm" variant="outline" onClick={() => setShowEditing(false)} disabled={showSaving}>Cancel</Button>
-              <Button size="sm" onClick={saveShow} disabled={showSaving}>{showSaving ? "Saving..." : "Save"}</Button>
-            </div>
           </div>
         )}
 
