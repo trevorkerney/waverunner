@@ -12,7 +12,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
 import { Slider } from "@/components/ui/slider";
-import { Settings, Download, Eye, EyeOff, MonitorPlay, Keyboard } from "lucide-react";
+import { Settings, Download, Eye, EyeOff, MonitorPlay, Keyboard, Globe } from "lucide-react";
 import {
   SUBTITLE_DEFAULTS,
   applySubtitleStyleToPlayer,
@@ -39,6 +39,7 @@ type SettingsMap = Record<string, string>;
 
 const categories = [
   { id: "general", label: "General", icon: Settings },
+  { id: "tmdb", label: "TMDB/OMDB", icon: Globe },
   { id: "player", label: "Player", icon: MonitorPlay },
   { id: "keybinds", label: "Keybinds", icon: Keyboard },
 ] as const;
@@ -301,6 +302,26 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                 </div>
               </div>
               <div>
+                <h3 className="mb-4 text-sm font-semibold">Artwork</h3>
+                <div className="flex items-center justify-between gap-4">
+                  <div>
+                    <p className="text-sm">Save artwork to source folders</p>
+                    <p className="text-xs text-muted-foreground">
+                      When downloading covers and backdrops from TMDB, save them into the media
+                      folder's covers/ and backdrops/ subfolders so they travel with your files.
+                    </p>
+                  </div>
+                  <Switch
+                    checked={view["save_artwork_to_source"] !== "false"}
+                    onCheckedChange={(v) => stageSetting("save_artwork_to_source", v ? "true" : "false")}
+                  />
+                </div>
+              </div>
+            </div>
+          )}
+          {activeCategory === "tmdb" && (
+            <div className="flex flex-col gap-6">
+              <div>
                 <h3 className="mb-4 text-sm font-semibold">TMDB</h3>
                 <div className="flex flex-col gap-4">
                   <div>
@@ -383,22 +404,6 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                       onCheckedChange={(v) => stageSetting("rt_scraper_enabled", v ? "true" : "false")}
                     />
                   </div>
-                </div>
-              </div>
-              <div>
-                <h3 className="mb-4 text-sm font-semibold">Artwork</h3>
-                <div className="flex items-center justify-between gap-4">
-                  <div>
-                    <p className="text-sm">Save artwork to source folders</p>
-                    <p className="text-xs text-muted-foreground">
-                      When downloading covers and backdrops from TMDB, save them into the media
-                      folder's covers/ and backdrops/ subfolders so they travel with your files.
-                    </p>
-                  </div>
-                  <Switch
-                    checked={view["save_artwork_to_source"] !== "false"}
-                    onCheckedChange={(v) => stageSetting("save_artwork_to_source", v ? "true" : "false")}
-                  />
                 </div>
               </div>
             </div>
