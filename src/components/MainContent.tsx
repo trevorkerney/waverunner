@@ -22,6 +22,7 @@ import {
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Input } from "@/components/ui/input";
 import { Slider } from "@/components/ui/slider";
 import {
@@ -316,6 +317,15 @@ export function MainContent({
     }
   }, [selectedLibrary]);
 
+  const deletePlaylistCollection = useCallback(async (collectionId: number) => {
+    try {
+      await invoke("delete_playlist_collection", { collectionId });
+      if (selectedLibrary) onPlaylistChanged(selectedLibrary.id);
+    } catch (err) {
+      toast.error(String(err));
+    }
+  }, [selectedLibrary, onPlaylistChanged]);
+
   // Keep the dialog's entry in sync with the live entries/selectedEntry so covers list updates after delete
   const liveCoverDialogEntry = useMemo(() => {
     if (!coverDialogEntry) return null;
@@ -410,6 +420,9 @@ export function MainContent({
   const [newCollectionName, setNewCollectionName] = useState("");
   const [deleteTarget, setDeleteTarget] = useState<MediaEntry | null>(null);
   const [deletingId, setDeletingId] = useState<number | null>(null);
+  // Confirm-before-delete targets (empty/cheap ones skip confirmation entirely).
+  const [deletePlaylistCollectionTarget, setDeletePlaylistCollectionTarget] = useState<MediaEntry | null>(null);
+  const [deletePresetTarget, setDeletePresetTarget] = useState<SortPreset | null>(null);
 
   // Playlist-related dialog state
   const [addToPlaylistFor, setAddToPlaylistFor] = useState<MediaEntry | null>(null);
@@ -1008,9 +1021,7 @@ export function MainContent({
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
-                        if (window.confirm(`Delete preset "${p.name}"?`)) {
-                          onDeletePreset(p.id);
-                        }
+                        setDeletePresetTarget(p);
                       }}
                       className="text-muted-foreground hover:text-destructive"
                       aria-label={`Delete preset ${p.name}`}
@@ -1158,13 +1169,12 @@ export function MainContent({
                       }
                     } : undefined}
                     onRenamePlaylistCollection={activeView?.kind === "playlist-detail" ? (e) => setRenameCollectionFor(e) : undefined}
-                    onDeletePlaylistCollection={activeView?.kind === "playlist-detail" ? async (e) => {
-                      if (!window.confirm(`Delete collection "${e.title}"? Its links and nested collections will be removed from the playlist.`)) return;
-                      try {
-                        await invoke("delete_playlist_collection", { collectionId: e.id });
-                        if (selectedLibrary) onPlaylistChanged(selectedLibrary.id);
-                      } catch (err) {
-                        toast.error(String(err));
+                    onDeletePlaylistCollection={activeView?.kind === "playlist-detail" ? (e) => {
+                      // Empty groups delete straight away; ones with content confirm first.
+                      if (e.child_count === 0) {
+                        void deletePlaylistCollection(e.id);
+                      } else {
+                        setDeletePlaylistCollectionTarget(e);
                       }
                     } : undefined}
                   />
@@ -1291,6 +1301,21 @@ export function MainContent({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <ConfirmDialog
+        open={deletePlaylistCollectionTarget != null}
+        onOpenChange={(open) => { if (!open) setDeletePlaylistCollectionTarget(null); }}
+        title="Delete Collection"
+        message={<>Delete &ldquo;{deletePlaylistCollectionTarget?.title}&rdquo;? Its links and nested collections will be removed from the playlist.</>}
+        onConfirm={() => { if (deletePlaylistCollectionTarget) void deletePlaylistCollection(deletePlaylistCollectionTarget.id); }}
+      />
+      <ConfirmDialog
+        open={deletePresetTarget != null}
+        onOpenChange={(open) => { if (!open) setDeletePresetTarget(null); }}
+        title="Delete Preset"
+        message={<>Delete preset &ldquo;{deletePresetTarget?.name}&rdquo;?</>}
+        onConfirm={() => { if (deletePresetTarget) onDeletePreset(deletePresetTarget.id); }}
+      />
 
       <SortPresetSaveDialog
         open={savePresetOpen}
@@ -3937,6 +3962,9 @@ function PlaylistsView({
   const [renameTarget, setRenameTarget] = useState<PlaylistSummary | null>(null);
   const [coverDialog, setCoverDialog] = useState<{ playlist: PlaylistSummary; mode: "select" | "delete" } | null>(null);
   const [savePresetOpen, setSavePresetOpen] = useState(false);
+  // Confirm-before-delete targets (empty playlists skip confirmation entirely).
+  const [deletePlaylistTarget, setDeletePlaylistTarget] = useState<PlaylistSummary | null>(null);
+  const [deletePresetTarget, setDeletePresetTarget] = useState<SortPreset | null>(null);
   // Play the page load-in (drop-in) on the cards the first time they appear, matching the
   // library grid. Fires once per mount (i.e. per navigation to the playlists list).
   const gridRef = useRef<HTMLDivElement | null>(null);
@@ -3949,13 +3977,22 @@ function PlaylistsView({
     playDropIn(grid.children);
   });
 
-  async function handleDelete(p: PlaylistSummary) {
-    if (!window.confirm(`Delete playlist "${p.title}"? The linked media will not be deleted.`)) return;
+  async function deletePlaylist(p: PlaylistSummary) {
     try {
       await invoke("delete_playlist", { playlistId: p.id });
       onPlaylistChanged(libraryId);
     } catch (e) {
       toast.error(String(e));
+    }
+  }
+
+  // Empty playlists delete straight away; ones holding anything (links, or
+  // nested collections even when those are empty) confirm first.
+  function handleDelete(p: PlaylistSummary) {
+    if (p.movie_count + p.show_count + p.collection_count === 0) {
+      void deletePlaylist(p);
+    } else {
+      setDeletePlaylistTarget(p);
     }
   }
 
@@ -4059,7 +4096,7 @@ function PlaylistsView({
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
-                        if (window.confirm(`Delete preset "${p.name}"?`)) onDeletePreset(p.id);
+                        setDeletePresetTarget(p);
                       }}
                       className="text-muted-foreground hover:text-destructive"
                       aria-label={`Delete preset ${p.name}`}
@@ -4154,6 +4191,20 @@ function PlaylistsView({
             toast.error(String(e));
           }
         }}
+      />
+      <ConfirmDialog
+        open={deletePlaylistTarget != null}
+        onOpenChange={(o) => { if (!o) setDeletePlaylistTarget(null); }}
+        title="Delete Playlist"
+        message={<>Delete &ldquo;{deletePlaylistTarget?.title}&rdquo;? The linked media will not be deleted.</>}
+        onConfirm={() => { if (deletePlaylistTarget) void deletePlaylist(deletePlaylistTarget); }}
+      />
+      <ConfirmDialog
+        open={deletePresetTarget != null}
+        onOpenChange={(o) => { if (!o) setDeletePresetTarget(null); }}
+        title="Delete Preset"
+        message={<>Delete preset &ldquo;{deletePresetTarget?.name}&rdquo;?</>}
+        onConfirm={() => { if (deletePresetTarget) onDeletePreset(deletePresetTarget.id); }}
       />
       {dialogEntry && coverDialog && (
         <CoverCarouselDialog

@@ -156,6 +156,8 @@ export interface PlaylistSummary {
   covers: string[];
   movie_count: number;
   show_count: number;
+  /** Nested collections (recursive) — with the link counts, decides whether deletion confirms. */
+  collection_count: number;
   year: string | null;
   end_year: string | null;
 }

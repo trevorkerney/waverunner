@@ -3436,6 +3436,9 @@ pub struct PlaylistSummary {
     /// at the root and nested in groupings) for the card subtitle.
     pub movie_count: i64,
     pub show_count: i64,
+    /// Nested collections (recursive). With the link counts this decides whether
+    /// deleting the playlist needs a confirmation (empty ones just go).
+    pub collection_count: i64,
     pub year: Option<String>,
     pub end_year: Option<String>,
 }
@@ -3480,7 +3483,8 @@ pub async fn get_playlists(
         ) \
         SELECT \
             COALESCE(SUM(CASE WHEN met.name = 'movie' THEN 1 ELSE 0 END), 0), \
-            COALESCE(SUM(CASE WHEN met.name = 'show' THEN 1 ELSE 0 END), 0) \
+            COALESCE(SUM(CASE WHEN met.name = 'show' THEN 1 ELSE 0 END), 0), \
+            (SELECT COUNT(*) FROM pcs) \
         FROM media_link ml \
         JOIN media_entry me ON me.id = ml.target_entry_id \
         JOIN media_entry_type met ON me.entry_type_id = met.id \
@@ -3507,7 +3511,7 @@ pub async fn get_playlists(
     for (id, title, selected_cover) in rows {
         let dir = playlist_covers_dir(&state.app_data_dir, "playlist", id);
         let covers = list_playlist_covers(&dir);
-        let (movie_count, show_count): (i64, i64) = sqlx::query_as(counts_sql)
+        let (movie_count, show_count, collection_count): (i64, i64, i64) = sqlx::query_as(counts_sql)
             .bind(id)
             .bind(id)
             .fetch_one(&state.app_db)
@@ -3525,7 +3529,7 @@ pub async fn get_playlists(
         };
         playlists.push(PlaylistSummary {
             id, title, selected_cover, covers,
-            movie_count, show_count, year: min_year, end_year,
+            movie_count, show_count, collection_count, year: min_year, end_year,
         });
     }
 
@@ -3669,6 +3673,14 @@ pub async fn create_playlist(
     .await
     .map_err(|e| e.to_string())?;
     let id = result.last_insert_rowid();
+    // A newborn playlist must start coverless: after a database reset (fresh
+    // autoincrement ids, surviving app-data) a cover folder for this id can
+    // still exist on disk — without this, the new playlist adopts a previous
+    // database's art.
+    let dir = playlist_covers_dir(&state.app_data_dir, "playlist", id);
+    if dir.exists() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     Ok(id)
 }
 
@@ -3816,7 +3828,13 @@ pub async fn create_playlist_collection(
     .execute(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
-    Ok(result.last_insert_rowid())
+    let id = result.last_insert_rowid();
+    // Same newborn-coverless guard as create_playlist (see comment there).
+    let dir = playlist_covers_dir(&state.app_data_dir, "collection", id);
+    if dir.exists() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    Ok(id)
 }
 
 #[tauri::command]
