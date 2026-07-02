@@ -44,6 +44,7 @@ import {
   ContextMenuTrigger,
   ContextMenuContent,
   ContextMenuItem,
+  ContextMenuSeparator,
 } from "@/components/ui/context-menu";
 import {
   Dialog,
@@ -2315,6 +2316,63 @@ function EntryDetailPage({
     updateDraft(field, value.split(",").map((s) => s.trim()).filter(Boolean));
   };
 
+  // One menu shared by the cover image and the hero/content area — identical
+  // items; only the tab the TMDB image browser lands on differs by surface.
+  // Grouped: watch → artwork → metadata → destructive.
+  const detailMenuItems = (tmdbTab: "posters" | "backdrops") => (
+    <>
+      {extrasCount > 0 && (
+        <>
+          <ContextMenuItem onClick={() => setExtrasOpen(true)}>
+            <Clapperboard size={14} />
+            View extras
+          </ContextMenuItem>
+          <ContextMenuSeparator />
+        </>
+      )}
+      <ContextMenuItem onClick={onChangeCover} disabled={entry.covers.length <= 1}>
+        <ImageIcon size={14} />
+        Change cover
+      </ContextMenuItem>
+      <ContextMenuItem onClick={() => setBackdropDialogOpen(true)}>
+        <ImageIcon size={14} />
+        Change backdrop
+      </ContextMenuItem>
+      <ContextMenuItem onClick={() => setTmdbImagesTab(tmdbTab)} disabled={!detail?.tmdb_id}>
+        <ImageIcon size={14} />
+        Add cover/backdrop from TMDB
+      </ContextMenuItem>
+      <ContextMenuItem onClick={onAddCover}>
+        <ImageIcon size={14} />
+        Add local cover
+      </ContextMenuItem>
+      <ContextMenuSeparator />
+      <ContextMenuItem onClick={startEditing}>
+        <Pencil size={14} />
+        Edit
+      </ContextMenuItem>
+      <ContextMenuItem onClick={() => setTmdbDialogOpen(true)}>
+        <Film size={14} />
+        {detail?.tmdb_id ? "Rematch TMDB" : "Match TMDB"}
+      </ContextMenuItem>
+      {omdbEnabled && (
+        <ContextMenuItem onClick={fetchRatings}>
+          <RefreshCw size={14} />
+          Get ratings
+        </ContextMenuItem>
+      )}
+      <ContextMenuSeparator />
+      <ContextMenuItem
+        onClick={onDeleteCover}
+        disabled={entry.covers.length < 1}
+        className="text-destructive focus:text-destructive"
+      >
+        <Trash2 size={14} />
+        Delete cover
+      </ContextMenuItem>
+    </>
+  );
+
   // Everything or nothing: a blank frame beats sections trickling in.
   if (loadedId !== entry.id) return null;
 
@@ -2326,7 +2384,9 @@ function EntryDetailPage({
         // -inset-x-4/-top-4 cancel the scroll container's p-4 so the wash reaches the section borders.
         <div aria-hidden className="pointer-events-none absolute -inset-x-4 -top-4 -z-10 h-[490px] overflow-hidden">
           {detail?.backdrop ? (
-            <img src={convertFileSrc(detail.backdrop)} alt="" className="absolute inset-0 h-full w-full object-cover opacity-15" />
+            // Anchored 25% from the top: center-crop beheads top-composed art,
+            // a hard top-anchor surfaces letterbox bars — upper-quarter splits it.
+            <img src={convertFileSrc(detail.backdrop)} alt="" className="absolute inset-0 h-full w-full object-cover object-[50%_25%] opacity-15" />
           ) : (
             // Oversized by the blur radius (64px) on every side so the blur's
             // transparent falloff lands outside the visible box.
@@ -2348,24 +2408,7 @@ function EntryDetailPage({
               />
             }
           />
-          <ContextMenuContent>
-            <ContextMenuItem onClick={onAddCover}>
-              <ImageIcon size={14} />
-              Add local cover
-            </ContextMenuItem>
-            <ContextMenuItem onClick={() => setTmdbImagesTab("posters")} disabled={!detail?.tmdb_id}>
-              <ImageIcon size={14} />
-              Add cover from TMDB
-            </ContextMenuItem>
-            <ContextMenuItem onClick={onChangeCover} disabled={entry.covers.length <= 1}>
-              <ImageIcon size={14} />
-              Change cover
-            </ContextMenuItem>
-            <ContextMenuItem onClick={onDeleteCover} disabled={entry.covers.length < 1}>
-              <Trash2 size={14} />
-              Delete cover
-            </ContextMenuItem>
-          </ContextMenuContent>
+          <ContextMenuContent>{detailMenuItems("posters")}</ContextMenuContent>
         </ContextMenu>
       )}
       <ContextMenu>
@@ -2526,36 +2569,7 @@ function EntryDetailPage({
           </div>
         )}
         </ContextMenuTrigger>
-        <ContextMenuContent>
-          <ContextMenuItem onClick={() => setTmdbDialogOpen(true)}>
-            <Film size={14} />
-            {detail?.tmdb_id ? "Rematch TMDB" : "Match TMDB"}
-          </ContextMenuItem>
-          <ContextMenuItem onClick={startEditing}>
-            <Pencil size={14} />
-            Edit
-          </ContextMenuItem>
-          <ContextMenuItem onClick={() => setTmdbImagesTab("backdrops")} disabled={!detail?.tmdb_id}>
-            <ImageIcon size={14} />
-            Add cover/backdrop from TMDB
-          </ContextMenuItem>
-          <ContextMenuItem onClick={() => setBackdropDialogOpen(true)}>
-            <ImageIcon size={14} />
-            Change backdrop
-          </ContextMenuItem>
-          {omdbEnabled && (
-            <ContextMenuItem onClick={fetchRatings}>
-              <RefreshCw size={14} />
-              Get ratings
-            </ContextMenuItem>
-          )}
-          {extrasCount > 0 && (
-            <ContextMenuItem onClick={() => setExtrasOpen(true)}>
-              <Clapperboard size={14} />
-              View extras
-            </ContextMenuItem>
-          )}
-        </ContextMenuContent>
+        <ContextMenuContent>{detailMenuItems("backdrops")}</ContextMenuContent>
       </ContextMenu>
       {/* Full-width band below the hero row (w-full forces the wrap) */}
       {detail && !editing && (detail.cast.length > 0 || detail.studios.length > 0 || detail.tmdb_id || detail.imdb_id || detail.rotten_tomatoes_id) && (
@@ -3067,6 +3081,63 @@ function ShowDetailPage({
   const hasTmdb = !!detail?.tmdb_id;
   const canSeasonTmdb = hasTmdb && selectedSeason?.season_number != null;
 
+  // One menu shared by the cover image and the hero/content area — identical
+  // items; only the tab the TMDB image browser lands on differs by surface.
+  // Grouped: watch → artwork → metadata → destructive.
+  const detailMenuItems = (tmdbTab: "posters" | "backdrops") => (
+    <>
+      {extrasCount > 0 && (
+        <>
+          <ContextMenuItem onClick={() => setExtrasOpen(true)}>
+            <Clapperboard size={14} />
+            View extras
+          </ContextMenuItem>
+          <ContextMenuSeparator />
+        </>
+      )}
+      <ContextMenuItem onClick={onChangeCover} disabled={entry.covers.length <= 1}>
+        <ImageIcon size={14} />
+        Change cover
+      </ContextMenuItem>
+      <ContextMenuItem onClick={() => setBackdropDialogOpen(true)}>
+        <ImageIcon size={14} />
+        Change backdrop
+      </ContextMenuItem>
+      <ContextMenuItem onClick={() => setTmdbImagesTab(tmdbTab)} disabled={!detail?.tmdb_id}>
+        <ImageIcon size={14} />
+        Add cover/backdrop from TMDB
+      </ContextMenuItem>
+      <ContextMenuItem onClick={onAddCover}>
+        <ImageIcon size={14} />
+        Add local cover
+      </ContextMenuItem>
+      <ContextMenuSeparator />
+      <ContextMenuItem onClick={startEditShow} disabled={!detail}>
+        <Pencil size={14} />
+        Edit
+      </ContextMenuItem>
+      <ContextMenuItem onClick={() => setTmdbDialogOpen(true)}>
+        <Film size={14} />
+        {detail?.tmdb_id ? "Rematch TMDB" : "Match TMDB"}
+      </ContextMenuItem>
+      {omdbEnabled && (
+        <ContextMenuItem onClick={fetchRatings}>
+          <RefreshCw size={14} />
+          Get ratings
+        </ContextMenuItem>
+      )}
+      <ContextMenuSeparator />
+      <ContextMenuItem
+        onClick={onDeleteCover}
+        disabled={entry.covers.length < 1}
+        className="text-destructive focus:text-destructive"
+      >
+        <Trash2 size={14} />
+        Delete cover
+      </ContextMenuItem>
+    </>
+  );
+
   // Everything or nothing: a blank frame beats sections trickling in.
   if (loadedId !== entry.id) return null;
 
@@ -3078,7 +3149,9 @@ function ShowDetailPage({
         // -inset-x-4/-top-4 cancel the scroll container's p-4 so the wash reaches the section borders.
         <div aria-hidden className="pointer-events-none absolute -inset-x-4 -top-4 -z-10 h-[490px] overflow-hidden">
           {detail?.backdrop ? (
-            <img src={convertFileSrc(detail.backdrop)} alt="" className="absolute inset-0 h-full w-full object-cover opacity-15" />
+            // Anchored 25% from the top: center-crop beheads top-composed art,
+            // a hard top-anchor surfaces letterbox bars — upper-quarter splits it.
+            <img src={convertFileSrc(detail.backdrop)} alt="" className="absolute inset-0 h-full w-full object-cover object-[50%_25%] opacity-15" />
           ) : (
             // Oversized by the blur radius (64px) on every side so the blur's
             // transparent falloff lands outside the visible box.
@@ -3100,24 +3173,7 @@ function ShowDetailPage({
               />
             }
           />
-          <ContextMenuContent>
-            <ContextMenuItem onClick={onAddCover}>
-              <ImageIcon size={14} />
-              Add local cover
-            </ContextMenuItem>
-            <ContextMenuItem onClick={() => setTmdbImagesTab("posters")} disabled={!detail?.tmdb_id}>
-              <ImageIcon size={14} />
-              Add cover from TMDB
-            </ContextMenuItem>
-            <ContextMenuItem onClick={onChangeCover} disabled={entry.covers.length <= 1}>
-              <ImageIcon size={14} />
-              Change cover
-            </ContextMenuItem>
-            <ContextMenuItem onClick={onDeleteCover} disabled={entry.covers.length < 1}>
-              <Trash2 size={14} />
-              Delete cover
-            </ContextMenuItem>
-          </ContextMenuContent>
+          <ContextMenuContent>{detailMenuItems("posters")}</ContextMenuContent>
         </ContextMenu>
       )}
       <ContextMenu>
@@ -3253,36 +3309,7 @@ function ShowDetailPage({
         )}
 
         </ContextMenuTrigger>
-        <ContextMenuContent>
-          <ContextMenuItem onClick={() => setTmdbDialogOpen(true)}>
-            <Film size={14} />
-            {detail?.tmdb_id ? "Rematch TMDB" : "Match TMDB"}
-          </ContextMenuItem>
-          <ContextMenuItem onClick={startEditShow} disabled={!detail}>
-            <Pencil size={14} />
-            Edit
-          </ContextMenuItem>
-          <ContextMenuItem onClick={() => setTmdbImagesTab("backdrops")} disabled={!detail?.tmdb_id}>
-            <ImageIcon size={14} />
-            Add cover/backdrop from TMDB
-          </ContextMenuItem>
-          <ContextMenuItem onClick={() => setBackdropDialogOpen(true)}>
-            <ImageIcon size={14} />
-            Change backdrop
-          </ContextMenuItem>
-          {omdbEnabled && (
-            <ContextMenuItem onClick={fetchRatings}>
-              <RefreshCw size={14} />
-              Get ratings
-            </ContextMenuItem>
-          )}
-          {extrasCount > 0 && (
-            <ContextMenuItem onClick={() => setExtrasOpen(true)}>
-              <Clapperboard size={14} />
-              View extras
-            </ContextMenuItem>
-          )}
-        </ContextMenuContent>
+        <ContextMenuContent>{detailMenuItems("backdrops")}</ContextMenuContent>
       </ContextMenu>
 
       {/* Seasons + episodes — full-width band below the hero (w-full forces the wrap) */}

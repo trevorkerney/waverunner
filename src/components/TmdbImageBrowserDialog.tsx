@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
 import {
@@ -45,6 +45,20 @@ interface ImageSelection {
 
 type Tab = "posters" | "backdrops";
 
+/** TMDB marks textless art with a null language (occasionally "xx" = "No Language"). */
+function imageLang(iso: string | null | undefined): string | null {
+  return iso && iso !== "xx" ? iso : null;
+}
+
+const LANGUAGE_NAMES = new Intl.DisplayNames(["en"], { type: "language" });
+function languageLabel(code: string): string {
+  try {
+    return LANGUAGE_NAMES.of(code) ?? code;
+  } catch {
+    return code;
+  }
+}
+
 export function TmdbImageBrowserDialog({
   open,
   onOpenChange,
@@ -62,11 +76,15 @@ export function TmdbImageBrowserDialog({
   const [posterSelections, setPosterSelections] = useState<Record<number, ImageSelection>>({});
   const [backdropSelections, setBackdropSelections] = useState<Record<number, ImageSelection>>({});
   const [tab, setTab] = useState<Tab>("posters");
+  // Language filter: "all" | "textless" | an iso_639_1 code. Filters the grid
+  // only — already-checked images stay selected (and download) even when hidden.
+  const [language, setLanguage] = useState<string>("all");
 
   useEffect(() => {
     if (!open) return;
     setLoading(true);
     setTab(initialTab);
+    setLanguage("all");
     setPosterSelections({});
     setBackdropSelections({});
 
@@ -129,6 +147,30 @@ export function TmdbImageBrowserDialog({
     Object.values(posterSelections).filter((s) => s.checked).length +
     Object.values(backdropSelections).filter((s) => s.checked).length;
 
+  // Filter options come from the languages actually present in this title's art.
+  const languages = useMemo(() => {
+    const codes = new Set<string>();
+    let hasTextless = false;
+    for (const img of [...posters, ...backdrops]) {
+      const code = imageLang(img.iso_639_1);
+      if (code) codes.add(code);
+      else hasTextless = true;
+    }
+    return { codes: [...codes].sort(), hasTextless };
+  }, [posters, backdrops]);
+
+  const matchesLanguage = useCallback(
+    (img: TmdbImage) =>
+      language === "all"
+        ? true
+        : language === "textless"
+          ? imageLang(img.iso_639_1) === null
+          : imageLang(img.iso_639_1) === language,
+    [language],
+  );
+  const visiblePosters = posters.filter(matchesLanguage).length;
+  const visibleBackdrops = backdrops.filter(matchesLanguage).length;
+
   const doDownload = useCallback(async () => {
     setDownloading(true);
     try {
@@ -177,8 +219,8 @@ export function TmdbImageBrowserDialog({
           <DialogTitle>TMDB Images</DialogTitle>
         </DialogHeader>
 
-        {/* Tabs */}
-        <div className="flex shrink-0 gap-1 border-b px-6 py-2">
+        {/* Tabs + language filter */}
+        <div className="flex shrink-0 items-center gap-1 border-b px-6 py-2">
           <button
             onClick={() => setTab("posters")}
             className={`rounded-md px-3 py-1.5 text-sm ${
@@ -187,7 +229,7 @@ export function TmdbImageBrowserDialog({
                 : "text-muted-foreground hover:bg-accent/50"
             }`}
           >
-            Posters ({posters.length})
+            Posters ({visiblePosters})
           </button>
           <button
             onClick={() => setTab("backdrops")}
@@ -197,8 +239,24 @@ export function TmdbImageBrowserDialog({
                 : "text-muted-foreground hover:bg-accent/50"
             }`}
           >
-            Backdrops ({backdrops.length})
+            Backdrops ({visibleBackdrops})
           </button>
+          <div className="ml-auto">
+            <Select value={language} onValueChange={(v) => v && setLanguage(v)}>
+              <SelectTrigger className="h-8 w-44 text-xs">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All languages</SelectItem>
+                {languages.hasTextless && <SelectItem value="textless">Textless</SelectItem>}
+                {languages.codes.map((c) => (
+                  <SelectItem key={c} value={c}>
+                    {languageLabel(c)}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
         </div>
 
         {/* Content */}
@@ -213,7 +271,7 @@ export function TmdbImageBrowserDialog({
             <div className="grid grid-cols-4 gap-3">
               {posters.map((img, idx) => {
                 const sel = posterSelections[idx];
-                if (!sel) return null;
+                if (!sel || !matchesLanguage(img)) return null;
                 return (
                   <div
                     key={img.file_path}
@@ -257,9 +315,9 @@ export function TmdbImageBrowserDialog({
                   </div>
                 );
               })}
-              {posters.length === 0 && (
+              {visiblePosters === 0 && (
                 <p className="col-span-4 py-8 text-center text-sm text-muted-foreground">
-                  No posters available
+                  {posters.length === 0 ? "No posters available" : "No posters in this language"}
                 </p>
               )}
             </div>
@@ -269,7 +327,7 @@ export function TmdbImageBrowserDialog({
             <div className="grid grid-cols-2 gap-3">
               {backdrops.map((img, idx) => {
                 const sel = backdropSelections[idx];
-                if (!sel) return null;
+                if (!sel || !matchesLanguage(img)) return null;
                 return (
                   <div
                     key={img.file_path}
@@ -313,9 +371,9 @@ export function TmdbImageBrowserDialog({
                   </div>
                 );
               })}
-              {backdrops.length === 0 && (
+              {visibleBackdrops === 0 && (
                 <p className="col-span-2 py-8 text-center text-sm text-muted-foreground">
-                  No backdrops available
+                  {backdrops.length === 0 ? "No backdrops available" : "No backdrops in this language"}
                 </p>
               )}
             </div>
