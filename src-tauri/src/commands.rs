@@ -2072,18 +2072,19 @@ pub async fn download_tmdb_images(
 
     let (folder_path,) = entry_row.ok_or("Entry not found")?;
 
-    // "Save artwork to source folders" (default on): downloaded covers/backdrops are written into
-    // the media folder's covers/ and backdrops/ subdirs, so they travel with the media and are
-    // re-read as library artwork on rescan. When off (or the source folder can't be resolved),
-    // originals fall back to the app-data mirror, untouched media folders.
+    // "Save artwork to source folders" (default OFF): when enabled, downloaded
+    // covers/backdrops are written into the media folder's covers/ and backdrops/
+    // subdirs, so they travel with the media and are re-read as library artwork on
+    // rescan. Otherwise (or when the source folder can't be resolved), originals
+    // go to the app-data mirror, leaving media folders untouched.
     let save_to_source = sqlx::query_scalar::<_, String>(
         "SELECT value FROM settings WHERE key = 'save_artwork_to_source'",
     )
     .fetch_optional(&state.app_db)
     .await
     .map_err(|e| e.to_string())?
-    .map(|v| v != "false")
-    .unwrap_or(true);
+    .map(|v| v == "true")
+    .unwrap_or(false);
 
     let app_base = app_images_base(&state.app_data_dir, &library_id);
     let source_root = if save_to_source {
