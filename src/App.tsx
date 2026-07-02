@@ -812,6 +812,13 @@ function App() {
           return updated ? { ...c, entry: updated } : c;
         }),
       );
+      // Search results are a parallel list over the same entries — refresh their
+      // copies too (skipping link-backed rows, whose covers are pinned per link).
+      setSearchResults((prev) =>
+        prev
+          ? prev.map((e) => fresh.find((f) => f.id === e.id && f.link_id == null) ?? e)
+          : prev,
+      );
     } catch (e) {
       console.error("Failed to refresh grid:", e);
     }
@@ -1061,14 +1068,33 @@ function App() {
     [selectedLibrary, breadcrumbs, loadView, saveScrollPosition]
   );
 
-  // Drill from the Genres view into a genre's filtered grid. selectView builds
-  // the "Genres > <genre>" breadcrumb chain (see its genre-detail case).
+  // Genre pages open IN CONTEXT: the genre crumb is appended to the current
+  // chain, so a chip on a detail page reads "Lib - Movies > Cars > Comedy" and
+  // the Genres view reads "Lib - Genres > Comedy" (its chain is the prefix).
+  // Revisiting a genre already in the chain collapses the loop instead of
+  // duplicating it ("Genres > SciFi > Godzilla > SciFi" becomes
+  // "Movies > Godzilla > SciFi"). Sidebar genre nodes go through selectView
+  // instead — fresh navigations keep the canonical "Lib - Genres > X" root.
   const navigateToGenre = useCallback(
     (libraryId: string, genre: string) => {
-      saveScrollPosition(); // remember the Genres list scroll for the return trip
-      selectView({ kind: "genre-detail", libraryId, genre });
+      const view: ViewSpec = { kind: "genre-detail", libraryId, genre };
+      const dupIndex = breadcrumbs.findIndex(
+        (c) => c.view?.kind === "genre-detail" && c.view.libraryId === libraryId && c.view.genre === genre,
+      );
+      if (dupIndex !== -1 && dupIndex === breadcrumbs.length - 1) return; // already on this genre
+      saveScrollPosition(); // remember the source page's scroll for the return trip
+      const base = dupIndex === -1 ? breadcrumbs : collapseLoop(breadcrumbs, dupIndex, libraryId);
+      const newBreadcrumbs: BreadcrumbItem[] = [
+        ...base,
+        { id: null, title: genre, view },
+      ];
+      setActiveView(view);
+      setSelectedEntry(null);
+      setSearch("");
+      setForwardStack([]);
+      loadView(view, null, newBreadcrumbs, false);
     },
-    [selectView, saveScrollPosition]
+    [breadcrumbs, loadView, collapseLoop, saveScrollPosition]
   );
 
   const navigateTo = useCallback(
@@ -1754,6 +1780,9 @@ function App() {
       setSelectedEntry((prev) =>
         prev && prev.id === entryId ? { ...prev, selected_cover: coverPath } : prev
       );
+      // The search grid renders searchResults, a parallel list over the same
+      // entries — patch its copy too or the change only shows after re-searching.
+      setSearchResults((prev) => (prev ? prev.map(patchCover) : prev));
       try {
         await invoke("set_cover", {
           libraryId: selectedLibrary.id,
@@ -1824,6 +1853,7 @@ function App() {
           return updated;
         });
         setSelectedEntry((prev) => (prev && prev.id === entryId ? updateEntry(prev) : prev));
+        setSearchResults((prev) => (prev ? prev.map(updateEntry) : prev));
         await invoke("set_cover", {
           libraryId: selectedLibrary!.id,
           entryId,
@@ -1888,6 +1918,7 @@ function App() {
           return updated;
         });
         setSelectedEntry((prev) => (prev && prev.id === entryId ? updateEntry(prev) : prev));
+        setSearchResults((prev) => (prev ? prev.map(updateEntry) : prev));
       } catch (e) {
         toast.error(String(e));
       }

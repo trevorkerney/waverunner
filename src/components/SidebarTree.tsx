@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   ChevronRight,
   Circle,
@@ -49,6 +49,29 @@ function formatCount(n: number): string {
   return `${rounded % 1 === 0 ? rounded.toFixed(0) : rounded.toFixed(1)}${unit}`;
 }
 
+// Active-view matching shared by the node highlight and ancestor checks.
+// Playlist sidebar entries stay highlighted while the user drills into nested
+// playlist_collections — the node's view always targets the root
+// (collectionId: null), so match on libraryId + playlistId instead of the key.
+function viewsMatch(nodeView: ViewSpec | null | undefined, activeView: ViewSpec | null): boolean {
+  if (!nodeView || !activeView) return false;
+  if (
+    nodeView.kind === "playlist-detail" &&
+    activeView.kind === "playlist-detail" &&
+    nodeView.libraryId === activeView.libraryId &&
+    nodeView.playlistId === activeView.playlistId
+  ) {
+    return true;
+  }
+  return viewCacheKey(nodeView) === viewCacheKey(activeView);
+}
+
+function hasActiveDescendant(node: ComplicationNode, activeView: ViewSpec | null): boolean {
+  return (node.children ?? []).some(
+    (c) => viewsMatch(c.view, activeView) || hasActiveDescendant(c, activeView),
+  );
+}
+
 interface SidebarTreeProps {
   nodes: ComplicationNode[];
   activeView: ViewSpec | null;
@@ -87,27 +110,19 @@ function TreeNode({ node, activeView, onSelectView, renderNodeMenu, depth }: Tre
   const [expanded, setExpanded] = useState(!node.defaultCollapsed);
   const Icon = getIcon(node.iconName);
   const hasChildren = (node.children?.length ?? 0) > 0;
-  // Playlist sidebar entries stay highlighted while the user drills into nested
-  // playlist_collections — the node's view always targets the root (collectionId: null),
-  // so match on libraryId + playlistId instead of the exact cache key.
-  const isActive = (() => {
-    if (!node.view || !activeView) return false;
-    if (
-      node.view.kind === "playlist-detail" &&
-      activeView.kind === "playlist-detail" &&
-      node.view.libraryId === activeView.libraryId &&
-      node.view.playlistId === activeView.playlistId
-    ) {
-      return true;
-    }
-    return viewCacheKey(node.view) === viewCacheKey(activeView);
-  })();
+  const isActive = viewsMatch(node.view, activeView);
+  // A highlighted descendant must stay visible: the group auto-expands when one
+  // of its children becomes active, and its chevron locks until the user leaves.
+  const activeInside = useMemo(() => hasActiveDescendant(node, activeView), [node, activeView]);
+  useEffect(() => {
+    if (activeInside) setExpanded(true);
+  }, [activeInside]);
 
   const handleClick = () => {
     if (node.view) {
       // Navigate only — expand/collapse is exclusively the chevron's job.
       onSelectView(node.view);
-    } else if (hasChildren) {
+    } else if (hasChildren && !activeInside) {
       // Non-navigable parent (no view): clicking the row is the only way to toggle.
       setExpanded((v) => !v);
     }
@@ -115,6 +130,7 @@ function TreeNode({ node, activeView, onSelectView, renderNodeMenu, depth }: Tre
 
   const toggleExpand = (e: React.MouseEvent) => {
     e.stopPropagation();
+    if (activeInside) return; // locked open while a child is highlighted
     setExpanded((v) => !v);
   };
 
@@ -139,7 +155,9 @@ function TreeNode({ node, activeView, onSelectView, renderNodeMenu, depth }: Tre
       {hasChildren ? (
         <span
           onClick={toggleExpand}
-          className="flex h-5 w-4 flex-shrink-0 items-center justify-center hover:text-sidebar-accent-foreground"
+          className={`flex h-5 w-4 flex-shrink-0 items-center justify-center ${
+            activeInside ? "cursor-default opacity-35" : "hover:text-sidebar-accent-foreground"
+          }`}
         >
           <ChevronRight
             size={12}
