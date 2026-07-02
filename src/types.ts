@@ -522,6 +522,10 @@ export interface BulkSeasonTarget {
   show_id: number;
   season_number: number;
   episode_count: number;
+  /** Season-metadata pass already ran — not counted, not refetched. */
+  season_done: boolean;
+  /** Per-episode pass already ran — not counted, not refetched. */
+  episodes_done: boolean;
 }
 
 export interface BulkWebisodeTarget {

@@ -8503,6 +8503,12 @@ pub struct BulkSeasonTarget {
     pub show_id: i64,
     pub season_number: i64,
     pub episode_count: i64,
+    /// The season-metadata pass already ran (stamped, or plot present from a
+    /// pre-stamp run) — the dialog neither counts nor refetches it.
+    pub season_done: bool,
+    /// Same for the per-episode pass (stamped, or any episode carries
+    /// TMDB-only fields from a pre-stamp run).
+    pub episodes_done: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -8559,9 +8565,20 @@ pub async fn get_tmdb_bulk_targets(
     .await
     .map_err(|e| e.to_string())?;
 
-    let seasons: Vec<(i64, i64, i64, i64)> = sqlx::query_as(
+    // done-ness = fetch stamp, OR (for libraries matched before stamps existed)
+    // metadata only a TMDB pass writes: a season plot or season cast / any
+    // episode plot or release date. The heuristic can't see fetches that found
+    // nothing at all — those recount once, get stamped on the next run, and
+    // then stay settled.
+    let seasons: Vec<(i64, i64, i64, i64, i64, i64)> = sqlx::query_as(
         "SELECT se.id, se.show_id, se.season_number, \
-           (SELECT COUNT(*) FROM episode e WHERE e.season_id = se.id) \
+           (SELECT COUNT(*) FROM episode e WHERE e.season_id = se.id), \
+           (EXISTS(SELECT 1 FROM tmdb_season_fetch f WHERE f.season_id = se.id AND f.pass = 'season') \
+              OR se.plot IS NOT NULL \
+              OR EXISTS(SELECT 1 FROM season_cast sc WHERE sc.season_id = se.id)), \
+           (EXISTS(SELECT 1 FROM tmdb_season_fetch f WHERE f.season_id = se.id AND f.pass = 'episodes') \
+              OR EXISTS(SELECT 1 FROM episode e WHERE e.season_id = se.id \
+                        AND (e.release_date IS NOT NULL OR e.plot IS NOT NULL))) \
          FROM season se JOIN media_entry me ON me.id = se.show_id \
          WHERE me.library_id = ? AND se.season_number IS NOT NULL \
          ORDER BY se.show_id, se.season_number",
@@ -8627,11 +8644,13 @@ pub async fn get_tmdb_bulk_targets(
             .collect(),
         seasons: seasons
             .into_iter()
-            .map(|(id, show_id, season_number, episode_count)| BulkSeasonTarget {
+            .map(|(id, show_id, season_number, episode_count, season_done, episodes_done)| BulkSeasonTarget {
                 id,
                 show_id,
                 season_number,
                 episode_count,
+                season_done: season_done != 0,
+                episodes_done: episodes_done != 0,
             })
             .collect(),
         webisodes: webisodes
@@ -8686,6 +8705,15 @@ pub async fn apply_tmdb_show_metadata(
     if let Some(ref tmdb_id) = fields.tmdb_id {
         sqlx::query("UPDATE show SET tmdb_id = ? WHERE id = ?")
             .bind(tmdb_id).bind(show_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
+        // A (re)match invalidates the season fetch stamps: the next bulk run
+        // should refetch this show's seasons/episodes against the new id.
+        sqlx::query(
+            "DELETE FROM tmdb_season_fetch WHERE season_id IN (SELECT id FROM season WHERE show_id = ?)",
+        )
+        .bind(show_id)
+        .execute(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
     }
     if let Some(ref imdb_id) = fields.imdb_id {
         sqlx::query("UPDATE show SET imdb_id = ? WHERE id = ?")
@@ -8831,6 +8859,15 @@ pub async fn apply_tmdb_season_metadata(
     }
 
     process_person_images(&state.app_db, &state.app_data_dir, new_people).await;
+
+    // Stamp the pass so bulk matching won't refetch this season — TMDB data may
+    // legitimately be sparse (no overview), so presence-of-metadata can't tell
+    // "fetched, nothing there" from "never fetched".
+    sqlx::query("INSERT OR IGNORE INTO tmdb_season_fetch (season_id, pass) VALUES (?, 'season')")
+        .bind(season_id)
+        .execute(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -9035,5 +9072,13 @@ pub async fn apply_tmdb_season_episodes(
     }
 
     process_person_images(&state.app_db, &state.app_data_dir, new_people).await;
+
+    // Stamp even when nothing matched — the fetch happened; re-running the bulk
+    // matcher shouldn't burn a request on this season again.
+    sqlx::query("INSERT OR IGNORE INTO tmdb_season_fetch (season_id, pass) VALUES (?, 'episodes')")
+        .bind(season_id)
+        .execute(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(applied_count)
 }

@@ -738,6 +738,22 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .execute(&pool)
     .await?;
 
+    // ── TMDB fetch stamps per season ──────────────────────────────────
+    // Which TMDB passes have run for a season ('season' metadata pass,
+    // 'episodes' pass). The bulk-match dialog counts only unstamped work —
+    // without this, seasons TMDB has sparse data for (no overview, undated
+    // episodes) would show as pending and refetch on every run.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS tmdb_season_fetch (
+            season_id INTEGER NOT NULL,
+            pass TEXT NOT NULL,
+            PRIMARY KEY (season_id, pass),
+            FOREIGN KEY (season_id) REFERENCES season(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     // ── Selected backdrop per entry ───────────────────────────────────
     // Separate table (not a column on movie/show) so it needs no ALTER
     // migrations and covers any entry type that grows a backdrop later.

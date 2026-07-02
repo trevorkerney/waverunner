@@ -273,14 +273,14 @@ export function TmdbBulkMatchDialog({
         setRtEnabled(settings["rt_scraper_enabled"] === "true");
         // Empty passes start unchecked instead of greyed-out-but-checked.
         const willDoShows = t.shows.some((s) => !s.tmdb_id);
-        const anyEligibleSeasons = t.seasons.some((se) => {
-          const show = t.shows.find((s) => s.id === se.show_id);
+        const showMatchable = (showId: number) => {
+          const show = t.shows.find((s) => s.id === showId);
           return show != null && (show.tmdb_id != null || willDoShows);
-        });
+        };
         setDoMovies(t.movies.length > 0);
         setDoShows(willDoShows);
-        setDoSeasons(anyEligibleSeasons);
-        setDoEpisodes(anyEligibleSeasons);
+        setDoSeasons(t.seasons.some((se) => !se.season_done && showMatchable(se.show_id)));
+        setDoEpisodes(t.seasons.some((se) => !se.episodes_done && showMatchable(se.show_id)));
         setPhase("configure");
       } catch (e) {
         toast.error(String(e));
@@ -316,12 +316,33 @@ export function TmdbBulkMatchDialog({
     return targets.webisodes.filter((w) => matchable.has(w.show_id));
   }, [targets, doShows]);
 
+  // Each pass only targets seasons it hasn't run for yet — a fully matched
+  // library counts (and fetches) zero here.
+  const seasonsNeeding = useMemo(
+    () => eligibleSeasons.filter((se) => !se.season_done),
+    [eligibleSeasons],
+  );
+  const episodeSeasonsNeeding = useMemo(
+    () => eligibleSeasons.filter((se) => !se.episodes_done),
+    [eligibleSeasons],
+  );
+
   // Display counts stay stable regardless of the shows checkbox (the rows grey
-  // out instead of dropping to 0); the run and the total estimate use
-  // eligibleSeasons, which reflects what can actually be processed.
-  const allSeasonsCount = targets?.seasons.length ?? 0;
+  // out instead of dropping to 0); the run and the total estimate use the
+  // needing lists, which reflect what can actually be processed.
+  const allSeasonsCount = useMemo(
+    () => targets?.seasons.filter((se) => !se.season_done).length ?? 0,
+    [targets],
+  );
+  const episodeFetchCount = useMemo(
+    () => targets?.seasons.filter((se) => !se.episodes_done).length ?? 0,
+    [targets],
+  );
   const allEpisodesCount = useMemo(
-    () => targets?.seasons.reduce((sum, se) => sum + se.episode_count, 0) ?? 0,
+    () =>
+      targets?.seasons
+        .filter((se) => !se.episodes_done)
+        .reduce((sum, se) => sum + se.episode_count, 0) ?? 0,
     [targets],
   );
   const allWebisodesCount = useMemo(
@@ -336,19 +357,20 @@ export function TmdbBulkMatchDialog({
     let hits = 0;
     if (doMovies) hits += targets.movies.length * 2;
     if (doShows) hits += unmatchedShows.length * 2;
-    if (doSeasons) hits += eligibleSeasons.length;
-    if (doEpisodes) hits += eligibleSeasons.length;
+    if (doSeasons) hits += seasonsNeeding.length;
+    if (doEpisodes) hits += episodeSeasonsNeeding.length;
     if (doWebisodes) hits += eligibleWebisodeShows.length;
     // OMDB once per title; the RT scrape adds up to 2 page requests per title.
     if (doRatings) hits += (targets.all_movies.length + targets.all_shows.length) * (rtEnabled ? 3 : 1);
     return hits;
-  }, [targets, doMovies, doShows, doSeasons, doEpisodes, doWebisodes, doRatings, rtEnabled, unmatchedShows, eligibleSeasons, eligibleWebisodeShows]);
+  }, [targets, doMovies, doShows, doSeasons, doEpisodes, doWebisodes, doRatings, rtEnabled, unmatchedShows, seasonsNeeding, episodeSeasonsNeeding, eligibleWebisodeShows]);
 
   const nothingSelected =
     !targets ||
     ((doMovies ? targets.movies.length : 0) +
       (doShows ? unmatchedShows.length : 0) +
-      ((doSeasons || doEpisodes) ? eligibleSeasons.length : 0) +
+      (doSeasons ? seasonsNeeding.length : 0) +
+      (doEpisodes ? episodeSeasonsNeeding.length : 0) +
       (doWebisodes ? eligibleWebisodeShows.length : 0) +
       (doRatings ? targets.all_movies.length + targets.all_shows.length : 0)) === 0;
 
@@ -374,8 +396,8 @@ export function TmdbBulkMatchDialog({
     const totalSteps =
       (doMovies ? targets.movies.length : 0) +
       (doShows ? unmatchedShows.length : 0) +
-      (doSeasons ? eligibleSeasons.length : 0) +
-      (doEpisodes ? eligibleSeasons.length : 0) +
+      (doSeasons ? seasonsNeeding.length : 0) +
+      (doEpisodes ? episodeSeasonsNeeding.length : 0) +
       (doWebisodes ? eligibleWebisodeShows.length : 0) +
       (doRatings ? targets.all_movies.length + targets.all_shows.length : 0);
     let step = 0;
@@ -449,7 +471,7 @@ export function TmdbBulkMatchDialog({
       const skippedSeasonIds = new Set<number>();
 
       if (doSeasons && !cancelRef.current) {
-        for (const se of eligibleSeasons) {
+        for (const se of seasonsNeeding) {
           if (cancelRef.current) break;
           const title = showTitle.get(se.show_id);
           tick(title ? `Season ${se.season_number} - ${title}` : `Season ${se.season_number}`);
@@ -475,7 +497,7 @@ export function TmdbBulkMatchDialog({
       }
 
       if (doEpisodes && !cancelRef.current) {
-        for (const se of eligibleSeasons) {
+        for (const se of episodeSeasonsNeeding) {
           if (cancelRef.current) break;
           const title = showTitle.get(se.show_id);
           tick(title ? `Season ${se.season_number} episodes - ${title}` : `Season ${se.season_number} episodes`);
@@ -565,7 +587,7 @@ export function TmdbBulkMatchDialog({
       setPhase("done");
       onApplied();
     }
-  }, [targets, libraryId, doMovies, doShows, doSeasons, doEpisodes, doWebisodes, doRatings, unmatchedShows, eligibleSeasons, eligibleWebisodeShows, onApplied]);
+  }, [targets, libraryId, doMovies, doShows, doSeasons, doEpisodes, doWebisodes, doRatings, unmatchedShows, seasonsNeeding, episodeSeasonsNeeding, eligibleWebisodeShows, onApplied]);
 
   // After a show is confirmed through the manual review dialog, fetch its
   // seasons/episodes (per the run's checkboxes) — the bulk run deliberately
@@ -578,12 +600,16 @@ export function TmdbBulkMatchDialog({
         const show = t.shows.find((s) => s.id === showId);
         const tmdbId = show?.tmdb_id ? Number(show.tmdb_id) : null;
         if (!tmdbId) return;
-        const seasons = t.seasons.filter((se) => se.show_id === showId);
+        // Only passes that haven't run for a season — a confirmed rematch clears
+        // the stamps backend-side, so this still refetches everything for it.
+        const seasons = t.seasons.filter(
+          (se) => se.show_id === showId && (!se.season_done || !se.episodes_done),
+        );
         if (seasons.length === 0) return;
         const toastId = toast.loading(`${title}: fetching ${seasons.length} season${seasons.length === 1 ? "" : "s"}…`);
         let failed = 0;
         for (const se of seasons) {
-          if (doSeasons) {
+          if (doSeasons && !se.season_done) {
             try {
               const detail = await invoke<TmdbSeasonDetail>("get_tmdb_season_detail", {
                 tmdbId,
@@ -594,7 +620,7 @@ export function TmdbBulkMatchDialog({
               failed++;
             }
           }
-          if (doEpisodes) {
+          if (doEpisodes && !se.episodes_done) {
             try {
               await invoke("apply_tmdb_season_episodes", {
                 seasonId: se.id,
@@ -701,8 +727,8 @@ export function TmdbBulkMatchDialog({
                   setDoWebisodes(false);
                 }
               }, `unmatched · ${unmatchedShows.length * 2} requests`)}
-              {checkboxRow("Seasons", allSeasonsCount, doSeasons, setDoSeasons, `unmatched · ${allSeasonsCount} requests`, eligibleSeasons.length === 0)}
-              {checkboxRow("Episodes", allEpisodesCount, doEpisodes, setDoEpisodes, `· ${allSeasonsCount} season fetches · ${allSeasonsCount} requests`, eligibleSeasons.length === 0)}
+              {checkboxRow("Seasons", allSeasonsCount, doSeasons, setDoSeasons, `to fetch · ${allSeasonsCount} requests`, seasonsNeeding.length === 0)}
+              {checkboxRow("Episodes", allEpisodesCount, doEpisodes, setDoEpisodes, `· ${episodeFetchCount} season fetches · ${episodeFetchCount} requests`, episodeSeasonsNeeding.length === 0)}
               {omdbEnabled &&
                 checkboxRow(
                   "Ratings",
