@@ -61,9 +61,9 @@ export function BackdropSelectDialog({
         )}
         {!loading && backdrops.length === 0 && (
           <p className="py-6 text-sm text-muted-foreground">
-            No backdrops yet. Right-click the cover and use "Browse TMDB images"
-            to download some, or drop images into a "backdrops" folder inside
-            the media folder and rescan.
+            No backdrops yet. Use "Add cover/backdrop from TMDB" to download
+            some, or drop images into a "backdrops" folder inside the media
+            folder and rescan.
           </p>
         )}
         {!loading && backdrops.length > 0 && (

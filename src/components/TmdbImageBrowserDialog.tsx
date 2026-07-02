@@ -33,6 +33,9 @@ interface TmdbImageBrowserDialogProps {
   /** Which TMDB endpoint the id belongs to — movie and TV ids overlap. */
   mediaType: "movie" | "tv";
   onDownloaded: () => void;
+  /** Tab the dialog opens on — "Add cover" entry points want posters,
+   *  "Add backdrop" wants backdrops. Defaults to posters. */
+  initialTab?: "posters" | "backdrops";
 }
 
 interface ImageSelection {
@@ -50,6 +53,7 @@ export function TmdbImageBrowserDialog({
   tmdbId,
   mediaType,
   onDownloaded,
+  initialTab = "posters",
 }: TmdbImageBrowserDialogProps) {
   const [loading, setLoading] = useState(false);
   const [downloading, setDownloading] = useState(false);
@@ -62,7 +66,7 @@ export function TmdbImageBrowserDialog({
   useEffect(() => {
     if (!open) return;
     setLoading(true);
-    setTab("posters");
+    setTab(initialTab);
     setPosterSelections({});
     setBackdropSelections({});
 
@@ -91,7 +95,7 @@ export function TmdbImageBrowserDialog({
       })
       .catch((e) => toast.error(String(e)))
       .finally(() => setLoading(false));
-  }, [open, tmdbId, mediaType]);
+  }, [open, tmdbId, mediaType, initialTab]);
 
   const togglePoster = (idx: number, checked: boolean) => {
     setPosterSelections((prev) => ({

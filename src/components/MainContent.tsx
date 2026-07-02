@@ -2185,8 +2185,10 @@ function EntryDetailPage({
   const [draft, setDraft] = useState<MovieDetailUpdate>({});
   const [saving, setSaving] = useState(false);
   const [tmdbDialogOpen, setTmdbDialogOpen] = useState(false);
-  const [tmdbImagesOpen, setTmdbImagesOpen] = useState(false);
-  const [backgroundDialogOpen, setBackgroundDialogOpen] = useState(false);
+  // Which tab the TMDB image browser opens on, or null when closed — the cover
+  // menu opens posters, the backdrop menu opens backdrops.
+  const [tmdbImagesTab, setTmdbImagesTab] = useState<"posters" | "backdrops" | null>(null);
+  const [backdropDialogOpen, setBackdropDialogOpen] = useState(false);
   const [extrasOpen, setExtrasOpen] = useState(false);
   const [extrasCount, setExtrasCount] = useState(0);
   const [ratings, setRatings] = useState<RatingInfo[]>([]);
@@ -2349,7 +2351,7 @@ function EntryDetailPage({
               <ImageIcon size={14} />
               Add local cover
             </ContextMenuItem>
-            <ContextMenuItem onClick={() => setTmdbImagesOpen(true)} disabled={!detail?.tmdb_id}>
+            <ContextMenuItem onClick={() => setTmdbImagesTab("posters")} disabled={!detail?.tmdb_id}>
               <ImageIcon size={14} />
               Add cover from TMDB
             </ContextMenuItem>
@@ -2531,9 +2533,13 @@ function EntryDetailPage({
             <Pencil size={14} />
             Edit
           </ContextMenuItem>
-          <ContextMenuItem onClick={() => setBackgroundDialogOpen(true)}>
+          <ContextMenuItem onClick={() => setTmdbImagesTab("backdrops")} disabled={!detail?.tmdb_id}>
             <ImageIcon size={14} />
-            Change background
+            Add cover/backdrop from TMDB
+          </ContextMenuItem>
+          <ContextMenuItem onClick={() => setBackdropDialogOpen(true)}>
+            <ImageIcon size={14} />
+            Change backdrop
           </ContextMenuItem>
           {omdbEnabled && (
             <ContextMenuItem onClick={fetchRatings}>
@@ -2590,8 +2596,9 @@ function EntryDetailPage({
       />
       {detail?.tmdb_id && (
         <TmdbImageBrowserDialog
-          open={tmdbImagesOpen}
-          onOpenChange={setTmdbImagesOpen}
+          open={tmdbImagesTab !== null}
+          onOpenChange={(open) => { if (!open) setTmdbImagesTab(null); }}
+          initialTab={tmdbImagesTab ?? "posters"}
           libraryId={selectedLibrary.id}
           entryId={entry.id}
           tmdbId={detail.tmdb_id}
@@ -2600,8 +2607,8 @@ function EntryDetailPage({
         />
       )}
       <BackdropSelectDialog
-        open={backgroundDialogOpen}
-        onOpenChange={setBackgroundDialogOpen}
+        open={backdropDialogOpen}
+        onOpenChange={setBackdropDialogOpen}
         entryId={entry.id}
         current={detail?.backdrop ?? null}
         onChanged={loadDetail}
@@ -2643,8 +2650,10 @@ function ShowDetailPage({
   const [selectedSeasonId, setSelectedSeasonId] = useState<number | null>(null);
   const [episodes, setEpisodes] = useState<EpisodeInfo[]>([]);
   const [tmdbDialogOpen, setTmdbDialogOpen] = useState(false);
-  const [tmdbImagesOpen, setTmdbImagesOpen] = useState(false);
-  const [backgroundDialogOpen, setBackgroundDialogOpen] = useState(false);
+  // Which tab the TMDB image browser opens on, or null when closed — the cover
+  // menu opens posters, the backdrop menu opens backdrops.
+  const [tmdbImagesTab, setTmdbImagesTab] = useState<"posters" | "backdrops" | null>(null);
+  const [backdropDialogOpen, setBackdropDialogOpen] = useState(false);
   const [ratings, setRatings] = useState<RatingInfo[]>([]);
   const [omdbEnabled, setOmdbEnabled] = useState(false);
   const [extrasOpen, setExtrasOpen] = useState(false);
@@ -3092,7 +3101,7 @@ function ShowDetailPage({
               <ImageIcon size={14} />
               Add local cover
             </ContextMenuItem>
-            <ContextMenuItem onClick={() => setTmdbImagesOpen(true)} disabled={!detail?.tmdb_id}>
+            <ContextMenuItem onClick={() => setTmdbImagesTab("posters")} disabled={!detail?.tmdb_id}>
               <ImageIcon size={14} />
               Add cover from TMDB
             </ContextMenuItem>
@@ -3249,9 +3258,13 @@ function ShowDetailPage({
             <Pencil size={14} />
             Edit
           </ContextMenuItem>
-          <ContextMenuItem onClick={() => setBackgroundDialogOpen(true)}>
+          <ContextMenuItem onClick={() => setTmdbImagesTab("backdrops")} disabled={!detail?.tmdb_id}>
             <ImageIcon size={14} />
-            Change background
+            Add cover/backdrop from TMDB
+          </ContextMenuItem>
+          <ContextMenuItem onClick={() => setBackdropDialogOpen(true)}>
+            <ImageIcon size={14} />
+            Change backdrop
           </ContextMenuItem>
           {omdbEnabled && (
             <ContextMenuItem onClick={fetchRatings}>
@@ -3602,8 +3615,9 @@ function ShowDetailPage({
 
       {detail?.tmdb_id && (
         <TmdbImageBrowserDialog
-          open={tmdbImagesOpen}
-          onOpenChange={setTmdbImagesOpen}
+          open={tmdbImagesTab !== null}
+          onOpenChange={(open) => { if (!open) setTmdbImagesTab(null); }}
+          initialTab={tmdbImagesTab ?? "posters"}
           libraryId={selectedLibrary.id}
           entryId={entry.id}
           tmdbId={detail.tmdb_id}
@@ -3612,8 +3626,8 @@ function ShowDetailPage({
         />
       )}
       <BackdropSelectDialog
-        open={backgroundDialogOpen}
-        onOpenChange={setBackgroundDialogOpen}
+        open={backdropDialogOpen}
+        onOpenChange={setBackdropDialogOpen}
         entryId={entry.id}
         current={detail?.backdrop ?? null}
         onChanged={loadDetail}
