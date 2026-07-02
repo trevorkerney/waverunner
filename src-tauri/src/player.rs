@@ -92,6 +92,47 @@ pub fn init_player(window: tauri::WebviewWindow, state: State<'_, AppState>, tit
     Ok(())
 }
 
+#[derive(serde::Serialize)]
+pub struct PlayerStatus {
+    pub path: Option<String>,
+    pub paused: bool,
+    pub position: f64,
+    pub duration: f64,
+    pub volume: f64,
+    pub muted: bool,
+}
+
+/// Snapshot of the live mpv instance, or None when no player exists. Used to
+/// rehydrate the React player UI after a webview refresh (F5): mpv is native
+/// and keeps playing; the frontend state it was driven by is gone.
+#[tauri::command]
+pub async fn get_player_status(state: State<'_, AppState>) -> Result<Option<PlayerStatus>, String> {
+    let inner = {
+        let guard = state.player.lock().map_err(|e| e.to_string())?;
+        match guard.as_ref() {
+            Some(inner) => inner.clone(),
+            None => return Ok(None),
+        }
+    };
+    run_mpv(inner, |mpv| {
+        let num = |key: &str| {
+            mpv.get_property_string(key)
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.0)
+        };
+        let flag = |key: &str| mpv.get_property_string(key).map(|s| s == "yes").unwrap_or(false);
+        Ok(Some(PlayerStatus {
+            path: mpv.get_property_string("path"),
+            paused: flag("pause"),
+            position: num("time-pos"),
+            duration: num("duration"),
+            volume: num("volume"),
+            muted: flag("mute"),
+        }))
+    })
+    .await
+}
+
 #[tauri::command]
 pub fn destroy_player(state: State<'_, AppState>) -> Result<(), String> {
     let mut guard = state.player.lock().map_err(|e| e.to_string())?;

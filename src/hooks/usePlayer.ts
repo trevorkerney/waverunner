@@ -83,6 +83,32 @@ const initialState: PlayerState = {
   autoPlayNext: true,
 };
 
+// Rehydration snapshot for webview refreshes (F5): mpv is native and survives
+// the reload, but every bit of React state driving its UI is lost. The
+// snapshot carries what mpv can't tell us back (title, episode context, which
+// UI mode the player was in). sessionStorage persists across reloads of the
+// same window and dies with it — a stale entry is ignored unless the live
+// player's path matches.
+const PLAYER_SESSION_KEY = "player_session";
+
+interface PlayerSessionSnapshot {
+  path: string | null;
+  title: string;
+  context: PlayerContext;
+  isMinimized: boolean;
+  isFullscreen: boolean;
+  autoPlayNext: boolean;
+}
+
+interface PlayerStatus {
+  path: string | null;
+  paused: boolean;
+  position: number;
+  duration: number;
+  volume: number;
+  muted: boolean;
+}
+
 function episodeTitle(show: string, ep: EpisodeRef): string {
   const s = ep.seasonNumber;
   const e = ep.episodeNumber;
@@ -139,6 +165,73 @@ export function usePlayer(): [PlayerState, PlayerActions] {
         // ignore
       }
     })();
+  }, []);
+
+  // Keep the rehydration snapshot current while a player is open (see
+  // PLAYER_SESSION_KEY). context changes on every episode advance, so the
+  // stored path stays in step with what mpv is actually playing.
+  useEffect(() => {
+    if (!state.isActive) {
+      sessionStorage.removeItem(PLAYER_SESSION_KEY);
+      return;
+    }
+    const snapshot: PlayerSessionSnapshot = {
+      path: currentPathRef.current,
+      title: state.title,
+      context: state.context,
+      isMinimized: state.isMinimized,
+      isFullscreen: state.isFullscreen,
+      autoPlayNext: state.autoPlayNext,
+    };
+    try {
+      sessionStorage.setItem(PLAYER_SESSION_KEY, JSON.stringify(snapshot));
+    } catch {
+      // Storage unavailable — refresh restore just degrades to basics.
+    }
+  }, [state.isActive, state.title, state.context, state.isMinimized, state.isFullscreen, state.autoPlayNext]);
+
+  // Webview refresh recovery: if a live mpv instance exists on mount, the app
+  // was reloaded mid-playback — rebuild the player UI around it instead of
+  // orphaning it (video hidden behind the opaque webview, audio still going).
+  // mpv still holds its render region and margins from before the reload, and
+  // the snapshot restores the matching UI mode, so the two line up.
+  useEffect(() => {
+    (async () => {
+      try {
+        const status = await invoke<PlayerStatus | null>("get_player_status");
+        if (!status?.path) return;
+        let snap: PlayerSessionSnapshot | null = null;
+        try {
+          snap = JSON.parse(sessionStorage.getItem(PLAYER_SESSION_KEY) ?? "null");
+        } catch {
+          snap = null;
+        }
+        const matched = snap != null && snap.path === status.path;
+        const fallbackTitle = status.path.split(/[\\/]/).pop() ?? status.path;
+        currentPathRef.current = status.path;
+        if (status.volume > 0) lastNonZeroVolume.current = status.volume;
+        setPosition(status.position);
+        setState((prev) => ({
+          ...prev,
+          isActive: true,
+          isPlaying: !status.paused,
+          loading: false,
+          duration: status.duration,
+          volume: Math.round(status.volume),
+          muted: status.muted,
+          title: matched && snap ? snap.title : fallbackTitle,
+          context: matched && snap ? snap.context : { kind: "movie" },
+          isMinimized: matched && snap ? snap.isMinimized : true,
+          isFullscreen: matched && snap ? snap.isFullscreen : false,
+          autoPlayNext: matched && snap ? snap.autoPlayNext : prev.autoPlayNext,
+        }));
+        refreshTracksInternal();
+      } catch {
+        // No live player (normal launch) — nothing to restore.
+      }
+    })();
+    // Mount-only: this races nothing — play() can't have run yet.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const refreshTracksInternal = useCallback(async () => {

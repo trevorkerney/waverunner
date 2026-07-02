@@ -180,6 +180,7 @@ pub fn run() {
             commands::get_playlist_contents,
             player::init_player,
             player::set_player_region,
+            player::get_player_status,
             player::destroy_player,
             player::play_file,
             player::player_command,
