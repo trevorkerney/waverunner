@@ -127,8 +127,46 @@ pub struct PersonSummary {
     pub id: i64,
     pub name: String,
     pub image_path: Option<String>,
+    /// Distinct titles credited in the requested role — a movie, or a whole
+    /// show no matter how many episodes within it. Drives the "Most credited"
+    /// ranking.
     pub work_count: i64,
     pub favorite: bool,
+    /// D&C breakdown ("directed … · created …") — populated for the D&C page
+    /// and, when non-empty, the all-people page.
+    pub dc: Option<DirectorCreatorCounts>,
+    /// Acting film/show split ("in 23 movies & 4 shows") — Actors page and,
+    /// when non-empty, the all-people page.
+    pub acting: Option<TitleCounts>,
+    /// Composing film/show split ("scored 12 movies & 3 shows") — Composers
+    /// page and, when non-empty, the all-people page.
+    pub composing: Option<TitleCounts>,
+}
+
+/// Plain film/show split of a role's distinct titles. A show counts once no
+/// matter the credit's level (show, season, or episode) or how many
+/// characters/episodes were involved.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct TitleCounts {
+    pub films: i64,
+    pub shows: i64,
+}
+
+/// Buckets behind the D&C card subtitle ("directed 3 movies, 1 show & 9
+/// episodes across 8 shows · created 2 shows"). Disjoint by title: each title counts
+/// once, at the person's highest credit on it (created show > fully-directed
+/// show > episode scatter; films are their own bucket) — mirroring the
+/// precedence get_entries_for_person uses for per-work labels.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct DirectorCreatorCounts {
+    pub films: i64,
+    /// Shows where their episode credits cover every episode in the library.
+    pub shows: i64,
+    /// Episodes directed on shows below full coverage (and not created by them).
+    pub episodes: i64,
+    /// Distinct shows those scattered episodes span.
+    pub episode_shows: i64,
+    pub created: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -2457,11 +2495,14 @@ fn role_works_body(role: &str) -> Result<&'static str, String> {
         ),
         "composer" => Ok(
             "SELECT person_id, 'movie' AS kind, movie_id AS eid FROM movie_composer \
-             UNION SELECT person_id, 'show', show_id FROM show_composer"
+             UNION SELECT person_id, 'show', show_id FROM show_composer \
+             UNION SELECT ec.person_id, 'show', ss.show_id \
+                     FROM episode_composer ec \
+                     JOIN episode e ON ec.episode_id = e.id \
+                     JOIN season ss ON e.season_id = ss.id"
         ),
-        // Union of every role — used by the top-level "People" sidebar node, for
-        // person-detail pages (they show all works regardless of role), and for the
-        // total work count shown on the role-specific people pages.
+        // Union of every role — used by the top-level "People" sidebar node and
+        // for person-detail pages (they show all works regardless of role).
         "all" => Ok(
             "SELECT person_id, 'movie' AS kind, movie_id AS eid FROM movie_cast \
              UNION SELECT person_id, 'show', show_id FROM show_cast \
@@ -2478,7 +2519,11 @@ fn role_works_body(role: &str) -> Result<&'static str, String> {
                      JOIN episode e ON ed.episode_id = e.id \
                      JOIN season ss ON e.season_id = ss.id \
              UNION SELECT person_id, 'movie', movie_id FROM movie_composer \
-             UNION SELECT person_id, 'show', show_id FROM show_composer"
+             UNION SELECT person_id, 'show', show_id FROM show_composer \
+             UNION SELECT ec.person_id, 'show', ss.show_id \
+                     FROM episode_composer ec \
+                     JOIN episode e ON ec.episode_id = e.id \
+                     JOIN season ss ON e.season_id = ss.id"
         ),
         other => Err(format!("Invalid role: {}", other)),
     }
@@ -2695,45 +2740,181 @@ async fn get_library_meta(
     Ok((format, paths, sort_mode))
 }
 
+/// Per-person film/show split for one role, all people at once — the counting
+/// behind "in 23 movies & 4 shows" / "scored 12 movies & 3 shows" on the
+/// all-people page (the role pages get the same split from their main query).
+async fn title_counts_for_role(
+    db: &SqlitePool,
+    role: &str,
+) -> Result<std::collections::HashMap<i64, TitleCounts>, String> {
+    let body = role_works_body(role)?;
+    let query = format!(
+        "WITH role_works AS ( {body} ) \
+         SELECT person_id, \
+                SUM(CASE WHEN kind = 'movie' THEN 1 ELSE 0 END) AS films, \
+                SUM(CASE WHEN kind = 'show' THEN 1 ELSE 0 END) AS shows \
+         FROM role_works \
+         GROUP BY person_id"
+    );
+    let rows: Vec<(i64, i64, i64)> = sqlx::query_as(&query)
+        .fetch_all(db)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .map(|(pid, films, shows)| (pid, TitleCounts { films, shows }))
+        .collect())
+}
+
+/// Per-person D&C subtitle buckets, computed for all people in one pass.
+/// Each show lands in exactly one bucket at the person's highest credit:
+/// created > fully-directed (episode coverage = every episode of the show in
+/// the library, same derived semantics as get_entries_for_person's rollup) >
+/// scattered episodes. Directed films are their own bucket.
+async fn director_creator_counts(
+    db: &SqlitePool,
+) -> Result<std::collections::HashMap<i64, DirectorCreatorCounts>, String> {
+    let mut map: std::collections::HashMap<i64, DirectorCreatorCounts> =
+        std::collections::HashMap::new();
+
+    let films: Vec<(i64, i64)> = sqlx::query_as(
+        "SELECT person_id, COUNT(DISTINCT movie_id) FROM movie_director GROUP BY person_id",
+    )
+    .fetch_all(db)
+    .await
+    .map_err(|e| e.to_string())?;
+    for (pid, n) in films {
+        map.entry(pid).or_default().films = n;
+    }
+
+    let created: Vec<(i64, i64)> = sqlx::query_as(
+        "SELECT person_id, COUNT(DISTINCT show_id) FROM show_creator GROUP BY person_id",
+    )
+    .fetch_all(db)
+    .await
+    .map_err(|e| e.to_string())?;
+    for (pid, n) in created {
+        map.entry(pid).or_default().created = n;
+    }
+
+    // Creator absorbs same-show episode directing (matches the detail page,
+    // where the "creator" label suppresses the lower directing credit).
+    let created_pairs: std::collections::HashSet<(i64, i64)> =
+        sqlx::query_as::<_, (i64, i64)>("SELECT DISTINCT person_id, show_id FROM show_creator")
+            .fetch_all(db)
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .collect();
+
+    // Per (person, show): episodes they directed vs the show's total episodes.
+    let coverage: Vec<(i64, i64, i64, i64)> = sqlx::query_as(
+        "SELECT ed.person_id, s.show_id, COUNT(*) AS directed, \
+                (SELECT COUNT(*) FROM episode e2 JOIN season s2 ON e2.season_id = s2.id \
+                  WHERE s2.show_id = s.show_id) AS total \
+         FROM episode_director ed \
+         JOIN episode e ON ed.episode_id = e.id \
+         JOIN season s ON e.season_id = s.id \
+         GROUP BY ed.person_id, s.show_id",
+    )
+    .fetch_all(db)
+    .await
+    .map_err(|e| e.to_string())?;
+    for (pid, show_id, directed, total) in coverage {
+        if created_pairs.contains(&(pid, show_id)) {
+            continue;
+        }
+        let e = map.entry(pid).or_default();
+        if total > 0 && directed >= total {
+            e.shows += 1;
+        } else {
+            e.episodes += directed;
+            e.episode_shows += 1;
+        }
+    }
+
+    Ok(map)
+}
+
 #[tauri::command]
 pub async fn get_people_in_library(
     state: tauri::State<'_, AppState>,
     library_id: String,
     role: String,
 ) -> Result<Vec<PersonSummary>, String> {
-    // Filter to people who have a credit in this role, but count their TOTAL works
-    // across every role — so e.g. an actor who directed one episode still shows on
-    // the Directors page with his full career count, not just "1".
-    let filter_body = role_works_body(&role)?;
-    let all_body = role_works_body("all")?;
+    let cte = role_works_cte(&role)?;
     let (format, _paths, _default_sort_mode) = get_library_meta(&state.app_db, &library_id).await?;
     if format != "video" {
         return Err("People browsing is only supported for video libraries".to_string());
     }
 
+    // work_count is role-specific: distinct titles credited in THIS role. The
+    // role pages don't all show it directly (their cards may render a richer
+    // breakdown), but it still drives "Most credited" ranking and search
+    // ordering everywhere. film_count carves out the movie share of it.
     let query = format!(
-        "WITH filter_works AS ( {filter_body} ), all_works AS ( {all_body} ) \
-         SELECT p.id, p.name, p.image_path, \
-                (SELECT COUNT(*) FROM all_works aw WHERE aw.person_id = p.id) AS work_count, \
+        "{cte} \
+         SELECT p.id, p.name, p.image_path, COUNT(*) AS work_count, \
+                SUM(CASE WHEN rw.kind = 'movie' THEN 1 ELSE 0 END) AS film_count, \
                 EXISTS(SELECT 1 FROM favorite_person fp WHERE fp.person_id = p.id) AS favorite \
          FROM person p \
-         WHERE EXISTS (SELECT 1 FROM filter_works fw WHERE fw.person_id = p.id) \
+         JOIN role_works rw ON rw.person_id = p.id \
+         GROUP BY p.id \
          ORDER BY p.name COLLATE NOCASE ASC"
     );
 
-    let rows: Vec<(i64, String, Option<String>, i64, i64)> = sqlx::query_as(&query)
+    let rows: Vec<(i64, String, Option<String>, i64, i64, i64)> = sqlx::query_as(&query)
         .fetch_all(&state.app_db)
         .await
         .map_err(|e| e.to_string())?;
 
+    // The all-people page combines every role's breakdown in one subtitle
+    // ("in … · directed … · created … · scored …"), so it needs all three
+    // maps; role pages need at most the D&C one (actor/composer splits fall
+    // out of film_count above).
+    let mut dc_map = if role == "director_creator" || role == "all" {
+        Some(director_creator_counts(&state.app_db).await?)
+    } else {
+        None
+    };
+    let mut acting_map = if role == "all" {
+        Some(title_counts_for_role(&state.app_db, "actor").await?)
+    } else {
+        None
+    };
+    let mut composing_map = if role == "all" {
+        Some(title_counts_for_role(&state.app_db, "composer").await?)
+    } else {
+        None
+    };
+
     Ok(rows
         .into_iter()
-        .map(|(id, name, image_path, work_count, favorite)| PersonSummary {
+        .map(|(id, name, image_path, work_count, film_count, favorite)| PersonSummary {
             id,
             name,
             image_path,
             work_count,
             favorite: favorite != 0,
+            // On the D&C page every person has D&C credits, so default the
+            // missing-entry case; on "all" a person may have none — leave None.
+            dc: match role.as_str() {
+                "director_creator" => {
+                    Some(dc_map.as_mut().and_then(|m| m.remove(&id)).unwrap_or_default())
+                }
+                "all" => dc_map.as_mut().and_then(|m| m.remove(&id)),
+                _ => None,
+            },
+            acting: match role.as_str() {
+                "actor" => Some(TitleCounts { films: film_count, shows: work_count - film_count }),
+                "all" => acting_map.as_mut().and_then(|m| m.remove(&id)),
+                _ => None,
+            },
+            composing: match role.as_str() {
+                "composer" => Some(TitleCounts { films: film_count, shows: work_count - film_count }),
+                "all" => composing_map.as_mut().and_then(|m| m.remove(&id)),
+                _ => None,
+            },
         })
         .collect())
 }
@@ -2866,7 +3047,7 @@ pub async fn search_people_by_character(
     let mut people: std::collections::HashMap<i64, PersonSummary> = prows
         .into_iter()
         .map(|(id, name, image_path, work_count, favorite)| {
-            (id, PersonSummary { id, name, image_path, work_count, favorite: favorite != 0 })
+            (id, PersonSummary { id, name, image_path, work_count, favorite: favorite != 0, dc: None, acting: None, composing: None })
         })
         .collect();
 

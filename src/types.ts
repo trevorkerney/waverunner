@@ -110,14 +110,43 @@ export interface LibraryCounts {
   composers: number;
 }
 
+// D&C-page subtitle buckets (get_people_in_library, role "director_creator").
+// Disjoint by title: each title counts once at the person's highest credit on
+// it — created show > fully-directed show > episode scatter; films separate.
+export interface DirectorCreatorCounts {
+  films: number;
+  /** Shows where their episode credits cover every episode in the library. */
+  shows: number;
+  /** Episodes directed on shows below full coverage (not created by them). */
+  episodes: number;
+  /** Distinct shows those scattered episodes span. */
+  episode_shows: number;
+  created: number;
+}
+
 // Returned by get_people_in_library.
 export interface PersonSummary {
   id: number;
   name: string;
   image_path: string | null;
+  /** Distinct titles credited in the requested role. Drives "Most credited" ranking. */
   work_count: number;
   /** Pinned to the top of alphabetical people views. */
   favorite: boolean;
+  /** D&C breakdown — D&C page, and the all-people page when non-empty. */
+  dc: DirectorCreatorCounts | null;
+  /** Acting split ("in 23 movies & 4 shows") — Actors page, and the all-people page when non-empty. */
+  acting: TitleCounts | null;
+  /** Composing split ("scored 12 movies & 3 shows") — Composers page, and the all-people page when non-empty. */
+  composing: TitleCounts | null;
+}
+
+// Plain film/show split of a role's distinct titles. A show counts once no
+// matter the credit's level (show, season, or episode) or how many
+// characters/episodes were involved.
+export interface TitleCounts {
+  films: number;
+  shows: number;
 }
 
 export interface PlaylistSummary {

@@ -16,20 +16,26 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { ScrubberRail } from "@/components/ScrubberRail";
 import { playDropIn } from "@/lib/dropIn";
-import type { CharacterMatch, PersonRole, PersonSummary } from "@/types";
+import type { CharacterMatch, DirectorCreatorCounts, PersonRole, PersonSummary, TitleCounts } from "@/types";
 
-// People pages hold thousands of entries, so the grid is virtualized: rows are
-// fixed-height and only the visible window (plus overscan) is mounted. The
-// default view is the Top 100 by credit count; "All" is alphabetical with
-// letter headers and an A–Z scrubber rail. Search always searches everyone.
+// People pages hold thousands of entries, so the grid is virtualized: row
+// heights are computed up front (each row sized to its tallest subtitle) and
+// only the visible window (plus overscan) is mounted. The default view ranks
+// everyone by credit count ("Most credited"); "A–Z" is alphabetical with
+// letter headers and a scrubber rail. Search always searches everyone.
 
-const TOP_N = 100;
-// Fixed cell geometry — virtualization needs constant row heights.
+// Display labels for the two modes. The persisted values stay "top" | "all"
+// (settings table, people_mode:*) — only the labels changed.
+const MODE_LABELS = { top: "Most credited", all: "A–Z" } as const;
+// Cell geometry — virtualization needs row heights known up front. Cards are a
+// fixed base (padding + face + 2-line name reserve) plus a measured number of
+// subtitle lines; each row is sized to its tallest subtitle so credit
+// breakdowns are never ellipsized.
 const CELL_MIN_W = 148;
-// Tall enough for a 2-line name plus a 2-line wrapped subtitle ("as X · Title").
-const CARD_H = 224;
+const CARD_BASE_H = 194;
+// One subtitle line: text-xs (12px) at leading-tight.
+const SUB_LINE_H = 15;
 const ROW_GAP = 8;
-const ROW_H = CARD_H + ROW_GAP;
 const HEADER_H = 48;
 const PAD_X = 16;
 const PAD_Y = 16;
@@ -40,11 +46,96 @@ const RAIL_W = 32;
 
 type Row =
   | { kind: "header"; letter: string }
-  | { kind: "people"; items: PersonSummary[] };
+  | { kind: "people"; items: PersonSummary[]; cardH: number };
 
 function letterFor(name: string): string {
   const c = name.trim().charAt(0).toUpperCase();
   return c >= "A" && c <= "Z" ? c : "#";
+}
+
+const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
+
+// "3 movies, 1 show & 9 episodes across 8 shows" — commas between units, "&" before the last.
+function joinUnits(units: string[]): string {
+  if (units.length <= 1) return units[0] ?? "";
+  return `${units.slice(0, -1).join(", ")} & ${units[units.length - 1]}`;
+}
+
+// D&C cards spell the credits out instead of "N works":
+// "directed 3 movies, 1 show & 9 episodes across 8 shows · created 2 shows".
+// Empty buckets are omitted; every real D&C person has at least one non-empty.
+function dcSubtitle(dc: DirectorCreatorCounts): string | null {
+  const directed: string[] = [];
+  if (dc.films > 0) directed.push(plural(dc.films, "movie", "movies"));
+  if (dc.shows > 0) directed.push(plural(dc.shows, "show", "shows"));
+  if (dc.episodes > 0) {
+    // "of 1 show", but "across N shows" — "across" implies spread.
+    const prep = dc.episode_shows === 1 ? "of" : "across";
+    directed.push(
+      `${plural(dc.episodes, "episode", "episodes")} ${prep} ${plural(dc.episode_shows, "show", "shows")}`,
+    );
+  }
+  const parts: string[] = [];
+  if (directed.length > 0) parts.push(`directed ${joinUnits(directed)}`);
+  if (dc.created > 0) parts.push(`created ${plural(dc.created, "show", "shows")}`);
+  return parts.length > 0 ? parts.join(" · ") : null;
+}
+
+// Actor cards: "in 23 movies & 4 shows"; composer cards: "scored 12 movies & 3 shows".
+function titleCountsSubtitle(tc: TitleCounts, verb: string): string | null {
+  const units: string[] = [];
+  if (tc.films > 0) units.push(plural(tc.films, "movie", "movies"));
+  if (tc.shows > 0) units.push(plural(tc.shows, "show", "shows"));
+  return units.length > 0 ? `${verb} ${joinUnits(units)}` : null;
+}
+
+// ── Subtitle measurement ────────────────────────────────────────────────────
+// Row heights must be known before render (the grid is virtualized), but
+// subtitles must never be ellipsized — so each subtitle's wrapped line count
+// is computed up front: word widths are measured once per string on a canvas
+// and greedy-wrapped arithmetically against the current cell width.
+let measureCtx: CanvasRenderingContext2D | null = null;
+let measureFont = "";
+let spaceW = 4;
+const wordWidthCache = new Map<string, number[]>();
+
+function ensureMeasureCtx(fontFamily: string) {
+  const font = `12px ${fontFamily}`; // subtitle is text-xs
+  if (!measureCtx) measureCtx = document.createElement("canvas").getContext("2d");
+  if (measureCtx && measureFont !== font) {
+    measureFont = font;
+    measureCtx.font = font;
+    wordWidthCache.clear();
+    spaceW = measureCtx.measureText(" ").width;
+  }
+}
+
+function subtitleLines(text: string, maxW: number): number {
+  if (maxW <= 0) return 1;
+  if (!measureCtx) return 2;
+  let widths = wordWidthCache.get(text);
+  if (!widths) {
+    widths = text.split(" ").map((w) => measureCtx!.measureText(w).width);
+    wordWidthCache.set(text, widths);
+  }
+  const max = maxW - 1; // wrap a hair early rather than ever clipping
+  let lines = 1;
+  let line = 0;
+  for (const w of widths) {
+    const cand = line === 0 ? w : line + spaceW + w;
+    if (cand <= max) {
+      line = cand;
+    } else if (w <= max) {
+      lines += 1;
+      line = w;
+    } else {
+      // A word wider than the cell hard-breaks mid-word (break-words).
+      if (line > 0) lines += 1;
+      lines += Math.ceil(w / max) - 1;
+      line = w % max || max;
+    }
+  }
+  return lines;
 }
 
 interface PeoplePageProps {
@@ -97,10 +188,22 @@ export function PeoplePage({ people, libraryId, role, initialMode, onModeChange,
   const [scrollTop, setScrollTop] = useState(0);
   const [viewport, setViewport] = useState({ width: 0, height: 0 });
 
+  // Re-measure subtitles once webfonts finish loading (metrics can shift).
+  const [fontsLoaded, setFontsLoaded] = useState(false);
+  useEffect(() => {
+    let mounted = true;
+    document.fonts?.ready.then(() => {
+      if (!mounted) return;
+      measureFont = ""; // drop widths measured against fallback fonts
+      setFontsLoaded(true);
+    });
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
   const searching = search.trim().length > 0;
-  // Small lists skip the Top-100 concept entirely — everything, alphabetical.
-  const hasTop = people.length > TOP_N;
-  const effectiveMode: "top" | "all" | "search" = searching ? "search" : hasTop ? mode : "all";
+  const effectiveMode: "top" | "all" | "search" = searching ? "search" : mode;
 
   const resetScroll = useCallback(() => {
     const el = scrollContainerRef.current;
@@ -108,13 +211,56 @@ export function PeoplePage({ people, libraryId, role, initialMode, onModeChange,
     setScrollTop(0);
   }, [scrollContainerRef]);
 
+  // Character-matched cards explain themselves: "as Walter White · Breaking Bad".
+  // (Computed before the row model — row heights depend on the text shown.)
+  const charSubtitles = useMemo(() => {
+    const map = new Map<number, string>();
+    for (const m of charMatches) {
+      let s = `as ${m.matched_role} · ${m.matched_title}`;
+      if (m.extra_matches > 0) s += ` (+${m.extra_matches} more)`;
+      if (!map.has(m.person.id)) map.set(m.person.id, s);
+    }
+    return map;
+  }, [charMatches]);
+
+  // Single source for a card's subtitle text — measurement (row heights) and
+  // render both go through this, so they can never disagree. Segments follow
+  // the sidebar's role order: acting · directing/creating · composing. On role
+  // pages only that role's segment is populated; the all-people page combines
+  // whichever a person has.
+  const subtitleTextFor = useCallback(
+    (p: PersonSummary): string => {
+      const charSub = effectiveMode === "search" ? charSubtitles.get(p.id) : undefined;
+      if (charSub) return charSub;
+      const parts = [
+        p.acting ? titleCountsSubtitle(p.acting, "in") : null,
+        p.dc ? dcSubtitle(p.dc) : null,
+        p.composing ? titleCountsSubtitle(p.composing, "scored") : null,
+      ].filter((s): s is string => s !== null);
+      if (parts.length > 0) return parts.join(" · ");
+      return p.work_count === 1 ? "1 work" : `${p.work_count} works`;
+    },
+    [effectiveMode, charSubtitles],
+  );
+
   // ── Row model ─────────────────────────────────────────────────────────────
   const { rows, letters, cols, padRight } = useMemo(() => {
     const padRight = PAD_X + (effectiveMode === "all" ? RAIL_W : 0);
     const cols = Math.max(1, Math.floor((viewport.width - PAD_X - padRight + GAP_X) / (CELL_MIN_W + GAP_X)));
+    // Subtitle width inside a card: the even column width minus the card's p-2.
+    const cellW = (viewport.width - PAD_X - padRight - (cols - 1) * GAP_X) / cols;
+    const subtitleW = cellW - 16;
+    ensureMeasureCtx(
+      scrollContainerRef.current ? getComputedStyle(scrollContainerRef.current).fontFamily : "sans-serif",
+    );
     const chunk = (list: PersonSummary[]): Row[] => {
       const out: Row[] = [];
-      for (let i = 0; i < list.length; i += cols) out.push({ kind: "people", items: list.slice(i, i + cols) });
+      for (let i = 0; i < list.length; i += cols) {
+        const items = list.slice(i, i + cols);
+        let lines = 1;
+        for (const p of items) lines = Math.max(lines, subtitleLines(subtitleTextFor(p), subtitleW));
+        out.push({ kind: "people", items, cardH: CARD_BASE_H + lines * SUB_LINE_H });
+      }
       return out;
     };
     const byCount = (a: PersonSummary, b: PersonSummary) =>
@@ -145,9 +291,21 @@ export function PeoplePage({ people, libraryId, role, initialMode, onModeChange,
       return { rows, letters: [] as string[], cols, padRight };
     }
 
+    // "top": everyone, ranked by credit count — no truncation. Favorites get a
+    // pinned ★ section first, ranked the same way (they still appear at their
+    // natural spot below, like A–Z keeps them under their letters); the main
+    // list then opens under its own header so the sections read as two.
     if (effectiveMode === "top") {
-      const top = [...people].sort(byCount).slice(0, TOP_N);
-      return { rows: chunk(top), letters: [] as string[], cols, padRight };
+      const ranked = [...people].sort(byCount);
+      const favorites = ranked.filter((p) => p.favorite);
+      const rows: Row[] = [];
+      if (favorites.length > 0) {
+        rows.push({ kind: "header", letter: "★" });
+        rows.push(...chunk(favorites));
+        rows.push({ kind: "header", letter: MODE_LABELS.top });
+      }
+      rows.push(...chunk(ranked));
+      return { rows, letters: [] as string[], cols, padRight };
     }
 
     // "All": alphabetical with letter sections. Grouped via map (not encounter
@@ -175,18 +333,7 @@ export function PeoplePage({ people, libraryId, role, initialMode, onModeChange,
       rows.push(...chunk(groups.get(l)!));
     }
     return { rows, letters, cols, padRight };
-  }, [people, search, effectiveMode, viewport.width, charMatches]);
-
-  // Character-matched cards explain themselves: "as Walter White · Breaking Bad".
-  const charSubtitles = useMemo(() => {
-    const map = new Map<number, string>();
-    for (const m of charMatches) {
-      let s = `as ${m.matched_role} · ${m.matched_title}`;
-      if (m.extra_matches > 0) s += ` (+${m.extra_matches} more)`;
-      if (!map.has(m.person.id)) map.set(m.person.id, s);
-    }
-    return map;
-  }, [charMatches]);
+  }, [people, search, effectiveMode, viewport.width, charMatches, subtitleTextFor, fontsLoaded, scrollContainerRef]);
 
   // Row offsets + per-letter jump targets.
   const { offsets, total, headerOffsets } = useMemo(() => {
@@ -196,7 +343,7 @@ export function PeoplePage({ people, libraryId, role, initialMode, onModeChange,
     rows.forEach((r, i) => {
       offsets[i] = y;
       if (r.kind === "header") headerOffsets[r.letter] = y;
-      y += r.kind === "header" ? HEADER_H : ROW_H;
+      y += r.kind === "header" ? HEADER_H : r.cardH + ROW_GAP;
     });
     return { offsets, total: y + PAD_Y, headerOffsets };
   }, [rows]);
@@ -261,11 +408,11 @@ export function PeoplePage({ people, libraryId, role, initialMode, onModeChange,
             className="h-8 pl-8 text-sm"
           />
         </div>
-        {hasTop && !searching && (
+        {!searching && (
           <DropdownMenu>
             <DropdownMenuTrigger className="flex h-8 items-center gap-1.5 rounded-md border border-input bg-background px-2.5 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground">
               <ListFilter size={12} />
-              {mode === "top" ? `Top ${TOP_N}` : "All"}
+              {MODE_LABELS[mode]}
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
               {(["top", "all"] as const).map((m) => (
@@ -277,7 +424,7 @@ export function PeoplePage({ people, libraryId, role, initialMode, onModeChange,
                     resetScroll();
                   }}
                 >
-                  {m === "top" ? `Top ${TOP_N}` : "All"}
+                  {MODE_LABELS[m]}
                 </DropdownMenuItem>
               ))}
             </DropdownMenuContent>
@@ -296,7 +443,7 @@ export function PeoplePage({ people, libraryId, role, initialMode, onModeChange,
           ) : (
             <div className="relative" style={{ height: total }}>
               {rows.map((row, i) => {
-                const h = row.kind === "header" ? HEADER_H : ROW_H;
+                const h = row.kind === "header" ? HEADER_H : row.cardH + ROW_GAP;
                 const y = offsets[i];
                 if (y + h < scrollTop - OVERSCAN_PX || y > scrollTop + viewport.height + OVERSCAN_PX) {
                   return null;
@@ -329,7 +476,7 @@ export function PeoplePage({ people, libraryId, role, initialMode, onModeChange,
                     className="absolute inset-x-0 grid"
                     style={{
                       top: y,
-                      height: CARD_H,
+                      height: row.cardH,
                       paddingLeft: PAD_X,
                       paddingRight: padRight,
                       gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))`,
@@ -340,7 +487,8 @@ export function PeoplePage({ people, libraryId, role, initialMode, onModeChange,
                       <PersonCard
                         key={p.id}
                         person={p}
-                        subtitle={effectiveMode === "search" ? charSubtitles.get(p.id) : undefined}
+                        height={row.cardH}
+                        subtitle={subtitleTextFor(p)}
                         onClick={() => onSelectPerson(p)}
                         onToggleFavorite={() => onToggleFavorite(p)}
                       />
@@ -360,15 +508,18 @@ export function PeoplePage({ people, libraryId, role, initialMode, onModeChange,
 
 function PersonCard({
   person,
+  height,
   onClick,
   onToggleFavorite,
   subtitle,
 }: {
   person: PersonSummary;
+  /** Row-uniform card height, sized upstream to fit the tallest subtitle. */
+  height: number;
   onClick: () => void;
   onToggleFavorite: () => void;
-  /** Replaces the work-count line (character-search context, "as X · Title"). */
-  subtitle?: string;
+  /** Computed by PeoplePage's subtitleTextFor — the same text row heights were measured against. */
+  subtitle: string;
 }) {
   const imageSrc = person.image_path ? convertFileSrc(person.image_path) : null;
   return (
@@ -378,7 +529,7 @@ function PersonCard({
           <button
             onClick={onClick}
             data-person-card=""
-            style={{ height: CARD_H }}
+            style={{ height }}
             className="group flex flex-col items-center gap-2 overflow-hidden rounded-md p-2 text-center transition-colors hover:bg-accent/40 focus:bg-accent/60 focus:outline-none"
           />
         }
@@ -402,8 +553,8 @@ function PersonCard({
             {person.favorite && <Star size={11} className="mb-0.5 mr-1 inline fill-primary text-primary" />}
             {person.name}
           </span>
-          <span className="w-full break-words text-xs leading-tight text-muted-foreground line-clamp-2" title={subtitle}>
-            {subtitle ?? (person.work_count === 1 ? "1 work" : `${person.work_count} works`)}
+          <span className="w-full break-words text-xs leading-tight text-muted-foreground" title={subtitle}>
+            {subtitle}
           </span>
         </div>
       </ContextMenuTrigger>

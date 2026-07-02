@@ -520,8 +520,8 @@ function App() {
             libraryId: view.libraryId,
             role,
           });
-          // Only the default Top-100 view is decode-gated; the virtualized
-          // "All" view lazy-loads faces as they scroll into view.
+          // Decode-gate only the first screenfuls of the default "Most credited"
+          // ranking; everything below (and the A–Z view) lazy-loads on scroll.
           const topFaces = [...res]
             .sort((a, b) => b.work_count - a.work_count)
             .slice(0, 100)
