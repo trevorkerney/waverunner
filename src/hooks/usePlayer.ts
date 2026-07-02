@@ -4,6 +4,7 @@ import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { PlayerTrack, PlayerContext, EpisodeRef, ShowEpisodeFlat } from "../types";
 import { TITLEBAR_HEIGHT } from "../components/Titlebar";
+import { applySubtitleStyleToPlayer } from "../lib/subtitleStyle";
 
 export interface PlayerState {
   isActive: boolean;
@@ -276,16 +277,18 @@ export function usePlayer(): [PlayerState, PlayerActions] {
     };
   }, [state.isActive, refreshTracksInternal, handleNaturalEnd, setPosition]);
 
-  // Apply the user's configured default volume (settings, default 50%) at the start of a
-  // freshly-opened video. Not used for in-player next/prev/auto-next, so a binge keeps
-  // whatever volume you set.
-  const applyStartupVolume = useCallback(async () => {
+  // Apply the user's configured default volume (settings, default 50%) and subtitle
+  // styling at the start of a freshly-opened video. Not used for in-player
+  // next/prev/auto-next, so a binge keeps whatever volume you set (subtitle styling
+  // persists on the mpv instance anyway).
+  const applyStartupSettings = useCallback(async () => {
     try {
       const settings = await invoke<Record<string, string>>("get_settings");
       const raw = parseInt(settings["default_volume"] ?? "", 10);
       const vol = Number.isNaN(raw) ? 50 : Math.max(0, Math.min(100, raw));
       await invoke("set_player_property", { name: "volume", value: vol.toString() });
       setState((prev) => ({ ...prev, volume: vol, muted: false }));
+      await applySubtitleStyleToPlayer(settings);
     } catch {
       // Player not ready or settings unreadable — leave volume as-is.
     }
@@ -308,12 +311,12 @@ export function usePlayer(): [PlayerState, PlayerActions] {
         await invoke("init_player", { titlebarHeight: TITLEBAR_HEIGHT });
       }
       await invoke("play_file", { path });
-      await applyStartupVolume();
+      await applyStartupSettings();
     } catch (e) {
       setState((prev) => ({ ...prev, loading: false, isActive: wasActive, isPlaying: false }));
       throw e;
     }
-  }, [applyStartupVolume, setPosition]);
+  }, [applyStartupSettings, setPosition]);
 
   const playEpisode = useCallback(async (args: PlayEpisodeArgs) => {
     const { libraryId, showId, showTitle, startEpisodeId } = args;
@@ -357,12 +360,12 @@ export function usePlayer(): [PlayerState, PlayerActions] {
         await invoke("init_player", { titlebarHeight: TITLEBAR_HEIGHT });
       }
       await invoke("play_file", { path });
-      await applyStartupVolume();
+      await applyStartupSettings();
     } catch (e) {
       setState((prev) => ({ ...prev, loading: false, isActive: wasActive }));
       throw e;
     }
-  }, [applyStartupVolume, setPosition]);
+  }, [applyStartupSettings, setPosition]);
 
   const playNextEpisode = useCallback(async () => {
     const ctx = stateRef.current.context;

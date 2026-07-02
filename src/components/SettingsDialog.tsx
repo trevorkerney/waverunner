@@ -12,7 +12,13 @@ import { Spinner } from "@/components/ui/spinner";
 import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
 import { Slider } from "@/components/ui/slider";
-import { Settings, Download, Eye, EyeOff } from "lucide-react";
+import { Settings, Download, Eye, EyeOff, MonitorPlay } from "lucide-react";
+import {
+  SUBTITLE_DEFAULTS,
+  applySubtitleStyleToPlayer,
+  subtitleSetting,
+  type SubtitleSettingKey,
+} from "@/lib/subtitleStyle";
 
 interface SettingsDialogProps {
   open: boolean;
@@ -23,6 +29,7 @@ type SettingsMap = Record<string, string>;
 
 const categories = [
   { id: "general", label: "General", icon: Settings },
+  { id: "player", label: "Player", icon: MonitorPlay },
 ] as const;
 
 export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
@@ -81,6 +88,27 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
     const n = raw == null ? NaN : parseInt(raw, 10);
     return Number.isNaN(n) ? 50 : Math.max(0, Math.min(100, n));
   })();
+
+  // Subtitle styling: persist + live-apply to an active player in one step
+  // (applySubtitleStyleToPlayer ignores the rejection when no player is open).
+  const setSubtitleSetting = useCallback(
+    (key: SubtitleSettingKey, value: string) => {
+      void setSetting(key, value);
+      void applySubtitleStyleToPlayer({ ...settings, [key]: value });
+    },
+    [setSetting, settings],
+  );
+
+  const resetSubtitleStyle = useCallback(() => {
+    for (const [k, v] of Object.entries(SUBTITLE_DEFAULTS)) void setSetting(k, v);
+    void applySubtitleStyleToPlayer({ ...settings, ...SUBTITLE_DEFAULTS });
+  }, [setSetting, settings]);
+
+  const sub = (k: SubtitleSettingKey) => subtitleSetting(settings, k);
+  const subNum = (k: SubtitleSettingKey, fallback: number) => {
+    const n = parseFloat(sub(k));
+    return Number.isNaN(n) ? fallback : n;
+  };
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -192,30 +220,6 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                 </div>
               </div>
               <div>
-                <h3 className="mb-4 text-sm font-semibold">Playback</h3>
-                <div className="flex items-center justify-between gap-4">
-                  <div>
-                    <p className="text-sm">Default volume</p>
-                    <p className="text-xs text-muted-foreground">
-                      Volume new videos start at. Adjustments during playback carry across episodes.
-                    </p>
-                  </div>
-                  <div className="flex w-44 shrink-0 items-center gap-3">
-                    <Slider
-                      value={[defaultVolume]}
-                      onValueChange={(v) => setSetting("default_volume", String(Array.isArray(v) ? v[0] : v))}
-                      min={0}
-                      max={100}
-                      step={5}
-                      className="flex-1"
-                    />
-                    <span className="w-9 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
-                      {defaultVolume}%
-                    </span>
-                  </div>
-                </div>
-              </div>
-              <div>
                 <h3 className="mb-4 text-sm font-semibold">TMDB</h3>
                 <div className="flex flex-col gap-4">
                   <div>
@@ -314,6 +318,180 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                     checked={settings["save_artwork_to_source"] !== "false"}
                     onCheckedChange={(v) => setSetting("save_artwork_to_source", v ? "true" : "false")}
                   />
+                </div>
+              </div>
+            </div>
+          )}
+          {activeCategory === "player" && (
+            <div className="flex flex-col gap-6">
+              <div>
+                <h3 className="mb-4 text-sm font-semibold">Playback</h3>
+                <div className="flex items-center justify-between gap-4">
+                  <div>
+                    <p className="text-sm">Default volume</p>
+                    <p className="text-xs text-muted-foreground">
+                      Volume new videos start at. Adjustments during playback carry across episodes.
+                    </p>
+                  </div>
+                  <div className="flex w-44 shrink-0 items-center gap-3">
+                    <Slider
+                      value={[defaultVolume]}
+                      onValueChange={(v) => setSetting("default_volume", String(Array.isArray(v) ? v[0] : v))}
+                      min={0}
+                      max={100}
+                      step={5}
+                      className="flex-1"
+                    />
+                    <span className="w-9 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
+                      {defaultVolume}%
+                    </span>
+                  </div>
+                </div>
+              </div>
+              <div>
+                <div className="mb-4 flex items-center justify-between">
+                  <div>
+                    <h3 className="text-sm font-semibold">Subtitles</h3>
+                    <p className="text-xs text-muted-foreground">
+                      Changes apply live to a playing video.
+                    </p>
+                  </div>
+                  <Button variant="outline" size="sm" onClick={resetSubtitleStyle}>
+                    Reset to defaults
+                  </Button>
+                </div>
+                <div className="flex flex-col gap-4">
+                  <div className="flex items-center justify-between gap-4">
+                    <div>
+                      <p className="text-sm">Size</p>
+                      <p className="text-xs text-muted-foreground">Subtitle text size.</p>
+                    </div>
+                    <div className="flex w-44 shrink-0 items-center gap-3">
+                      <Slider
+                        value={[subNum("sub_scale", 100)]}
+                        onValueChange={(v) => setSubtitleSetting("sub_scale", String(Array.isArray(v) ? v[0] : v))}
+                        min={50}
+                        max={200}
+                        step={5}
+                        className="flex-1"
+                      />
+                      <span className="w-9 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
+                        {Math.round(subNum("sub_scale", 100))}%
+                      </span>
+                    </div>
+                  </div>
+                  <div className="flex items-center justify-between gap-4">
+                    <p className="text-sm">Bold</p>
+                    <Switch
+                      checked={sub("sub_bold") === "true"}
+                      onCheckedChange={(v) => setSubtitleSetting("sub_bold", v ? "true" : "false")}
+                    />
+                  </div>
+                  <div className="flex items-center justify-between gap-4">
+                    <div>
+                      <p className="text-sm">Font</p>
+                      <p className="text-xs text-muted-foreground">
+                        Font family name, e.g. Arial. Leave empty for the player default.
+                      </p>
+                    </div>
+                    <Input
+                      value={settings["sub_font"] ?? ""}
+                      onChange={(e) => setSubtitleSetting("sub_font", e.target.value)}
+                      placeholder="Player default"
+                      className="w-44 shrink-0"
+                    />
+                  </div>
+                  <div className="flex items-center justify-between gap-4">
+                    <p className="text-sm">Text color</p>
+                    <input
+                      type="color"
+                      value={sub("sub_color")}
+                      onChange={(e) => setSubtitleSetting("sub_color", e.target.value)}
+                      className="h-8 w-14 shrink-0 cursor-pointer rounded-md border border-input bg-background p-1"
+                    />
+                  </div>
+                  <div className="flex items-center justify-between gap-4">
+                    <div>
+                      <p className="text-sm">Outline</p>
+                      <p className="text-xs text-muted-foreground">Thickness of the outline around text.</p>
+                    </div>
+                    <div className="flex w-44 shrink-0 items-center gap-3">
+                      <Slider
+                        value={[subNum("sub_border_size", 3)]}
+                        onValueChange={(v) => setSubtitleSetting("sub_border_size", String(Array.isArray(v) ? v[0] : v))}
+                        min={0}
+                        max={8}
+                        step={0.5}
+                        className="flex-1"
+                      />
+                      <span className="w-9 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
+                        {subNum("sub_border_size", 3)}
+                      </span>
+                    </div>
+                  </div>
+                  <div className="flex items-center justify-between gap-4">
+                    <p className="text-sm">Outline color</p>
+                    <input
+                      type="color"
+                      value={sub("sub_border_color")}
+                      onChange={(e) => setSubtitleSetting("sub_border_color", e.target.value)}
+                      className="h-8 w-14 shrink-0 cursor-pointer rounded-md border border-input bg-background p-1"
+                    />
+                  </div>
+                  <div className="flex items-center justify-between gap-4">
+                    <div>
+                      <p className="text-sm">Background</p>
+                      <p className="text-xs text-muted-foreground">
+                        Opacity of a black box behind subtitles for readability.
+                      </p>
+                    </div>
+                    <div className="flex w-44 shrink-0 items-center gap-3">
+                      <Slider
+                        value={[subNum("sub_back_opacity", 0)]}
+                        onValueChange={(v) => setSubtitleSetting("sub_back_opacity", String(Array.isArray(v) ? v[0] : v))}
+                        min={0}
+                        max={100}
+                        step={5}
+                        className="flex-1"
+                      />
+                      <span className="w-9 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
+                        {Math.round(subNum("sub_back_opacity", 0))}%
+                      </span>
+                    </div>
+                  </div>
+                  <div className="flex items-center justify-between gap-4">
+                    <div>
+                      <p className="text-sm">Vertical position</p>
+                      <p className="text-xs text-muted-foreground">
+                        100 sits at the bottom edge; lower values lift subtitles up the screen.
+                      </p>
+                    </div>
+                    <div className="flex w-44 shrink-0 items-center gap-3">
+                      <Slider
+                        value={[subNum("sub_pos", 100)]}
+                        onValueChange={(v) => setSubtitleSetting("sub_pos", String(Array.isArray(v) ? v[0] : v))}
+                        min={20}
+                        max={100}
+                        step={5}
+                        className="flex-1"
+                      />
+                      <span className="w-9 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
+                        {Math.round(subNum("sub_pos", 100))}
+                      </span>
+                    </div>
+                  </div>
+                  <div className="flex items-center justify-between gap-4">
+                    <div>
+                      <p className="text-sm">Override styled subtitles</p>
+                      <p className="text-xs text-muted-foreground">
+                        Force these settings onto ASS/SSA subtitles that carry their own built-in styling.
+                      </p>
+                    </div>
+                    <Switch
+                      checked={sub("sub_ass_override") === "true"}
+                      onCheckedChange={(v) => setSubtitleSetting("sub_ass_override", v ? "true" : "false")}
+                    />
+                  </div>
                 </div>
               </div>
             </div>

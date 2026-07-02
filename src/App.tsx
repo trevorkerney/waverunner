@@ -23,6 +23,9 @@ function App() {
   const [sidebarCounts, setSidebarCounts] = useState<Record<string, LibraryCounts>>({});
   // Per-library genre lists shown as children of the "Genres" sidebar node.
   const [sidebarGenres, setSidebarGenres] = useState<Record<string, GenreSummary[]>>({});
+  // Library auto-opened on launch (settings key "default_library_id").
+  // undefined = settings not hydrated yet; null = no default set ("" stored).
+  const [defaultLibraryId, setDefaultLibraryId] = useState<string | null | undefined>(undefined);
   const [activeView, setActiveView] = useState<ViewSpec | null>(null);
   const selectedLibrary = activeView
     ? libraries.find((l) => l.id === activeView.libraryId) ?? null
@@ -356,8 +359,8 @@ function App() {
     }, 300);
   }, []);
 
-  // Hydrate the per-view people Top-100/All mode from settings on mount, so a saved choice
-  // is in the ref before the user navigates into a people view. (viewCacheKey already
+  // Hydrate the per-view people mode + the default library from settings on mount,
+  // so a saved choice is in place before the user navigates. (viewCacheKey already
   // embeds the library id, so a single global read covers every library.)
   useEffect(() => {
     invoke<Record<string, string>>("get_settings")
@@ -367,8 +370,12 @@ function App() {
             peopleModeRef.current.set(k.slice("people_mode:".length), v);
           }
         }
+        setDefaultLibraryId(s["default_library_id"] || null);
       })
-      .catch(() => {});
+      .catch(() => {
+        // Settings unavailable: unblock the auto-select gate with "no default".
+        setDefaultLibraryId(null);
+      });
   }, []);
 
   // Scroll-key "kind": must uniquely identify a view so distinct pages don't share
@@ -811,6 +818,26 @@ function App() {
     },
     [loadView]
   );
+
+  // Open the default library on launch, once libraries AND settings have both
+  // loaded. One-shot: later library-list refreshes (rescan, create, delete)
+  // must not yank navigation, and a user click always beats a slow settings read.
+  const didAutoSelectRef = useRef(false);
+  useEffect(() => {
+    if (didAutoSelectRef.current) return;
+    if (defaultLibraryId === undefined || libraries.length === 0) return;
+    didAutoSelectRef.current = true;
+    if (defaultLibraryId === null || activeView !== null) return;
+    const lib = libraries.find((l) => l.id === defaultLibraryId);
+    if (lib) selectLibrary(lib);
+  }, [libraries, defaultLibraryId, activeView, selectLibrary]);
+
+  // "Set as default" / "Unset as default" in a library's sidebar context menu.
+  // Unset stores "" (settings rows are blanked, not deleted).
+  const changeDefaultLibrary = useCallback((libraryId: string | null) => {
+    setDefaultLibraryId(libraryId);
+    invoke("set_setting", { key: "default_library_id", value: libraryId ?? "" }).catch(() => {});
+  }, []);
 
   const selectView = useCallback(
     (view: ViewSpec) => {
@@ -1974,6 +2001,8 @@ function App() {
           })()}
           onSelectLibrary={selectLibrary}
           onSelectView={selectView}
+          defaultLibraryId={defaultLibraryId ?? null}
+          onSetDefaultLibrary={changeDefaultLibrary}
           onLibraryCreated={loadLibraries}
           onLibraryDeleted={async (deletedId) => {
             invalidateCache();

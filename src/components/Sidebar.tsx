@@ -2,7 +2,7 @@ import { useCallback, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
-import { Trash2, RefreshCw, FolderPlus, ChevronRight, Sparkles, Pencil } from "lucide-react";
+import { Trash2, RefreshCw, FolderPlus, ChevronRight, Sparkles, Pencil, Home } from "lucide-react";
 import {
   ContextMenu,
   ContextMenuTrigger,
@@ -41,6 +41,10 @@ interface SidebarProps {
   activeView: ViewSpec | null;
   onSelectLibrary: (library: Library) => void;
   onSelectView: (view: ViewSpec) => void;
+  /** Library auto-opened on launch, or null when none is set. */
+  defaultLibraryId: string | null;
+  /** Set (library id) or clear (null) the default library. */
+  onSetDefaultLibrary: (libraryId: string | null) => void;
   onLibraryCreated: () => void;
   onLibraryDeleted: (deletedId: string) => void;
   onLibraryRescanned: () => void;
@@ -64,6 +68,8 @@ export function Sidebar({
   activeView,
   onSelectLibrary,
   onSelectView,
+  defaultLibraryId,
+  onSetDefaultLibrary,
   onLibraryCreated,
   onLibraryDeleted,
   onLibraryRescanned,
@@ -219,6 +225,20 @@ export function Sidebar({
                       >
                         <RefreshCw size={14} />
                         Rescan
+                      </ContextMenuItem>
+                      <ContextMenuItem
+                        onClick={() => {
+                          const makingDefault = defaultLibraryId !== lib.id;
+                          onSetDefaultLibrary(makingDefault ? lib.id : null);
+                          toast.success(
+                            makingDefault
+                              ? `${lib.name} will open on launch`
+                              : "Default library cleared",
+                          );
+                        }}
+                      >
+                        <Home size={14} />
+                        {defaultLibraryId === lib.id ? "Unset as default" : "Set as default"}
                       </ContextMenuItem>
                       {lib.format === "video" && (
                         <ContextMenuItem onClick={() => setTmdbMatchTarget(lib)}>
