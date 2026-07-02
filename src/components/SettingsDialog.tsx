@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { toast } from "sonner";
@@ -12,13 +12,23 @@ import { Spinner } from "@/components/ui/spinner";
 import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
 import { Slider } from "@/components/ui/slider";
-import { Settings, Download, Eye, EyeOff, MonitorPlay } from "lucide-react";
+import { Settings, Download, Eye, EyeOff, MonitorPlay, Keyboard } from "lucide-react";
 import {
   SUBTITLE_DEFAULTS,
   applySubtitleStyleToPlayer,
   subtitleSetting,
   type SubtitleSettingKey,
 } from "@/lib/subtitleStyle";
+import {
+  KEYBINDS_SETTING,
+  PLAYER_ACTIONS,
+  boundKey,
+  displayKey,
+  normalizeKey,
+  parseKeybindOverrides,
+  setRuntimeKeybinds,
+  type PlayerActionId,
+} from "@/lib/playerKeybinds";
 
 interface SettingsDialogProps {
   open: boolean;
@@ -30,6 +40,7 @@ type SettingsMap = Record<string, string>;
 const categories = [
   { id: "general", label: "General", icon: Settings },
   { id: "player", label: "Player", icon: MonitorPlay },
+  { id: "keybinds", label: "Keybinds", icon: Keyboard },
 ] as const;
 
 export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
@@ -46,6 +57,8 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
   // Staged-but-unsaved changes. Values only reach the settings table when the
   // user clicks Save; Cancel (or closing the dialog any other way) discards.
   const [draft, setDraft] = useState<SettingsMap>({});
+  // Keybind row currently listening for its new key (Settings → Keybinds).
+  const [capturing, setCapturing] = useState<PlayerActionId | null>(null);
   // What the controls display: saved settings with staged changes overlaid.
   const view: SettingsMap = { ...settings, ...draft };
   const dirty = Object.entries(draft).some(([k, v]) => (settings[k] ?? "") !== v);
@@ -56,6 +69,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
     invoke<string>("get_app_version").then(setAppVersion).catch(console.error);
     setUpdateStatus("idle");
     setDraft({});
+    setCapturing(null);
   }, [open]);
 
   const stageSetting = useCallback((key: string, value: string) => {
@@ -66,6 +80,8 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
     try {
       const changed = Object.entries(draft).filter(([k, v]) => (settings[k] ?? "") !== v);
       await Promise.all(changed.map(([key, value]) => invoke("set_setting", { key, value })));
+      // The keydown handler reads binds from a module-level copy — refresh it.
+      if (KEYBINDS_SETTING in draft) setRuntimeKeybinds(draft[KEYBINDS_SETTING]);
       setSettings((prev) => ({ ...prev, ...draft }));
       setDraft({});
       onOpenChange(false);
@@ -133,6 +149,38 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
     return Number.isNaN(n) ? fallback : n;
   };
 
+  // Staged keybind overrides + the capture flow: clicking a key button arms
+  // `capturing`; the next plain keypress stages the rebind. Escape cancels,
+  // and duplicates are rejected so two actions can never share a key.
+  const keybindsRaw = view[KEYBINDS_SETTING];
+  const keybinds = useMemo(() => parseKeybindOverrides(keybindsRaw), [keybindsRaw]);
+  useEffect(() => {
+    if (!capturing) return;
+    const onKey = (e: KeyboardEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.key === "Escape") {
+        setCapturing(null);
+        return;
+      }
+      if (e.ctrlKey || e.metaKey || e.altKey) return; // plain keys only, no chords
+      if (["Shift", "Control", "Alt", "Meta"].includes(e.key)) return;
+      const taken = PLAYER_ACTIONS.find(
+        (a) => a.id !== capturing && normalizeKey(boundKey(keybinds, a)) === normalizeKey(e.key),
+      );
+      if (taken) {
+        toast.error(`"${displayKey(e.key)}" is already bound to ${taken.label}`);
+        setCapturing(null);
+        return;
+      }
+      stageSetting(KEYBINDS_SETTING, JSON.stringify({ ...keybinds, [capturing]: e.key }));
+      setCapturing(null);
+    };
+    // Capture phase so this wins over the dialog's own Escape-to-close.
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [capturing, keybinds, stageSetting]);
+
   return (
     <Dialog
       open={open}
@@ -151,7 +199,10 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
           {categories.map((cat) => (
             <button
               key={cat.id}
-              onClick={() => setActiveCategory(cat.id)}
+              onClick={() => {
+                setActiveCategory(cat.id);
+                setCapturing(null);
+              }}
               className={`flex items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm ${
                 activeCategory === cat.id
                   ? "bg-accent text-accent-foreground"
@@ -522,6 +573,48 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                       onCheckedChange={(v) => setSubtitleSetting("sub_ass_override", v ? "true" : "false")}
                     />
                   </div>
+                </div>
+              </div>
+            </div>
+          )}
+          {activeCategory === "keybinds" && (
+            <div className="flex flex-col gap-6">
+              <div>
+                <div className="mb-4 flex items-center justify-between">
+                  <div>
+                    <h3 className="text-sm font-semibold">Player keybinds</h3>
+                    <p className="text-xs text-muted-foreground">
+                      Click a key to rebind it, then press the new key. Esc cancels.
+                    </p>
+                  </div>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      setCapturing(null);
+                      stageSetting(KEYBINDS_SETTING, "");
+                    }}
+                  >
+                    Reset to defaults
+                  </Button>
+                </div>
+                <div className="flex flex-col gap-1.5">
+                  {PLAYER_ACTIONS.map((a) => (
+                    <div
+                      key={a.id}
+                      className="flex items-center justify-between gap-4 rounded-md px-2 py-1.5 hover:bg-accent/30"
+                    >
+                      <p className="text-sm">{a.label}</p>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="min-w-24 font-mono text-xs"
+                        onClick={() => setCapturing(capturing === a.id ? null : a.id)}
+                      >
+                        {capturing === a.id ? "Press a key…" : displayKey(boundKey(keybinds, a))}
+                      </Button>
+                    </div>
+                  ))}
                 </div>
               </div>
             </div>

@@ -1,4 +1,5 @@
 import { useEffect, useCallback, useRef, useState } from "react";
+import { actionForKey } from "../lib/playerKeybinds";
 import { PlayerState, PlayerActions } from "../hooks/usePlayer";
 import { ControlsOverlay } from "./player/ControlsOverlay";
 import { CenterTransport } from "./player/CenterTransport";
@@ -34,17 +35,9 @@ export function PlayerView({ state, actions }: PlayerViewProps) {
   // to wiggle the mouse. Action handling itself lives at the App level.
   useEffect(() => {
     const handleKey = (e: KeyboardEvent) => {
-      switch (e.key) {
-        case " ":
-        case "ArrowLeft":
-        case "ArrowRight":
-        case "ArrowUp":
-        case "ArrowDown":
-        case "m":
-        case "M":
-          resetHideTimer();
-          break;
-      }
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      // Any bound player shortcut reveals the overlay (rebinds included).
+      if (actionForKey(e.key)) resetHideTimer();
     };
     // Capture phase so the slider wrapper's stopPropagation can't suppress
     // this — we still want pressing arrow keys with the seek bar focused to

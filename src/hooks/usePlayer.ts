@@ -41,6 +41,9 @@ export interface PlayerActions {
   togglePause: () => Promise<void>;
   seek: (seconds: number) => Promise<void>;
   seekAbsolute: (seconds: number) => Promise<void>;
+  /** Step one frame forward/back; mpv pauses playback as a side effect. */
+  frameStep: () => Promise<void>;
+  frameBackStep: () => Promise<void>;
   /** Isolated playback-position store — subscribe for live currentTime without
    *  re-rendering the rest of the app on every tick. */
   subscribePosition: (cb: () => void) => () => void;
@@ -583,6 +586,15 @@ export function usePlayer(): [PlayerState, PlayerActions] {
     draggingRef.current = field;
   }, []);
 
+  // mpv pauses on frame-step; the "pause" property event syncs isPlaying.
+  const frameStep = useCallback(async () => {
+    await invoke("player_command", { cmd: "frame-step", args: [] });
+  }, []);
+
+  const frameBackStep = useCallback(async () => {
+    await invoke("player_command", { cmd: "frame-back-step", args: [] });
+  }, []);
+
   const actions: PlayerActions = {
     play,
     playEpisode,
@@ -609,6 +621,8 @@ export function usePlayer(): [PlayerState, PlayerActions] {
     toggleAutoPlayNext,
     close,
     setDragging,
+    frameStep,
+    frameBackStep,
   };
 
   return [state, actions];

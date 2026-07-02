@@ -11,6 +11,7 @@ import { toast } from "sonner";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { Library, MediaEntry, EntriesResponse, BreadcrumbItem, ViewSpec, PersonInfo, PersonSummary, PersonRole, PlaylistSummary, PlaylistsResponse, PlaylistContents, SortPreset, LibraryCounts, GenreSummary } from "@/types";
+import { KEYBINDS_SETTING, actionForKey, setRuntimeKeybinds } from "@/lib/playerKeybinds";
 import { viewCacheKey, scopeKeyFor } from "@/lib/complications";
 
 function App() {
@@ -359,9 +360,10 @@ function App() {
     }, 300);
   }, []);
 
-  // Hydrate the per-view people mode + the default library from settings on mount,
-  // so a saved choice is in place before the user navigates. (viewCacheKey already
-  // embeds the library id, so a single global read covers every library.)
+  // Hydrate the per-view people mode, the default library, and the player
+  // keybinds from settings on mount, so saved choices are in place before the
+  // user navigates. (viewCacheKey already embeds the library id, so a single
+  // global read covers every library.)
   useEffect(() => {
     invoke<Record<string, string>>("get_settings")
       .then((s) => {
@@ -371,6 +373,7 @@ function App() {
           }
         }
         setDefaultLibraryId(s["default_library_id"] || null);
+        setRuntimeKeybinds(s[KEYBINDS_SETTING]);
       })
       .catch(() => {
         // Settings unavailable: unblock the auto-select gate with "no default".
@@ -1921,44 +1924,49 @@ function App() {
       ) {
         return;
       }
-      switch (e.key) {
-        case " ":
-          e.preventDefault();
+      // Escape is fixed (never rebindable) so the player can always be exited.
+      if (e.key === "Escape") {
+        e.preventDefault();
+        if (playerState.isFullscreen) {
+          playerActions.toggleFullscreen();
+        } else {
+          playerActions.close();
+        }
+        return;
+      }
+      // Everything else routes through the rebindable map (Settings → Keybinds).
+      // Modifier chords stay out of it — Ctrl+, must still open settings, etc.
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      const action = actionForKey(e.key);
+      if (!action) return;
+      e.preventDefault();
+      switch (action) {
+        case "play_pause":
           playerActions.togglePause();
           break;
-        case "ArrowLeft":
-          e.preventDefault();
+        case "seek_back":
           playerActions.seek(-10);
           break;
-        case "ArrowRight":
-          e.preventDefault();
+        case "seek_forward":
           playerActions.seek(10);
           break;
-        case "ArrowUp":
-          e.preventDefault();
+        case "volume_up":
           playerActions.setVolume(Math.min(playerState.volume + 5, 100));
           break;
-        case "ArrowDown":
-          e.preventDefault();
+        case "volume_down":
           playerActions.setVolume(Math.max(playerState.volume - 5, 0));
           break;
-        case "f":
-        case "F":
-          e.preventDefault();
+        case "prev_frame":
+          playerActions.frameBackStep();
+          break;
+        case "next_frame":
+          playerActions.frameStep();
+          break;
+        case "fullscreen":
           playerActions.toggleFullscreen();
           break;
-        case "m":
-        case "M":
-          e.preventDefault();
+        case "mute":
           playerActions.toggleMute();
-          break;
-        case "Escape":
-          e.preventDefault();
-          if (playerState.isFullscreen) {
-            playerActions.toggleFullscreen();
-          } else {
-            playerActions.close();
-          }
           break;
       }
     };

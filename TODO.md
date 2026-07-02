@@ -34,8 +34,6 @@ add warnings about tv episodes without episode numbers (they will likely play ou
 
 need to consider some sort of ability to queue up things for the player. TV show autoplay should probably take this system into heavy consideration. Users should be able to queue playlists. Users should be able to queue up individual movies in context menus at their whim. On the player and maybe not on the player, the user should be able to view the queue and manipulate it in a dialog or sidebar or something
 
-bind comma and period to prev frame and next frame on player. KEYBINDS MENU IN SETTINGS
-
 consider how streamed media should be dealt with as opposed to local media (like from a plex server)
 
 library and usage statistics (prompt user to enable/disable usage stats on first startup)
