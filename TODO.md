@@ -38,11 +38,11 @@ consider how streamed media should be dealt with as opposed to local media (like
 
 library and usage statistics (prompt user to enable/disable usage stats on first startup)
 
+---
+
 Interactive media support (Netflix-style branching video, e.g. Black Mirror: Bandersnatch). Let waverunner play "interactive" titles where the viewer makes timed choices that branch the story.
 
-The model: an interactive title is ONE linear video file with every branch concatenated end to end, plus a JSON branch graph. "Playing" = seeking between timestamp ranges in that single file based on the graph + the viewer's choices. There are no per-branch video files.
-
----
+- The model: an interactive title is ONE linear video file with every branch concatenated end to end, plus a JSON branch graph. "Playing" = seeking between timestamp ranges in that single file based on the graph + the viewer's choices. There are no per-branch video files.
 
 INTERACTIVE PLAYER
 

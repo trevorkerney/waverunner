@@ -1060,8 +1060,8 @@ export function MainContent({
       <div ref={scrollContainerRef} className={`min-w-0 flex-1 overflow-y-auto overflow-x-hidden p-4 ${scrubberApplies ? "pr-10" : ""}`}>
       {selectedEntry ? (
         selectedEntry.entry_type === "show"
-          ? <ShowDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getCoverUrl={getCoverUrl} getFullCoverUrl={getFullCoverUrl} onEntryChanged={onEntryChanged} onTitleChanged={onTitleChanged} onChangeCover={() => openCoverDialog(selectedEntry, "select")} onAddCover={() => onAddCover(selectedEntry.id)} onDeleteCover={() => openCoverDialog(selectedEntry, "delete")} onPlayEpisode={onPlayEpisode} onPlayFile={onPlayFile} onNavigateToPerson={onNavigateToPerson} />
-          : <EntryDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getCoverUrl={getCoverUrl} getFullCoverUrl={getFullCoverUrl} onEntryChanged={onEntryChanged} onTitleChanged={onTitleChanged} onChangeCover={() => openCoverDialog(selectedEntry, "select")} onAddCover={() => onAddCover(selectedEntry.id)} onDeleteCover={() => openCoverDialog(selectedEntry, "delete")} onPlayFile={onPlayFile} onNavigateToPerson={onNavigateToPerson} />
+          ? <ShowDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getCoverUrl={getCoverUrl} getFullCoverUrl={getFullCoverUrl} onEntryChanged={onEntryChanged} onTitleChanged={onTitleChanged} onChangeCover={() => openCoverDialog(selectedEntry, "select")} onAddCover={() => onAddCover(selectedEntry.id)} onDeleteCover={() => openCoverDialog(selectedEntry, "delete")} onPlayEpisode={onPlayEpisode} onPlayFile={onPlayFile} onNavigateToPerson={onNavigateToPerson} onSelectGenre={onSelectGenre} />
+          : <EntryDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getCoverUrl={getCoverUrl} getFullCoverUrl={getFullCoverUrl} onEntryChanged={onEntryChanged} onTitleChanged={onTitleChanged} onChangeCover={() => openCoverDialog(selectedEntry, "select")} onAddCover={() => onAddCover(selectedEntry.id)} onDeleteCover={() => openCoverDialog(selectedEntry, "delete")} onPlayFile={onPlayFile} onNavigateToPerson={onNavigateToPerson} onSelectGenre={onSelectGenre} />
       ) : (
       <ContextMenu>
         <ContextMenuTrigger render={<div className="flex min-h-full flex-col" />}>
@@ -2167,6 +2167,7 @@ function EntryDetailPage({
   onDeleteCover,
   onPlayFile,
   onNavigateToPerson,
+  onSelectGenre,
 }: {
   entry: MediaEntry;
   selectedLibrary: Library;
@@ -2179,6 +2180,7 @@ function EntryDetailPage({
   onDeleteCover: () => void;
   onPlayFile?: (path: string, title: string) => void;
   onNavigateToPerson?: (person: PersonInfo, role: PersonRole) => void;
+  onSelectGenre?: (libraryId: string, genre: string) => void;
 }) {
   const [detail, setDetail] = useState<MovieDetail | null>(null);
   const [editing, setEditing] = useState(false);
@@ -2450,10 +2452,10 @@ function EntryDetailPage({
             {detail.genres.length > 0 && (
               <div className="flex flex-wrap gap-1.5">
                 {detail.genres.map((g) => (
-                  // Buttons so genre filtering can hang off these later.
                   <button
                     key={g}
-                    className="rounded-full bg-secondary px-2.5 py-1 text-xs font-medium text-secondary-foreground transition-colors hover:bg-accent"
+                    onClick={() => onSelectGenre?.(selectedLibrary.id, g)}
+                    className="cursor-pointer rounded-full bg-secondary px-2.5 py-1 text-xs font-medium text-secondary-foreground ring-1 ring-transparent transition-all hover:bg-primary/15 hover:text-foreground hover:ring-primary/50"
                   >
                     {g}
                   </button>
@@ -2630,6 +2632,7 @@ function ShowDetailPage({
   onPlayEpisode,
   onPlayFile,
   onNavigateToPerson,
+  onSelectGenre,
 }: {
   entry: MediaEntry;
   selectedLibrary: Library;
@@ -2644,6 +2647,7 @@ function ShowDetailPage({
   /** Plays a standalone file (used for extras — episodes go through onPlayEpisode). */
   onPlayFile?: (path: string, title: string) => void;
   onNavigateToPerson?: (person: PersonInfo, role: PersonRole) => void;
+  onSelectGenre?: (libraryId: string, genre: string) => void;
 }) {
   const [detail, setDetail] = useState<ShowDetail | null>(null);
   const [seasons, setSeasons] = useState<SeasonInfo[]>([]);
@@ -3173,10 +3177,10 @@ function ShowDetailPage({
             {detail.genres.length > 0 && (
               <div className="flex flex-wrap gap-1.5">
                 {detail.genres.map((g) => (
-                  // Buttons so genre filtering can hang off these later.
                   <button
                     key={g}
-                    className="rounded-full bg-secondary px-2.5 py-1 text-xs font-medium text-secondary-foreground transition-colors hover:bg-accent"
+                    onClick={() => onSelectGenre?.(selectedLibrary.id, g)}
+                    className="cursor-pointer rounded-full bg-secondary px-2.5 py-1 text-xs font-medium text-secondary-foreground ring-1 ring-transparent transition-all hover:bg-primary/15 hover:text-foreground hover:ring-primary/50"
                   >
                     {g}
                   </button>

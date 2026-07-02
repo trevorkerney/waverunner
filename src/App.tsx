@@ -763,6 +763,19 @@ function App() {
           entries: fresh, sort_mode: fresh_sort,
           selected_preset_id: null, presets: [],
         });
+      } else if (view.kind === "genre-detail") {
+        // Detail pages opened from a genre grid live under this view; without a
+        // refresh here a cover downloaded on such a page never reaches
+        // selectedEntry (and the change-cover dialog reads covers off it).
+        fresh = await invoke<MediaEntry[]>("get_entries_for_genre", {
+          libraryId: view.libraryId,
+          genre: view.genre,
+        });
+        fresh_sort = "alpha";
+        viewEntriesCacheRef.current.set(viewCacheKey(view), {
+          entries: fresh, sort_mode: fresh_sort,
+          selected_preset_id: null, presets: [],
+        });
       } else if (view.kind === "playlist-detail") {
         // A playlist grid renders media-link entries; their cover pool comes from
         // the same cached_images source as the library grid, so a cover added on a
