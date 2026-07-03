@@ -6957,10 +6957,17 @@ fn cache_images_for_entry(
         let filename = entry.file_name().to_string_lossy().to_string();
         let cached_path = cache_dir.join(&filename);
         if std::fs::copy(&path, &cached_path).is_ok() {
-            // Generate thumbnail
-            if let Ok(img) = image::open(&cached_path) {
-                let thumb = img.thumbnail(600, 900);
-                let _ = thumb.save(thumb_dir.join(&filename));
+            // Generate thumbnail. The grid loads covers_thumb/<file> directly, so
+            // a missing file renders as a broken image. Formats the image crate
+            // can't decode or re-encode (AVIF — decoding needs a native dav1d
+            // build) fall back to copying the original into the thumb slot: the
+            // webview decodes those fine, and they tend to be tiny anyway.
+            let thumbed = image::open(&cached_path)
+                .ok()
+                .and_then(|img| img.thumbnail(600, 900).save(thumb_dir.join(&filename)).ok())
+                .is_some();
+            if !thumbed {
+                let _ = std::fs::copy(&cached_path, thumb_dir.join(&filename));
             }
             results.push((filename, cached_path.to_string_lossy().to_string()));
         }
@@ -7109,10 +7116,14 @@ async fn sync_cached_images_for_entry(
                 // Thumbnail too — the grid loads covers_thumb/<file> directly,
                 // so a cover without one renders broken until something
                 // re-caches it (this was the scan path's job only, leaving
-                // app-added covers thumb-less).
-                if let Ok(img) = image::open(&cached) {
-                    let thumb = img.thumbnail(600, 900);
-                    let _ = thumb.save(thumb_dir.join(filename));
+                // app-added covers thumb-less). Same undecodable-format
+                // fallback as cache_images_for_entry (AVIF et al).
+                let thumbed = image::open(&cached)
+                    .ok()
+                    .and_then(|img| img.thumbnail(600, 900).save(thumb_dir.join(filename)).ok())
+                    .is_some();
+                if !thumbed {
+                    let _ = std::fs::copy(&cached, thumb_dir.join(filename));
                 }
                 sqlx::query(
                     "INSERT OR REPLACE INTO cached_images (library_id, entry_folder_path, image_type, source_filename, cached_path, origin) VALUES (?, ?, ?, ?, ?, ?)",
