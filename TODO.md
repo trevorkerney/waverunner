@@ -9,6 +9,7 @@ dropping media into a collection (when the media is far from the collection scro
 
 ## bugs / needs fixing
 
+i want to revamp the import/tmdb/ratings process. Instead of these being somewhat separated processes, they shoud all be part of a multi step, multi window (modal) import process. needs discussion.
 
 
 ## changes / small new features

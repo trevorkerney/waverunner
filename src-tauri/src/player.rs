@@ -135,6 +135,8 @@ pub async fn get_player_status(state: State<'_, AppState>) -> Result<Option<Play
 
 #[tauri::command]
 pub fn destroy_player(state: State<'_, AppState>) -> Result<(), String> {
+    // An interactive session drives this mpv instance — stop it first.
+    crate::interactive_session::stop_session(&state);
     let mut guard = state.player.lock().map_err(|e| e.to_string())?;
     if let Some(inner) = guard.take() {
         // Signal event loop to stop
@@ -148,6 +150,8 @@ pub fn destroy_player(state: State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn play_file(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    // Linear playback replaces any interactive session on this instance.
+    crate::interactive_session::stop_session(&state);
     let inner = current_player(&state)?;
     run_mpv(inner, move |mpv| {
         mpv.command(&["loadfile", &path])?;

@@ -754,6 +754,36 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .execute(&pool)
     .await?;
 
+    // ── Interactive titles (Netflix-style branching video) ───────────
+    // Sidecar marking a movie entry as interactive: the scanner found a
+    // matched manifest + info JSON pair next to the video. Filenames are
+    // stored relative to the entry folder (detection is content-based, so
+    // the names vary per pack). Separate table, not a movie column — no
+    // ALTER migrations.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS interactive_title (
+            entry_id INTEGER PRIMARY KEY,
+            manifest_file TEXT NOT NULL,
+            info_file TEXT NOT NULL,
+            FOREIGN KEY (entry_id) REFERENCES media_entry(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // Persistent story state per interactive title (the format's
+    // 'persistentState' scope — "remembers your choices" across playthroughs).
+    // JSON object of key -> value. Deleted by \"Reset story\".
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS interactive_state (
+            entry_id INTEGER PRIMARY KEY,
+            persistent_json TEXT NOT NULL,
+            FOREIGN KEY (entry_id) REFERENCES media_entry(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     // ── Selected backdrop per entry ───────────────────────────────────
     // Separate table (not a column on movie/show) so it needs no ALTER
     // migrations and covers any entry type that grows a backdrop later.

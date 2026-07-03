@@ -101,6 +101,10 @@ pub struct MediaEntry {
     /// Non-null only when this row represents a `media_link` inside a playlist view.
     /// Frontend uses it to offer "Remove from playlist".
     pub link_id: Option<i64>,
+    /// Movie has an interactive branch-graph pair next to its video (see
+    /// interactive_title). Play routes into the interactive engine.
+    #[serde(default)]
+    pub interactive: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1111,6 +1115,7 @@ pub async fn get_entries(
                         role_display: None,
                         tmdb_id,
                         link_id: None,
+                        interactive: false,
                     }
                 })
                 .collect();
@@ -1153,7 +1158,7 @@ pub async fn get_entries(
 
             // If a preset is active, reorder the entries to match its saved sequence.
             // Items not in the preset stay at the end in their existing sort_order.
-            let entries = if sort_mode == "custom" {
+            let mut entries = if sort_mode == "custom" {
                 if let Some(pid) = selected_preset_id {
                     apply_library_preset_ordering(&state.app_db, pid, entries).await?
                 } else {
@@ -1162,6 +1167,8 @@ pub async fn get_entries(
             } else {
                 entries
             };
+
+            mark_interactive_entries(&state.app_db, &mut entries).await?;
 
             EntriesResponse {
                 entries,
@@ -1211,6 +1218,7 @@ pub async fn get_entries(
                         role_display: None,
                         tmdb_id: None,
                         link_id: None,
+                        interactive: false,
                     }
                 })
                 .collect();
@@ -1330,7 +1338,7 @@ pub async fn search_entries(
             let mut entries: Vec<MediaEntry> = rows.into_iter()
                 .map(|(id, title, year, end_year, folder_path, parent_id, entry_type, selected_cover, tmdb_id, season_display)| {
                     let covers = covers_map.remove(&folder_path).unwrap_or_default();
-                    MediaEntry { id, title, year, end_year, folder_path, parent_id, entry_type, covers, selected_cover, child_count: 0, season_display, collection_display: None, role_display: None, tmdb_id, link_id: None }
+                    MediaEntry { id, title, year, end_year, folder_path, parent_id, entry_type, covers, selected_cover, child_count: 0, season_display, collection_display: None, role_display: None, tmdb_id, link_id: None, interactive: false }
                 })
                 .collect();
 
@@ -1387,7 +1395,7 @@ pub async fn search_entries(
             rows.into_iter()
                 .map(|(id, title, folder_path, selected_cover)| {
                     let covers = covers_map.remove(&folder_path).unwrap_or_default();
-                    MediaEntry { id, title, year: None, end_year: None, folder_path, parent_id: None, entry_type: "artist".to_string(), covers, selected_cover, child_count: 0, season_display: None, collection_display: None, role_display: None, tmdb_id: None, link_id: None }
+                    MediaEntry { id, title, year: None, end_year: None, folder_path, parent_id: None, entry_type: "artist".to_string(), covers, selected_cover, child_count: 0, season_display: None, collection_display: None, role_display: None, tmdb_id: None, link_id: None, interactive: false }
                 })
                 .collect()
         }
@@ -1396,7 +1404,43 @@ pub async fn search_entries(
         }
     };
 
+    let mut entries = entries;
+    mark_interactive_entries(&state.app_db, &mut entries).await?;
     Ok(entries)
+}
+
+/// Flag movie entries that have an interactive sidecar row (interactive_title).
+/// One batched query per response instead of a JOIN in every entry-listing SQL
+/// variant. Chunked to stay under SQLite's bind-variable limit.
+async fn mark_interactive_entries(
+    pool: &sqlx::SqlitePool,
+    entries: &mut [MediaEntry],
+) -> Result<(), String> {
+    let ids: Vec<i64> = entries
+        .iter()
+        .filter(|e| e.entry_type == "movie")
+        .map(|e| e.id)
+        .collect();
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let mut flagged: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    for chunk in ids.chunks(900) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let query = format!("SELECT entry_id FROM interactive_title WHERE entry_id IN ({placeholders})");
+        let mut q = sqlx::query_as::<_, (i64,)>(&query);
+        for id in chunk {
+            q = q.bind(id);
+        }
+        let rows: Vec<(i64,)> = q.fetch_all(pool).await.map_err(|e| e.to_string())?;
+        flagged.extend(rows.into_iter().map(|(id,)| id));
+    }
+    for e in entries.iter_mut() {
+        if flagged.contains(&e.id) {
+            e.interactive = true;
+        }
+    }
+    Ok(())
 }
 
 /// All cached backdrops for an entry, in cache order.
@@ -2643,10 +2687,13 @@ pub async fn get_entries_for_genre(
                 role_display: None,
                 tmdb_id,
                 link_id: None,
+                interactive: false,
             }
         })
         .collect();
 
+    let mut entries = entries;
+    mark_interactive_entries(&state.app_db, &mut entries).await?;
     Ok(entries)
 }
 
@@ -3419,10 +3466,13 @@ pub async fn get_entries_for_person(
                 role_display,
                 tmdb_id,
                 link_id: None,
+                interactive: false,
             }
         })
         .collect();
 
+    let mut entries = entries;
+    mark_interactive_entries(&state.app_db, &mut entries).await?;
     Ok(entries)
 }
 
@@ -4708,6 +4758,7 @@ pub async fn get_playlist_contents(
             role_display: None,
             tmdb_id: None,
             link_id: Some(link_id),
+            interactive: false,
         };
         items.push((sort_order, sort_title.unwrap_or_default(), sort_date, entry));
     }
@@ -4810,6 +4861,7 @@ pub async fn get_playlist_contents(
             role_display: None,
             tmdb_id: None,
             link_id: None,
+            interactive: false,
         };
         items.push((sort_order, sort_title, min_date, entry));
     }
@@ -4831,6 +4883,9 @@ pub async fn get_playlist_contents(
         items.sort_by_key(|t| t.0);
         items.into_iter().map(|(_, _, _, e)| e).collect()
     };
+
+    let mut entries = entries;
+    mark_interactive_entries(&state.app_db, &mut entries).await?;
 
     Ok(PlaylistContents {
         entries,
@@ -4975,25 +5030,35 @@ pub async fn get_movie_file_path(
     library_id: String,
     entry_id: i64,
 ) -> Result<String, String> {
-    let (format, _paths, _default_sort_mode) = get_library_meta(&state.app_db, &library_id).await?;
-    let lib_paths = _paths;
+    let (_, video, _) = movie_playback_info(&state.app_db, &library_id, entry_id).await?;
+    Ok(video.to_string_lossy().into_owned())
+}
 
-    let folder_path: String = match format.as_str() {
+/// Resolve a movie entry to (its folder on disk, its video file, its title).
+/// Shared by linear playback and the interactive engine (which also needs the
+/// folder to load the branch-graph JSONs).
+pub(crate) async fn movie_playback_info(
+    pool: &sqlx::SqlitePool,
+    library_id: &str,
+    entry_id: i64,
+) -> Result<(PathBuf, PathBuf, String), String> {
+    let (format, lib_paths, _default_sort_mode) = get_library_meta(pool, library_id).await?;
+
+    let (folder_path, title): (String, String) = match format.as_str() {
         "video" => {
-            let row: Option<(String,)> = sqlx::query_as(
-                "SELECT folder_path FROM media_entry_full WHERE id = ?",
+            let row: Option<(String, String)> = sqlx::query_as(
+                "SELECT folder_path, title FROM media_entry_full WHERE id = ?",
             )
             .bind(entry_id)
-            .fetch_optional(&state.app_db)
+            .fetch_optional(pool)
             .await
             .map_err(|e| e.to_string())?;
-            row.ok_or("Entry not found")?.0
+            row.ok_or("Entry not found")?
         }
         _ => {
             return Err(format!("Unsupported library format: {}", format));
         }
     };
-
 
     let root = resolve_entry_root(&lib_paths, &folder_path)
         .ok_or("Could not find entry on disk")?;
@@ -5007,7 +5072,7 @@ pub async fn get_movie_file_path(
         .next()
         .ok_or("No video file found in movie folder")?;
 
-    Ok(video_file.to_string_lossy().into_owned())
+    Ok((full_folder, video_file, title))
 }
 
 // ---------- Ratings (RT scraper + optional OMDB) ----------
@@ -6236,6 +6301,9 @@ async fn rescan_video_library(
                 sync_extras_for_entry(pool, entry_id, base_path, rel_path)
                     .await
                     .map_err(|e| e.to_string())?;
+                sync_interactive_for_entry(pool, entry_id, base_path, rel_path)
+                    .await
+                    .map_err(|e| e.to_string())?;
             }
             Ok(())
         }
@@ -6256,6 +6324,9 @@ async fn rescan_video_library(
             let res: Result<(), String> = async {
                 sync_entry_images(pool, library_id, cache_base, base, rel_path).await?;
                 sync_extras_for_entry(pool, *entry_id, base, rel_path)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                sync_interactive_for_entry(pool, *entry_id, base, rel_path)
                     .await
                     .map_err(|e| e.to_string())?;
                 Ok(())
@@ -7714,6 +7785,7 @@ async fn scan_video_dir(
 
         cache_entry_images(pool, library_id, cache_base, base_path, &rel_path).await?;
         sync_extras_for_entry(pool, entry_id, base_path, &rel_path).await?;
+        sync_interactive_for_entry(pool, entry_id, base_path, &rel_path).await?;
         return Ok(());
     }
 
@@ -8092,6 +8164,46 @@ fn collect_extra_files(
 /// Rebuild the extras for one movie/show entry from disk: extras dirs directly
 /// inside the entry folder, plus one level deeper (season folders). Diff-aware so
 /// already-populated TMDB metadata survives rescans.
+/// Detect (or forget) a movie folder's interactive metadata pair. Called from
+/// scan and rescan alongside the extras sync, so an interactive title is
+/// flagged the moment its JSONs land next to the video — and unflagged when
+/// they disappear. Non-movie entries are ignored.
+async fn sync_interactive_for_entry(
+    pool: &sqlx::SqlitePool,
+    entry_id: i64,
+    base_path: &Path,
+    entry_rel_path: &str,
+) -> Result<(), sqlx::Error> {
+    let is_movie: Option<(i64,)> = sqlx::query_as("SELECT id FROM movie WHERE id = ?")
+        .bind(entry_id)
+        .fetch_optional(pool)
+        .await?;
+    if is_movie.is_none() {
+        return Ok(());
+    }
+    let dir = base_path.join(entry_rel_path);
+    match crate::interactive::detect_bundle_files(&dir) {
+        Some((manifest_file, info_file)) => {
+            sqlx::query(
+                "INSERT INTO interactive_title (entry_id, manifest_file, info_file) VALUES (?, ?, ?)
+                 ON CONFLICT(entry_id) DO UPDATE SET manifest_file = excluded.manifest_file, info_file = excluded.info_file",
+            )
+            .bind(entry_id)
+            .bind(manifest_file)
+            .bind(info_file)
+            .execute(pool)
+            .await?;
+        }
+        None => {
+            sqlx::query("DELETE FROM interactive_title WHERE entry_id = ?")
+                .bind(entry_id)
+                .execute(pool)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
 async fn sync_extras_for_entry(
     pool: &sqlx::SqlitePool,
     owner_id: i64,

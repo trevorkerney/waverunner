@@ -149,6 +149,9 @@ pub struct Moment {
     pub impression_data: Option<Value>,
     #[serde(rename = "preconditionId")]
     pub precondition_id: Option<String>,
+    /// Inline precondition expression (playbackImpression moments carry the
+    /// tree directly rather than referencing the named `preconditions` map).
+    pub precondition: Option<Value>,
     #[serde(rename = "layoutType")]
     pub layout_type: Option<String>,
     #[serde(rename = "headerText")]
@@ -163,6 +166,8 @@ pub struct Moment {
 pub struct Choice {
     pub id: Option<String>,
     pub text: Option<String>,
+    #[serde(rename = "subText")]
+    pub sub_text: Option<String>,
     #[serde(rename = "segmentId")]
     pub segment_id: Option<String>,
     /// Segment-group target (used by some titles instead of a direct segment).
@@ -226,10 +231,9 @@ fn looks_like_manifest(root: &Value) -> bool {
     }
 }
 
-/// Content-sniff every root-level *.json in `dir` and pair up the manifest and
-/// info files. Returns Ok(None) when the folder simply isn't an interactive
-/// bundle; Err only for a broken half-bundle worth surfacing.
-pub fn load_bundle_from_dir(dir: &Path) -> Result<Option<InteractiveBundle>, String> {
+/// Content-sniff every root-level *.json in `dir` into (manifest, info)
+/// candidates. Shared by the full loader and the scan-time detector.
+fn classify_dir(dir: &Path) -> Result<(Option<(PathBuf, Value)>, Option<(PathBuf, Value)>), String> {
     let mut candidates: Vec<PathBuf> = std::fs::read_dir(dir)
         .map_err(|e| format!("read_dir {}: {e}", dir.display()))?
         .filter_map(|e| e.ok())
@@ -256,8 +260,23 @@ pub fn load_bundle_from_dir(dir: &Path) -> Result<Option<InteractiveBundle>, Str
             break;
         }
     }
+    Ok((manifest, info))
+}
 
-    match (manifest, info) {
+/// Scan-time detection: does this folder hold a matched interactive pair?
+/// Returns the two filenames (relative to `dir`) without keeping the parsed
+/// JSON. A half-bundle (one file without the other) counts as not interactive.
+pub fn detect_bundle_files(dir: &Path) -> Option<(String, String)> {
+    let (manifest, info) = classify_dir(dir).ok()?;
+    let name = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned());
+    Some((name(&manifest?.0)?, name(&info?.0)?))
+}
+
+/// Load and parse the full bundle. Returns Ok(None) when the folder simply
+/// isn't an interactive bundle; Err only for a broken half-bundle worth
+/// surfacing.
+pub fn load_bundle_from_dir(dir: &Path) -> Result<Option<InteractiveBundle>, String> {
+    match classify_dir(dir)? {
         (None, None) => Ok(None),
         (Some(_), None) => Err("found an interactive manifest but no info file (interactiveVideoMoments)".into()),
         (None, Some(_)) => Err("found an interactive info file but no segment manifest".into()),

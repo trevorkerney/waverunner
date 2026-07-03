@@ -1,6 +1,7 @@
 mod commands;
 mod db;
 pub mod interactive;
+mod interactive_session;
 mod mpv;
 mod player;
 mod rt;
@@ -20,6 +21,8 @@ pub struct AppState {
     pub cancel_creation: AtomicBool,
     pub player: Mutex<Option<Arc<player::PlayerInner>>>,
     pub thumbnailer: Mutex<Option<player::Thumbnailer>>,
+    /// Live interactive-title session (branch-graph driver), if one is playing.
+    pub interactive: Mutex<Option<Arc<interactive_session::Session>>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -52,6 +55,7 @@ pub fn run() {
                 cancel_creation: AtomicBool::new(false),
                 player: Mutex::new(None),
                 thumbnailer: Mutex::new(None),
+                interactive: Mutex::new(None),
             });
 
             if cfg!(debug_assertions) {
@@ -179,6 +183,11 @@ pub fn run() {
             commands::set_playlist_cover,
             commands::set_playlist_collection_cover,
             commands::get_playlist_contents,
+            interactive_session::interactive_start,
+            interactive_session::interactive_choose,
+            interactive_session::interactive_status,
+            interactive_session::interactive_stop,
+            interactive_session::reset_interactive_story,
             player::init_player,
             player::set_player_region,
             player::get_player_status,
