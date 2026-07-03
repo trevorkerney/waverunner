@@ -1,5 +1,6 @@
 mod commands;
 mod db;
+pub mod interactive;
 mod mpv;
 mod player;
 mod rt;
