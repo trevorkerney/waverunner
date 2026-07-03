@@ -70,6 +70,17 @@ function App() {
     [playerActions]
   );
 
+  const handlePlayInteractive = useCallback(
+    async (args: { libraryId: string; entryId: number; title: string }) => {
+      try {
+        await playerActions.playInteractive(args);
+      } catch (e) {
+        toast.error(String(e));
+      }
+    },
+    [playerActions]
+  );
+
   // Keep webview transparent while player is active (full or minimized), so
   // mpv video shows through the transparent dock/takeover region.
   useEffect(() => {
@@ -1991,6 +2002,15 @@ function App() {
       if (e.ctrlKey || e.metaKey || e.altKey) return;
       const action = actionForKey(e.key);
       if (!action) return;
+      // Interactive titles: the engine owns the timeline — user seeking and
+      // frame-stepping would jump across unrelated branches. Let those keys
+      // fall through (arrows navigate the choice overlay instead).
+      if (
+        playerState.context.kind === "interactive" &&
+        ["seek_back", "seek_forward", "prev_frame", "next_frame"].includes(action)
+      ) {
+        return;
+      }
       e.preventDefault();
       switch (action) {
         case "play_pause":
@@ -2027,7 +2047,7 @@ function App() {
     // slider thumb's keydown also kills native bubble propagation).
     window.addEventListener("keydown", handleKey, true);
     return () => window.removeEventListener("keydown", handleKey, true);
-  }, [playerState.isActive, playerState.volume, playerState.isFullscreen, playerActions]);
+  }, [playerState.isActive, playerState.volume, playerState.isFullscreen, playerState.context.kind, playerActions]);
 
   return (
     <div className="flex h-screen flex-col overflow-hidden">
@@ -2208,6 +2228,7 @@ function App() {
           getFullCoverUrl={getFullCoverUrl}
           scrollContainerRef={scrollContainerRef}
           onPlayFile={handlePlayFile}
+          onPlayInteractive={handlePlayInteractive}
           onPlayEpisode={handlePlayEpisode}
         />
       </div>

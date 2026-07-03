@@ -92,6 +92,8 @@ import {
   ListPlus,
   Save,
   Clapperboard,
+  GitBranch,
+  RotateCcw,
 } from "lucide-react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -234,6 +236,7 @@ interface MainContentProps {
   getFullCoverUrl: (filePath: string) => string;
   scrollContainerRef: RefObject<HTMLDivElement | null>;
   onPlayFile?: (path: string, title: string) => void;
+  onPlayInteractive?: (args: { libraryId: string; entryId: number; title: string }) => void;
   onPlayEpisode?: (args: { libraryId: string; showId: number; showTitle: string; startEpisodeId: number }) => void;
 }
 
@@ -285,6 +288,7 @@ export function MainContent({
   getFullCoverUrl,
   scrollContainerRef,
   onPlayFile,
+  onPlayInteractive,
   onPlayEpisode,
 }: MainContentProps) {
   const [coverDialogEntry, setCoverDialogEntry] = useState<MediaEntry | null>(
@@ -1068,7 +1072,7 @@ export function MainContent({
       {selectedEntry ? (
         selectedEntry.entry_type === "show"
           ? <ShowDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getCoverUrl={getCoverUrl} getFullCoverUrl={getFullCoverUrl} onEntryChanged={onEntryChanged} onTitleChanged={onTitleChanged} onChangeCover={() => openCoverDialog(selectedEntry, "select")} onAddCover={() => onAddCover(selectedEntry.id)} onDeleteCover={() => openCoverDialog(selectedEntry, "delete")} onPlayEpisode={onPlayEpisode} onPlayFile={onPlayFile} onNavigateToPerson={onNavigateToPerson} onSelectGenre={onSelectGenre} />
-          : <EntryDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getCoverUrl={getCoverUrl} getFullCoverUrl={getFullCoverUrl} onEntryChanged={onEntryChanged} onTitleChanged={onTitleChanged} onChangeCover={() => openCoverDialog(selectedEntry, "select")} onAddCover={() => onAddCover(selectedEntry.id)} onDeleteCover={() => openCoverDialog(selectedEntry, "delete")} onPlayFile={onPlayFile} onNavigateToPerson={onNavigateToPerson} onSelectGenre={onSelectGenre} />
+          : <EntryDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getCoverUrl={getCoverUrl} getFullCoverUrl={getFullCoverUrl} onEntryChanged={onEntryChanged} onTitleChanged={onTitleChanged} onChangeCover={() => openCoverDialog(selectedEntry, "select")} onAddCover={() => onAddCover(selectedEntry.id)} onDeleteCover={() => openCoverDialog(selectedEntry, "delete")} onPlayFile={onPlayFile} onPlayInteractive={onPlayInteractive} onNavigateToPerson={onNavigateToPerson} onSelectGenre={onSelectGenre} />
       ) : (
       <ContextMenu>
         <ContextMenuTrigger render={<div className="flex min-h-full flex-col" />}>
@@ -1610,6 +1614,15 @@ function SortableCoverCard({
           {isCollection && (
             <div className="absolute bottom-1 right-1 rounded-sm bg-black/70 px-1.5 py-0.5 text-xs text-white backdrop-blur-sm">
               Collection
+            </div>
+          )}
+          {entry.interactive && (
+            <div
+              className="absolute bottom-1 right-1 flex items-center gap-1 rounded-sm bg-black/70 px-1.5 py-0.5 text-xs text-white backdrop-blur-sm"
+              title="Branching title — you make choices while it plays"
+            >
+              <GitBranch size={10} />
+              Interactive
             </div>
           )}
         </div>
@@ -2187,6 +2200,7 @@ function EntryDetailPage({
   onAddCover,
   onDeleteCover,
   onPlayFile,
+  onPlayInteractive,
   onNavigateToPerson,
   onSelectGenre,
 }: {
@@ -2200,6 +2214,7 @@ function EntryDetailPage({
   onAddCover: () => void;
   onDeleteCover: () => void;
   onPlayFile?: (path: string, title: string) => void;
+  onPlayInteractive?: (args: { libraryId: string; entryId: number; title: string }) => void;
   onNavigateToPerson?: (person: PersonInfo, role: PersonRole) => void;
   onSelectGenre?: (libraryId: string, genre: string) => void;
 }) {
@@ -2381,6 +2396,21 @@ function EntryDetailPage({
           Get ratings
         </ContextMenuItem>
       )}
+      {entry.interactive && (
+        <ContextMenuItem
+          onClick={async () => {
+            try {
+              await invoke("reset_interactive_story", { entryId: entry.id });
+              toast.success("Story reset — the next playthrough starts fresh");
+            } catch (e) {
+              toast.error(String(e));
+            }
+          }}
+        >
+          <RotateCcw size={14} />
+          Reset story
+        </ContextMenuItem>
+      )}
       <ContextMenuSeparator />
       <ContextMenuItem
         onClick={onDeleteCover}
@@ -2468,6 +2498,15 @@ function EntryDetailPage({
                       {detail.maturity_rating}
                     </span>
                   )}
+                  {entry.interactive && (
+                    <span
+                      className="inline-flex items-center gap-1 rounded border border-primary/40 bg-primary/10 px-1.5 py-px text-xs font-medium text-primary"
+                      title="Branching title — you make choices while it plays"
+                    >
+                      <GitBranch size={11} />
+                      Interactive
+                    </span>
+                  )}
                 </div>
                 {detail?.tagline && (
                   <p className="mt-2 italic text-muted-foreground">{detail.tagline}</p>
@@ -2480,6 +2519,10 @@ function EntryDetailPage({
             <Button
               size="sm"
               onClick={async () => {
+                if (entry.interactive) {
+                  onPlayInteractive?.({ libraryId: selectedLibrary.id, entryId: entry.id, title: entry.title });
+                  return;
+                }
                 try {
                   const path = await invoke<string>("get_movie_file_path", { libraryId: selectedLibrary.id, entryId: entry.id });
                   onPlayFile?.(path, entry.title);
@@ -4024,6 +4067,7 @@ function PlaylistsView({
         collection_display: null,
         tmdb_id: null,
         link_id: null,
+        interactive: false,
       }
     : null;
 

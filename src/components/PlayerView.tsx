@@ -3,6 +3,7 @@ import { actionForKey } from "../lib/playerKeybinds";
 import { PlayerState, PlayerActions } from "../hooks/usePlayer";
 import { ControlsOverlay } from "./player/ControlsOverlay";
 import { CenterTransport } from "./player/CenterTransport";
+import { InteractiveOverlay } from "./player/InteractiveOverlay";
 import { Loader2 } from "lucide-react";
 
 interface PlayerViewProps {
@@ -79,6 +80,10 @@ export function PlayerView({ state, actions }: PlayerViewProps) {
         visible={showControls}
         onInteraction={resetHideTimer}
       />
+
+      {/* Branching-title decision UI — its own layer, never auto-hidden with
+          the controls (a choice must stay visible while its timer runs). */}
+      {ctx.kind === "interactive" && <InteractiveOverlay />}
 
       <CenterTransport
         isPlaying={state.isPlaying}

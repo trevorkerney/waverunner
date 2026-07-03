@@ -41,6 +41,9 @@ export interface MediaEntry {
   /** Non-null only when this row represents a `media_link` inside a playlist view.
    *  Used to offer "Remove from playlist" from the context menu. */
   link_id: number | null;
+  /** Movie with an interactive branch-graph pair next to its video — Play
+   *  routes into the interactive engine instead of linear playback. */
+  interactive: boolean;
 }
 
 // Each step in the navigation chain. `view` is set when this breadcrumb corresponds to a
@@ -584,6 +587,7 @@ export interface EpisodeRef {
 export type PlayerContext =
   | { kind: "none" }
   | { kind: "movie" }
+  | { kind: "interactive"; libraryId: string; entryId: number }
   | {
       kind: "episode";
       libraryId: string;
@@ -592,6 +596,25 @@ export type PlayerContext =
       episodes: EpisodeRef[];
       index: number;
     };
+
+/** Payload of interactive-choice-open (and interactive_status rehydration). */
+export interface InteractiveChoiceOpen {
+  segmentId: string;
+  choices: { text: string; subText: string | null }[];
+  defaultIndex: number;
+  remainingMs: number;
+  totalMs: number;
+  layoutType: string | null;
+  selectedIndex: number | null;
+}
+
+export interface InteractiveStatus {
+  entryId: number;
+  libraryId: string;
+  title: string;
+  segmentId: string;
+  choice: InteractiveChoiceOpen | null;
+}
 
 export interface PlayerTrack {
   id: number;

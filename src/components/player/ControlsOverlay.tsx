@@ -195,6 +195,12 @@ export function ControlsOverlay({
     onInteraction();
   }, [actions, onInteraction]);
 
+  // Interactive titles: the engine owns the timeline (jumping between graph
+  // segments of one big concatenated file), so the seek bar and clock would
+  // show meaningless positions — v1 policy is to hide them. Volume, tracks,
+  // and fullscreen all still apply.
+  const isInteractive = state.context.kind === "interactive";
+
   return (
     <div
       className={`absolute inset-0 flex flex-col justify-between transition-opacity duration-300 ${
@@ -235,6 +241,7 @@ export function ControlsOverlay({
       {/* Bottom bar */}
       <div className="px-4 pb-3 pt-6 bg-gradient-to-t from-black/70 to-transparent">
         {/* Seek bar */}
+        {!isInteractive && (
         <div
           className="relative mb-2"
           onPointerUp={handleSeekCommit}
@@ -310,6 +317,7 @@ export function ControlsOverlay({
             </div>
           )}
         </div>
+        )}
 
         {/* Controls row */}
         <div className="flex items-center gap-3">
@@ -340,13 +348,15 @@ export function ControlsOverlay({
 
           {/* Time — shows the hovered position while scrubbing the bar,
               otherwise the live playback position. */}
-          <span className="text-white/80 text-xs tabular-nums select-none">
-            {formatTime(
-              seekDragValue ??
-                (hoverRatio != null ? hoverRatio * state.duration : currentTime)
-            )}{" "}
-            / {formatTime(state.duration)}
-          </span>
+          {!isInteractive && (
+            <span className="text-white/80 text-xs tabular-nums select-none">
+              {formatTime(
+                seekDragValue ??
+                  (hoverRatio != null ? hoverRatio * state.duration : currentTime)
+              )}{" "}
+              / {formatTime(state.duration)}
+            </span>
+          )}
 
           {/* Spacer */}
           <div className="flex-1" />

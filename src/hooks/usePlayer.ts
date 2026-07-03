@@ -2,7 +2,7 @@ import { useState, useCallback, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { PlayerTrack, PlayerContext, EpisodeRef, ShowEpisodeFlat } from "../types";
+import { PlayerTrack, PlayerContext, EpisodeRef, ShowEpisodeFlat, InteractiveStatus } from "../types";
 import { TITLEBAR_HEIGHT } from "../components/Titlebar";
 import { applySubtitleStyleToPlayer } from "../lib/subtitleStyle";
 
@@ -33,8 +33,15 @@ export interface PlayEpisodeArgs {
   startEpisodeId: number;
 }
 
+export interface PlayInteractiveArgs {
+  libraryId: string;
+  entryId: number;
+  title: string;
+}
+
 export interface PlayerActions {
   play: (path: string, title: string) => Promise<void>;
+  playInteractive: (args: PlayInteractiveArgs) => Promise<void>;
   playEpisode: (args: PlayEpisodeArgs) => Promise<void>;
   playNextEpisode: () => Promise<void>;
   playPreviousEpisode: () => Promise<void>;
@@ -200,6 +207,15 @@ export function usePlayer(): [PlayerState, PlayerActions] {
       try {
         const status = await invoke<PlayerStatus | null>("get_player_status");
         if (!status?.path) return;
+        // The interactive driver thread also survives an F5 — when one is
+        // live, it is the authority on title/context (the snapshot is only a
+        // fallback for UI mode).
+        let interactive: InteractiveStatus | null = null;
+        try {
+          interactive = await invoke<InteractiveStatus | null>("interactive_status");
+        } catch {
+          interactive = null;
+        }
         let snap: PlayerSessionSnapshot | null = null;
         try {
           snap = JSON.parse(sessionStorage.getItem(PLAYER_SESSION_KEY) ?? "null");
@@ -219,8 +235,12 @@ export function usePlayer(): [PlayerState, PlayerActions] {
           duration: status.duration,
           volume: Math.round(status.volume),
           muted: status.muted,
-          title: matched && snap ? snap.title : fallbackTitle,
-          context: matched && snap ? snap.context : { kind: "movie" },
+          title: interactive ? interactive.title : matched && snap ? snap.title : fallbackTitle,
+          context: interactive
+            ? { kind: "interactive", libraryId: interactive.libraryId, entryId: interactive.entryId }
+            : matched && snap
+              ? snap.context
+              : { kind: "movie" },
           isMinimized: matched && snap ? snap.isMinimized : true,
           isFullscreen: matched && snap ? snap.isFullscreen : false,
           autoPlayNext: matched && snap ? snap.autoPlayNext : prev.autoPlayNext,
@@ -409,6 +429,44 @@ export function usePlayer(): [PlayerState, PlayerActions] {
       await invoke("play_file", { path });
       await applyStartupSettings();
     } catch (e) {
+      setState((prev) => ({ ...prev, loading: false, isActive: wasActive, isPlaying: false }));
+      throw e;
+    }
+  }, [applyStartupSettings, setPosition]);
+
+  // Interactive titles: the Rust engine loads the file itself (it must
+  // validate the video against the branch graph first) and then drives all
+  // segment jumps; the UI plays the same role as for a movie minus seeking.
+  const playInteractive = useCallback(async (args: PlayInteractiveArgs) => {
+    const wasActive = stateRef.current.isActive;
+    setPosition(0);
+    setState((prev) => ({
+      ...prev,
+      loading: true,
+      title: args.title,
+      isActive: true,
+      isPlaying: true,
+      context: { kind: "interactive", libraryId: args.libraryId, entryId: args.entryId },
+    }));
+    try {
+      if (!wasActive) {
+        await invoke("init_player", { titlebarHeight: TITLEBAR_HEIGHT });
+      }
+      await invoke("interactive_start", { libraryId: args.libraryId, entryId: args.entryId });
+      // The engine resolved the video path — mirror it for the F5 snapshot.
+      const status = await invoke<PlayerStatus | null>("get_player_status");
+      if (status?.path) currentPathRef.current = status.path;
+      await applyStartupSettings();
+    } catch (e) {
+      // A validation refusal (mismatched pair) lands here after init — tear the
+      // idle player down so the next Play can init cleanly.
+      if (!wasActive) {
+        try {
+          await invoke("destroy_player");
+        } catch {
+          // ignore
+        }
+      }
       setState((prev) => ({ ...prev, loading: false, isActive: wasActive, isPlaying: false }));
       throw e;
     }
@@ -690,6 +748,7 @@ export function usePlayer(): [PlayerState, PlayerActions] {
 
   const actions: PlayerActions = {
     play,
+    playInteractive,
     playEpisode,
     playNextEpisode,
     playPreviousEpisode,

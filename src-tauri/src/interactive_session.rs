@@ -899,6 +899,68 @@ mod tests {
         assert_eq!(sh2.resolve_ref(&bundle, "outer", 8), Some("C".into()));
     }
 
+    /// Play the real Bandersnatch graph hands-off (every choice times out to
+    /// its default), exactly as the driver would: fire each segment's passing
+    /// moments, apply impressions, commit the default choice's target, resolve
+    /// the next segment. Must reach a terminal (credits) segment without ever
+    /// dead-ending. Skips when the local bundle isn't present.
+    #[test]
+    fn default_path_walks_real_bandersnatch_to_credits() {
+        let dir = std::env::var("INTERACTIVE_TEST_DIR")
+            .unwrap_or_else(|_| r"A:\public\media\movies\Black Mirror Bandersnatch (2018)".into());
+        let dir = std::path::PathBuf::from(dir);
+        if !dir.is_dir() {
+            eprintln!("skipping: no local interactive test bundle");
+            return;
+        }
+        let bundle = crate::interactive::load_bundle_from_dir(&dir)
+            .expect("load")
+            .expect("detected");
+
+        let defaults = bundle.moments.state_history.as_ref();
+        let mut sh = shared_on(&bundle.manifest.initial_segment);
+        sh.global = defaults.map(|d| d.global.clone()).unwrap_or_default();
+        sh.persistent = defaults.map(|d| d.persistent.clone()).unwrap_or_default();
+
+        let mut path: Vec<String> = vec![sh.current_segment.clone()];
+        for _ in 0..500 {
+            let current = sh.current_segment.clone();
+            if let Some(moments) = bundle.moments.moments_by_segment.get(&current) {
+                for m in moments {
+                    if !sh.moment_passes(&bundle, m) {
+                        continue;
+                    }
+                    if let Some(imp) = &m.impression_data {
+                        sh.apply_impression(imp);
+                    }
+                    if moment_is_choice(m) {
+                        let choices = m.choices.as_deref().unwrap_or(&[]);
+                        let idx = (m.default_choice_index.unwrap_or(0).max(0) as usize)
+                            .min(choices.len().saturating_sub(1));
+                        let c = &choices[idx];
+                        if let Some(imp) = &c.impression_data {
+                            sh.apply_impression(imp);
+                        }
+                        if let Some(t) = choice_target(c) {
+                            sh.pending_target = Some(t);
+                        }
+                    }
+                }
+            }
+            let seg = bundle.manifest.segments.get(&current).expect("segment exists");
+            if seg.end_time_ms.is_none() {
+                eprintln!("terminal '{current}' reached after {} segments", path.len());
+                return; // credits — the story resolved
+            }
+            let next = sh
+                .resolve_next(&bundle)
+                .unwrap_or_else(|| panic!("dead end at '{current}' after {:?}", path));
+            path.push(next.clone());
+            sh.current_segment = next;
+        }
+        panic!("no terminal segment within 500 hops; tail: {:?}", &path[path.len().saturating_sub(25)..]);
+    }
+
     #[test]
     fn impression_merges_and_reports_persistent_changes() {
         let mut sh = shared_on("A");
