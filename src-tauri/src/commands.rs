@@ -3439,6 +3439,9 @@ pub struct PlaylistSummary {
     /// Nested collections (recursive). With the link counts this decides whether
     /// deleting the playlist needs a confirmation (empty ones just go).
     pub collection_count: i64,
+    /// Items at the playlist's TOP level only (links + collections) — the
+    /// sidebar count, matching exactly what the grid shows when opened.
+    pub root_item_count: i64,
     pub year: Option<String>,
     pub end_year: Option<String>,
 }
@@ -3527,9 +3530,18 @@ pub async fn get_playlists(
             (Some(a), Some(b)) if a != b => Some(b.clone()),
             _ => None,
         };
+        let (root_item_count,): (i64,) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM media_link WHERE parent_playlist_id = ?1) \
+                  + (SELECT COUNT(*) FROM media_playlist_collection WHERE parent_playlist_id = ?1)",
+        )
+        .bind(id)
+        .fetch_one(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
         playlists.push(PlaylistSummary {
             id, title, selected_cover, covers,
-            movie_count, show_count, collection_count, year: min_year, end_year,
+            movie_count, show_count, collection_count, root_item_count,
+            year: min_year, end_year,
         });
     }
 

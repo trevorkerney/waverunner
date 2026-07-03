@@ -35,7 +35,9 @@ function videoComplications(
     id: `playlist.${p.id}`,
     label: p.title,
     iconName: "ListMusic",
-    count: p.movie_count + p.show_count,
+    // Top-level items only (links + collections) — what the grid shows when
+    // opened, not the recursive media total.
+    count: p.root_item_count,
     view: {
       kind: "playlist-detail",
       libraryId,

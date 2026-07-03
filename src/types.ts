@@ -158,6 +158,8 @@ export interface PlaylistSummary {
   show_count: number;
   /** Nested collections (recursive) — with the link counts, decides whether deletion confirms. */
   collection_count: number;
+  /** Items at the playlist's top level only (links + collections) — the sidebar count. */
+  root_item_count: number;
   year: string | null;
   end_year: string | null;
 }
