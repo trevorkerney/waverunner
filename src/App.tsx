@@ -691,8 +691,12 @@ function App() {
         setSortMode(sort_mode);
         setSelectedPresetId(selected_preset_id);
         setPresets(view_presets);
-        if (restoreScroll) restoreScrollPosition(view.libraryId, scrollKindFor(view), breadcrumb[breadcrumb.length - 1]?.id ?? null);
-        else resetScrollToTop();
+        // In-place refreshes never touch the scroll: the grid stayed mounted and
+        // the user may be mid-page — restoring a stale saved offset would jump.
+        if (!inPlace) {
+          if (restoreScroll) restoreScrollPosition(view.libraryId, scrollKindFor(view), breadcrumb[breadcrumb.length - 1]?.id ?? null);
+          else resetScrollToTop();
+        }
       } catch (e) {
         console.error("Failed to load view:", e);
       } finally {
@@ -1338,7 +1342,11 @@ function App() {
       activeView.libraryId === libraryId &&
       (activeView.kind === "playlists" || activeView.kind === "playlist-detail")
     ) {
-      loadView(activeView, null, breadcrumbs, true);
+      // playlist-detail refreshes IN PLACE: dropping a link into a collection
+      // (or removing/moving one) must just shift the grid like the library
+      // grids do — a full reload unmounts the grid and replays the page
+      // drop-in, which reads as a flash.
+      loadView(activeView, null, breadcrumbs, true, activeView.kind === "playlist-detail");
     }
   }, [activeView, breadcrumbs, invalidateCache, loadView]);
 
@@ -1363,7 +1371,7 @@ function App() {
       }
 
       // Playlist-detail has its own per-level sort_mode storage (playlist root vs nested collection)
-      // and a limited vocabulary ("custom" | "alpha"). Route there instead of set_sort_mode.
+      // and its own vocabulary ("custom" | "alpha" | "date"). Route there instead of set_sort_mode.
       if (activeView?.kind === "playlist-detail") {
         try {
           if (activeView.collectionId !== null) {

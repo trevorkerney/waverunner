@@ -4077,7 +4077,7 @@ pub async fn set_playlist_sort_mode(
     playlist_id: i64,
     mode: String,
 ) -> Result<(), String> {
-    if !matches!(mode.as_str(), "custom" | "alpha") {
+    if !matches!(mode.as_str(), "custom" | "alpha" | "date") {
         return Err(format!("Invalid playlist sort mode: {mode}"));
     }
     sqlx::query("UPDATE media_playlist SET sort_mode = ?, selected_preset_id = NULL WHERE id = ?")
@@ -4095,7 +4095,7 @@ pub async fn set_playlist_collection_sort_mode(
     collection_id: i64,
     mode: String,
 ) -> Result<(), String> {
-    if !matches!(mode.as_str(), "custom" | "alpha") {
+    if !matches!(mode.as_str(), "custom" | "alpha" | "date") {
         return Err(format!("Invalid playlist-collection sort mode: {mode}"));
     }
     sqlx::query("UPDATE media_playlist_collection SET sort_mode = ?, selected_preset_id = NULL WHERE id = ?")
@@ -4624,6 +4624,17 @@ pub async fn get_playlist_contents(
         CASE WHEN mef.entry_type = 'show' THEN \
           NULLIF((SELECT MAX(yr) FROM ({show_episode_years})), (SELECT MIN(yr) FROM ({show_episode_years}))) \
         END");
+    // Earliest full release date — the "date" sort key, same derivation the
+    // library grid uses (movie release date; a show's first episode air date).
+    let show_episode_dates = "\
+        SELECT e.release_date as dt FROM episode e \
+          JOIN season s ON e.season_id = s.id \
+          WHERE s.show_id = mef.id AND e.release_date IS NOT NULL";
+    let sort_date_expr = format!("\
+        CASE \
+          WHEN mef.entry_type = 'movie' THEN mef.release_date \
+          WHEN mef.entry_type = 'show' THEN (SELECT MIN(dt) FROM ({show_episode_dates})) \
+        END");
     // COALESCE(link.selected_cover, target.selected_cover) — the link's own override
     // wins; NULL falls back to whatever the target entry currently shows. The `?`
     // placeholders handle "playlist root" vs "nested collection".
@@ -4635,14 +4646,15 @@ pub async fn get_playlist_contents(
                 mef.folder_path, mef.parent_id, mef.entry_type, \
                 COALESCE(ml.selected_cover, mef.selected_cover) as selected_cover, \
                 mef.sort_title, \
-                {SEASON_DISPLAY_EXPR} as season_display \
+                {SEASON_DISPLAY_EXPR} as season_display, \
+                {sort_date_expr} as sort_date \
          FROM media_link ml \
          JOIN media_entry_full mef ON mef.id = ml.target_entry_id \
          WHERE (ml.parent_playlist_id IS ? AND ml.parent_collection_id IS ?)"
     );
     let link_rows: Vec<(
         i64, i64, i64,
-        String, Option<String>, Option<String>, String, Option<i64>, String, Option<String>, Option<String>, Option<String>,
+        String, Option<String>, Option<String>, String, Option<i64>, String, Option<String>, Option<String>, Option<String>, Option<String>,
     )> = sqlx::query_as(&link_query)
         .bind(if parent_collection_id.is_none() { Some(playlist_id) } else { None })
         .bind(parent_collection_id)
@@ -4664,9 +4676,9 @@ pub async fn get_playlist_contents(
     // Build the merged list. Each playlist-collection becomes an entry with entry_type="playlist_collection".
     // Each link is hydrated from its target entry's row. We carry (sort_order, sort_title) alongside
     // each item to apply the current sort mode uniformly after merging.
-    let mut items: Vec<(i64, String, MediaEntry)> = Vec::new();
+    let mut items: Vec<(i64, String, Option<String>, MediaEntry)> = Vec::new();
 
-    for (link_id, sort_order, id, title, year, end_year, folder_path, parent_id, entry_type, selected_cover, sort_title, season_display) in link_rows {
+    for (link_id, sort_order, id, title, year, end_year, folder_path, parent_id, entry_type, selected_cover, sort_title, season_display, sort_date) in link_rows {
         let covers = covers_map.get(&folder_path).cloned().unwrap_or_default();
         let entry = MediaEntry {
             id,
@@ -4685,7 +4697,7 @@ pub async fn get_playlist_contents(
             tmdb_id: None,
             link_id: Some(link_id),
         };
-        items.push((sort_order, sort_title.unwrap_or_default(), entry));
+        items.push((sort_order, sort_title.unwrap_or_default(), sort_date, entry));
     }
 
     for (id, title, selected_cover, sort_order, sort_title) in collection_rows {
@@ -4723,7 +4735,9 @@ pub async fn get_playlist_contents(
         .await
         .map_err(|e| e.to_string())?;
 
-        let (min_year, max_year): (Option<String>, Option<String>) = sqlx::query_as(
+        // MIN/MAX full dates in one pass: years for the subtitle range, the
+        // earliest full date as the "date" sort key (library-grid semantics).
+        let (min_date, max_date): (Option<String>, Option<String>) = sqlx::query_as(
             "WITH RECURSIVE pc_descendants(id) AS ( \
                 SELECT ? \
                 UNION ALL \
@@ -4733,11 +4747,11 @@ pub async fn get_playlist_contents(
                 SELECT ml.target_entry_id AS tid FROM media_link ml \
                   WHERE ml.parent_collection_id IN (SELECT id FROM pc_descendants) \
              ) \
-             SELECT MIN(yr), MAX(yr) FROM ( \
-                SELECT SUBSTR(m.release_date, 1, 4) AS yr FROM movie m \
+             SELECT MIN(dt), MAX(dt) FROM ( \
+                SELECT m.release_date AS dt FROM movie m \
                   WHERE m.id IN (SELECT tid FROM targets) AND m.release_date IS NOT NULL \
                 UNION ALL \
-                SELECT SUBSTR(e.release_date, 1, 4) AS yr FROM episode e \
+                SELECT e.release_date AS dt FROM episode e \
                   JOIN season s ON e.season_id = s.id \
                   WHERE s.show_id IN (SELECT tid FROM targets) AND e.release_date IS NOT NULL \
              )",
@@ -4746,6 +4760,8 @@ pub async fn get_playlist_contents(
         .fetch_one(&state.app_db)
         .await
         .map_err(|e| e.to_string())?;
+        let min_year = min_date.as_deref().map(|d| d[..d.len().min(4)].to_string());
+        let max_year = max_date.as_deref().map(|d| d[..d.len().min(4)].to_string());
 
         let collection_display = {
             let mut parts: Vec<String> = Vec::new();
@@ -4783,20 +4799,25 @@ pub async fn get_playlist_contents(
             tmdb_id: None,
             link_id: None,
         };
-        items.push((sort_order, sort_title, entry));
+        items.push((sort_order, sort_title, min_date, entry));
     }
 
     // Apply sort mode. Custom-sort with a selected preset overrides the normal sort_order
     // with the preset's saved order (items not in the preset tail onto the end).
     let entries: Vec<MediaEntry> = if sort_mode == "alpha" {
         items.sort_by(|a, b| a.1.cmp(&b.1));
-        items.into_iter().map(|(_, _, e)| e).collect()
+        items.into_iter().map(|(_, _, _, e)| e).collect()
+    } else if sort_mode == "date" {
+        // Mirrors the library grids' date sort: earliest known release date
+        // first (undated items lead, like SQL NULLs ASC), title as tiebreak.
+        items.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.1.cmp(&b.1)));
+        items.into_iter().map(|(_, _, _, e)| e).collect()
     } else if let Some(pid) = selected_preset_id {
         items.sort_by_key(|t| t.0);
         apply_playlist_preset_ordering(&state.app_db, pid, items).await?
     } else {
         items.sort_by_key(|t| t.0);
-        items.into_iter().map(|(_, _, e)| e).collect()
+        items.into_iter().map(|(_, _, _, e)| e).collect()
     };
 
     Ok(PlaylistContents {
@@ -4875,7 +4896,7 @@ async fn apply_library_preset_ordering(
 async fn apply_playlist_preset_ordering(
     pool: &sqlx::SqlitePool,
     preset_id: i64,
-    items: Vec<(i64, String, MediaEntry)>,
+    items: Vec<(i64, String, Option<String>, MediaEntry)>,
 ) -> Result<Vec<MediaEntry>, String> {
     let row: Option<(String,)> = sqlx::query_as("SELECT items FROM sort_preset WHERE id = ?")
         .bind(preset_id)
@@ -4883,7 +4904,7 @@ async fn apply_playlist_preset_ordering(
         .await
         .map_err(|e| e.to_string())?;
     let Some((items_json,)) = row else {
-        return Ok(items.into_iter().map(|(_, _, e)| e).collect());
+        return Ok(items.into_iter().map(|(_, _, _, e)| e).collect());
     };
     let preset_items: Vec<PlaylistSortItem> = serde_json::from_str(&items_json).unwrap_or_default();
 
@@ -4892,7 +4913,7 @@ async fn apply_playlist_preset_ordering(
     let mut by_key: std::collections::HashMap<(String, i64), MediaEntry> =
         std::collections::HashMap::new();
     let mut order: Vec<(String, i64)> = Vec::new();
-    for (_, _, e) in items {
+    for (_, _, _, e) in items {
         let key = if let Some(lid) = e.link_id {
             ("link".to_string(), lid)
         } else {

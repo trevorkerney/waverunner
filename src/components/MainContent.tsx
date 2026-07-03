@@ -999,14 +999,9 @@ export function MainContent({
                 <DropdownMenuItem onClick={() => onSortModeChange("alpha")}>
                   Alphabetical
                 </DropdownMenuItem>
-                {/* Date sort is only meaningful for library-scoped grids — playlists have
-                    no uniform release-date semantics, and the user's intent is usually
-                    custom chronological ordering via the Custom option. */}
-                {activeView?.kind !== "playlist-detail" && (
-                  <DropdownMenuItem onClick={() => onSortModeChange("date")}>
-                    Date
-                  </DropdownMenuItem>
-                )}
+                <DropdownMenuItem onClick={() => onSortModeChange("date")}>
+                  Date
+                </DropdownMenuItem>
                 <DropdownMenuItem onClick={() => { onSortModeChange("custom"); onChangePreset(null); }}>
                   Custom
                 </DropdownMenuItem>
