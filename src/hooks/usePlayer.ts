@@ -458,16 +458,16 @@ export function usePlayer(): [PlayerState, PlayerActions] {
       if (status?.path) currentPathRef.current = status.path;
       await applyStartupSettings();
     } catch (e) {
-      // A validation refusal (mismatched pair) lands here after init — tear the
-      // idle player down so the next Play can init cleanly.
-      if (!wasActive) {
-        try {
-          await invoke("destroy_player");
-        } catch {
-          // ignore
-        }
+      // A validation refusal (mismatched pair) lands here after loadfile has
+      // already replaced whatever was playing — the player has nothing valid
+      // to show either way, so tear it down entirely.
+      currentPathRef.current = null;
+      try {
+        await invoke("destroy_player");
+      } catch {
+        // ignore
       }
-      setState((prev) => ({ ...prev, loading: false, isActive: wasActive, isPlaying: false }));
+      setState((prev) => ({ ...initialState, autoPlayNext: prev.autoPlayNext }));
       throw e;
     }
   }, [applyStartupSettings, setPosition]);

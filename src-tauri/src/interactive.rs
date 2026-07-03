@@ -537,6 +537,19 @@ mod tests {
     }
 
     #[test]
+    fn scan_detection_returns_filenames() {
+        let Some(dir) = test_dir() else {
+            eprintln!("skipping: no local interactive test bundle");
+            return;
+        };
+        let (manifest_file, info_file) = detect_bundle_files(&dir).expect("detected");
+        // Content decided the classification; for this pack the conventional
+        // names happen to hold.
+        assert_eq!(manifest_file, "manifest.json");
+        assert_eq!(info_file, "info.json");
+    }
+
+    #[test]
     fn non_interactive_folder_yields_none() {
         // The repo's own src dir has no interactive JSON.
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
