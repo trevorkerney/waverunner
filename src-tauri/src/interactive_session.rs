@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::SqlitePool;
 use tauri::{AppHandle, Emitter, State};
@@ -71,6 +71,33 @@ struct OpenChoice {
     window_end_ms: i64,
 }
 
+/// One decision point on the current path, captured just before its choice
+/// window opened (state included, so restoring one is always consistent).
+/// Recorded for resume now; the rewind timeline picker consumes these later.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChoiceSnapshot {
+    pub segment_id: String,
+    pub story_ms: i64,
+    pub global: HashMap<String, Value>,
+    pub persistent: HashMap<String, Value>,
+    pub selected_index: Option<usize>,
+}
+
+/// Serialized session for interactive_resume — everything needed to put the
+/// viewer back mid-story: playhead, story clock, both state scopes, the
+/// traversal path, and the decision snapshots.
+#[derive(Debug, Serialize, Deserialize)]
+struct ResumePayload {
+    segment: String,
+    offset_ms: i64,
+    story_ms: i64,
+    global: HashMap<String, Value>,
+    persistent: HashMap<String, Value>,
+    path: Vec<String>,
+    snapshots: Vec<ChoiceSnapshot>,
+    pending_target: Option<String>,
+}
+
 pub struct Shared {
     pub entry_id: i64,
     pub library_id: String,
@@ -81,6 +108,13 @@ pub struct Shared {
     open: Option<OpenChoice>,
     global: HashMap<String, Value>,
     persistent: HashMap<String, Value>,
+    /// Story time at the current segment's entry (elapsed = this + in-segment
+    /// offset). Advances on every transition; restored by resume.
+    story_base_ms: i64,
+    /// Segment ids visited this playthrough, in order.
+    path: Vec<String>,
+    /// Decision points passed this playthrough (see ChoiceSnapshot).
+    snapshots: Vec<ChoiceSnapshot>,
 }
 
 pub struct Session {
@@ -301,6 +335,70 @@ fn spawn_save_persistent(pool: &SqlitePool, entry_id: i64, persistent: &HashMap<
     });
 }
 
+/// Serialize the session for mid-story resume, and keep the title's recency
+/// fresh in movie_watch. Fired every ~10s, on transitions, and on driver exit.
+fn spawn_save_resume(pool: &SqlitePool, sh: &Shared, bundle: &InteractiveBundle, pos_ms: i64) {
+    let seg_start = bundle
+        .manifest
+        .segments
+        .get(&sh.current_segment)
+        .map(|s| s.start_time_ms)
+        .unwrap_or(pos_ms);
+    let payload = ResumePayload {
+        segment: sh.current_segment.clone(),
+        offset_ms: (pos_ms - seg_start).max(0),
+        story_ms: sh.story_base_ms + (pos_ms - seg_start).max(0),
+        global: sh.global.clone(),
+        persistent: sh.persistent.clone(),
+        path: sh.path.clone(),
+        snapshots: sh.snapshots.clone(),
+        pending_target: sh.pending_target.clone(),
+    };
+    let Ok(json) = serde_json::to_string(&payload) else { return };
+    let pool = pool.clone();
+    let entry_id = sh.entry_id;
+    tauri::async_runtime::spawn(async move {
+        let _ = sqlx::query(
+            "INSERT INTO interactive_resume (entry_id, resume_json, updated_at) VALUES (?, ?, datetime('now'))
+             ON CONFLICT(entry_id) DO UPDATE SET resume_json = excluded.resume_json, updated_at = excluded.updated_at",
+        )
+        .bind(entry_id)
+        .bind(json)
+        .execute(&pool)
+        .await;
+        let _ = sqlx::query(
+            "INSERT INTO movie_watch (entry_id, watched, last_played_at) VALUES (?, 0, datetime('now'))
+             ON CONFLICT(entry_id) DO UPDATE SET last_played_at = datetime('now')",
+        )
+        .bind(entry_id)
+        .execute(&pool)
+        .await;
+    });
+}
+
+/// An ending was reached: the title counts as watched and the mid-story
+/// resume is cleared (persistent story memory stays, by design).
+fn spawn_mark_story_finished(pool: &SqlitePool, entry_id: i64) {
+    let pool = pool.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = sqlx::query(
+            "INSERT INTO movie_watch (entry_id, position_secs, watched, watched_at, last_played_at)
+             VALUES (?, NULL, 1, datetime('now'), datetime('now'))
+             ON CONFLICT(entry_id) DO UPDATE SET
+                position_secs = NULL, watched = 1,
+                watched_at = COALESCE(movie_watch.watched_at, datetime('now')),
+                last_played_at = datetime('now')",
+        )
+        .bind(entry_id)
+        .execute(&pool)
+        .await;
+        let _ = sqlx::query("DELETE FROM interactive_resume WHERE entry_id = ?")
+            .bind(entry_id)
+            .execute(&pool)
+            .await;
+    });
+}
+
 fn driver_loop(
     app: AppHandle,
     player: Arc<PlayerInner>,
@@ -315,6 +413,8 @@ fn driver_loop(
     // After a jump seek, ignore stale positions until mpv lands (or times out).
     let mut settling_until: Option<(i64, Instant)> = None;
     let mut ended_emitted = false;
+    let mut last_resume_save = Instant::now();
+    let mut last_pos_ms: Option<i64> = None;
 
     let entry_id = {
         let Ok(sh) = session.shared.lock() else { return };
@@ -332,6 +432,7 @@ fn driver_loop(
             continue;
         };
         let pos_ms = (pos * 1000.0) as i64;
+        last_pos_ms = Some(pos_ms);
 
         // Post-seek settling: mpv reports the old position until the seek
         // lands; acting on it would re-trigger the segment we just left.
@@ -364,6 +465,19 @@ fn driver_loop(
                     fired.insert(i);
                     if !sh.moment_passes(&bundle, m) {
                         continue;
+                    }
+                    // Decision point: snapshot the pre-impression state (a
+                    // restore must be able to re-fire this moment cleanly).
+                    if moment_is_choice(m) {
+                        let story_ms = sh.story_base_ms + (pos_ms - seg.start_time_ms).max(0);
+                        let snapshot = ChoiceSnapshot {
+                            segment_id: current.clone(),
+                            story_ms,
+                            global: sh.global.clone(),
+                            persistent: sh.persistent.clone(),
+                            selected_index: None,
+                        };
+                        sh.snapshots.push(snapshot);
                     }
                     if let Some(imp) = &m.impression_data {
                         if sh.apply_impression(imp) {
@@ -421,6 +535,13 @@ fn driver_loop(
                         }
                     }
                 }
+                if let Some(snap) = sh.snapshots.last_mut() {
+                    if snap.selected_index.is_none() {
+                        snap.selected_index = selected;
+                    }
+                }
+                spawn_save_resume(&pool, &sh, &bundle, pos_ms);
+                last_resume_save = Instant::now();
                 let _ = app.emit(
                     "interactive-choice-closed",
                     serde_json::json!({ "selectedIndex": selected, "timedOut": timed_out }),
@@ -441,12 +562,14 @@ fn driver_loop(
                             if (target_start - end).abs() > CONTIGUOUS_MS {
                                 seek_to = Some(target_start);
                             }
+                            sh.story_base_ms += end - seg.start_time_ms;
                             sh.current_segment = next_id.clone();
+                            sh.path.push(next_id.clone());
                             sh.open = None;
                             fired.clear();
                             let _ = app.emit("interactive-segment", serde_json::json!({ "segmentId": next_id }));
-                            // Terminal credits segments have no endTimeMs; tell
-                            // the UI the story has resolved.
+                            // Terminal credits segments have no endTimeMs; the
+                            // story has resolved — watched, resume forgotten.
                             let terminal = bundle
                                 .manifest
                                 .segments
@@ -454,17 +577,28 @@ fn driver_loop(
                                 .map_or(false, |s| s.end_time_ms.is_none());
                             if terminal && !ended_emitted {
                                 ended_emitted = true;
+                                spawn_mark_story_finished(&pool, entry_id);
                                 let _ = app.emit("interactive-ended", serde_json::json!({}));
+                            } else if !ended_emitted {
+                                spawn_save_resume(&pool, &sh, &bundle, target_start);
+                                last_resume_save = Instant::now();
                             }
                         }
                         None => {
                             if !ended_emitted {
                                 ended_emitted = true;
+                                spawn_mark_story_finished(&pool, entry_id);
                                 let _ = app.emit("interactive-ended", serde_json::json!({}));
                             }
                         }
                     }
                 }
+            }
+
+            // 4. Periodic resume checkpoint (~10s of playback).
+            if !ended_emitted && last_resume_save.elapsed() >= Duration::from_secs(10) {
+                spawn_save_resume(&pool, &sh, &bundle, pos_ms);
+                last_resume_save = Instant::now();
             }
         } // shared lock released before the (slow) seek
 
@@ -486,6 +620,15 @@ fn driver_loop(
             seg_end.map_or(false, |end| end - pos_ms < 120)
         };
         std::thread::sleep(Duration::from_millis(if near_boundary { 4 } else { 15 }));
+    }
+
+    // Driver stopping (player closed / session replaced): one final checkpoint
+    // so "come back later" resumes from the last frame watched, not up to 10s
+    // earlier.
+    if !ended_emitted {
+        if let (Some(pos_ms), Ok(sh)) = (last_pos_ms, session.shared.lock()) {
+            spawn_save_resume(&pool, &sh, &bundle, pos_ms);
+        }
     }
 }
 
@@ -558,8 +701,17 @@ pub async fn interactive_start(
     state: State<'_, AppState>,
     library_id: String,
     entry_id: i64,
+    fresh: Option<bool>,
 ) -> Result<(), String> {
     stop_session(&state);
+    // "Play from beginning": forget the mid-story resume (persistent story
+    // memory stays — Reset story is the bigger hammer).
+    if fresh.unwrap_or(false) {
+        let _ = sqlx::query("DELETE FROM interactive_resume WHERE entry_id = ?")
+            .bind(entry_id)
+            .execute(&state.app_db)
+            .await;
+    }
 
     let (folder, video, title) =
         crate::commands::movie_playback_info(&state.app_db, &library_id, entry_id).await?;
@@ -623,53 +775,117 @@ pub async fn interactive_start(
         ));
     }
 
-    // Story state: persistent survives playthroughs (DB over format defaults);
-    // global resets every playthrough.
-    let defaults = bundle.moments.state_history.as_ref();
-    let global: HashMap<String, Value> = defaults.map(|d| d.global.clone()).unwrap_or_default();
-    let mut persistent: HashMap<String, Value> = defaults.map(|d| d.persistent.clone()).unwrap_or_default();
-    let saved: Option<(String,)> =
-        sqlx::query_as("SELECT persistent_json FROM interactive_state WHERE entry_id = ?")
+    // A saved mid-story session wins (unless fresh cleared it); otherwise
+    // start at the graph's initial segment with default state. Persistent
+    // story memory survives playthroughs (DB over format defaults); global
+    // resets every playthrough.
+    let resume: Option<ResumePayload> = if fresh.unwrap_or(false) {
+        None
+    } else {
+        sqlx::query_as::<_, (String,)>("SELECT resume_json FROM interactive_resume WHERE entry_id = ?")
             .bind(entry_id)
             .fetch_optional(&state.app_db)
             .await
-            .map_err(|e| e.to_string())?;
-    if let Some((json,)) = saved {
-        if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&json) {
-            for (k, v) in map {
-                persistent.insert(k, v);
+            .map_err(|e| e.to_string())?
+            .and_then(|(json,)| serde_json::from_str::<ResumePayload>(&json).ok())
+            .filter(|r| bundle.manifest.segments.contains_key(&r.segment))
+    };
+
+    let shared = if let Some(resume) = resume {
+        let seg = &bundle.manifest.segments[&resume.segment];
+        let offset = resume.offset_ms.max(0);
+        // Re-entry cushion (~4s of context), but never land somewhere that
+        // re-opens a decided choice: a window that closed before the save
+        // point — or one the save sat inside with a pick already committed —
+        // is skipped past; an undecided mid-window save re-presents the
+        // choice from its top instead.
+        let mut land = (offset - 4_000).max(0);
+        if let Some(moments) = bundle.moments.moments_by_segment.get(&resume.segment) {
+            for m in moments.iter().filter(|m| moment_is_choice(m)) {
+                if let Some((ws, we)) = moment_window(m) {
+                    let (rs, re) = (ws - seg.start_time_ms, we - seg.start_time_ms);
+                    if offset >= re {
+                        land = land.max(re);
+                    } else if offset >= rs {
+                        land = if resume.pending_target.is_some() {
+                            land.max(re)
+                        } else {
+                            (rs - 1_000).max(0)
+                        };
+                    }
+                }
             }
         }
-    }
-
-    // Enter the graph at its initial segment.
-    let initial = bundle.manifest.initial_segment.clone();
-    let initial_start = bundle
-        .manifest
-        .segments
-        .get(&initial)
-        .map(|s| s.start_time_ms)
-        .unwrap_or(0);
-    if initial_start > 100 {
+        let target_ms = seg.start_time_ms + land;
         let p = player.clone();
         let _ = tauri::async_runtime::spawn_blocking(move || {
-            p.mpv.command(&["seek", &format!("{:.3}", initial_start as f64 / 1000.0), "absolute+exact"])
+            p.mpv.command(&["seek", &format!("{:.3}", target_ms as f64 / 1000.0), "absolute+exact"])
         })
         .await;
-    }
-
-    let session = Arc::new(Session {
-        shutdown: Arc::new(AtomicBool::new(false)),
-        shared: Arc::new(Mutex::new(Shared {
+        Shared {
             entry_id,
             library_id,
             title,
-            current_segment: initial,
+            current_segment: resume.segment,
+            pending_target: resume.pending_target,
+            open: None,
+            global: resume.global,
+            persistent: resume.persistent,
+            story_base_ms: resume.story_ms - offset,
+            path: resume.path,
+            snapshots: resume.snapshots,
+        }
+    } else {
+        let defaults = bundle.moments.state_history.as_ref();
+        let global: HashMap<String, Value> = defaults.map(|d| d.global.clone()).unwrap_or_default();
+        let mut persistent: HashMap<String, Value> =
+            defaults.map(|d| d.persistent.clone()).unwrap_or_default();
+        let saved: Option<(String,)> =
+            sqlx::query_as("SELECT persistent_json FROM interactive_state WHERE entry_id = ?")
+                .bind(entry_id)
+                .fetch_optional(&state.app_db)
+                .await
+                .map_err(|e| e.to_string())?;
+        if let Some((json,)) = saved {
+            if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&json) {
+                for (k, v) in map {
+                    persistent.insert(k, v);
+                }
+            }
+        }
+
+        let initial = bundle.manifest.initial_segment.clone();
+        let initial_start = bundle
+            .manifest
+            .segments
+            .get(&initial)
+            .map(|s| s.start_time_ms)
+            .unwrap_or(0);
+        if initial_start > 100 {
+            let p = player.clone();
+            let _ = tauri::async_runtime::spawn_blocking(move || {
+                p.mpv.command(&["seek", &format!("{:.3}", initial_start as f64 / 1000.0), "absolute+exact"])
+            })
+            .await;
+        }
+        Shared {
+            entry_id,
+            library_id,
+            title,
+            current_segment: initial.clone(),
             pending_target: None,
             open: None,
             global,
             persistent,
-        })),
+            story_base_ms: 0,
+            path: vec![initial],
+            snapshots: Vec::new(),
+        }
+    };
+
+    let session = Arc::new(Session {
+        shutdown: Arc::new(AtomicBool::new(false)),
+        shared: Arc::new(Mutex::new(shared)),
     });
 
     {
@@ -778,11 +994,17 @@ pub async fn interactive_stop(state: State<'_, AppState>) -> Result<(), String> 
     Ok(())
 }
 
-/// Forget the title's persistent story state ("Reset story"). Applies to the
-/// next playthrough; a running session keeps its in-memory state.
+/// Forget the title's persistent story state AND any mid-story resume
+/// ("Reset story" — the full fresh start). Applies to the next playthrough;
+/// a running session keeps its in-memory state.
 #[tauri::command]
 pub async fn reset_interactive_story(state: State<'_, AppState>, entry_id: i64) -> Result<(), String> {
     sqlx::query("DELETE FROM interactive_state WHERE entry_id = ?")
+        .bind(entry_id)
+        .execute(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+    sqlx::query("DELETE FROM interactive_resume WHERE entry_id = ?")
         .bind(entry_id)
         .execute(&state.app_db)
         .await
@@ -840,6 +1062,9 @@ mod tests {
             open: None,
             global: HashMap::new(),
             persistent: HashMap::new(),
+            story_base_ms: 0,
+            path: vec![segment.into()],
+            snapshots: Vec::new(),
         }
     }
 

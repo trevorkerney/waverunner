@@ -105,6 +105,12 @@ pub struct MediaEntry {
     /// interactive_title). Play routes into the interactive engine.
     #[serde(default)]
     pub interactive: bool,
+    /// Watch history (movies only; shows derive theirs per-episode): sticky
+    /// watched flag + resume progress ratio (0..1) for the card sliver.
+    #[serde(default)]
+    pub watched: bool,
+    #[serde(default)]
+    pub watch_progress: Option<f64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1116,6 +1122,8 @@ pub async fn get_entries(
                         tmdb_id,
                         link_id: None,
                         interactive: false,
+                        watched: false,
+                        watch_progress: None,
                     }
                 })
                 .collect();
@@ -1168,7 +1176,7 @@ pub async fn get_entries(
                 entries
             };
 
-            mark_interactive_entries(&state.app_db, &mut entries).await?;
+            mark_entry_flags(&state.app_db, &mut entries).await?;
 
             EntriesResponse {
                 entries,
@@ -1219,6 +1227,8 @@ pub async fn get_entries(
                         tmdb_id: None,
                         link_id: None,
                         interactive: false,
+                        watched: false,
+                        watch_progress: None,
                     }
                 })
                 .collect();
@@ -1338,7 +1348,7 @@ pub async fn search_entries(
             let mut entries: Vec<MediaEntry> = rows.into_iter()
                 .map(|(id, title, year, end_year, folder_path, parent_id, entry_type, selected_cover, tmdb_id, season_display)| {
                     let covers = covers_map.remove(&folder_path).unwrap_or_default();
-                    MediaEntry { id, title, year, end_year, folder_path, parent_id, entry_type, covers, selected_cover, child_count: 0, season_display, collection_display: None, role_display: None, tmdb_id, link_id: None, interactive: false }
+                    MediaEntry { id, title, year, end_year, folder_path, parent_id, entry_type, covers, selected_cover, child_count: 0, season_display, collection_display: None, role_display: None, tmdb_id, link_id: None, interactive: false, watched: false, watch_progress: None }
                 })
                 .collect();
 
@@ -1395,7 +1405,7 @@ pub async fn search_entries(
             rows.into_iter()
                 .map(|(id, title, folder_path, selected_cover)| {
                     let covers = covers_map.remove(&folder_path).unwrap_or_default();
-                    MediaEntry { id, title, year: None, end_year: None, folder_path, parent_id: None, entry_type: "artist".to_string(), covers, selected_cover, child_count: 0, season_display: None, collection_display: None, role_display: None, tmdb_id: None, link_id: None, interactive: false }
+                    MediaEntry { id, title, year: None, end_year: None, folder_path, parent_id: None, entry_type: "artist".to_string(), covers, selected_cover, child_count: 0, season_display: None, collection_display: None, role_display: None, tmdb_id: None, link_id: None, interactive: false, watched: false, watch_progress: None }
                 })
                 .collect()
         }
@@ -1405,14 +1415,15 @@ pub async fn search_entries(
     };
 
     let mut entries = entries;
-    mark_interactive_entries(&state.app_db, &mut entries).await?;
+    mark_entry_flags(&state.app_db, &mut entries).await?;
     Ok(entries)
 }
 
-/// Flag movie entries that have an interactive sidecar row (interactive_title).
-/// One batched query per response instead of a JOIN in every entry-listing SQL
-/// variant. Chunked to stay under SQLite's bind-variable limit.
-async fn mark_interactive_entries(
+/// Per-movie flags batch-filled after the entry list is assembled: interactive
+/// sidecar presence + watch history (watched flag, resume ratio). One batched
+/// query per response instead of JOINs in every entry-listing SQL variant.
+/// Chunked to stay under SQLite's bind-variable limit.
+async fn mark_entry_flags(
     pool: &sqlx::SqlitePool,
     entries: &mut [MediaEntry],
 ) -> Result<(), String> {
@@ -1424,20 +1435,37 @@ async fn mark_interactive_entries(
     if ids.is_empty() {
         return Ok(());
     }
-    let mut flagged: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    // id -> (interactive, watched, progress ratio)
+    let mut flags: std::collections::HashMap<i64, (bool, bool, Option<f64>)> =
+        std::collections::HashMap::new();
     for chunk in ids.chunks(900) {
         let placeholders = vec!["?"; chunk.len()].join(",");
-        let query = format!("SELECT entry_id FROM interactive_title WHERE entry_id IN ({placeholders})");
-        let mut q = sqlx::query_as::<_, (i64,)>(&query);
+        let query = format!(
+            "SELECT me.id,
+                    (it.entry_id IS NOT NULL),
+                    COALESCE(mw.watched, 0),
+                    CASE WHEN mw.watched = 0 AND mw.position_secs IS NOT NULL AND mw.duration_secs > 0
+                         THEN mw.position_secs / mw.duration_secs ELSE NULL END
+             FROM media_entry me
+             LEFT JOIN interactive_title it ON it.entry_id = me.id
+             LEFT JOIN movie_watch mw ON mw.entry_id = me.id
+             WHERE me.id IN ({placeholders})
+               AND (it.entry_id IS NOT NULL OR mw.entry_id IS NOT NULL)"
+        );
+        let mut q = sqlx::query_as::<_, (i64, bool, i64, Option<f64>)>(&query);
         for id in chunk {
             q = q.bind(id);
         }
-        let rows: Vec<(i64,)> = q.fetch_all(pool).await.map_err(|e| e.to_string())?;
-        flagged.extend(rows.into_iter().map(|(id,)| id));
+        let rows = q.fetch_all(pool).await.map_err(|e| e.to_string())?;
+        for (id, interactive, watched, progress) in rows {
+            flags.insert(id, (interactive, watched != 0, progress));
+        }
     }
     for e in entries.iter_mut() {
-        if flagged.contains(&e.id) {
-            e.interactive = true;
+        if let Some((interactive, watched, progress)) = flags.get(&e.id) {
+            e.interactive = *interactive;
+            e.watched = *watched;
+            e.watch_progress = *progress;
         }
     }
     Ok(())
@@ -2688,12 +2716,14 @@ pub async fn get_entries_for_genre(
                 tmdb_id,
                 link_id: None,
                 interactive: false,
+                watched: false,
+                watch_progress: None,
             }
         })
         .collect();
 
     let mut entries = entries;
-    mark_interactive_entries(&state.app_db, &mut entries).await?;
+    mark_entry_flags(&state.app_db, &mut entries).await?;
     Ok(entries)
 }
 
@@ -3467,12 +3497,14 @@ pub async fn get_entries_for_person(
                 tmdb_id,
                 link_id: None,
                 interactive: false,
+                watched: false,
+                watch_progress: None,
             }
         })
         .collect();
 
     let mut entries = entries;
-    mark_interactive_entries(&state.app_db, &mut entries).await?;
+    mark_entry_flags(&state.app_db, &mut entries).await?;
     Ok(entries)
 }
 
@@ -4759,6 +4791,8 @@ pub async fn get_playlist_contents(
             tmdb_id: None,
             link_id: Some(link_id),
             interactive: false,
+            watched: false,
+            watch_progress: None,
         };
         items.push((sort_order, sort_title.unwrap_or_default(), sort_date, entry));
     }
@@ -4862,6 +4896,8 @@ pub async fn get_playlist_contents(
             tmdb_id: None,
             link_id: None,
             interactive: false,
+            watched: false,
+            watch_progress: None,
         };
         items.push((sort_order, sort_title, min_date, entry));
     }
@@ -4885,7 +4921,7 @@ pub async fn get_playlist_contents(
     };
 
     let mut entries = entries;
-    mark_interactive_entries(&state.app_db, &mut entries).await?;
+    mark_entry_flags(&state.app_db, &mut entries).await?;
 
     Ok(PlaylistContents {
         entries,

@@ -2,6 +2,7 @@ mod commands;
 mod db;
 pub mod interactive;
 mod interactive_session;
+mod watch;
 mod mpv;
 mod player;
 mod rt;
@@ -183,6 +184,12 @@ pub fn run() {
             commands::set_playlist_cover,
             commands::set_playlist_collection_cover,
             commands::get_playlist_contents,
+            watch::set_watch_target,
+            watch::get_watch_state,
+            watch::get_show_watch,
+            watch::get_show_continue,
+            watch::mark_watched,
+            watch::mark_season_watched,
             interactive_session::interactive_start,
             interactive_session::interactive_choose,
             interactive_session::interactive_status,

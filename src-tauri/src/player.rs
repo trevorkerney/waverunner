@@ -4,18 +4,22 @@
 
 use std::os::raw::{c_char, c_int};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::ffi::CStr;
 
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::mpv::{self, MpvFormat, MpvHandle};
+use crate::watch::WatchTarget;
 use crate::AppState;
 
 /// Holds the live mpv instance + a flag the event loop checks for shutdown.
 pub struct PlayerInner {
     pub mpv: MpvHandle,
     pub shutdown: Arc<AtomicBool>,
+    /// What's playing, for watch-history attribution (set_watch_target). The
+    /// event loop samples it on time-pos ticks; None (extras etc.) = untracked.
+    pub watch: Mutex<Option<WatchTarget>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -82,7 +86,7 @@ pub fn init_player(window: tauri::WebviewWindow, state: State<'_, AppState>, tit
     // *without* holding the player mutex — keeping playback control responsive
     // even while a file is loading off a slow/spun-down disk. The event loop
     // gets its own clone instead of re-locking state every iteration.
-    let inner = Arc::new(PlayerInner { mpv, shutdown });
+    let inner = Arc::new(PlayerInner { mpv, shutdown, watch: Mutex::new(None) });
     let loop_inner = inner.clone();
     std::thread::spawn(move || {
         event_loop(&app, loop_inner);
@@ -548,6 +552,12 @@ fn event_loop(app: &AppHandle, inner: Arc<PlayerInner>) {
     let mut last_timepos_emit: Option<std::time::Instant> = None;
     const TIMEPOS_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
+    // Watch-history sampling rides the same time-pos stream on its own ~5s
+    // throttle. Pauses stop the stream, so paused time never writes; worst
+    // case on crash/power-loss is 5 seconds of lost progress.
+    let mut last_watch_write: Option<std::time::Instant> = None;
+    const WATCH_WRITE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
     loop {
         if inner.shutdown.load(Ordering::SeqCst) {
             break;
@@ -575,6 +585,22 @@ fn event_loop(app: &AppHandle, inner: Arc<PlayerInner>) {
                     // other property (pause, duration, eof, …) through at once.
                     if name == "time-pos" {
                         let now = std::time::Instant::now();
+                        // Watch-history sample — independent of the emit throttle
+                        // (a `continue` below must not starve it).
+                        if last_watch_write.map_or(true, |t| now.duration_since(t) >= WATCH_WRITE_INTERVAL) {
+                            let target = inner.watch.lock().ok().and_then(|g| *g);
+                            if let Some(target) = target {
+                                if let Some(pos) = property_value_to_json(prop).as_f64() {
+                                    if let Some(dur) = inner.mpv.get_property_double("duration") {
+                                        last_watch_write = Some(now);
+                                        let pool = app.state::<AppState>().app_db.clone();
+                                        tauri::async_runtime::spawn(async move {
+                                            crate::watch::record_progress(&pool, target, pos, dur).await;
+                                        });
+                                    }
+                                }
+                            }
+                        }
                         if last_timepos_emit
                             .is_some_and(|t| now.duration_since(t) < TIMEPOS_MIN_INTERVAL)
                         {

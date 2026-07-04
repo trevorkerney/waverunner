@@ -784,6 +784,56 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .execute(&pool)
     .await?;
 
+    // ── Watch history ─────────────────────────────────────────────────
+    // Progress + watched state, written by the player event loop every ~5s of
+    // playback. position_secs is the resume point — NULL when there isn't one
+    // (finished, or never got past the 30s noise floor). watched flips at
+    // ≥95% or ≤60s remaining and is sticky across rewatches. Keyed on ids,
+    // which rescans keep stable for unchanged paths (rename on disk = history
+    // lost until file-hashing gives entries a durable identity).
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS movie_watch (
+            entry_id INTEGER PRIMARY KEY,
+            position_secs REAL,
+            duration_secs REAL,
+            watched INTEGER NOT NULL DEFAULT 0,
+            watched_at TEXT,
+            last_played_at TEXT,
+            FOREIGN KEY (entry_id) REFERENCES media_entry(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS episode_watch (
+            episode_id INTEGER PRIMARY KEY,
+            position_secs REAL,
+            duration_secs REAL,
+            watched INTEGER NOT NULL DEFAULT 0,
+            watched_at TEXT,
+            last_played_at TEXT,
+            FOREIGN KEY (episode_id) REFERENCES episode(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // Mid-story resume for interactive titles (percent-complete is meaningless
+    // there). JSON payload: current segment + offset, story clock, both state
+    // scopes, and the traversal/snapshot stack — written by the interactive
+    // driver, cleared when an ending is reached (which sets movie_watch.watched).
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS interactive_resume (
+            entry_id INTEGER PRIMARY KEY,
+            resume_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (entry_id) REFERENCES media_entry(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     // ── Selected backdrop per entry ───────────────────────────────────
     // Separate table (not a column on movie/show) so it needs no ALTER
     // migrations and covers any entry type that grows a backdrop later.
