@@ -94,11 +94,14 @@ import {
   Clapperboard,
   GitBranch,
   RotateCcw,
+  Check,
+  Eye,
+  EyeOff,
 } from "lucide-react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
-import { Library, MediaEntry, BreadcrumbItem, MovieDetail, MovieDetailUpdate, SeasonInfo, EpisodeInfo, ShowDetail, SeasonDetailLocal, EpisodeDetailLocal, TmdbSeasonDetail, TmdbEpisodeDetail, TmdbShowFieldSelection, TmdbSeasonFieldSelection, TmdbEpisodeFieldSelection, CastUpdateInfo, CastInfo, RatingInfo, ViewSpec, PersonInfo, PersonSummary, PersonRole, PlaylistSummary, GenreSummary, SortPreset } from "@/types";
+import { Library, MediaEntry, BreadcrumbItem, MovieDetail, MovieDetailUpdate, SeasonInfo, EpisodeInfo, ShowDetail, SeasonDetailLocal, EpisodeDetailLocal, TmdbSeasonDetail, TmdbEpisodeDetail, TmdbShowFieldSelection, TmdbSeasonFieldSelection, TmdbEpisodeFieldSelection, CastUpdateInfo, CastInfo, RatingInfo, ViewSpec, PersonInfo, PersonSummary, PersonRole, PlaylistSummary, GenreSummary, SortPreset, WatchState, EpisodeWatchInfo, ContinueTarget, ShowEpisodeFlat } from "@/types";
 import { scopeKeyFor, viewCacheKey } from "@/lib/complications";
 import { ExtrasDialog } from "@/components/ExtrasDialog";
 import { SortPresetSaveDialog } from "@/components/SortPresetSaveDialog";
@@ -235,9 +238,9 @@ interface MainContentProps {
   getCoverAspect: (filePath: string) => number | undefined;
   getFullCoverUrl: (filePath: string) => string;
   scrollContainerRef: RefObject<HTMLDivElement | null>;
-  onPlayFile?: (path: string, title: string) => void;
-  onPlayInteractive?: (args: { libraryId: string; entryId: number; title: string }) => void;
-  onPlayEpisode?: (args: { libraryId: string; showId: number; showTitle: string; startEpisodeId: number }) => void;
+  onPlayFile?: (path: string, title: string, opts?: { watch?: { kind: "movie" | "episode"; id: number }; startSecs?: number }) => void;
+  onPlayInteractive?: (args: { libraryId: string; entryId: number; title: string; fresh?: boolean }) => void;
+  onPlayEpisode?: (args: { libraryId: string; showId: number; showTitle: string; startEpisodeId: number; startSecs?: number }) => void;
 }
 
 export function MainContent({
@@ -1473,6 +1476,13 @@ function SortableCoverCard({
   const isCollection = entry.entry_type === "collection";
   const isPlaylistCollection = entry.entry_type === "playlist_collection";
   const isDropTarget = isCollection || isPlaylistCollection;
+
+  // Optimistic watched flag: entry lists are cached upstream, so after
+  // mark-watched from this card's menu the card corrects itself locally and
+  // the caches catch up on their next reload.
+  const [watchedOverride, setWatchedOverride] = useState<boolean | null>(null);
+  useEffect(() => setWatchedOverride(null), [entry.id, entry.watched]);
+  const isWatched = watchedOverride ?? entry.watched;
   // Different prefixes so the drag-end handler knows which backend to call.
   const dropId = isPlaylistCollection
     ? `pc-drop-${entry.id}`
@@ -1625,6 +1635,22 @@ function SortableCoverCard({
               Interactive
             </div>
           )}
+          {isWatched && (
+            <div
+              className="absolute right-1 top-1 rounded-full bg-black/70 p-1 text-white backdrop-blur-sm"
+              title="Watched"
+            >
+              <Check size={12} />
+            </div>
+          )}
+          {!isWatched && entry.watch_progress != null && (
+            <div className="absolute inset-x-0 bottom-0 h-1 bg-black/50">
+              <div
+                className="h-full bg-primary"
+                style={{ width: `${Math.round(Math.min(1, Math.max(0, entry.watch_progress)) * 100)}%` }}
+              />
+            </div>
+          )}
         </div>
         <div className="w-full">
           {isDeleting ? (
@@ -1735,6 +1761,21 @@ function SortableCoverCard({
               <ContextMenuItem onClick={() => onAddToPlaylist(entry)}>
                 <ListPlus size={14} />
                 Add to playlist
+              </ContextMenuItem>
+            )}
+            {entry.entry_type === "movie" && (
+              <ContextMenuItem
+                onClick={async () => {
+                  try {
+                    await invoke("mark_watched", { kind: "movie", id: entry.id, watched: !isWatched });
+                    setWatchedOverride(!isWatched);
+                  } catch (e) {
+                    toast.error(String(e));
+                  }
+                }}
+              >
+                {isWatched ? <EyeOff size={14} /> : <Eye size={14} />}
+                {isWatched ? "Mark unwatched" : "Mark watched"}
               </ContextMenuItem>
             )}
             {onRemoveLink && entry.link_id != null && (
@@ -1988,6 +2029,17 @@ function fmtRuntime(minutes: number): string {
   return minutes >= 60 ? `${Math.floor(minutes / 60)}h ${minutes % 60}m` : `${minutes}m`;
 }
 
+/** Clock-style position for resume labels: 1:12:03 / 12:03. */
+function fmtClock(seconds: number): string {
+  const s = Math.max(0, Math.floor(seconds));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  return h > 0
+    ? `${h}:${m.toString().padStart(2, "0")}:${sec.toString().padStart(2, "0")}`
+    : `${m}:${sec.toString().padStart(2, "0")}`;
+}
+
 const RATING_ORDER = ["rotten_tomatoes", "rotten_tomatoes_audience", "imdb", "metacritic"];
 const RATING_LABELS: Record<string, string> = {
   rotten_tomatoes_audience: "RT Audience",
@@ -2213,8 +2265,8 @@ function EntryDetailPage({
   onChangeCover: () => void;
   onAddCover: () => void;
   onDeleteCover: () => void;
-  onPlayFile?: (path: string, title: string) => void;
-  onPlayInteractive?: (args: { libraryId: string; entryId: number; title: string }) => void;
+  onPlayFile?: (path: string, title: string, opts?: { watch?: { kind: "movie" | "episode"; id: number }; startSecs?: number }) => void;
+  onPlayInteractive?: (args: { libraryId: string; entryId: number; title: string; fresh?: boolean }) => void;
   onNavigateToPerson?: (person: PersonInfo, role: PersonRole) => void;
   onSelectGenre?: (libraryId: string, genre: string) => void;
 }) {
@@ -2231,14 +2283,27 @@ function EntryDetailPage({
   const [extrasCount, setExtrasCount] = useState(0);
   const [ratings, setRatings] = useState<RatingInfo[]>([]);
   const [omdbEnabled, setOmdbEnabled] = useState(false);
+  const [watch, setWatch] = useState<WatchState | null>(null);
   // Entry id everything below has finished loading for. Render is gated on it so
   // the page appears in one piece instead of sections popping in one by one.
   const [loadedId, setLoadedId] = useState<number | null>(null);
 
+  // Watch indicators refresh when the player closes — that's when the
+  // session's progress recording has settled.
+  useEffect(() => {
+    const refresh = () => {
+      invoke<WatchState>("get_watch_state", { entryId: entry.id })
+        .then(setWatch)
+        .catch(() => {});
+    };
+    window.addEventListener("waverunner:player-closed", refresh);
+    return () => window.removeEventListener("waverunner:player-closed", refresh);
+  }, [entry.id]);
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      const [extras, cachedRatings, settings, d] = await Promise.all([
+      const [extras, cachedRatings, settings, d, w] = await Promise.all([
         invoke<unknown[]>("get_extras", { entryId: entry.id }).catch(() => [] as unknown[]),
         // Cached ratings only — fetching is always explicit (context menu / bulk match).
         invoke<RatingInfo[]>("get_ratings", { entryId: entry.id }).catch(() => [] as RatingInfo[]),
@@ -2247,6 +2312,7 @@ function EntryDetailPage({
           console.error("Failed to load movie detail:", e);
           return null;
         }),
+        invoke<WatchState>("get_watch_state", { entryId: entry.id }).catch(() => null),
       ]);
       // Decode the hero backdrop before the gate opens so it paints with the page.
       if (d?.backdrop) {
@@ -2261,6 +2327,7 @@ function EntryDetailPage({
       setRatings(cachedRatings);
       setOmdbEnabled(settings["omdb_enabled"] === "true");
       setDetail(d);
+      setWatch(w);
       setLoadedId(entry.id);
     })();
     return () => {
@@ -2396,11 +2463,27 @@ function EntryDetailPage({
           Get ratings
         </ContextMenuItem>
       )}
+      <ContextMenuItem
+        onClick={async () => {
+          try {
+            const next = !(watch?.watched ?? entry.watched);
+            await invoke("mark_watched", { kind: "movie", id: entry.id, watched: next });
+            setWatch(await invoke<WatchState>("get_watch_state", { entryId: entry.id }));
+            onEntryChanged();
+          } catch (e) {
+            toast.error(String(e));
+          }
+        }}
+      >
+        {(watch?.watched ?? entry.watched) ? <EyeOff size={14} /> : <Eye size={14} />}
+        {(watch?.watched ?? entry.watched) ? "Mark unwatched" : "Mark watched"}
+      </ContextMenuItem>
       {entry.interactive && (
         <ContextMenuItem
           onClick={async () => {
             try {
               await invoke("reset_interactive_story", { entryId: entry.id });
+              setWatch(await invoke<WatchState>("get_watch_state", { entryId: entry.id }));
               toast.success("Story reset — the next playthrough starts fresh");
             } catch (e) {
               toast.error(String(e));
@@ -2507,6 +2590,12 @@ function EntryDetailPage({
                       Interactive
                     </span>
                   )}
+                  {(watch?.watched ?? entry.watched) && (
+                    <span className="inline-flex items-center gap-1 rounded border border-border px-1.5 py-px text-xs">
+                      <Check size={11} />
+                      Watched
+                    </span>
+                  )}
                 </div>
                 {detail?.tagline && (
                   <p className="mt-2 italic text-muted-foreground">{detail.tagline}</p>
@@ -2516,24 +2605,53 @@ function EntryDetailPage({
             )}
           </div>
           <div className="flex shrink-0 gap-2">
-            <Button
-              size="sm"
-              onClick={async () => {
-                if (entry.interactive) {
-                  onPlayInteractive?.({ libraryId: selectedLibrary.id, entryId: entry.id, title: entry.title });
-                  return;
-                }
+            {(() => {
+              const playMovie = async (startSecs?: number) => {
                 try {
                   const path = await invoke<string>("get_movie_file_path", { libraryId: selectedLibrary.id, entryId: entry.id });
-                  onPlayFile?.(path, entry.title);
+                  onPlayFile?.(path, entry.title, { watch: { kind: "movie", id: entry.id }, startSecs });
                 } catch (e) {
                   toast.error(String(e));
                 }
-              }}
-            >
-              <Play size={14} />
-              Play
-            </Button>
+              };
+              if (entry.interactive) {
+                const canResume = watch?.interactive_resume ?? false;
+                return (
+                  <>
+                    <Button
+                      size="sm"
+                      onClick={() => onPlayInteractive?.({ libraryId: selectedLibrary.id, entryId: entry.id, title: entry.title, fresh: false })}
+                    >
+                      <Play size={14} />
+                      {canResume ? "Resume" : "Play"}
+                    </Button>
+                    {canResume && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => onPlayInteractive?.({ libraryId: selectedLibrary.id, entryId: entry.id, title: entry.title, fresh: true })}
+                      >
+                        Play from beginning
+                      </Button>
+                    )}
+                  </>
+                );
+              }
+              const resumePos = watch?.position_secs ?? null;
+              return (
+                <>
+                  <Button size="sm" onClick={() => playMovie(resumePos ?? undefined)}>
+                    <Play size={14} />
+                    {resumePos != null ? `Resume · ${fmtClock(resumePos)}` : "Play"}
+                  </Button>
+                  {resumePos != null && (
+                    <Button size="sm" variant="outline" onClick={() => playMovie(undefined)}>
+                      Play from beginning
+                    </Button>
+                  )}
+                </>
+              );
+            })()}
             {extrasCount > 0 && (
               <Button size="sm" variant="outline" onClick={() => setExtrasOpen(true)}>
                 <Clapperboard size={14} />
@@ -2720,7 +2838,7 @@ function ShowDetailPage({
   onChangeCover: () => void;
   onAddCover: () => void;
   onDeleteCover: () => void;
-  onPlayEpisode?: (args: { libraryId: string; showId: number; showTitle: string; startEpisodeId: number }) => void;
+  onPlayEpisode?: (args: { libraryId: string; showId: number; showTitle: string; startEpisodeId: number; startSecs?: number }) => void;
   /** Plays a standalone file (used for extras — episodes go through onPlayEpisode). */
   onPlayFile?: (path: string, title: string) => void;
   onNavigateToPerson?: (person: PersonInfo, role: PersonRole) => void;
@@ -2758,7 +2876,36 @@ function ShowDetailPage({
   // Entry id everything below has finished loading for. Render is gated on it so
   // the page appears in one piece instead of sections popping in one by one.
   const [loadedId, setLoadedId] = useState<number | null>(null);
+  // Watch history: per-episode rows, the continue-watching target for the
+  // header Play button, and the show's first episode (plain Play fallback).
+  const [epWatch, setEpWatch] = useState<Map<number, EpisodeWatchInfo>>(new Map());
+  const [continueTarget, setContinueTarget] = useState<ContinueTarget | null>(null);
+  const [firstEpisodeId, setFirstEpisodeId] = useState<number | null>(null);
   const selectedSeason = seasons.find((s) => s.id === selectedSeasonId);
+
+  const loadWatch = useCallback(async () => {
+    try {
+      const [rows, cont, flat] = await Promise.all([
+        invoke<EpisodeWatchInfo[]>("get_show_watch", { showId: entry.id }),
+        invoke<ContinueTarget | null>("get_show_continue", { showId: entry.id }),
+        invoke<ShowEpisodeFlat[]>("get_show_episodes", { showId: entry.id }),
+      ]);
+      setEpWatch(new Map(rows.map((r) => [r.episode_id, r])));
+      setContinueTarget(cont);
+      setFirstEpisodeId(flat[0]?.episode_id ?? null);
+    } catch {
+      // Indicators degrade to absent.
+    }
+  }, [entry.id]);
+
+  // Refresh indicators when the player closes (progress has settled by then).
+  useEffect(() => {
+    const refresh = () => {
+      loadWatch();
+    };
+    window.addEventListener("waverunner:player-closed", refresh);
+    return () => window.removeEventListener("waverunner:player-closed", refresh);
+  }, [loadWatch]);
 
   const loadDetail = useCallback(async () => {
     try {
@@ -2856,11 +3003,12 @@ function ShowDetailPage({
       setEpisodeDetails(new Map());
       setExpandedEpisodeId(null);
       setLoadedId(entry.id);
+      loadWatch();
     })();
     return () => {
       cancelled = true;
     };
-  }, [entry.id]);
+  }, [entry.id, loadWatch]);
 
   // Pill click: keep the old season on screen and swap everything in one render
   // once both queries land — clearing eagerly (or setting the two results
@@ -3283,6 +3431,33 @@ function ShowDetailPage({
             <RatingsLine ratings={ratings} />
           </div>
           <div className="flex shrink-0 gap-2">
+            {(continueTarget != null || firstEpisodeId != null) && !showEditing && (
+              <Button
+                size="sm"
+                onClick={() => {
+                  const targetId = continueTarget?.episode_id ?? firstEpisodeId;
+                  if (targetId == null) return;
+                  try {
+                    onPlayEpisode?.({
+                      libraryId: selectedLibrary.id,
+                      showId: entry.id,
+                      showTitle: entry.title,
+                      startEpisodeId: targetId,
+                      startSecs: continueTarget?.position_secs ?? undefined,
+                    });
+                  } catch (err) {
+                    toast.error(String(err));
+                  }
+                }}
+              >
+                <Play size={14} />
+                {continueTarget
+                  ? continueTarget.season_number != null && continueTarget.episode_number != null
+                    ? `Continue · S${continueTarget.season_number}E${continueTarget.episode_number}`
+                    : "Continue"
+                  : "Play"}
+              </Button>
+            )}
             {extrasCount > 0 && (
               <Button size="sm" variant="outline" onClick={() => setExtrasOpen(true)}>
                 <Clapperboard size={14} />
@@ -3411,6 +3586,7 @@ function ShowDetailPage({
                 so there's a right-click target even when the season has no metadata */}
             {selectedSeason && !seasonEditing && (() => {
               const episodesNumbered = episodes.length > 0 && episodes.every((e) => e.episode_number != null);
+              const seasonAllWatched = episodes.length > 0 && episodes.every((e) => epWatch.get(e.id)?.watched);
               const totalRuntime = episodes.reduce((sum, e) => sum + (e.runtime ?? 0), 0);
               const years = [...new Set(episodes.map((e) => e.release_date?.slice(0, 4)).filter((y): y is string => !!y))].sort();
               const seasonMeta = [
@@ -3442,6 +3618,21 @@ function ShowDetailPage({
                       <Film size={14} />
                       {bulkEpisodesLoading ? "Loading..." : "Fetch all episodes' details"}
                     </ContextMenuItem>
+                    <ContextMenuSeparator />
+                    <ContextMenuItem
+                      disabled={episodes.length === 0}
+                      onClick={async () => {
+                        try {
+                          await invoke("mark_season_watched", { seasonId: selectedSeason.id, watched: !seasonAllWatched });
+                          loadWatch();
+                        } catch (e) {
+                          toast.error(String(e));
+                        }
+                      }}
+                    >
+                      {seasonAllWatched ? <EyeOff size={14} /> : <Eye size={14} />}
+                      {seasonAllWatched ? "Mark season unwatched" : "Mark season watched"}
+                    </ContextMenuItem>
                   </ContextMenuContent>
                 </ContextMenu>
               );
@@ -3465,6 +3656,11 @@ function ShowDetailPage({
                 const isExpanded = expandedEpisodeId === ep.id;
                 const epDetail = episodeDetails.get(ep.id);
                 const hasDetail = epDetail && (epDetail.release_date || epDetail.plot || epDetail.runtime || epDetail.cast.length > 0 || epDetail.directors.length > 0 || epDetail.composers.length > 0);
+                const w = epWatch.get(ep.id);
+                const epProgress =
+                  w && !w.watched && w.position_secs != null && w.duration_secs && w.duration_secs > 0
+                    ? Math.min(1, Math.max(0, w.position_secs / w.duration_secs))
+                    : null;
                 return (
                   <div key={ep.id} className="flex flex-col">
                     <ContextMenu>
@@ -3496,6 +3692,15 @@ function ShowDetailPage({
                           <p className="mt-0.5 text-xs leading-snug text-muted-foreground line-clamp-2">{ep.plot}</p>
                         )}
                       </div>
+                      {/* Watch indicator: check = watched, mini bar = partial */}
+                      {w?.watched && (
+                        <Check size={14} className="self-center text-primary" aria-label="Watched" />
+                      )}
+                      {epProgress != null && (
+                        <div className="h-1 w-12 self-center overflow-hidden rounded-full bg-muted" title={`${Math.round(epProgress * 100)}% watched`}>
+                          <div className="h-full rounded-full bg-primary" style={{ width: `${Math.round(epProgress * 100)}%` }} />
+                        </div>
+                      )}
                       <Button
                         size="sm"
                         variant="ghost"
@@ -3508,6 +3713,7 @@ function ShowDetailPage({
                               showId: entry.id,
                               showTitle: entry.title,
                               startEpisodeId: ep.id,
+                              startSecs: w?.watched ? undefined : w?.position_secs ?? undefined,
                             });
                           } catch (err) {
                             toast.error(String(err));
@@ -3518,6 +3724,20 @@ function ShowDetailPage({
                       </Button>
                       </ContextMenuTrigger>
                       <ContextMenuContent>
+                        <ContextMenuItem
+                          onClick={async () => {
+                            try {
+                              await invoke("mark_watched", { kind: "episode", id: ep.id, watched: !w?.watched });
+                              loadWatch();
+                            } catch (e) {
+                              toast.error(String(e));
+                            }
+                          }}
+                        >
+                          {w?.watched ? <EyeOff size={14} /> : <Eye size={14} />}
+                          {w?.watched ? "Mark unwatched" : "Mark watched"}
+                        </ContextMenuItem>
+                        <ContextMenuSeparator />
                         <ContextMenuItem
                           onClick={() => handleEpisodeTmdb(ep)}
                           disabled={!canSeasonTmdb || ep.episode_number == null || episodeTmdbLoading === ep.id}
@@ -4068,6 +4288,8 @@ function PlaylistsView({
         tmdb_id: null,
         link_id: null,
         interactive: false,
+        watched: false,
+        watch_progress: null,
       }
     : null;
 

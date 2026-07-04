@@ -44,6 +44,35 @@ export interface MediaEntry {
   /** Movie with an interactive branch-graph pair next to its video — Play
    *  routes into the interactive engine instead of linear playback. */
   interactive: boolean;
+  /** Watch history (movies only; shows derive theirs per-episode). */
+  watched: boolean;
+  /** Resume progress ratio (0..1) for the card sliver; null when none. */
+  watch_progress: number | null;
+}
+
+/** Watch state for a movie detail page (get_watch_state). */
+export interface WatchState {
+  position_secs: number | null;
+  duration_secs: number | null;
+  watched: boolean;
+  /** Interactive titles: a mid-story resume exists (Play → "Resume"). */
+  interactive_resume: boolean;
+}
+
+/** One episode's watch row (get_show_watch). */
+export interface EpisodeWatchInfo {
+  episode_id: number;
+  position_secs: number | null;
+  duration_secs: number | null;
+  watched: boolean;
+}
+
+/** Where a show's Play button should land (get_show_continue). */
+export interface ContinueTarget {
+  episode_id: number;
+  season_number: number | null;
+  episode_number: number | null;
+  position_secs: number | null;
 }
 
 // Each step in the navigation chain. `view` is set when this breadcrumb corresponds to a

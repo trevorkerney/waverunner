@@ -31,16 +31,32 @@ export interface PlayEpisodeArgs {
   showId: number;
   showTitle: string;
   startEpisodeId: number;
+  /** Resume point (raw seconds); the player backs up a few seconds of context. */
+  startSecs?: number;
 }
 
 export interface PlayInteractiveArgs {
   libraryId: string;
   entryId: number;
   title: string;
+  /** Discard the mid-story resume and start over (persistent memory stays). */
+  fresh?: boolean;
+}
+
+/** Watch-history attribution for a played file (omit for untracked extras). */
+export interface PlayWatchTarget {
+  kind: "movie" | "episode";
+  id: number;
+}
+
+export interface PlayOptions {
+  watch?: PlayWatchTarget;
+  /** Resume point (raw seconds); the player backs up a few seconds of context. */
+  startSecs?: number;
 }
 
 export interface PlayerActions {
-  play: (path: string, title: string) => Promise<void>;
+  play: (path: string, title: string, opts?: PlayOptions) => Promise<void>;
   playInteractive: (args: PlayInteractiveArgs) => Promise<void>;
   playEpisode: (args: PlayEpisodeArgs) => Promise<void>;
   playNextEpisode: () => Promise<void>;
@@ -136,6 +152,9 @@ export function usePlayer(): [PlayerState, PlayerActions] {
   const unlistenRefs = useRef<UnlistenFn[]>([]);
   // Path of the file currently loaded — used to start the seek-bar thumbnailer.
   const currentPathRef = useRef<string | null>(null);
+  // Resume point (already cushioned) applied once the pending file loads —
+  // seeking before FILE_LOADED lands in the void, so it waits for the event.
+  const pendingStartRef = useRef<number | null>(null);
   const draggingRef = useRef<"seek" | "volume" | null>(null);
   const lastUserSeek = useRef(0);
   const lastUserVolume = useRef(0);
@@ -294,6 +313,7 @@ export function usePlayer(): [PlayerState, PlayerActions] {
         title: episodeTitle(ctx.showTitle, ep),
         context: { ...ctx, index: newIndex },
       }));
+      await invoke("set_watch_target", { kind: "episode", id: ep.episodeId }).catch(() => {});
       await invoke("play_file", { path });
     } catch (e) {
       setState((prev) => ({ ...prev, loading: false }));
@@ -370,6 +390,13 @@ export function usePlayer(): [PlayerState, PlayerActions] {
 
       const unlisten2 = await listen("mpv-file-loaded", () => {
         setState((prev) => ({ ...prev, loading: false }));
+        // Resume: jump to the stored position now that a timeline exists.
+        if (pendingStartRef.current != null) {
+          const t = pendingStartRef.current;
+          pendingStartRef.current = null;
+          setPosition(t);
+          invoke("player_command", { cmd: "seek", args: [t.toString(), "absolute+exact"] }).catch(() => {});
+        }
         refreshTracksInternal();
       });
 
@@ -410,10 +437,15 @@ export function usePlayer(): [PlayerState, PlayerActions] {
     }
   }, []);
 
-  const play = useCallback(async (path: string, title: string) => {
+  /** Resume cushion: land a few seconds before the stored position for context. */
+  const cushioned = (startSecs: number | undefined) =>
+    startSecs != null && startSecs > 0 ? Math.max(0, startSecs - 4) : null;
+
+  const play = useCallback(async (path: string, title: string, opts?: PlayOptions) => {
     const wasActive = stateRef.current.isActive;
     currentPathRef.current = path;
-    setPosition(0);
+    pendingStartRef.current = cushioned(opts?.startSecs);
+    setPosition(pendingStartRef.current ?? 0);
     setState((prev) => ({
       ...prev,
       loading: true,
@@ -426,9 +458,15 @@ export function usePlayer(): [PlayerState, PlayerActions] {
       if (!wasActive) {
         await invoke("init_player", { titlebarHeight: TITLEBAR_HEIGHT });
       }
+      // Attribute (or explicitly un-attribute — extras) progress recording.
+      await invoke("set_watch_target", {
+        kind: opts?.watch?.kind ?? null,
+        id: opts?.watch?.id ?? null,
+      }).catch(() => {});
       await invoke("play_file", { path });
       await applyStartupSettings();
     } catch (e) {
+      pendingStartRef.current = null;
       setState((prev) => ({ ...prev, loading: false, isActive: wasActive, isPlaying: false }));
       throw e;
     }
@@ -439,6 +477,7 @@ export function usePlayer(): [PlayerState, PlayerActions] {
   // segment jumps; the UI plays the same role as for a movie minus seeking.
   const playInteractive = useCallback(async (args: PlayInteractiveArgs) => {
     const wasActive = stateRef.current.isActive;
+    pendingStartRef.current = null; // the engine owns all seeking
     setPosition(0);
     setState((prev) => ({
       ...prev,
@@ -452,7 +491,14 @@ export function usePlayer(): [PlayerState, PlayerActions] {
       if (!wasActive) {
         await invoke("init_player", { titlebarHeight: TITLEBAR_HEIGHT });
       }
-      await invoke("interactive_start", { libraryId: args.libraryId, entryId: args.entryId });
+      // The interactive driver records its own resume; the linear watch
+      // recorder must not attribute this playback to anything.
+      await invoke("set_watch_target", { kind: null, id: null }).catch(() => {});
+      await invoke("interactive_start", {
+        libraryId: args.libraryId,
+        entryId: args.entryId,
+        fresh: args.fresh ?? false,
+      });
       // The engine resolved the video path — mirror it for the F5 snapshot.
       const status = await invoke<PlayerStatus | null>("get_player_status");
       if (status?.path) currentPathRef.current = status.path;
@@ -473,7 +519,7 @@ export function usePlayer(): [PlayerState, PlayerActions] {
   }, [applyStartupSettings, setPosition]);
 
   const playEpisode = useCallback(async (args: PlayEpisodeArgs) => {
-    const { libraryId, showId, showTitle, startEpisodeId } = args;
+    const { libraryId, showId, showTitle, startEpisodeId, startSecs } = args;
     const flat = await invoke<ShowEpisodeFlat[]>("get_show_episodes", {
       showId,
     });
@@ -499,7 +545,8 @@ export function usePlayer(): [PlayerState, PlayerActions] {
     const ctx: PlayerContext = { kind: "episode", libraryId, showId, showTitle, episodes, index };
 
     const wasActive = stateRef.current.isActive;
-    setPosition(0);
+    pendingStartRef.current = cushioned(startSecs);
+    setPosition(pendingStartRef.current ?? 0);
     setState((prev) => ({
       ...prev,
       loading: true,
@@ -513,9 +560,11 @@ export function usePlayer(): [PlayerState, PlayerActions] {
       if (!wasActive) {
         await invoke("init_player", { titlebarHeight: TITLEBAR_HEIGHT });
       }
+      await invoke("set_watch_target", { kind: "episode", id: ep.episodeId }).catch(() => {});
       await invoke("play_file", { path });
       await applyStartupSettings();
     } catch (e) {
+      pendingStartRef.current = null;
       setState((prev) => ({ ...prev, loading: false, isActive: wasActive }));
       throw e;
     }

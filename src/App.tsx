@@ -49,9 +49,9 @@ function App() {
   const [playerState, playerActions] = usePlayer();
 
   const handlePlayFile = useCallback(
-    async (path: string, title: string) => {
+    async (path: string, title: string, opts?: { watch?: { kind: "movie" | "episode"; id: number }; startSecs?: number }) => {
       try {
-        await playerActions.play(path, title);
+        await playerActions.play(path, title, opts);
       } catch (e) {
         toast.error(String(e));
       }
@@ -60,7 +60,7 @@ function App() {
   );
 
   const handlePlayEpisode = useCallback(
-    async (args: { libraryId: string; showId: number; showTitle: string; startEpisodeId: number }) => {
+    async (args: { libraryId: string; showId: number; showTitle: string; startEpisodeId: number; startSecs?: number }) => {
       try {
         await playerActions.playEpisode(args);
       } catch (e) {
@@ -71,7 +71,7 @@ function App() {
   );
 
   const handlePlayInteractive = useCallback(
-    async (args: { libraryId: string; entryId: number; title: string }) => {
+    async (args: { libraryId: string; entryId: number; title: string; fresh?: boolean }) => {
       try {
         await playerActions.playInteractive(args);
       } catch (e) {
@@ -80,6 +80,14 @@ function App() {
     },
     [playerActions]
   );
+
+  // Detail pages refresh their watch indicators when the player closes —
+  // that's the moment progress recording for the session settles.
+  useEffect(() => {
+    if (!playerState.isActive) {
+      window.dispatchEvent(new Event("waverunner:player-closed"));
+    }
+  }, [playerState.isActive]);
 
   // Keep webview transparent while player is active (full or minimized), so
   // mpv video shows through the transparent dock/takeover region.
