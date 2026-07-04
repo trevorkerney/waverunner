@@ -73,7 +73,7 @@ struct OpenChoice {
 
 /// One decision point on the current path, captured just before its choice
 /// window opened (state included, so restoring one is always consistent).
-/// Recorded for resume now; the rewind timeline picker consumes these later.
+/// Feeds both resume and the "Previous choices" rewind timeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChoiceSnapshot {
     pub segment_id: String,
@@ -81,6 +81,29 @@ pub struct ChoiceSnapshot {
     pub global: HashMap<String, Value>,
     pub persistent: HashMap<String, Value>,
     pub selected_index: Option<usize>,
+    /// The options as shown (timeline card captions). Defaulted so resume
+    /// payloads written before these fields existed still parse.
+    #[serde(default)]
+    pub choice_texts: Vec<String>,
+    /// Absolute file ms of the window opening — where the timeline card's
+    /// thumbnail is grabbed and where a rewind seeks back to (minus a beat).
+    #[serde(default)]
+    pub file_ms: i64,
+    /// Traversal-path length when this snapshot was taken, so a rewind can
+    /// truncate the path to match the restored position.
+    #[serde(default)]
+    pub path_len: usize,
+}
+
+/// Branch-jump measurements for the stats panel.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JumpMetrics {
+    pub jumps: u32,
+    pub seek_jumps: u32,
+    pub last_from: Option<String>,
+    pub last_to: Option<String>,
+    pub last_latency_ms: Option<i64>,
 }
 
 /// Serialized session for interactive_resume — everything needed to put the
@@ -115,6 +138,19 @@ pub struct Shared {
     path: Vec<String>,
     /// Decision points passed this playthrough (see ChoiceSnapshot).
     snapshots: Vec<ChoiceSnapshot>,
+    /// ±10s skip requested by the frontend; the driver applies the clamps
+    /// (it has the bundle and the fired-moment context).
+    skip_request: Option<f64>,
+    /// Jump-back-to-snapshot request (index into `snapshots`).
+    rewind_request: Option<usize>,
+    /// Set after a rewind until its choice fires again — that commit is what
+    /// truncates the abandoned future (rewinding alone discards nothing).
+    rewound_index: Option<usize>,
+    metrics: JumpMetrics,
+    /// Current segment's file bounds, mirrored from the bundle (which lives on
+    /// the driver thread) so commands can report timing without it.
+    seg_start_ms: i64,
+    seg_end_ms: Option<i64>,
 }
 
 pub struct Session {
@@ -415,6 +451,10 @@ fn driver_loop(
     let mut ended_emitted = false;
     let mut last_resume_save = Instant::now();
     let mut last_pos_ms: Option<i64> = None;
+    let mut last_clock_emit = Instant::now();
+    // A branch jump in flight: (from, to, issued-at) — resolved into metrics
+    // once the seek settles, giving the stats panel real jump latency.
+    let mut pending_jump: Option<(String, String, Instant)> = None;
 
     let entry_id = {
         let Ok(sh) = session.shared.lock() else { return };
@@ -444,9 +484,32 @@ fn driver_loop(
                 continue;
             }
             settling_until = None;
+            if let Some((from, to, issued)) = pending_jump.take() {
+                if let Ok(mut sh) = session.shared.lock() {
+                    sh.metrics.last_from = Some(from);
+                    sh.metrics.last_to = Some(to);
+                    sh.metrics.last_latency_ms = Some(issued.elapsed().as_millis() as i64);
+                }
+            }
+        }
+
+        // 0. Frontend requests (rewind to a decision / bounded ±10s skip) —
+        // handled before normal processing; a granted request seeks and skips
+        // the rest of this tick.
+        let request_seek = {
+            let Ok(mut sh) = session.shared.lock() else { break };
+            handle_requests(&app, &mut sh, &bundle, &pool, entry_id, pos_ms, &mut fired)
+        };
+        if let Some(target_ms) = request_seek {
+            let _ = player
+                .mpv
+                .command(&["seek", &format!("{:.3}", target_ms as f64 / 1000.0), "absolute+exact"]);
+            settling_until = Some((target_ms, Instant::now()));
+            continue;
         }
 
         let mut seek_to: Option<i64> = None;
+        let mut jump_meta: Option<(String, String)> = None;
         {
             let Ok(mut sh) = session.shared.lock() else { break };
             let current = sh.current_segment.clone();
@@ -469,6 +532,11 @@ fn driver_loop(
                     // Decision point: snapshot the pre-impression state (a
                     // restore must be able to re-fire this moment cleanly).
                     if moment_is_choice(m) {
+                        // Committing a choice after a rewind is what abandons
+                        // the old future — the timeline forks here.
+                        if let Some(idx) = sh.rewound_index.take() {
+                            sh.snapshots.truncate(idx);
+                        }
                         let story_ms = sh.story_base_ms + (pos_ms - seg.start_time_ms).max(0);
                         let snapshot = ChoiceSnapshot {
                             segment_id: current.clone(),
@@ -476,6 +544,15 @@ fn driver_loop(
                             global: sh.global.clone(),
                             persistent: sh.persistent.clone(),
                             selected_index: None,
+                            choice_texts: m
+                                .choices
+                                .as_deref()
+                                .unwrap_or(&[])
+                                .iter()
+                                .map(|c| c.text.clone().unwrap_or_default())
+                                .collect(),
+                            file_ms: start,
+                            path_len: sh.path.len(),
                         };
                         sh.snapshots.push(snapshot);
                     }
@@ -559,11 +636,18 @@ fn driver_loop(
                                 .get(&next_id)
                                 .map(|t| t.start_time_ms)
                                 .unwrap_or(end);
+                            sh.metrics.jumps += 1;
                             if (target_start - end).abs() > CONTIGUOUS_MS {
                                 seek_to = Some(target_start);
+                                jump_meta = Some((current.clone(), next_id.clone()));
+                                sh.metrics.seek_jumps += 1;
                             }
                             sh.story_base_ms += end - seg.start_time_ms;
                             sh.current_segment = next_id.clone();
+                            if let Some(next_seg) = bundle.manifest.segments.get(&next_id) {
+                                sh.seg_start_ms = next_seg.start_time_ms;
+                                sh.seg_end_ms = next_seg.end_time_ms;
+                            }
                             sh.path.push(next_id.clone());
                             sh.open = None;
                             fired.clear();
@@ -600,6 +684,14 @@ fn driver_loop(
                 spawn_save_resume(&pool, &sh, &bundle, pos_ms);
                 last_resume_save = Instant::now();
             }
+
+            // 5. Story clock for the controls (elapsed along the chosen path).
+            // Skipped on transition ticks — pos still belongs to the old segment.
+            if sh.current_segment == current && last_clock_emit.elapsed() >= Duration::from_millis(500) {
+                last_clock_emit = Instant::now();
+                let story_ms = sh.story_base_ms + (pos_ms - seg.start_time_ms).max(0);
+                let _ = app.emit("interactive-clock", serde_json::json!({ "storyMs": story_ms }));
+            }
         } // shared lock released before the (slow) seek
 
         if let Some(target_ms) = seek_to {
@@ -607,6 +699,9 @@ fn driver_loop(
                 .mpv
                 .command(&["seek", &format!("{:.3}", target_ms as f64 / 1000.0), "absolute+exact"]);
             settling_until = Some((target_ms, Instant::now()));
+            if let Some((from, to)) = jump_meta {
+                pending_jump = Some((from, to, Instant::now()));
+            }
             continue;
         }
 
@@ -630,6 +725,123 @@ fn driver_loop(
             spawn_save_resume(&pool, &sh, &bundle, pos_ms);
         }
     }
+}
+
+/// Apply a queued rewind or ±skip request. Returns the absolute file ms to
+/// seek to when one was granted.
+///
+/// Rewind restores a decision snapshot wholesale (both state scopes, story
+/// clock, path) and lands a beat before the choice window so it re-presents.
+/// The abandoned future is NOT discarded here — the next choice commit does
+/// that (see the snapshot push in the driver).
+///
+/// Skips are strictly bounded to the current inter-choice span: -10 clamps at
+/// the segment start and never crosses a boundary backward; +10 clamps at the
+/// next unopened choice window (or the boundary, whose crossing then happens
+/// through normal live resolution) and is dead while a choice is open. Skips
+/// never re-open choices or rewind state; forward skips still apply the state
+/// writes of any moment they jump over.
+fn handle_requests(
+    app: &AppHandle,
+    sh: &mut Shared,
+    bundle: &InteractiveBundle,
+    pool: &SqlitePool,
+    entry_id: i64,
+    pos_ms: i64,
+    fired: &mut HashSet<usize>,
+) -> Option<i64> {
+    if let Some(i) = sh.rewind_request.take() {
+        sh.skip_request = None;
+        let Some(snap) = sh.snapshots.get(i).cloned() else { return None };
+        let Some(seg) = bundle.manifest.segments.get(&snap.segment_id) else { return None };
+        sh.global = snap.global;
+        sh.persistent = snap.persistent;
+        sh.pending_target = None;
+        sh.current_segment = snap.segment_id.clone();
+        sh.rewound_index = Some(i);
+        sh.open = None;
+        sh.story_base_ms = snap.story_ms - (snap.file_ms - seg.start_time_ms).max(0);
+        sh.seg_start_ms = seg.start_time_ms;
+        sh.seg_end_ms = seg.end_time_ms;
+        sh.path.truncate(snap.path_len.max(1));
+        fired.clear();
+        spawn_save_persistent(pool, entry_id, &sh.persistent);
+        let _ = app.emit(
+            "interactive-choice-closed",
+            serde_json::json!({ "selectedIndex": null, "timedOut": false }),
+        );
+        let _ = app.emit("interactive-segment", serde_json::json!({ "segmentId": snap.segment_id }));
+        return Some((snap.file_ms - 2_500).max(seg.start_time_ms));
+    }
+
+    let delta = sh.skip_request.take()?;
+    // Dead while a choice is open (in either direction — the arrow keys
+    // belong to the overlay then), including a window playback has entered
+    // that simply hasn't fired yet this tick.
+    if sh.open.is_some() {
+        return None;
+    }
+    let delta_ms = (delta * 1000.0) as i64;
+    let current = sh.current_segment.clone();
+    let Some(seg) = bundle.manifest.segments.get(&current) else { return None };
+    let moments = bundle.moments.moments_by_segment.get(&current);
+    if let Some(moments) = moments {
+        for (i, m) in moments.iter().enumerate() {
+            if !fired.contains(&i) && moment_is_choice(m) {
+                if let Some((start, end)) = moment_window(m) {
+                    if pos_ms >= start && pos_ms < end {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
+    if delta_ms < 0 {
+        // Backward: pure rewatching. Fired moments stay fired, so a decided
+        // choice window replays without its overlay.
+        let target = (pos_ms + delta_ms).max(seg.start_time_ms);
+        return (target < pos_ms - 250).then_some(target);
+    }
+
+    let mut target = pos_ms + delta_ms;
+    if let Some(end) = seg.end_time_ms {
+        // Landing at the boundary epsilon lets normal live resolution cross it;
+        // spamming +10 walks pass-through segments toward the next decision.
+        target = target.min(end - BOUNDARY_EPS_MS);
+    }
+    if let Some(moments) = moments {
+        for (i, m) in moments.iter().enumerate() {
+            if !fired.contains(&i) && moment_is_choice(m) {
+                if let Some((start, _)) = moment_window(m) {
+                    if start > pos_ms {
+                        target = target.min(start);
+                    }
+                }
+            }
+        }
+        // Jumped-over state writes still happen — skipping content must not
+        // skip the story's bookkeeping.
+        if target > pos_ms {
+            for (i, m) in moments.iter().enumerate() {
+                if fired.contains(&i) || moment_is_choice(m) {
+                    continue;
+                }
+                let Some((start, _)) = moment_window(m) else { continue };
+                if start > pos_ms && start <= target {
+                    fired.insert(i);
+                    if sh.moment_passes(bundle, m) {
+                        if let Some(imp) = &m.impression_data {
+                            if sh.apply_impression(imp) {
+                                spawn_save_persistent(pool, entry_id, &sh.persistent);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (target > pos_ms + 250).then_some(target)
 }
 
 /// Build the visible choice list (precondition-filtered), store the live
@@ -834,6 +1046,12 @@ pub async fn interactive_start(
             story_base_ms: resume.story_ms - offset,
             path: resume.path,
             snapshots: resume.snapshots,
+            skip_request: None,
+            rewind_request: None,
+            rewound_index: None,
+            metrics: JumpMetrics::default(),
+            seg_start_ms: seg.start_time_ms,
+            seg_end_ms: seg.end_time_ms,
         }
     } else {
         let defaults = bundle.moments.state_history.as_ref();
@@ -878,8 +1096,14 @@ pub async fn interactive_start(
             global,
             persistent,
             story_base_ms: 0,
-            path: vec![initial],
+            path: vec![initial.clone()],
             snapshots: Vec::new(),
+            skip_request: None,
+            rewind_request: None,
+            rewound_index: None,
+            metrics: JumpMetrics::default(),
+            seg_start_ms: initial_start,
+            seg_end_ms: bundle.manifest.segments.get(&initial).and_then(|s| s.end_time_ms),
         }
     };
 
@@ -994,6 +1218,122 @@ pub async fn interactive_stop(state: State<'_, AppState>) -> Result<(), String> 
     Ok(())
 }
 
+fn current_session(state: &AppState) -> Result<Arc<Session>, String> {
+    let guard = state.interactive.lock().map_err(|e| e.to_string())?;
+    guard.as_ref().cloned().ok_or_else(|| "No interactive session".into())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryEntry {
+    pub index: usize,
+    pub segment_id: String,
+    pub story_ms: i64,
+    pub file_ms: i64,
+    pub choice_texts: Vec<String>,
+    pub selected_index: Option<usize>,
+}
+
+/// The decision points of the current playthrough, oldest first — the
+/// "Previous choices" timeline.
+#[tauri::command]
+pub async fn interactive_history(state: State<'_, AppState>) -> Result<Vec<HistoryEntry>, String> {
+    let session = current_session(&state)?;
+    let sh = session.shared.lock().map_err(|e| e.to_string())?;
+    Ok(sh
+        .snapshots
+        .iter()
+        .enumerate()
+        .map(|(index, s)| HistoryEntry {
+            index,
+            segment_id: s.segment_id.clone(),
+            story_ms: s.story_ms,
+            file_ms: s.file_ms,
+            choice_texts: s.choice_texts.clone(),
+            selected_index: s.selected_index,
+        })
+        .collect())
+}
+
+/// Jump back to a past decision (timeline card click). The driver applies it
+/// on its next tick.
+#[tauri::command]
+pub async fn interactive_rewind(state: State<'_, AppState>, index: usize) -> Result<(), String> {
+    let session = current_session(&state)?;
+    let mut sh = session.shared.lock().map_err(|e| e.to_string())?;
+    if index >= sh.snapshots.len() {
+        return Err("No such decision point".into());
+    }
+    sh.rewind_request = Some(index);
+    Ok(())
+}
+
+/// Bounded ±skip (seconds). The driver enforces the inter-choice-span clamps.
+#[tauri::command]
+pub async fn interactive_skip(state: State<'_, AppState>, seconds: f64) -> Result<(), String> {
+    if !seconds.is_finite() {
+        return Err("Bad skip".into());
+    }
+    let session = current_session(&state)?;
+    let mut sh = session.shared.lock().map_err(|e| e.to_string())?;
+    sh.skip_request = Some(seconds.clamp(-60.0, 60.0));
+    Ok(())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InteractiveDebug {
+    pub segment_id: String,
+    pub segment_start_ms: i64,
+    pub segment_end_ms: Option<i64>,
+    pub story_ms: Option<i64>,
+    pub pending_target: Option<String>,
+    pub choice_open: bool,
+    pub snapshot_count: usize,
+    pub path_len: usize,
+    pub persistent_set: usize,
+    pub global_set: usize,
+    pub metrics: JumpMetrics,
+}
+
+/// Stats-for-nerds: the engine's view of the session. Segment timing comes
+/// from the session's own bookkeeping, not the bundle (which lives on the
+/// driver thread).
+#[tauri::command]
+pub async fn interactive_debug(
+    state: State<'_, AppState>,
+) -> Result<Option<InteractiveDebug>, String> {
+    let session = {
+        let guard = state.interactive.lock().map_err(|e| e.to_string())?;
+        match guard.as_ref() {
+            Some(s) => s.clone(),
+            None => return Ok(None),
+        }
+    };
+    let pos_ms = {
+        let guard = state.player.lock().map_err(|e| e.to_string())?;
+        guard
+            .as_ref()
+            .and_then(|p| p.mpv.get_property_double("time-pos"))
+            .map(|s| (s * 1000.0) as i64)
+    };
+    let sh = session.shared.lock().map_err(|e| e.to_string())?;
+    let truthy_count = |m: &HashMap<String, Value>| m.values().filter(|v| truthy(v)).count();
+    Ok(Some(InteractiveDebug {
+        segment_id: sh.current_segment.clone(),
+        segment_start_ms: sh.seg_start_ms,
+        segment_end_ms: sh.seg_end_ms,
+        story_ms: pos_ms.map(|p| sh.story_base_ms + (p - sh.seg_start_ms).max(0)),
+        pending_target: sh.pending_target.clone(),
+        choice_open: sh.open.is_some(),
+        snapshot_count: sh.snapshots.len(),
+        path_len: sh.path.len(),
+        persistent_set: truthy_count(&sh.persistent),
+        global_set: truthy_count(&sh.global),
+        metrics: sh.metrics.clone(),
+    }))
+}
+
 /// Forget the title's persistent story state AND any mid-story resume
 /// ("Reset story" — the full fresh start). Applies to the next playthrough;
 /// a running session keeps its in-memory state.
@@ -1065,6 +1405,12 @@ mod tests {
             story_base_ms: 0,
             path: vec![segment.into()],
             snapshots: Vec::new(),
+            skip_request: None,
+            rewind_request: None,
+            rewound_index: None,
+            metrics: JumpMetrics::default(),
+            seg_start_ms: 0,
+            seg_end_ms: None,
         }
     }
 

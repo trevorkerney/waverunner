@@ -67,6 +67,9 @@ export interface PlayerActions {
   /** Step one frame forward/back; mpv pauses playback as a side effect. */
   frameStep: () => Promise<void>;
   frameBackStep: () => Promise<void>;
+  /** Bounded ±skip inside an interactive title (the engine enforces the
+   *  inter-choice-span clamps). */
+  interactiveSkip: (seconds: number) => Promise<void>;
   /** Isolated playback-position store — subscribe for live currentTime without
    *  re-rendering the rest of the app on every tick. */
   subscribePosition: (cb: () => void) => () => void;
@@ -795,6 +798,14 @@ export function usePlayer(): [PlayerState, PlayerActions] {
     await invoke("player_command", { cmd: "frame-back-step", args: [] });
   }, []);
 
+  const interactiveSkip = useCallback(async (seconds: number) => {
+    try {
+      await invoke("interactive_skip", { seconds });
+    } catch {
+      // No session / clamped away — nothing to do.
+    }
+  }, []);
+
   const actions: PlayerActions = {
     play,
     playInteractive,
@@ -824,6 +835,7 @@ export function usePlayer(): [PlayerState, PlayerActions] {
     setDragging,
     frameStep,
     frameBackStep,
+    interactiveSkip,
   };
 
   return [state, actions];

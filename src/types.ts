@@ -645,6 +645,54 @@ export interface InteractiveStatus {
   choice: InteractiveChoiceOpen | null;
 }
 
+/** Live decode numbers for the stats panel (get_player_stats; snake_case). */
+export interface PlayerStats {
+  file: string | null;
+  video_codec: string | null;
+  width: number | null;
+  height: number | null;
+  container_fps: number | null;
+  estimated_fps: number | null;
+  dropped_frames: number | null;
+  hwdec: string | null;
+  position: number | null;
+  duration: number | null;
+  cache_secs: number | null;
+}
+
+export interface InteractiveJumpMetrics {
+  jumps: number;
+  seekJumps: number;
+  lastFrom: string | null;
+  lastTo: string | null;
+  lastLatencyMs: number | null;
+}
+
+/** Engine internals for the stats panel (interactive_debug). */
+export interface InteractiveDebug {
+  segmentId: string;
+  segmentStartMs: number;
+  segmentEndMs: number | null;
+  storyMs: number | null;
+  pendingTarget: string | null;
+  choiceOpen: boolean;
+  snapshotCount: number;
+  pathLen: number;
+  persistentSet: number;
+  globalSet: number;
+  metrics: InteractiveJumpMetrics;
+}
+
+/** One decision point on the "Previous choices" timeline (interactive_history). */
+export interface InteractiveHistoryEntry {
+  index: number;
+  segmentId: string;
+  storyMs: number;
+  fileMs: number;
+  choiceTexts: string[];
+  selectedIndex: number | null;
+}
+
 export interface PlayerTrack {
   id: number;
   type: "audio" | "sub" | "video";

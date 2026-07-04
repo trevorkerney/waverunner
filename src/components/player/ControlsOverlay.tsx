@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import { PlayerState, PlayerActions } from "../../hooks/usePlayer";
 import { Slider } from "../ui/slider";
 import {
@@ -11,6 +12,8 @@ import {
   Subtitles,
   AudioLines,
   Clapperboard,
+  Settings,
+  History,
 } from "lucide-react";
 import { Switch } from "../ui/switch";
 import {
@@ -25,6 +28,10 @@ interface ControlsOverlayProps {
   actions: PlayerActions;
   visible: boolean;
   onInteraction: () => void;
+  showStats: boolean;
+  onToggleStats: () => void;
+  /** Opens the "Previous choices" timeline (interactive titles only). */
+  onOpenTimeline?: () => void;
 }
 
 function formatTime(seconds: number): string {
@@ -38,11 +45,39 @@ function formatTime(seconds: number): string {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
+/** Elapsed story time for interactive titles — driven by the engine's clock
+ *  events (path-aware; a rewind rewinds it too). Elapsed only: there is no
+ *  honest total for a branching story. */
+function StoryClock() {
+  const [ms, setMs] = useState<number | null>(null);
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    let disposed = false;
+    listen<{ storyMs: number }>("interactive-clock", (e) => setMs(e.payload.storyMs)).then((u) => {
+      if (disposed) u();
+      else unlisten = u;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+  if (ms == null) return null;
+  return (
+    <span className="text-white/80 text-xs tabular-nums select-none" title="Story time elapsed">
+      {formatTime(ms / 1000)}
+    </span>
+  );
+}
+
 export function ControlsOverlay({
   state,
   actions,
   visible,
   onInteraction,
+  showStats,
+  onToggleStats,
+  onOpenTimeline,
 }: ControlsOverlayProps) {
   const [seekDragValue, setSeekDragValue] = useState<number | null>(null);
   const seekDragRef = useRef<number | null>(null);
@@ -347,8 +382,11 @@ export function ControlsOverlay({
           </div>
 
           {/* Time — shows the hovered position while scrubbing the bar,
-              otherwise the live playback position. */}
-          {!isInteractive && (
+              otherwise the live playback position. Interactive titles show
+              elapsed story time instead (the file timeline is meaningless). */}
+          {isInteractive ? (
+            <StoryClock />
+          ) : (
             <span className="text-white/80 text-xs tabular-nums select-none">
               {formatTime(
                 seekDragValue ??
@@ -450,6 +488,20 @@ export function ControlsOverlay({
             </DropdownMenu>
           )}
 
+          {/* Previous choices (interactive only) */}
+          {isInteractive && onOpenTimeline && (
+            <button
+              onClick={() => {
+                onOpenTimeline();
+                onInteraction();
+              }}
+              className="text-white/80 hover:text-white transition-colors"
+              title="Previous choices"
+            >
+              <History className="h-5 w-5" />
+            </button>
+          )}
+
           {/* Fullscreen */}
           <button
             onClick={() => actions.toggleFullscreen()}
@@ -461,6 +513,35 @@ export function ControlsOverlay({
               <Maximize className="h-5 w-5" />
             )}
           </button>
+
+          {/* Player settings (stats now; more later) */}
+          <DropdownMenu>
+            <DropdownMenuTrigger className="text-white/80 hover:text-white transition-colors" title="Player settings">
+              <Settings className="h-5 w-5" />
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="bg-black/90 border-white/20">
+              <DropdownMenuItem
+                onClick={() => {
+                  onToggleStats();
+                  onInteraction();
+                }}
+                className="text-white/80 hover:text-white"
+              >
+                {showStats ? "Hide stats for nerds" : "Stats for nerds"}
+              </DropdownMenuItem>
+              {isInteractive && onOpenTimeline && (
+                <DropdownMenuItem
+                  onClick={() => {
+                    onOpenTimeline();
+                    onInteraction();
+                  }}
+                  className="text-white/80 hover:text-white"
+                >
+                  Previous choices
+                </DropdownMenuItem>
+              )}
+            </DropdownMenuContent>
+          </DropdownMenu>
         </div>
       </div>
     </div>

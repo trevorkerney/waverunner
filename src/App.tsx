@@ -1995,6 +1995,9 @@ function App() {
       ) {
         return;
       }
+      // A player overlay (e.g. the Previous-choices timeline) owns the keys
+      // while it's up — it flags itself on the root element.
+      if (document.documentElement.dataset.wrOverlay) return;
       // Escape is fixed (never rebindable) so the player can always be exited.
       if (e.key === "Escape") {
         e.preventDefault();
@@ -2010,14 +2013,17 @@ function App() {
       if (e.ctrlKey || e.metaKey || e.altKey) return;
       const action = actionForKey(e.key);
       if (!action) return;
-      // Interactive titles: the engine owns the timeline — user seeking and
-      // frame-stepping would jump across unrelated branches. Let those keys
-      // fall through (arrows navigate the choice overlay instead).
-      if (
-        playerState.context.kind === "interactive" &&
-        ["seek_back", "seek_forward", "prev_frame", "next_frame"].includes(action)
-      ) {
-        return;
+      // Interactive titles: frame-stepping would walk across unrelated
+      // branches, so it stays dead; seeking becomes the engine's bounded
+      // ±10s skip. Arrows still navigate an open choice overlay — the skip
+      // is simply refused while a choice is up, so both can claim the key.
+      if (playerState.context.kind === "interactive") {
+        if (action === "prev_frame" || action === "next_frame") return;
+        if (action === "seek_back" || action === "seek_forward") {
+          e.preventDefault();
+          playerActions.interactiveSkip(action === "seek_back" ? -10 : 10);
+          return;
+        }
       }
       e.preventDefault();
       switch (action) {

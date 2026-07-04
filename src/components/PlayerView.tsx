@@ -4,6 +4,8 @@ import { PlayerState, PlayerActions } from "../hooks/usePlayer";
 import { ControlsOverlay } from "./player/ControlsOverlay";
 import { CenterTransport } from "./player/CenterTransport";
 import { InteractiveOverlay } from "./player/InteractiveOverlay";
+import { InteractiveTimeline } from "./player/InteractiveTimeline";
+import { StatsPanel } from "./player/StatsPanel";
 import { Loader2 } from "lucide-react";
 
 interface PlayerViewProps {
@@ -15,6 +17,8 @@ const IDLE_MS = 3000;
 
 export function PlayerView({ state, actions }: PlayerViewProps) {
   const [showControls, setShowControls] = useState(true);
+  const [showStats, setShowStats] = useState(false);
+  const [timelineOpen, setTimelineOpen] = useState(false);
   const hideTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Auto-hide after IDLE_MS of no mouse movement, regardless of playing/paused.
@@ -79,11 +83,24 @@ export function PlayerView({ state, actions }: PlayerViewProps) {
         actions={actions}
         visible={showControls}
         onInteraction={resetHideTimer}
+        showStats={showStats}
+        onToggleStats={() => setShowStats((s) => !s)}
+        onOpenTimeline={ctx.kind === "interactive" ? () => setTimelineOpen(true) : undefined}
       />
+
+      {showStats && <StatsPanel interactive={ctx.kind === "interactive"} />}
 
       {/* Branching-title decision UI — its own layer, never auto-hidden with
           the controls (a choice must stay visible while its timer runs). */}
       {ctx.kind === "interactive" && <InteractiveOverlay />}
+      {ctx.kind === "interactive" && (
+        <InteractiveTimeline
+          open={timelineOpen}
+          onClose={() => setTimelineOpen(false)}
+          actions={actions}
+          isPlaying={state.isPlaying}
+        />
+      )}
 
       <CenterTransport
         isPlaying={state.isPlaying}

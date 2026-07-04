@@ -213,6 +213,50 @@ pub async fn set_player_region(
     .await
 }
 
+#[derive(serde::Serialize)]
+pub struct PlayerStats {
+    pub file: Option<String>,
+    pub video_codec: Option<String>,
+    pub width: Option<f64>,
+    pub height: Option<f64>,
+    pub container_fps: Option<f64>,
+    pub estimated_fps: Option<f64>,
+    pub dropped_frames: Option<f64>,
+    pub hwdec: Option<String>,
+    pub position: Option<f64>,
+    pub duration: Option<f64>,
+    pub cache_secs: Option<f64>,
+}
+
+/// Live decode/playback numbers for the stats-for-nerds panel. Cheap property
+/// reads, polled by the frontend only while the panel is open.
+#[tauri::command]
+pub async fn get_player_stats(state: State<'_, AppState>) -> Result<Option<PlayerStats>, String> {
+    let inner = {
+        let guard = state.player.lock().map_err(|e| e.to_string())?;
+        match guard.as_ref() {
+            Some(inner) => inner.clone(),
+            None => return Ok(None),
+        }
+    };
+    run_mpv(inner, |mpv| {
+        Ok(Some(PlayerStats {
+            file: mpv.get_property_string("filename"),
+            video_codec: mpv.get_property_string("video-codec"),
+            width: mpv.get_property_double("video-params/w"),
+            height: mpv.get_property_double("video-params/h"),
+            container_fps: mpv.get_property_double("container-fps"),
+            estimated_fps: mpv.get_property_double("estimated-vf-fps"),
+            dropped_frames: mpv.get_property_double("frame-drop-count"),
+            hwdec: mpv.get_property_string("hwdec-current"),
+            position: mpv.get_property_double("time-pos"),
+            duration: mpv.get_property_double("duration"),
+            cache_secs: mpv.get_property_double("demuxer-cache-duration"),
+        }))
+    })
+    .await
+}
+
 /// Get all audio/subtitle/video tracks as JSON array.
 #[tauri::command]
 pub async fn get_player_tracks(state: State<'_, AppState>) -> Result<String, String> {
