@@ -2642,7 +2642,7 @@ function EntryDetailPage({
                 <>
                   <Button size="sm" onClick={() => playMovie(resumePos ?? undefined)}>
                     <Play size={14} />
-                    {resumePos != null ? `Resume · ${fmtClock(resumePos)}` : "Play"}
+                    {resumePos != null ? `Resume from ${fmtClock(resumePos)}` : "Play"}
                   </Button>
                   {resumePos != null && (
                     <Button size="sm" variant="outline" onClick={() => playMovie(undefined)}>
