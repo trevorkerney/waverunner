@@ -213,7 +213,10 @@ export function InteractiveOverlay() {
                     }`}
                     style={{
                       aspectRatio: `${aspects.get(c.imagePath) ?? 2.75}`,
-                      backgroundImage: `url(${convertFileSrc(c.imagePath)})`,
+                      // Quoted: convertFileSrc leaves parentheses unencoded
+                      // (folder names like "(2018)"), and a bare url(...)
+                      // terminates at the first `)`.
+                      backgroundImage: `url("${convertFileSrc(c.imagePath)}")`,
                       backgroundSize: c.imageSize ?? "100% 300%",
                       backgroundPosition: `50% ${SPRITE_ROWS[stateRow]}`,
                     }}
