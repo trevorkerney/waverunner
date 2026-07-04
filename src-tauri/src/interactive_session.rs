@@ -35,12 +35,17 @@ const BOUNDARY_EPS_MS: i64 = 24;
 /// A jump target starting within this of the current end is contiguous — the
 /// file just keeps playing, no seek.
 const CONTIGUOUS_MS: i64 = 40;
-/// How far ahead of the boundary the upcoming jump is resolved and handed to
-/// mpv as an ab-loop (loop point B = the exact endTimeMs, A = the target), so
-/// the cut happens at demux precision instead of poll-triggered seek timing.
+/// How far ahead of the boundary the upcoming jump is resolved. BACKWARD
+/// jumps (target earlier in the file) are handed to mpv as an ab-loop
+/// (A = target, B = the exact endTimeMs) for a demux-precision cut — ab-loop
+/// only works with A before B, so FORWARD jumps stay driver-seeked instead.
 /// Re-checked every tick inside this window in case late state writes change
 /// the resolution.
 const PREARM_MS: i64 = 450;
+/// Forward non-contiguous jumps seek this early so the seek completes before
+/// any frame of the physically-next (wrong) segment can display. Costs ~2
+/// authored frames of scene tail; showing the wrong branch costs the story.
+const FORWARD_CUT_MARGIN_MS: i64 = 90;
 
 // ---------------------------------------------------------------------------
 // Session state
@@ -583,7 +588,10 @@ fn driver_loop(
         if let Some((expect_ms, started)) = settling_until {
             let landed = (pos_ms - expect_ms).abs() < 1500
                 && !player.mpv.get_property_flag("seeking").unwrap_or(false);
-            if !landed && started.elapsed() < Duration::from_secs(4) {
+            // A loop-armed cut should fire within EPS of arming — give it 1s;
+            // ordinary seeks get longer for cold-disk reads.
+            let limit = if clear_loop_after_settle { Duration::from_secs(1) } else { Duration::from_secs(4) };
+            if !landed && started.elapsed() < limit {
                 std::thread::sleep(Duration::from_millis(8));
                 continue;
             }
@@ -780,7 +788,8 @@ fn driver_loop(
                             let stale = armed.as_ref().map_or(true, |(n, _)| *n != next_id);
                             if stale {
                                 let contiguous = (t_start - end).abs() <= CONTIGUOUS_MS;
-                                if !contiguous {
+                                // ab-loop requires A < B: only backward jumps.
+                                if !contiguous && t_start < end {
                                     set_loop = Some((t_start, end));
                                 } else if loop_live {
                                     drop_loop = true;
@@ -798,18 +807,28 @@ fn driver_loop(
                 }
             }
 
-            // 3. Segment boundary — normally the pre-armed mpv loop makes the
-            // cut itself; this poll path does the bookkeeping (and is the
-            // fallback seek when no loop was armed). `loop_jumped` catches the
-            // case where mpv already jumped to a target earlier in the file,
-            // which the pos >= end check alone would never see.
+            // 3. Segment boundary — backward jumps are cut by the pre-armed
+            // mpv loop (this path just does the bookkeeping; `loop_jumped`
+            // catches that the jump already happened, which pos >= end alone
+            // would never see). Forward jumps are driver seeks, triggered
+            // early enough that the seek lands before a wrong-branch frame
+            // can display. Contiguous transitions are pure bookkeeping.
             if let Some(end) = seg.end_time_ms {
                 let loop_jumped = loop_live
                     && armed.as_ref().map_or(false, |(_, t_start)| {
                         (pos_ms - t_start).abs() < 1500
                             && (pos_ms < seg.start_time_ms || pos_ms >= end)
                     });
-                if pos_ms >= end - BOUNDARY_EPS_MS || loop_jumped {
+                let forward_jump_pending = !loop_live
+                    && armed
+                        .as_ref()
+                        .map_or(false, |(_, t_start)| (t_start - end).abs() > CONTIGUOUS_MS);
+                let trigger = if forward_jump_pending {
+                    end - FORWARD_CUT_MARGIN_MS
+                } else {
+                    end - BOUNDARY_EPS_MS
+                };
+                if pos_ms >= trigger || loop_jumped {
                     match sh.resolve_next(&bundle) {
                         Some(next_id) => {
                             let target_start = bundle
@@ -942,11 +961,12 @@ fn driver_loop(
     }
 
     // Driver stopping (player closed / session replaced): drop any armed loop
-    // points — linear playback on this mpv instance must never inherit them —
-    // and take one final checkpoint so "come back later" resumes from the last
-    // frame watched, not up to 10s earlier.
+    // points and the hr-seek override — linear playback on this mpv instance
+    // must never inherit them — and take one final checkpoint so "come back
+    // later" resumes from the last frame watched, not up to 10s earlier.
     let _ = player.mpv.set_property_string("ab-loop-a", "no");
     let _ = player.mpv.set_property_string("ab-loop-b", "no");
+    let _ = player.mpv.set_property_string("hr-seek", "default");
     if !ended_emitted {
         if let (Some(pos_ms), Ok(sh)) = (last_pos_ms, session.shared.lock()) {
             spawn_save_resume(&pool, &sh, &bundle, pos_ms);
@@ -1191,12 +1211,15 @@ pub async fn interactive_start(
         guard.as_ref().cloned().ok_or("Player not initialised")?
     };
 
-    // Load the video (same semantics as play_file).
+    // Load the video (same semantics as play_file). hr-seek makes every cut —
+    // including mpv's own ab-loop jumps — land on the exact frame rather than
+    // a keyframe; reset when the driver exits.
     {
         let p = player.clone();
         let path = video.to_string_lossy().into_owned();
         tauri::async_runtime::spawn_blocking(move || {
             p.mpv.command(&["loadfile", &path])?;
+            let _ = p.mpv.set_property_string("hr-seek", "yes");
             p.mpv.set_property_string("pause", "no")
         })
         .await
