@@ -168,6 +168,11 @@ pub struct Choice {
     pub text: Option<String>,
     #[serde(rename = "subText")]
     pub sub_text: Option<String>,
+    /// Choice-point art: a 3-state sprite-sheet URL + CSS-ish styles. Some
+    /// choices are image-ONLY (text is a bare space) — e.g. Bandersnatch's
+    /// symbol decisions — so this is content, not decoration. Kept opaque;
+    /// the session layer extracts what it renders.
+    pub background: Option<Value>,
     #[serde(rename = "segmentId")]
     pub segment_id: Option<String>,
     /// Segment-group target (used by some titles instead of a direct segment).

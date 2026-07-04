@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import { InteractiveChoiceOpen, InteractiveStatus } from "../../types";
 
@@ -18,6 +18,22 @@ interface NotificationState {
 
 const TICK_MS = 250;
 
+// Netflix choice-point sprites stack their visual states vertically:
+// default / focused / selected. The format ships the default row's
+// backgroundPosition; the other rows follow the standard CSS percentage
+// spacing for a 3-frame sheet.
+const SPRITE_ROWS = ["0%", "50%", "100%"];
+
+/** Frame aspect ratio of a sprite sheet, from its natural size and the
+ *  format's backgroundSize ("100.9% 303.2%" → ~3 frames tall). */
+function frameAspect(natW: number, natH: number, size: string | null): number {
+  const m = size?.match(/([\d.]+)%\s+([\d.]+)%/);
+  if (!m) return 2.75;
+  const fw = natW / (parseFloat(m[1]) / 100);
+  const fh = natH / (parseFloat(m[2]) / 100);
+  return fh > 0 ? fw / fh : 2.75;
+}
+
 export function InteractiveOverlay() {
   const [choice, setChoice] = useState<InteractiveChoiceOpen | null>(null);
   const [remaining, setRemaining] = useState(0);
@@ -25,6 +41,8 @@ export function InteractiveOverlay() {
   const [focusIndex, setFocusIndex] = useState(0);
   const [closing, setClosing] = useState(false);
   const [notification, setNotification] = useState<NotificationState | null>(null);
+  // Sprite-sheet frame aspect per image path (loaded lazily per choice open).
+  const [aspects, setAspects] = useState<Map<string, number>>(new Map());
   const choiceRef = useRef<InteractiveChoiceOpen | null>(null);
   choiceRef.current = choice;
   const selectedRef = useRef<number | null>(null);
@@ -41,6 +59,20 @@ export function InteractiveOverlay() {
     setRemaining(payload.remainingMs);
     setSelected(payload.selectedIndex);
     setFocusIndex(payload.selectedIndex ?? payload.defaultIndex ?? 0);
+    // Measure any sprite sheets so their buttons reserve the right shape.
+    for (const c of payload.choices) {
+      const path = c.imagePath;
+      if (!path) continue;
+      const img = new Image();
+      img.onload = () =>
+        setAspects((prev) => {
+          if (prev.has(path)) return prev;
+          const next = new Map(prev);
+          next.set(path, frameAspect(img.naturalWidth, img.naturalHeight, c.imageSize));
+          return next;
+        });
+      img.src = convertFileSrc(path);
+    }
   }, []);
 
   useEffect(() => {
@@ -160,10 +192,34 @@ export function InteractiveOverlay() {
           onClick={(e) => e.stopPropagation()}
           onDoubleClick={(e) => e.stopPropagation()}
         >
-          <div className="flex max-w-full flex-wrap items-stretch justify-center gap-4">
+          <div className="flex max-w-full flex-wrap items-center justify-center gap-4">
             {choice.choices.map((c, i) => {
               const isSelected = selected === i;
               const dimmed = selected != null && !isSelected;
+              // Image choice: the sprite sheet stacks default/focused/selected
+              // rows — show the matching row, dim when another option won.
+              if (c.imagePath) {
+                const stateRow = isSelected ? 2 : focusIndex === i && selected == null ? 1 : 0;
+                return (
+                  <button
+                    key={i}
+                    onClick={() => pick(i)}
+                    onMouseEnter={() => selected == null && setFocusIndex(i)}
+                    disabled={selected != null}
+                    aria-label={c.text}
+                    title={c.text}
+                    className={`w-64 max-w-[30vw] bg-no-repeat shadow-xl transition-all duration-200 ${
+                      dimmed ? "opacity-40" : "cursor-pointer"
+                    }`}
+                    style={{
+                      aspectRatio: `${aspects.get(c.imagePath) ?? 2.75}`,
+                      backgroundImage: `url(${convertFileSrc(c.imagePath)})`,
+                      backgroundSize: c.imageSize ?? "100% 300%",
+                      backgroundPosition: `50% ${SPRITE_ROWS[stateRow]}`,
+                    }}
+                  />
+                );
+              }
               return (
                 <button
                   key={i}

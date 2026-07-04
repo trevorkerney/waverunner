@@ -30,21 +30,33 @@ use crate::AppState;
 
 /// Act this many ms before a segment's endTimeMs so a non-contiguous jump
 /// never shows frames of the physically-next (wrong) segment. One PAL frame.
+/// (Fallback path only — pre-armed jumps are cut by mpv itself, frame-exact.)
 const BOUNDARY_EPS_MS: i64 = 24;
 /// A jump target starting within this of the current end is contiguous — the
 /// file just keeps playing, no seek.
 const CONTIGUOUS_MS: i64 = 40;
+/// How far ahead of the boundary the upcoming jump is resolved and handed to
+/// mpv as an ab-loop (loop point B = the exact endTimeMs, A = the target), so
+/// the cut happens at demux precision instead of poll-triggered seek timing.
+/// Re-checked every tick inside this window in case late state writes change
+/// the resolution.
+const PREARM_MS: i64 = 450;
 
 // ---------------------------------------------------------------------------
 // Session state
 // ---------------------------------------------------------------------------
 
-/// One visible choice as the frontend renders it.
+/// One visible choice as the frontend renders it. Image-only choices carry a
+/// locally-resolved sprite path (plus the format's CSS sizing) and a derived
+/// text fallback for when no asset pack is present.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChoiceView {
     pub text: String,
     pub sub_text: Option<String>,
+    pub image_path: Option<String>,
+    pub image_size: Option<String>,
+    pub image_position: Option<String>,
 }
 
 /// Payload for `interactive-choice-open` (and rehydration via
@@ -315,24 +327,33 @@ impl Shared {
     /// wins, then segmentGroup routing keyed by the segment id (many segment
     /// ids double as group keys — the group is the router, so it must be
     /// consulted as a group, never re-read as the segment itself), then
-    /// defaultNext, then the first `next` entry.
-    fn resolve_next(&mut self, bundle: &InteractiveBundle) -> Option<String> {
-        if let Some(target) = self.pending_target.take() {
-            if let Some(hit) = self.resolve_ref(bundle, &target, 8) {
+    /// defaultNext, then the first `next` entry. Non-consuming — the driver
+    /// peeks this ahead of the boundary to pre-arm mpv's frame-exact cut.
+    fn resolve_peek(&self, bundle: &InteractiveBundle) -> Option<String> {
+        if let Some(target) = &self.pending_target {
+            if let Some(hit) = self.resolve_ref(bundle, target, 8) {
                 return Some(hit);
             }
         }
-        let current = self.current_segment.clone();
-        if let Some(hit) = self.resolve_group(bundle, &current, 8) {
+        let current = &self.current_segment;
+        if let Some(hit) = self.resolve_group(bundle, current, 8) {
             return Some(hit);
         }
-        let seg = bundle.manifest.segments.get(&current)?;
+        let seg = bundle.manifest.segments.get(current)?;
         if let Some(next) = &seg.default_next {
             return Some(next.clone());
         }
         seg.next
             .as_ref()
             .and_then(|n| n.keys().min().cloned())
+    }
+
+    /// Commit form of resolve_peek: the pending choice target is consumed by
+    /// the transition whether or not it resolved.
+    fn resolve_next(&mut self, bundle: &InteractiveBundle) -> Option<String> {
+        let hit = self.resolve_peek(bundle);
+        self.pending_target = None;
+        hit
     }
 }
 
@@ -354,6 +375,82 @@ fn moment_window(m: &Moment) -> Option<(i64, i64)> {
 
 fn choice_target(c: &Choice) -> Option<String> {
     c.segment_id.clone().or_else(|| c.sg.clone())
+}
+
+/// (sprite basename, backgroundSize, backgroundPosition) from a choice's art.
+fn choice_art(c: &Choice) -> Option<(String, Option<String>, Option<String>)> {
+    let image = c
+        .background
+        .as_ref()?
+        .get("visualStates")?
+        .get("default")?
+        .get("image")?;
+    let url = image.get("url").and_then(Value::as_str)?;
+    let base = url.rsplit('/').next()?.to_lowercase();
+    let styles = image.get("styles");
+    let size = styles
+        .and_then(|s| s.get("backgroundSize"))
+        .and_then(Value::as_str)
+        .map(String::from);
+    let position = styles
+        .and_then(|s| s.get("backgroundPosition"))
+        .and_then(Value::as_str)
+        .map(String::from);
+    Some((base, size, position))
+}
+
+/// Human label derived from a sprite filename — the fallback when the local
+/// asset pack doesn't carry the file ("netflix_2x.png" → "NETFLIX").
+fn label_from_art(base: &str) -> String {
+    let stem = base.split('.').next().unwrap_or(base);
+    stem.split(['_', '-'])
+        .filter(|w| !w.is_empty() && *w != "2x" && *w != "update" && !w.chars().all(|c| c.is_ascii_digit()))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_uppercase()
+}
+
+/// Display label for a choice: its text, else a name derived from its art,
+/// else its id. (Image-only choices have a bare-space text.)
+fn choice_label(c: &Choice) -> String {
+    if let Some(text) = &c.text {
+        if !text.trim().is_empty() {
+            return text.clone();
+        }
+    }
+    if let Some((base, _, _)) = choice_art(c) {
+        let label = label_from_art(&base);
+        if !label.is_empty() {
+            return label;
+        }
+    }
+    c.id.clone().unwrap_or_default()
+}
+
+/// basename (lowercased) → path for every image under the bundle folder's
+/// assets/ tree — how CDN sprite URLs resolve to the user's local pack.
+fn scan_assets(folder: &std::path::Path) -> HashMap<String, std::path::PathBuf> {
+    const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif"];
+    let mut map = HashMap::new();
+    let mut stack = vec![folder.join("assets")];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for e in rd.filter_map(|e| e.ok()) {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p
+                .extension()
+                .and_then(|x| x.to_str())
+                .map_or(false, |x| IMAGE_EXTS.contains(&x.to_lowercase().as_str()))
+            {
+                if let Some(name) = p.file_name() {
+                    map.entry(name.to_string_lossy().to_lowercase()).or_insert(p);
+                }
+            }
+        }
+    }
+    map
 }
 
 fn spawn_save_persistent(pool: &SqlitePool, entry_id: i64, persistent: &HashMap<String, Value>) {
@@ -440,6 +537,7 @@ fn driver_loop(
     player: Arc<PlayerInner>,
     pool: SqlitePool,
     bundle: InteractiveBundle,
+    assets: HashMap<String, std::path::PathBuf>,
     session: Arc<Session>,
 ) {
     // Moments already fired during the current segment visit (index-keyed;
@@ -455,6 +553,12 @@ fn driver_loop(
     // A branch jump in flight: (from, to, issued-at) — resolved into metrics
     // once the seek settles, giving the stats panel real jump latency.
     let mut pending_jump: Option<(String, String, Instant)> = None;
+    // The pre-resolved upcoming transition: (next segment, its start ms).
+    let mut armed: Option<(String, i64)> = None;
+    // mpv currently holds ab-loop points for that transition.
+    let mut loop_live = false;
+    // The armed loop's jump is settling; drop the loop points once it lands.
+    let mut clear_loop_after_settle = false;
 
     let entry_id = {
         let Ok(sh) = session.shared.lock() else { return };
@@ -483,6 +587,19 @@ fn driver_loop(
                 std::thread::sleep(Duration::from_millis(8));
                 continue;
             }
+            if !landed && clear_loop_after_settle {
+                // The armed ab-loop never fired — repair with a manual seek so
+                // playback can't run on into the wrong branch.
+                clear_loop_after_settle = false;
+                loop_live = false;
+                let _ = player.mpv.set_property_string("ab-loop-a", "no");
+                let _ = player.mpv.set_property_string("ab-loop-b", "no");
+                let _ = player
+                    .mpv
+                    .command(&["seek", &format!("{:.3}", expect_ms as f64 / 1000.0), "absolute+exact"]);
+                settling_until = Some((expect_ms, Instant::now()));
+                continue;
+            }
             settling_until = None;
             if let Some((from, to, issued)) = pending_jump.take() {
                 if let Ok(mut sh) = session.shared.lock() {
@@ -490,6 +607,12 @@ fn driver_loop(
                     sh.metrics.last_to = Some(to);
                     sh.metrics.last_latency_ms = Some(issued.elapsed().as_millis() as i64);
                 }
+            }
+            if clear_loop_after_settle {
+                clear_loop_after_settle = false;
+                loop_live = false;
+                let _ = player.mpv.set_property_string("ab-loop-a", "no");
+                let _ = player.mpv.set_property_string("ab-loop-b", "no");
             }
         }
 
@@ -501,6 +624,14 @@ fn driver_loop(
             handle_requests(&app, &mut sh, &bundle, &pool, entry_id, pos_ms, &mut fired)
         };
         if let Some(target_ms) = request_seek {
+            // A user-driven seek invalidates any pre-armed cut.
+            armed = None;
+            clear_loop_after_settle = false;
+            if loop_live {
+                loop_live = false;
+                let _ = player.mpv.set_property_string("ab-loop-a", "no");
+                let _ = player.mpv.set_property_string("ab-loop-b", "no");
+            }
             let _ = player
                 .mpv
                 .command(&["seek", &format!("{:.3}", target_ms as f64 / 1000.0), "absolute+exact"]);
@@ -510,6 +641,12 @@ fn driver_loop(
 
         let mut seek_to: Option<i64> = None;
         let mut jump_meta: Option<(String, String)> = None;
+        // mpv property writes collected under the lock, applied after release:
+        // set ab-loop points (a_ms, b_ms), or drop them.
+        let mut set_loop: Option<(i64, i64)> = None;
+        let mut drop_loop = false;
+        // A pre-armed cut is being made by mpv itself — settle on its target.
+        let mut settle_to: Option<i64> = None;
         {
             let Ok(mut sh) = session.shared.lock() else { break };
             let current = sh.current_segment.clone();
@@ -549,7 +686,7 @@ fn driver_loop(
                                 .as_deref()
                                 .unwrap_or(&[])
                                 .iter()
-                                .map(|c| c.text.clone().unwrap_or_default())
+                                .map(choice_label)
                                 .collect(),
                             file_ms: start,
                             path_len: sh.path.len(),
@@ -562,7 +699,7 @@ fn driver_loop(
                         }
                     }
                     if moment_is_choice(m) {
-                        open_choice(&app, &mut sh, &bundle, m, &current, pos_ms, start, end);
+                        open_choice(&app, &mut sh, &bundle, &assets, m, &current, pos_ms, start, end);
                     } else if m.kind.as_deref() == Some("notification:inlineTutorial") {
                         let _ = app.emit(
                             "interactive-notification",
@@ -625,9 +762,54 @@ fn driver_loop(
                 );
             }
 
-            // 3. Segment boundary.
+            // 2.6 Pre-arm the upcoming cut. Inside the window, resolve where
+            // the boundary will go and hand mpv ab-loop points (B = the exact
+            // endTimeMs, A = the target start): mpv then performs the jump at
+            // frame precision on its own. Re-checked every tick — a late state
+            // write can change the resolution, in which case the loop re-arms.
             if let Some(end) = seg.end_time_ms {
-                if pos_ms >= end - BOUNDARY_EPS_MS {
+                if pos_ms >= end - PREARM_MS && pos_ms < end - BOUNDARY_EPS_MS {
+                    match sh.resolve_peek(&bundle) {
+                        Some(next_id) => {
+                            let t_start = bundle
+                                .manifest
+                                .segments
+                                .get(&next_id)
+                                .map(|t| t.start_time_ms)
+                                .unwrap_or(end);
+                            let stale = armed.as_ref().map_or(true, |(n, _)| *n != next_id);
+                            if stale {
+                                let contiguous = (t_start - end).abs() <= CONTIGUOUS_MS;
+                                if !contiguous {
+                                    set_loop = Some((t_start, end));
+                                } else if loop_live {
+                                    drop_loop = true;
+                                }
+                                armed = Some((next_id, t_start));
+                            }
+                        }
+                        None => {
+                            armed = None;
+                            if loop_live {
+                                drop_loop = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 3. Segment boundary — normally the pre-armed mpv loop makes the
+            // cut itself; this poll path does the bookkeeping (and is the
+            // fallback seek when no loop was armed). `loop_jumped` catches the
+            // case where mpv already jumped to a target earlier in the file,
+            // which the pos >= end check alone would never see.
+            if let Some(end) = seg.end_time_ms {
+                let loop_jumped = loop_live
+                    && armed.as_ref().map_or(false, |(_, t_start)| {
+                        (pos_ms - t_start).abs() < 1500
+                            && (pos_ms < seg.start_time_ms || pos_ms >= end)
+                    });
+                if pos_ms >= end - BOUNDARY_EPS_MS || loop_jumped {
                     match sh.resolve_next(&bundle) {
                         Some(next_id) => {
                             let target_start = bundle
@@ -638,10 +820,22 @@ fn driver_loop(
                                 .unwrap_or(end);
                             sh.metrics.jumps += 1;
                             if (target_start - end).abs() > CONTIGUOUS_MS {
-                                seek_to = Some(target_start);
-                                jump_meta = Some((current.clone(), next_id.clone()));
                                 sh.metrics.seek_jumps += 1;
+                                let pre_armed =
+                                    loop_live && armed.as_ref().map_or(false, |(n, _)| *n == next_id);
+                                if pre_armed {
+                                    // mpv makes (or already made) the frame-exact
+                                    // cut — settle on its landing, then drop the loop.
+                                    settle_to = Some(target_start);
+                                    sh.metrics.last_from = Some(current.clone());
+                                    sh.metrics.last_to = Some(next_id.clone());
+                                    sh.metrics.last_latency_ms = Some(0);
+                                } else {
+                                    seek_to = Some(target_start);
+                                    jump_meta = Some((current.clone(), next_id.clone()));
+                                }
                             }
+                            armed = None;
                             sh.story_base_ms += end - seg.start_time_ms;
                             sh.current_segment = next_id.clone();
                             if let Some(next_seg) = bundle.manifest.segments.get(&next_id) {
@@ -669,6 +863,10 @@ fn driver_loop(
                             }
                         }
                         None => {
+                            armed = None;
+                            if loop_live {
+                                drop_loop = true;
+                            }
                             if !ended_emitted {
                                 ended_emitted = true;
                                 spawn_mark_story_finished(&pool, entry_id);
@@ -692,9 +890,35 @@ fn driver_loop(
                 let story_ms = sh.story_base_ms + (pos_ms - seg.start_time_ms).max(0);
                 let _ = app.emit("interactive-clock", serde_json::json!({ "storyMs": story_ms }));
             }
-        } // shared lock released before the (slow) seek
+        } // shared lock released before the (slow) mpv calls
 
+        if drop_loop && loop_live {
+            loop_live = false;
+            let _ = player.mpv.set_property_string("ab-loop-a", "no");
+            let _ = player.mpv.set_property_string("ab-loop-b", "no");
+        }
+        if let Some((a_ms, b_ms)) = set_loop {
+            let _ = player
+                .mpv
+                .set_property_string("ab-loop-a", &format!("{:.3}", a_ms as f64 / 1000.0));
+            let _ = player
+                .mpv
+                .set_property_string("ab-loop-b", &format!("{:.3}", b_ms as f64 / 1000.0));
+            loop_live = true;
+        }
+        if let Some(target_ms) = settle_to {
+            settling_until = Some((target_ms, Instant::now()));
+            clear_loop_after_settle = true;
+            continue;
+        }
         if let Some(target_ms) = seek_to {
+            // Late resolution change while a stale loop is armed: drop it so
+            // its B point can't fire spuriously later.
+            if loop_live {
+                loop_live = false;
+                let _ = player.mpv.set_property_string("ab-loop-a", "no");
+                let _ = player.mpv.set_property_string("ab-loop-b", "no");
+            }
             let _ = player
                 .mpv
                 .command(&["seek", &format!("{:.3}", target_ms as f64 / 1000.0), "absolute+exact"]);
@@ -717,9 +941,12 @@ fn driver_loop(
         std::thread::sleep(Duration::from_millis(if near_boundary { 4 } else { 15 }));
     }
 
-    // Driver stopping (player closed / session replaced): one final checkpoint
-    // so "come back later" resumes from the last frame watched, not up to 10s
-    // earlier.
+    // Driver stopping (player closed / session replaced): drop any armed loop
+    // points — linear playback on this mpv instance must never inherit them —
+    // and take one final checkpoint so "come back later" resumes from the last
+    // frame watched, not up to 10s earlier.
+    let _ = player.mpv.set_property_string("ab-loop-a", "no");
+    let _ = player.mpv.set_property_string("ab-loop-b", "no");
     if !ended_emitted {
         if let (Some(pos_ms), Ok(sh)) = (last_pos_ms, session.shared.lock()) {
             spawn_save_resume(&pool, &sh, &bundle, pos_ms);
@@ -847,10 +1074,12 @@ fn handle_requests(
 /// Build the visible choice list (precondition-filtered), store the live
 /// window, and notify the frontend.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn open_choice(
     app: &AppHandle,
     sh: &mut Shared,
     bundle: &InteractiveBundle,
+    assets: &HashMap<String, std::path::PathBuf>,
     m: &Moment,
     segment_id: &str,
     pos_ms: i64,
@@ -872,9 +1101,22 @@ fn open_choice(
         if raw_idx == raw_default {
             default_index = views.len();
         }
+        let mut image_path = None;
+        let mut image_size = None;
+        let mut image_position = None;
+        if let Some((base, size, position)) = choice_art(c) {
+            if let Some(path) = assets.get(&base) {
+                image_path = Some(path.to_string_lossy().into_owned());
+                image_size = size;
+                image_position = position;
+            }
+        }
         views.push(ChoiceView {
-            text: c.text.clone().unwrap_or_default(),
+            text: choice_label(c),
             sub_text: c.sub_text.clone(),
+            image_path,
+            image_size,
+            image_position,
         });
         targets.push(choice_target(c));
         impressions.push(c.impression_data.clone());
@@ -928,10 +1170,13 @@ pub async fn interactive_start(
     let (folder, video, title) =
         crate::commands::movie_playback_info(&state.app_db, &library_id, entry_id).await?;
 
-    let bundle = tauri::async_runtime::spawn_blocking(move || interactive::load_bundle_from_dir(&folder))
-        .await
-        .map_err(|e| e.to_string())??
-        .ok_or("This title has no interactive metadata")?;
+    let (bundle, assets) = tauri::async_runtime::spawn_blocking(move || {
+        let bundle = interactive::load_bundle_from_dir(&folder)?;
+        Ok::<_, String>((bundle, scan_assets(&folder)))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    let bundle = bundle.ok_or("This title has no interactive metadata")?;
 
     let report = interactive::validate(&bundle);
     if !report.ok() {
@@ -1118,7 +1363,7 @@ pub async fn interactive_start(
     }
 
     let pool = state.app_db.clone();
-    std::thread::spawn(move || driver_loop(app, player, pool, bundle, session));
+    std::thread::spawn(move || driver_loop(app, player, pool, bundle, assets, session));
     Ok(())
 }
 

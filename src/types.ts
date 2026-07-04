@@ -626,10 +626,20 @@ export type PlayerContext =
       index: number;
     };
 
+/** One rendered choice: text, or a locally-resolved 3-state sprite sheet
+ *  (image-only choices carry both; text is the no-assets fallback). */
+export interface InteractiveChoiceView {
+  text: string;
+  subText: string | null;
+  imagePath: string | null;
+  imageSize: string | null;
+  imagePosition: string | null;
+}
+
 /** Payload of interactive-choice-open (and interactive_status rehydration). */
 export interface InteractiveChoiceOpen {
   segmentId: string;
-  choices: { text: string; subText: string | null }[];
+  choices: InteractiveChoiceView[];
   defaultIndex: number;
   remainingMs: number;
   totalMs: number;
