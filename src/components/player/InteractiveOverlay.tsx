@@ -18,14 +18,10 @@ interface NotificationState {
 
 const TICK_MS = 250;
 
-// Netflix choice-point sprites stack their visual states vertically:
-// default / focused / selected. The format ships the default row's
-// backgroundPosition; the other rows follow the standard CSS percentage
-// spacing for a 3-frame sheet.
-const SPRITE_ROWS = ["0%", "50%", "100%"];
-
 /** Frame aspect ratio of a sprite sheet, from its natural size and the
- *  format's backgroundSize ("100.9% 303.2%" → ~3 frames tall). */
+ *  format's backgroundSize ("100.9% 303.2%" → ~3 frames tall). Only the
+ *  sheet's first (default) row is used — waverunner's own button chrome
+ *  conveys focus/selection, same as for text choices. */
 function frameAspect(natW: number, natH: number, size: string | null): number {
   const m = size?.match(/([\d.]+)%\s+([\d.]+)%/);
   if (!m) return 2.75;
@@ -196,39 +192,14 @@ export function InteractiveOverlay() {
             {choice.choices.map((c, i) => {
               const isSelected = selected === i;
               const dimmed = selected != null && !isSelected;
-              // Image choice: the sprite sheet stacks default/focused/selected
-              // rows — show the matching row, dim when another option won.
-              if (c.imagePath) {
-                const stateRow = isSelected ? 2 : focusIndex === i && selected == null ? 1 : 0;
-                return (
-                  <button
-                    key={i}
-                    onClick={() => pick(i)}
-                    onMouseEnter={() => selected == null && setFocusIndex(i)}
-                    disabled={selected != null}
-                    aria-label={c.text}
-                    title={c.text}
-                    className={`w-64 max-w-[30vw] bg-no-repeat shadow-xl transition-all duration-200 ${
-                      dimmed ? "opacity-40" : "cursor-pointer"
-                    }`}
-                    style={{
-                      aspectRatio: `${aspects.get(c.imagePath) ?? 2.75}`,
-                      // Quoted: convertFileSrc leaves parentheses unencoded
-                      // (folder names like "(2018)"), and a bare url(...)
-                      // terminates at the first `)`.
-                      backgroundImage: `url("${convertFileSrc(c.imagePath)}")`,
-                      backgroundSize: c.imageSize ?? "100% 300%",
-                      backgroundPosition: `50% ${SPRITE_ROWS[stateRow]}`,
-                    }}
-                  />
-                );
-              }
               return (
                 <button
                   key={i}
                   onClick={() => pick(i)}
                   onMouseEnter={() => selected == null && setFocusIndex(i)}
                   disabled={selected != null}
+                  title={c.imagePath ? c.text : undefined}
+                  aria-label={c.text}
                   className={`min-w-40 max-w-md rounded-md px-8 py-4 text-center shadow-xl ring-1 backdrop-blur-sm transition-all duration-200 ${
                     isSelected
                       ? "bg-white text-black ring-white"
@@ -239,8 +210,31 @@ export function InteractiveOverlay() {
                           : "cursor-pointer bg-black/55 text-white/90 ring-white/20 hover:bg-white/20"
                   }`}
                 >
-                  <span className="text-lg font-semibold tracking-wide">{c.text}</span>
-                  {c.subText && <span className="mt-1 block text-xs opacity-70">{c.subText}</span>}
+                  {c.imagePath ? (
+                    // The sprite's default row as content, in place of text.
+                    // screen-blend sinks the art's black plate into the button;
+                    // invert+multiply keeps the glyph legible on the white
+                    // selected state. Chrome conveys focus, same as text.
+                    <span
+                      className={`mx-auto block h-7 bg-no-repeat ${dimmed ? "opacity-40" : ""}`}
+                      style={{
+                        width: `${(aspects.get(c.imagePath) ?? 2.75) * 1.75}rem`,
+                        // Quoted: convertFileSrc leaves parentheses unencoded
+                        // (folder names like "(2018)"), and a bare url(...)
+                        // terminates at the first `)`.
+                        backgroundImage: `url("${convertFileSrc(c.imagePath)}")`,
+                        backgroundSize: c.imageSize ?? "100% 300%",
+                        backgroundPosition: "50% 0%",
+                        mixBlendMode: isSelected ? "multiply" : "screen",
+                        filter: isSelected ? "invert(1)" : undefined,
+                      }}
+                    />
+                  ) : (
+                    <>
+                      <span className="text-lg font-semibold tracking-wide">{c.text}</span>
+                      {c.subText && <span className="mt-1 block text-xs opacity-70">{c.subText}</span>}
+                    </>
+                  )}
                 </button>
               );
             })}
