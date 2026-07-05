@@ -18,16 +18,52 @@ interface NotificationState {
 
 const TICK_MS = 250;
 
-/** Frame aspect ratio of a sprite sheet, from its natural size and the
- *  format's backgroundSize ("100.9% 303.2%" → ~3 frames tall). Only the
- *  sheet's first (default) row is used — waverunner's own button chrome
- *  conveys focus/selection, same as for text choices. */
-function frameAspect(natW: number, natH: number, size: string | null): number {
-  const m = size?.match(/([\d.]+)%\s+([\d.]+)%/);
-  if (!m) return 2.75;
-  const fw = natW / (parseFloat(m[1]) / 100);
-  const fh = natH / (parseFloat(m[2]) / 100);
-  return fh > 0 ? fw / fh : 2.75;
+/** Extract a sprite sheet's default frame as a transparent white glyph.
+ *
+ *  The Netflix choice-point sprites are white art on an opaque black plate,
+ *  with three button states stacked vertically. CSS blending can't hide the
+ *  plate here — the movie renders behind a transparent webview, so there's
+ *  nothing in the DOM to blend into. Instead: crop the default row (geometry
+ *  from the format's backgroundSize/Position) and key luminance → alpha on a
+ *  canvas, yielding an image that drops into the standard button like text.
+ */
+async function keySprite(
+  path: string,
+  size: string | null,
+  position: string | null
+): Promise<{ url: string; aspect: number }> {
+  // fetch → blob keeps the canvas untainted (same pattern as cover preloads).
+  const resp = await fetch(convertFileSrc(path));
+  if (!resp.ok) throw new Error(`sprite fetch ${resp.status}`);
+  const bitmap = await createImageBitmap(await resp.blob());
+  const sm = size?.match(/([\d.]+)%\s+([\d.]+)%/);
+  const fw = Math.round(bitmap.width / ((sm ? parseFloat(sm[1]) : 100) / 100));
+  const fh = Math.round(bitmap.height / ((sm ? parseFloat(sm[2]) : 300) / 100));
+  const pm = position?.match(/([\d.]+)%\s+([\d.]+)%/);
+  const sx = Math.round((bitmap.width - fw) * ((pm ? parseFloat(pm[1]) : 50) / 100));
+  const sy = Math.round((bitmap.height - fh) * ((pm ? parseFloat(pm[2]) : 0) / 100));
+
+  const canvas = document.createElement("canvas");
+  canvas.width = fw;
+  canvas.height = fh;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("no 2d context");
+  ctx.drawImage(bitmap, sx, sy, fw, fh, 0, 0, fw, fh);
+  const data = ctx.getImageData(0, 0, fw, fh);
+  const px = data.data;
+  for (let i = 0; i < px.length; i += 4) {
+    // Brightness becomes opacity; the glyph itself becomes pure white so the
+    // selected state can recolor it with a simple invert.
+    const lum = Math.max(px[i], px[i + 1], px[i + 2]);
+    px[i] = 255;
+    px[i + 1] = 255;
+    px[i + 2] = 255;
+    px[i + 3] = Math.min(px[i + 3], lum);
+  }
+  ctx.putImageData(data, 0, 0);
+  const blob = await new Promise<Blob | null>((r) => canvas.toBlob(r, "image/png"));
+  if (!blob) throw new Error("toBlob failed");
+  return { url: URL.createObjectURL(blob), aspect: fh > 0 ? fw / fh : 2.75 };
 }
 
 export function InteractiveOverlay() {
@@ -37,8 +73,11 @@ export function InteractiveOverlay() {
   const [focusIndex, setFocusIndex] = useState(0);
   const [closing, setClosing] = useState(false);
   const [notification, setNotification] = useState<NotificationState | null>(null);
-  // Sprite-sheet frame aspect per image path (loaded lazily per choice open).
-  const [aspects, setAspects] = useState<Map<string, number>>(new Map());
+  // Keyed (transparent-glyph) sprite frames by source path — cached for the
+  // session; the same few sprites recur across a title's variants.
+  const [sprites, setSprites] = useState<Map<string, { url: string; aspect: number }>>(new Map());
+  const spritesRef = useRef(sprites);
+  spritesRef.current = sprites;
   const choiceRef = useRef<InteractiveChoiceOpen | null>(null);
   choiceRef.current = choice;
   const selectedRef = useRef<number | null>(null);
@@ -55,19 +94,25 @@ export function InteractiveOverlay() {
     setRemaining(payload.remainingMs);
     setSelected(payload.selectedIndex);
     setFocusIndex(payload.selectedIndex ?? payload.defaultIndex ?? 0);
-    // Measure any sprite sheets so their buttons reserve the right shape.
+    // Key any sprite art into transparent glyphs (cached across opens).
     for (const c of payload.choices) {
       const path = c.imagePath;
-      if (!path) continue;
-      const img = new Image();
-      img.onload = () =>
-        setAspects((prev) => {
-          if (prev.has(path)) return prev;
-          const next = new Map(prev);
-          next.set(path, frameAspect(img.naturalWidth, img.naturalHeight, c.imageSize));
-          return next;
+      if (!path || spritesRef.current.has(path)) continue;
+      keySprite(path, c.imageSize, c.imagePosition)
+        .then((glyph) =>
+          setSprites((prev) => {
+            if (prev.has(path)) {
+              URL.revokeObjectURL(glyph.url);
+              return prev;
+            }
+            const next = new Map(prev);
+            next.set(path, glyph);
+            return next;
+          })
+        )
+        .catch(() => {
+          // Keying failed — the button shows its text fallback.
         });
-      img.src = convertFileSrc(path);
     }
   }, []);
 
@@ -210,24 +255,17 @@ export function InteractiveOverlay() {
                           : "cursor-pointer bg-black/55 text-white/90 ring-white/20 hover:bg-white/20"
                   }`}
                 >
-                  {c.imagePath ? (
-                    // The sprite's default row as content, in place of text.
-                    // screen-blend sinks the art's black plate into the button;
-                    // invert+multiply keeps the glyph legible on the white
-                    // selected state. Chrome conveys focus, same as text.
-                    <span
-                      className={`mx-auto block h-7 bg-no-repeat ${dimmed ? "opacity-40" : ""}`}
-                      style={{
-                        width: `${(aspects.get(c.imagePath) ?? 2.75) * 1.75}rem`,
-                        // Quoted: convertFileSrc leaves parentheses unencoded
-                        // (folder names like "(2018)"), and a bare url(...)
-                        // terminates at the first `)`.
-                        backgroundImage: `url("${convertFileSrc(c.imagePath)}")`,
-                        backgroundSize: c.imageSize ?? "100% 300%",
-                        backgroundPosition: "50% 0%",
-                        mixBlendMode: isSelected ? "multiply" : "screen",
-                        filter: isSelected ? "invert(1)" : undefined,
-                      }}
+                  {c.imagePath && sprites.has(c.imagePath) ? (
+                    // The keyed glyph (white on transparency) sits in the
+                    // button exactly like text — inverted to black on the
+                    // white selected state, dimmed like unpicked text.
+                    <img
+                      src={sprites.get(c.imagePath)!.url}
+                      alt={c.text}
+                      draggable={false}
+                      className={`mx-auto block h-7 w-auto select-none ${isSelected ? "invert" : ""} ${
+                        dimmed ? "opacity-40" : ""
+                      }`}
                     />
                   ) : (
                     <>
