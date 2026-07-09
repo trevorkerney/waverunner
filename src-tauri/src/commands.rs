@@ -1438,6 +1438,46 @@ async fn mark_entry_flags(
         .filter(|e| e.entry_type == "movie")
         .map(|e| e.id)
         .collect();
+    let show_ids: Vec<i64> = entries
+        .iter()
+        .filter(|e| e.entry_type == "show")
+        .map(|e| e.id)
+        .collect();
+    if ids.is_empty() && show_ids.is_empty() {
+        return Ok(());
+    }
+
+    // A show is "explicitly unwatched" when every one of its episodes is.
+    let mut unwatched_shows: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    for chunk in show_ids.chunks(900) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let query = format!(
+            "SELECT s.show_id
+             FROM season s
+             JOIN episode e ON e.season_id = s.id
+             LEFT JOIN episode_watch ew ON ew.episode_id = e.id
+             WHERE s.show_id IN ({placeholders})
+             GROUP BY s.show_id
+             HAVING COUNT(e.id) > 0
+                AND COUNT(e.id) = SUM(CASE WHEN ew.episode_id IS NOT NULL
+                                            AND ew.watched = 0
+                                            AND ew.position_secs IS NULL
+                                           THEN 1 ELSE 0 END)"
+        );
+        let mut q = sqlx::query_as::<_, (i64,)>(&query);
+        for id in chunk {
+            q = q.bind(id);
+        }
+        let rows = q.fetch_all(pool).await.map_err(|e| e.to_string())?;
+        unwatched_shows.extend(rows.into_iter().map(|(id,)| id));
+    }
+    if !unwatched_shows.is_empty() {
+        for e in entries.iter_mut() {
+            if e.entry_type == "show" && unwatched_shows.contains(&e.id) {
+                e.unwatched = true;
+            }
+        }
+    }
     if ids.is_empty() {
         return Ok(());
     }

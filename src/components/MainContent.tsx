@@ -1764,13 +1764,18 @@ function SortableCoverCard({
                 Add to playlist
               </ContextMenuItem>
             )}
-            {entry.entry_type === "movie" && (
+            {(entry.entry_type === "movie" || entry.entry_type === "show") && (
               // Watched is the default, so the offered action pivots on the
               // explicit-unwatched flag: untouched titles offer Mark unwatched.
+              // Shows flip every episode at once.
               <ContextMenuItem
                 onClick={async () => {
                   try {
-                    await invoke("mark_watched", { kind: "movie", id: entry.id, watched: isUnwatched });
+                    if (entry.entry_type === "show") {
+                      await invoke("mark_show_watched", { showId: entry.id, watched: isUnwatched });
+                    } else {
+                      await invoke("mark_watched", { kind: "movie", id: entry.id, watched: isUnwatched });
+                    }
                     setWatchOverride(isUnwatched ? "watched" : "unwatched");
                   } catch (e) {
                     toast.error(String(e));
@@ -2884,6 +2889,7 @@ function ShowDetailPage({
   const [firstEpisodeId, setFirstEpisodeId] = useState<number | null>(null);
   const selectedSeason = seasons.find((s) => s.id === selectedSeasonId);
 
+  const [episodeIds, setEpisodeIds] = useState<number[]>([]);
   const loadWatch = useCallback(async () => {
     try {
       const [rows, cont, flat] = await Promise.all([
@@ -2894,6 +2900,7 @@ function ShowDetailPage({
       setEpWatch(new Map(rows.map((r) => [r.episode_id, r])));
       setContinueTarget(cont);
       setFirstEpisodeId(flat[0]?.episode_id ?? null);
+      setEpisodeIds(flat.map((f) => f.episode_id));
     } catch {
       // Indicators degrade to absent.
     }
@@ -3338,6 +3345,34 @@ function ShowDetailPage({
           Get ratings
         </ContextMenuItem>
       )}
+      {(() => {
+        // Show-wide toggle, pivoting like everywhere else: watched is the
+        // default, so the offered action is Mark unwatched unless every
+        // episode is already explicitly flagged.
+        const allUnwatched =
+          episodeIds.length > 0 &&
+          episodeIds.every((id) => {
+            const w = epWatch.get(id);
+            return !!w && !w.watched && w.position_secs == null;
+          });
+        return (
+          <ContextMenuItem
+            disabled={episodeIds.length === 0}
+            onClick={async () => {
+              try {
+                await invoke("mark_show_watched", { showId: entry.id, watched: allUnwatched });
+                loadWatch();
+                onEntryChanged();
+              } catch (e) {
+                toast.error(String(e));
+              }
+            }}
+          >
+            {allUnwatched ? <Eye size={14} /> : <EyeOff size={14} />}
+            {allUnwatched ? "Mark show watched" : "Mark show unwatched"}
+          </ContextMenuItem>
+        );
+      })()}
       <ContextMenuSeparator />
       <ContextMenuItem
         onClick={onDeleteCover}
