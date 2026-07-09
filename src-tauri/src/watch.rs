@@ -185,12 +185,14 @@ pub async fn get_show_continue(
     state: State<'_, AppState>,
     show_id: i64,
 ) -> Result<Option<ContinueTarget>, String> {
+    // A resume point is in-progress regardless of the sticky watched flag —
+    // a rewatch of a finished episode still deserves Continue.
     let in_progress: Option<(i64, Option<i64>, Option<i64>, Option<f64>)> = sqlx::query_as(
         "SELECT e.id, s.season_number, e.episode_number, ew.position_secs
          FROM episode_watch ew
          JOIN episode e ON e.id = ew.episode_id
          JOIN season s ON s.id = e.season_id
-         WHERE s.show_id = ? AND ew.watched = 0 AND ew.position_secs IS NOT NULL
+         WHERE s.show_id = ? AND ew.position_secs IS NOT NULL
          ORDER BY ew.last_played_at DESC
          LIMIT 1",
     )

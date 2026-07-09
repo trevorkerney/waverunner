@@ -2478,7 +2478,7 @@ function EntryDetailPage({
           offer Mark watched. */}
       {(() => {
         const offerWatched = watch
-          ? watch.unwatched || (!watch.watched && watch.position_secs != null)
+          ? watch.unwatched || watch.position_secs != null
           : entry.unwatched || entry.has_progress;
         return (
           <ContextMenuItem
@@ -3700,8 +3700,10 @@ function ShowDetailPage({
                 const epDetail = episodeDetails.get(ep.id);
                 const hasDetail = epDetail && (epDetail.release_date || epDetail.plot || epDetail.runtime || epDetail.cast.length > 0 || epDetail.directors.length > 0 || epDetail.composers.length > 0);
                 const w = epWatch.get(ep.id);
+                // Position is the sole in-progress signal — the sticky watched
+                // flag doesn't hide a rewatch's bar.
                 const epProgress =
-                  w && !w.watched && w.position_secs != null && w.duration_secs && w.duration_secs > 0
+                  w && w.position_secs != null && w.duration_secs && w.duration_secs > 0
                     ? Math.min(1, Math.max(0, w.position_secs / w.duration_secs))
                     : null;
                 return (
@@ -3747,9 +3749,7 @@ function ShowDetailPage({
                         variant="ghost"
                         className="self-center"
                         title={
-                          !w?.watched && w?.position_secs != null
-                            ? `Resume from ${fmtClock(w.position_secs)}`
-                            : undefined
+                          w?.position_secs != null ? `Resume from ${fmtClock(w.position_secs)}` : undefined
                         }
                         onClick={(e) => {
                           e.stopPropagation();
@@ -3759,7 +3759,7 @@ function ShowDetailPage({
                               showId: entry.id,
                               showTitle: entry.title,
                               startEpisodeId: ep.id,
-                              startSecs: w?.watched ? undefined : w?.position_secs ?? undefined,
+                              startSecs: w?.position_secs ?? undefined,
                             });
                           } catch (err) {
                             toast.error(String(err));

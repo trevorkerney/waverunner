@@ -1510,7 +1510,7 @@ async fn mark_entry_flags(
             "SELECT me.id,
                     (it.entry_id IS NOT NULL),
                     COALESCE(mw.watched, 0),
-                    CASE WHEN mw.watched = 0 AND mw.position_secs IS NOT NULL AND mw.duration_secs > 0
+                    CASE WHEN mw.position_secs IS NOT NULL AND mw.duration_secs > 0
                          THEN mw.position_secs / mw.duration_secs ELSE NULL END,
                     (mw.entry_id IS NOT NULL AND mw.watched = 0 AND mw.position_secs IS NULL)
              FROM media_entry me
