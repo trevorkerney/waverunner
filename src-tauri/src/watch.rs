@@ -236,7 +236,9 @@ pub async fn get_show_continue(
 }
 
 /// Manually flip watched state. Marking watched clears the resume point;
-/// marking unwatched deletes the row entirely (a fresh start).
+/// marking unwatched writes an EXPLICIT unwatched row (watched=0, no resume)
+/// — distinct from never-tracked, so the grid can badge deliberately
+/// unwatched titles without badging the whole library.
 #[tauri::command]
 pub async fn mark_watched(
     state: State<'_, AppState>,
@@ -259,7 +261,12 @@ pub async fn mark_watched(
                 watched_at = COALESCE({table}.watched_at, datetime('now'))"
         )
     } else {
-        format!("DELETE FROM {table} WHERE {key} = ?")
+        format!(
+            "INSERT INTO {table} ({key}, position_secs, watched, watched_at)
+             VALUES (?, NULL, 0, NULL)
+             ON CONFLICT({key}) DO UPDATE SET
+                position_secs = NULL, watched = 0, watched_at = NULL"
+        )
     };
     sqlx::query(&query)
         .bind(id)
@@ -298,8 +305,12 @@ pub async fn mark_season_watched(
         .await
         .map_err(|e| e.to_string())?;
     } else {
+        // Same explicit-unwatched semantics as mark_watched.
         sqlx::query(
-            "DELETE FROM episode_watch WHERE episode_id IN (SELECT id FROM episode WHERE season_id = ?)",
+            "INSERT INTO episode_watch (episode_id, position_secs, watched, watched_at)
+             SELECT id, NULL, 0, NULL FROM episode WHERE season_id = ?1
+             ON CONFLICT(episode_id) DO UPDATE SET
+                position_secs = NULL, watched = 0, watched_at = NULL",
         )
         .bind(season_id)
         .execute(&state.app_db)

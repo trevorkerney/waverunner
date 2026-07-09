@@ -111,6 +111,10 @@ pub struct MediaEntry {
     pub watched: bool,
     #[serde(default)]
     pub watch_progress: Option<f64>,
+    /// Deliberately marked unwatched (an explicit row, not merely untracked)
+    /// — the state the grid badges, since watched is the library default.
+    #[serde(default)]
+    pub unwatched: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1124,6 +1128,7 @@ pub async fn get_entries(
                         interactive: false,
                         watched: false,
                         watch_progress: None,
+                        unwatched: false,
                     }
                 })
                 .collect();
@@ -1229,6 +1234,7 @@ pub async fn get_entries(
                         interactive: false,
                         watched: false,
                         watch_progress: None,
+                        unwatched: false,
                     }
                 })
                 .collect();
@@ -1348,7 +1354,7 @@ pub async fn search_entries(
             let mut entries: Vec<MediaEntry> = rows.into_iter()
                 .map(|(id, title, year, end_year, folder_path, parent_id, entry_type, selected_cover, tmdb_id, season_display)| {
                     let covers = covers_map.remove(&folder_path).unwrap_or_default();
-                    MediaEntry { id, title, year, end_year, folder_path, parent_id, entry_type, covers, selected_cover, child_count: 0, season_display, collection_display: None, role_display: None, tmdb_id, link_id: None, interactive: false, watched: false, watch_progress: None }
+                    MediaEntry { id, title, year, end_year, folder_path, parent_id, entry_type, covers, selected_cover, child_count: 0, season_display, collection_display: None, role_display: None, tmdb_id, link_id: None, interactive: false, watched: false, watch_progress: None, unwatched: false }
                 })
                 .collect();
 
@@ -1405,7 +1411,7 @@ pub async fn search_entries(
             rows.into_iter()
                 .map(|(id, title, folder_path, selected_cover)| {
                     let covers = covers_map.remove(&folder_path).unwrap_or_default();
-                    MediaEntry { id, title, year: None, end_year: None, folder_path, parent_id: None, entry_type: "artist".to_string(), covers, selected_cover, child_count: 0, season_display: None, collection_display: None, role_display: None, tmdb_id: None, link_id: None, interactive: false, watched: false, watch_progress: None }
+                    MediaEntry { id, title, year: None, end_year: None, folder_path, parent_id: None, entry_type: "artist".to_string(), covers, selected_cover, child_count: 0, season_display: None, collection_display: None, role_display: None, tmdb_id: None, link_id: None, interactive: false, watched: false, watch_progress: None, unwatched: false }
                 })
                 .collect()
         }
@@ -1435,8 +1441,8 @@ async fn mark_entry_flags(
     if ids.is_empty() {
         return Ok(());
     }
-    // id -> (interactive, watched, progress ratio)
-    let mut flags: std::collections::HashMap<i64, (bool, bool, Option<f64>)> =
+    // id -> (interactive, watched, progress ratio, explicitly unwatched)
+    let mut flags: std::collections::HashMap<i64, (bool, bool, Option<f64>, bool)> =
         std::collections::HashMap::new();
     for chunk in ids.chunks(900) {
         let placeholders = vec!["?"; chunk.len()].join(",");
@@ -1445,27 +1451,29 @@ async fn mark_entry_flags(
                     (it.entry_id IS NOT NULL),
                     COALESCE(mw.watched, 0),
                     CASE WHEN mw.watched = 0 AND mw.position_secs IS NOT NULL AND mw.duration_secs > 0
-                         THEN mw.position_secs / mw.duration_secs ELSE NULL END
+                         THEN mw.position_secs / mw.duration_secs ELSE NULL END,
+                    (mw.entry_id IS NOT NULL AND mw.watched = 0 AND mw.position_secs IS NULL)
              FROM media_entry me
              LEFT JOIN interactive_title it ON it.entry_id = me.id
              LEFT JOIN movie_watch mw ON mw.entry_id = me.id
              WHERE me.id IN ({placeholders})
                AND (it.entry_id IS NOT NULL OR mw.entry_id IS NOT NULL)"
         );
-        let mut q = sqlx::query_as::<_, (i64, bool, i64, Option<f64>)>(&query);
+        let mut q = sqlx::query_as::<_, (i64, bool, i64, Option<f64>, bool)>(&query);
         for id in chunk {
             q = q.bind(id);
         }
         let rows = q.fetch_all(pool).await.map_err(|e| e.to_string())?;
-        for (id, interactive, watched, progress) in rows {
-            flags.insert(id, (interactive, watched != 0, progress));
+        for (id, interactive, watched, progress, unwatched) in rows {
+            flags.insert(id, (interactive, watched != 0, progress, unwatched));
         }
     }
     for e in entries.iter_mut() {
-        if let Some((interactive, watched, progress)) = flags.get(&e.id) {
+        if let Some((interactive, watched, progress, unwatched)) = flags.get(&e.id) {
             e.interactive = *interactive;
             e.watched = *watched;
             e.watch_progress = *progress;
+            e.unwatched = *unwatched;
         }
     }
     Ok(())
@@ -2718,6 +2726,7 @@ pub async fn get_entries_for_genre(
                 interactive: false,
                 watched: false,
                 watch_progress: None,
+                unwatched: false,
             }
         })
         .collect();
@@ -3499,6 +3508,7 @@ pub async fn get_entries_for_person(
                 interactive: false,
                 watched: false,
                 watch_progress: None,
+                unwatched: false,
             }
         })
         .collect();
@@ -4793,6 +4803,7 @@ pub async fn get_playlist_contents(
             interactive: false,
             watched: false,
             watch_progress: None,
+            unwatched: false,
         };
         items.push((sort_order, sort_title.unwrap_or_default(), sort_date, entry));
     }
@@ -4898,6 +4909,7 @@ pub async fn get_playlist_contents(
             interactive: false,
             watched: false,
             watch_progress: None,
+            unwatched: false,
         };
         items.push((sort_order, sort_title, min_date, entry));
     }

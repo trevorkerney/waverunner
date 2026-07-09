@@ -48,6 +48,9 @@ export interface MediaEntry {
   watched: boolean;
   /** Resume progress ratio (0..1) for the card sliver; null when none. */
   watch_progress: number | null;
+  /** Deliberately marked unwatched — the state the grid badges, since
+   *  watched is the library default. */
+  unwatched: boolean;
 }
 
 /** Watch state for a movie detail page (get_watch_state). */

@@ -1478,12 +1478,13 @@ function SortableCoverCard({
   const isPlaylistCollection = entry.entry_type === "playlist_collection";
   const isDropTarget = isCollection || isPlaylistCollection;
 
-  // Optimistic watched flag: entry lists are cached upstream, so after
-  // mark-watched from this card's menu the card corrects itself locally and
-  // the caches catch up on their next reload.
-  const [watchedOverride, setWatchedOverride] = useState<boolean | null>(null);
-  useEffect(() => setWatchedOverride(null), [entry.id, entry.watched]);
-  const isWatched = watchedOverride ?? entry.watched;
+  // Optimistic watch state: entry lists are cached upstream, so after
+  // mark-watched/unwatched from this card's menu the card corrects itself
+  // locally and the caches catch up on their next reload.
+  const [watchOverride, setWatchOverride] = useState<"watched" | "unwatched" | null>(null);
+  useEffect(() => setWatchOverride(null), [entry.id, entry.watched, entry.unwatched]);
+  const isWatched = watchOverride ? watchOverride === "watched" : entry.watched;
+  const isUnwatched = watchOverride ? watchOverride === "unwatched" : entry.unwatched;
   // Different prefixes so the drag-end handler knows which backend to call.
   const dropId = isPlaylistCollection
     ? `pc-drop-${entry.id}`
@@ -1622,8 +1623,8 @@ function SortableCoverCard({
               )}
             </div>
           )}
-          {/* Top-right badge stack: card-type icon (collection / interactive)
-              above the watched check — an interactive movie can carry both. */}
+          {/* Top-right badge stack. Watched is the library default and goes
+              unbadged; the notable state is DELIBERATELY unwatched. */}
           <div className="absolute right-1 top-1 flex flex-col items-end gap-1">
             {isCollection && (
               <div className="rounded-sm bg-black/70 p-1 text-white backdrop-blur-sm" title="Collection">
@@ -1638,9 +1639,9 @@ function SortableCoverCard({
                 <GitBranch size={12} />
               </div>
             )}
-            {isWatched && (
-              <div className="rounded-full bg-black/70 p-1 text-white backdrop-blur-sm" title="Watched">
-                <Check size={12} />
+            {isUnwatched && (
+              <div className="rounded-sm bg-black/70 p-1 text-white backdrop-blur-sm" title="Marked unwatched">
+                <EyeOff size={12} />
               </div>
             )}
           </div>
@@ -1769,7 +1770,7 @@ function SortableCoverCard({
                 onClick={async () => {
                   try {
                     await invoke("mark_watched", { kind: "movie", id: entry.id, watched: !isWatched });
-                    setWatchedOverride(!isWatched);
+                    setWatchOverride(isWatched ? "unwatched" : "watched");
                   } catch (e) {
                     toast.error(String(e));
                   }
@@ -2589,12 +2590,6 @@ function EntryDetailPage({
                     >
                       <GitBranch size={11} />
                       Interactive
-                    </span>
-                  )}
-                  {(watch?.watched ?? entry.watched) && (
-                    <span className="inline-flex items-center gap-1 rounded border border-border px-1.5 py-px text-xs">
-                      <Check size={11} />
-                      Watched
                     </span>
                   )}
                 </div>
@@ -4295,6 +4290,7 @@ function PlaylistsView({
         interactive: false,
         watched: false,
         watch_progress: null,
+        unwatched: false,
       }
     : null;
 
