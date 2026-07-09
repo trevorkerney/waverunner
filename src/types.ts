@@ -58,6 +58,8 @@ export interface WatchState {
   position_secs: number | null;
   duration_secs: number | null;
   watched: boolean;
+  /** Deliberately marked unwatched (explicit row, not merely untracked). */
+  unwatched: boolean;
   /** Interactive titles: a mid-story resume exists (Play → "Resume"). */
   interactive_resume: boolean;
 }

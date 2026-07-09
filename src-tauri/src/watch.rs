@@ -108,6 +108,9 @@ pub struct WatchState {
     pub position_secs: Option<f64>,
     pub duration_secs: Option<f64>,
     pub watched: bool,
+    /// Deliberately marked unwatched (explicit row; watched is the default
+    /// state of a personal library, so this is what gets surfaced).
+    pub unwatched: bool,
     /// Interactive titles: a mid-story resume exists (Play → "Resume").
     pub interactive_resume: bool,
 }
@@ -128,8 +131,9 @@ pub async fn get_watch_state(state: State<'_, AppState>, entry_id: i64) -> Resul
             .fetch_optional(&state.app_db)
             .await
             .map_err(|e| e.to_string())?;
+    let unwatched = matches!(&row, Some((p, _, w)) if *w == 0 && p.is_none());
     let (position_secs, duration_secs, watched) = row.map_or((None, None, false), |(p, d, w)| (p, d, w != 0));
-    Ok(WatchState { position_secs, duration_secs, watched, interactive_resume: resume.is_some() })
+    Ok(WatchState { position_secs, duration_secs, watched, unwatched, interactive_resume: resume.is_some() })
 }
 
 #[derive(Debug, Serialize)]

@@ -94,7 +94,6 @@ import {
   Clapperboard,
   GitBranch,
   RotateCcw,
-  Check,
   Eye,
   EyeOff,
   LayoutGrid,
@@ -1766,18 +1765,20 @@ function SortableCoverCard({
               </ContextMenuItem>
             )}
             {entry.entry_type === "movie" && (
+              // Watched is the default, so the offered action pivots on the
+              // explicit-unwatched flag: untouched titles offer Mark unwatched.
               <ContextMenuItem
                 onClick={async () => {
                   try {
-                    await invoke("mark_watched", { kind: "movie", id: entry.id, watched: !isWatched });
-                    setWatchOverride(isWatched ? "unwatched" : "watched");
+                    await invoke("mark_watched", { kind: "movie", id: entry.id, watched: isUnwatched });
+                    setWatchOverride(isUnwatched ? "watched" : "unwatched");
                   } catch (e) {
                     toast.error(String(e));
                   }
                 }}
               >
-                {isWatched ? <EyeOff size={14} /> : <Eye size={14} />}
-                {isWatched ? "Mark unwatched" : "Mark watched"}
+                {isUnwatched ? <Eye size={14} /> : <EyeOff size={14} />}
+                {isUnwatched ? "Mark watched" : "Mark unwatched"}
               </ContextMenuItem>
             )}
             {onRemoveLink && entry.link_id != null && (
@@ -2465,11 +2466,13 @@ function EntryDetailPage({
           Get ratings
         </ContextMenuItem>
       )}
+      {/* Watched is the default — the offered action pivots on the
+          explicit-unwatched flag, so untouched titles offer Mark unwatched. */}
       <ContextMenuItem
         onClick={async () => {
           try {
-            const next = !(watch?.watched ?? entry.watched);
-            await invoke("mark_watched", { kind: "movie", id: entry.id, watched: next });
+            const unwatched = watch?.unwatched ?? entry.unwatched;
+            await invoke("mark_watched", { kind: "movie", id: entry.id, watched: unwatched });
             setWatch(await invoke<WatchState>("get_watch_state", { entryId: entry.id }));
             onEntryChanged();
           } catch (e) {
@@ -2477,8 +2480,8 @@ function EntryDetailPage({
           }
         }}
       >
-        {(watch?.watched ?? entry.watched) ? <EyeOff size={14} /> : <Eye size={14} />}
-        {(watch?.watched ?? entry.watched) ? "Mark unwatched" : "Mark watched"}
+        {(watch?.unwatched ?? entry.unwatched) ? <Eye size={14} /> : <EyeOff size={14} />}
+        {(watch?.unwatched ?? entry.unwatched) ? "Mark watched" : "Mark unwatched"}
       </ContextMenuItem>
       {entry.interactive && (
         <ContextMenuItem
@@ -3586,7 +3589,14 @@ function ShowDetailPage({
                 so there's a right-click target even when the season has no metadata */}
             {selectedSeason && !seasonEditing && (() => {
               const episodesNumbered = episodes.length > 0 && episodes.every((e) => e.episode_number != null);
-              const seasonAllWatched = episodes.length > 0 && episodes.every((e) => epWatch.get(e.id)?.watched);
+              // Watched is the default — the season action pivots on every
+              // episode being explicitly flagged unwatched.
+              const seasonAllUnwatched =
+                episodes.length > 0 &&
+                episodes.every((e) => {
+                  const w = epWatch.get(e.id);
+                  return !!w && !w.watched && w.position_secs == null;
+                });
               const totalRuntime = episodes.reduce((sum, e) => sum + (e.runtime ?? 0), 0);
               const years = [...new Set(episodes.map((e) => e.release_date?.slice(0, 4)).filter((y): y is string => !!y))].sort();
               const seasonMeta = [
@@ -3623,15 +3633,15 @@ function ShowDetailPage({
                       disabled={episodes.length === 0}
                       onClick={async () => {
                         try {
-                          await invoke("mark_season_watched", { seasonId: selectedSeason.id, watched: !seasonAllWatched });
+                          await invoke("mark_season_watched", { seasonId: selectedSeason.id, watched: seasonAllUnwatched });
                           loadWatch();
                         } catch (e) {
                           toast.error(String(e));
                         }
                       }}
                     >
-                      {seasonAllWatched ? <EyeOff size={14} /> : <Eye size={14} />}
-                      {seasonAllWatched ? "Mark season unwatched" : "Mark season watched"}
+                      {seasonAllUnwatched ? <Eye size={14} /> : <EyeOff size={14} />}
+                      {seasonAllUnwatched ? "Mark season watched" : "Mark season unwatched"}
                     </ContextMenuItem>
                   </ContextMenuContent>
                 </ContextMenu>
@@ -3661,6 +3671,8 @@ function ShowDetailPage({
                   w && !w.watched && w.position_secs != null && w.duration_secs && w.duration_secs > 0
                     ? Math.min(1, Math.max(0, w.position_secs / w.duration_secs))
                     : null;
+                // Explicitly flagged unwatched — the state worth surfacing.
+                const epUnwatched = !!w && !w.watched && w.position_secs == null;
                 return (
                   <div key={ep.id} className="flex flex-col">
                     <ContextMenu>
@@ -3692,9 +3704,10 @@ function ShowDetailPage({
                           <p className="mt-0.5 text-xs leading-snug text-muted-foreground line-clamp-2">{ep.plot}</p>
                         )}
                       </div>
-                      {/* Watch indicator: check = watched, mini bar = partial */}
-                      {w?.watched && (
-                        <Check size={14} className="self-center text-primary" aria-label="Watched" />
+                      {/* Watch indicator: eye-off = flagged unwatched, mini
+                          bar = partial. Watched is the default — unbadged. */}
+                      {epUnwatched && (
+                        <EyeOff size={14} className="self-center text-muted-foreground" aria-label="Marked unwatched" />
                       )}
                       {epProgress != null && (
                         <div className="h-1 w-12 self-center overflow-hidden rounded-full bg-muted" title={`${Math.round(epProgress * 100)}% watched`}>
@@ -3727,15 +3740,15 @@ function ShowDetailPage({
                         <ContextMenuItem
                           onClick={async () => {
                             try {
-                              await invoke("mark_watched", { kind: "episode", id: ep.id, watched: !w?.watched });
+                              await invoke("mark_watched", { kind: "episode", id: ep.id, watched: epUnwatched });
                               loadWatch();
                             } catch (e) {
                               toast.error(String(e));
                             }
                           }}
                         >
-                          {w?.watched ? <EyeOff size={14} /> : <Eye size={14} />}
-                          {w?.watched ? "Mark unwatched" : "Mark watched"}
+                          {epUnwatched ? <Eye size={14} /> : <EyeOff size={14} />}
+                          {epUnwatched ? "Mark watched" : "Mark unwatched"}
                         </ContextMenuItem>
                         <ContextMenuSeparator />
                         <ContextMenuItem
