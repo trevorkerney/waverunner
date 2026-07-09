@@ -10,7 +10,7 @@ import { Toaster } from "@/components/ui/sonner";
 import { toast } from "sonner";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { Library, MediaEntry, EntriesResponse, BreadcrumbItem, ViewSpec, PersonInfo, PersonSummary, PersonRole, PlaylistSummary, PlaylistsResponse, PlaylistContents, SortPreset, LibraryCounts, GenreSummary } from "@/types";
+import { Library, MediaEntry, EntriesResponse, BreadcrumbItem, ViewSpec, PersonInfo, PersonSummary, PersonRole, PlaylistSummary, PlaylistsResponse, PlaylistContents, SortPreset, LibraryCounts, GenreSummary, EntryWatchFlags } from "@/types";
 import { KEYBINDS_SETTING, actionForKey, setRuntimeKeybinds } from "@/lib/playerKeybinds";
 import { viewCacheKey, scopeKeyFor } from "@/lib/complications";
 
@@ -82,10 +82,14 @@ function App() {
   );
 
   // Detail pages refresh their watch indicators when the player closes —
-  // that's the moment progress recording for the session settles.
+  // that's the moment progress recording for the session settles — and the
+  // grids get their baked-in flags patched at the same time (defined below,
+  // after the entry caches it walks).
+  const refreshWatchFlagsRef = useRef<() => void>(() => {});
   useEffect(() => {
     if (!playerState.isActive) {
       window.dispatchEvent(new Event("waverunner:player-closed"));
+      refreshWatchFlagsRef.current();
     }
   }, [playerState.isActive]);
 
@@ -117,6 +121,52 @@ function App() {
   // (the card at the viewport top + its offset) so restore survives content-
   // visibility height-estimation drift that a raw scrollTop can't.
   const scrollCacheRef = useRef<Map<string, { scrollTop: number; anchorId: string | null; anchorDelta: number }>>(new Map());
+
+  // Watch flags (progress slivers, unwatched badges) are baked into entry
+  // lists at fetch time, so after playback they're stale in the visible grid
+  // AND every cached view. One batched query re-derives them and patches all
+  // copies in place — no view refetch, no flash.
+  const entriesStateRef = useRef<MediaEntry[]>([]);
+  const searchResultsStateRef = useRef<MediaEntry[] | null>(null);
+  useEffect(() => {
+    entriesStateRef.current = entries;
+  }, [entries]);
+  useEffect(() => {
+    searchResultsStateRef.current = searchResults;
+  }, [searchResults]);
+  refreshWatchFlagsRef.current = async () => {
+    const ids = new Set<number>();
+    const gather = (list?: MediaEntry[] | null) => {
+      list?.forEach((e) => {
+        if (e.entry_type === "movie" || e.entry_type === "show") ids.add(e.id);
+      });
+    };
+    gather(entriesStateRef.current);
+    gather(searchResultsStateRef.current);
+    entryCacheRef.current.forEach((v) => gather(v.entries));
+    viewEntriesCacheRef.current.forEach((v) => gather(v.entries));
+    if (ids.size === 0) return;
+    try {
+      const rows = await invoke<EntryWatchFlags[]>("get_watch_flags", { entryIds: [...ids] });
+      const byId = new Map(rows.map((r) => [r.id, r]));
+      const apply = (e: MediaEntry): MediaEntry => {
+        const f = byId.get(e.id);
+        return f
+          ? { ...e, watched: f.watched, watch_progress: f.watch_progress, unwatched: f.unwatched, has_progress: f.has_progress }
+          : e;
+      };
+      setEntries((prev) => prev.map(apply));
+      setSearchResults((prev) => (prev ? prev.map(apply) : prev));
+      entryCacheRef.current.forEach((v) => {
+        v.entries = v.entries.map(apply);
+      });
+      viewEntriesCacheRef.current.forEach((v) => {
+        v.entries = v.entries.map(apply);
+      });
+    } catch {
+      // Best-effort; views re-derive flags on their next real fetch anyway.
+    }
+  };
   // Sort mode for the playlists-list view ("alpha" | "custom"). Held in a ref so
   // loadView reads it without a dep; the toolbar's sort dropdown drives it.
   const playlistsSortModeRef = useRef("custom");

@@ -291,6 +291,88 @@ pub async fn mark_watched(
     Ok(())
 }
 
+#[derive(Debug, Serialize)]
+pub struct EntryWatchFlags {
+    pub id: i64,
+    pub watched: bool,
+    pub watch_progress: Option<f64>,
+    pub unwatched: bool,
+    pub has_progress: bool,
+}
+
+/// Recompute the per-entry watch flags for a batch of ids — the grid bakes
+/// these into cached entry lists, so the frontend refreshes them after
+/// playback instead of re-fetching whole views. Mirrors the listing-time
+/// flag pass in commands.rs (movies join movie_watch; shows roll up their
+/// episodes; shows keep watched=false for parity with that pass).
+#[tauri::command]
+pub async fn get_watch_flags(
+    state: State<'_, AppState>,
+    entry_ids: Vec<i64>,
+) -> Result<Vec<EntryWatchFlags>, String> {
+    let pool = &state.app_db;
+    let mut out: Vec<EntryWatchFlags> = Vec::new();
+    for chunk in entry_ids.chunks(900) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+
+        let movie_query = format!(
+            "SELECT me.id,
+                    COALESCE(mw.watched, 0),
+                    CASE WHEN mw.position_secs IS NOT NULL AND mw.duration_secs > 0
+                         THEN mw.position_secs / mw.duration_secs ELSE NULL END,
+                    (mw.entry_id IS NOT NULL AND mw.watched = 0 AND mw.position_secs IS NULL),
+                    (mw.position_secs IS NOT NULL)
+             FROM media_entry me
+             JOIN media_entry_type met ON met.id = me.entry_type_id AND met.name = 'movie'
+             LEFT JOIN movie_watch mw ON mw.entry_id = me.id
+             WHERE me.id IN ({placeholders})"
+        );
+        let mut q = sqlx::query_as::<_, (i64, i64, Option<f64>, bool, bool)>(&movie_query);
+        for id in chunk {
+            q = q.bind(id);
+        }
+        for (id, watched, watch_progress, unwatched, has_progress) in
+            q.fetch_all(pool).await.map_err(|e| e.to_string())?
+        {
+            out.push(EntryWatchFlags { id, watched: watched != 0, watch_progress, unwatched, has_progress });
+        }
+
+        let show_query = format!(
+            "SELECT me.id,
+                    COUNT(e.id),
+                    COALESCE(SUM(CASE WHEN ew.watched = 1 THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN ew.position_secs IS NOT NULL THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN ew.episode_id IS NOT NULL
+                                       AND ew.watched = 0
+                                       AND ew.position_secs IS NULL
+                                      THEN 1 ELSE 0 END), 0)
+             FROM media_entry me
+             JOIN media_entry_type met ON met.id = me.entry_type_id AND met.name = 'show'
+             JOIN season s ON s.show_id = me.id
+             JOIN episode e ON e.season_id = s.id
+             LEFT JOIN episode_watch ew ON ew.episode_id = e.id
+             WHERE me.id IN ({placeholders})
+             GROUP BY me.id"
+        );
+        let mut q = sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(&show_query);
+        for id in chunk {
+            q = q.bind(id);
+        }
+        for (id, total, watched, in_progress, explicit) in
+            q.fetch_all(pool).await.map_err(|e| e.to_string())?
+        {
+            out.push(EntryWatchFlags {
+                id,
+                watched: false,
+                watch_progress: None,
+                unwatched: total > 0 && explicit == total,
+                has_progress: (watched > 0 || in_progress > 0) && watched < total,
+            });
+        }
+    }
+    Ok(out)
+}
+
 /// Mark every episode of a show watched/unwatched at once (same explicit
 /// semantics as mark_watched).
 #[tauri::command]

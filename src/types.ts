@@ -56,6 +56,16 @@ export interface MediaEntry {
   has_progress: boolean;
 }
 
+/** Refreshed per-entry watch flags (get_watch_flags) — patched into cached
+ *  entry lists after playback so grid slivers/badges stay current. */
+export interface EntryWatchFlags {
+  id: number;
+  watched: boolean;
+  watch_progress: number | null;
+  unwatched: boolean;
+  has_progress: boolean;
+}
+
 /** Watch state for a movie detail page (get_watch_state). */
 export interface WatchState {
   position_secs: number | null;
