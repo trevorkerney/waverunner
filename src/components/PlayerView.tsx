@@ -13,7 +13,7 @@ interface PlayerViewProps {
   actions: PlayerActions;
 }
 
-const IDLE_MS = 3000;
+const IDLE_MS = 1000;
 
 export function PlayerView({ state, actions }: PlayerViewProps) {
   const [showControls, setShowControls] = useState(true);
