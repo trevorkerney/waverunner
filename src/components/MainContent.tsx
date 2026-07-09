@@ -3454,11 +3454,17 @@ function ShowDetailPage({
                 }}
               >
                 <Play size={14} />
-                {continueTarget
-                  ? continueTarget.season_number != null && continueTarget.episode_number != null
-                    ? `Continue · S${continueTarget.season_number}E${continueTarget.episode_number}`
-                    : "Continue"
-                  : "Play"}
+                {(() => {
+                  if (!continueTarget) return "Play";
+                  const label =
+                    continueTarget.season_number != null && continueTarget.episode_number != null
+                      ? `Continue · S${continueTarget.season_number}E${continueTarget.episode_number}`
+                      : "Continue";
+                  // Mid-episode resume shows its timestamp, like the movie button.
+                  return continueTarget.position_secs != null
+                    ? `${label} from ${fmtClock(continueTarget.position_secs)}`
+                    : label;
+                })()}
               </Button>
             )}
             {extrasCount > 0 && (
@@ -3718,6 +3724,11 @@ function ShowDetailPage({
                         size="sm"
                         variant="ghost"
                         className="self-center"
+                        title={
+                          !w?.watched && w?.position_secs != null
+                            ? `Resume from ${fmtClock(w.position_secs)}`
+                            : undefined
+                        }
                         onClick={(e) => {
                           e.stopPropagation();
                           try {
