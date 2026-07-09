@@ -51,6 +51,9 @@ export interface MediaEntry {
   /** Deliberately marked unwatched — the state the grid badges, since
    *  watched is the library default. */
   unwatched: boolean;
+  /** Partway through — counts as unwatched for the menu pivot (offer Mark
+   *  watched) but never badges. */
+  has_progress: boolean;
 }
 
 /** Watch state for a movie detail page (get_watch_state). */

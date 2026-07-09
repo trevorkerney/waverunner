@@ -1482,8 +1482,12 @@ function SortableCoverCard({
   // locally and the caches catch up on their next reload.
   const [watchOverride, setWatchOverride] = useState<"watched" | "unwatched" | null>(null);
   useEffect(() => setWatchOverride(null), [entry.id, entry.watched, entry.unwatched]);
-  const isWatched = watchOverride ? watchOverride === "watched" : entry.watched;
   const isUnwatched = watchOverride ? watchOverride === "unwatched" : entry.unwatched;
+  // In-progress counts as unwatched for the menu pivot (offer Mark watched),
+  // but only the explicit no-progress flag ever badges.
+  const offerMarkWatched = watchOverride
+    ? watchOverride === "unwatched"
+    : entry.unwatched || entry.has_progress;
   // Different prefixes so the drag-end handler knows which backend to call.
   const dropId = isPlaylistCollection
     ? `pc-drop-${entry.id}`
@@ -1644,7 +1648,7 @@ function SortableCoverCard({
               </div>
             )}
           </div>
-          {!isWatched && entry.watch_progress != null && (
+          {watchOverride == null && entry.watch_progress != null && (
             <div className="absolute inset-x-0 bottom-0 h-1 bg-black/50">
               <div
                 className="h-full bg-primary"
@@ -1765,25 +1769,24 @@ function SortableCoverCard({
               </ContextMenuItem>
             )}
             {(entry.entry_type === "movie" || entry.entry_type === "show") && (
-              // Watched is the default, so the offered action pivots on the
-              // explicit-unwatched flag: untouched titles offer Mark unwatched.
-              // Shows flip every episode at once.
+              // Watched is the default; flagged-unwatched and in-progress
+              // items offer Mark watched. Shows flip every episode at once.
               <ContextMenuItem
                 onClick={async () => {
                   try {
                     if (entry.entry_type === "show") {
-                      await invoke("mark_show_watched", { showId: entry.id, watched: isUnwatched });
+                      await invoke("mark_show_watched", { showId: entry.id, watched: offerMarkWatched });
                     } else {
-                      await invoke("mark_watched", { kind: "movie", id: entry.id, watched: isUnwatched });
+                      await invoke("mark_watched", { kind: "movie", id: entry.id, watched: offerMarkWatched });
                     }
-                    setWatchOverride(isUnwatched ? "watched" : "unwatched");
+                    setWatchOverride(offerMarkWatched ? "watched" : "unwatched");
                   } catch (e) {
                     toast.error(String(e));
                   }
                 }}
               >
-                {isUnwatched ? <Eye size={14} /> : <EyeOff size={14} />}
-                {isUnwatched ? "Mark watched" : "Mark unwatched"}
+                {offerMarkWatched ? <Eye size={14} /> : <EyeOff size={14} />}
+                {offerMarkWatched ? "Mark watched" : "Mark unwatched"}
               </ContextMenuItem>
             )}
             {onRemoveLink && entry.link_id != null && (
@@ -2471,23 +2474,29 @@ function EntryDetailPage({
           Get ratings
         </ContextMenuItem>
       )}
-      {/* Watched is the default — the offered action pivots on the
-          explicit-unwatched flag, so untouched titles offer Mark unwatched. */}
-      <ContextMenuItem
-        onClick={async () => {
-          try {
-            const unwatched = watch?.unwatched ?? entry.unwatched;
-            await invoke("mark_watched", { kind: "movie", id: entry.id, watched: unwatched });
-            setWatch(await invoke<WatchState>("get_watch_state", { entryId: entry.id }));
-            onEntryChanged();
-          } catch (e) {
-            toast.error(String(e));
-          }
-        }}
-      >
-        {(watch?.unwatched ?? entry.unwatched) ? <Eye size={14} /> : <EyeOff size={14} />}
-        {(watch?.unwatched ?? entry.unwatched) ? "Mark watched" : "Mark unwatched"}
-      </ContextMenuItem>
+      {/* Watched is the default; flagged-unwatched and in-progress titles
+          offer Mark watched. */}
+      {(() => {
+        const offerWatched = watch
+          ? watch.unwatched || (!watch.watched && watch.position_secs != null)
+          : entry.unwatched || entry.has_progress;
+        return (
+          <ContextMenuItem
+            onClick={async () => {
+              try {
+                await invoke("mark_watched", { kind: "movie", id: entry.id, watched: offerWatched });
+                setWatch(await invoke<WatchState>("get_watch_state", { entryId: entry.id }));
+                onEntryChanged();
+              } catch (e) {
+                toast.error(String(e));
+              }
+            }}
+          >
+            {offerWatched ? <Eye size={14} /> : <EyeOff size={14} />}
+            {offerWatched ? "Mark watched" : "Mark unwatched"}
+          </ContextMenuItem>
+        );
+      })()}
       {entry.interactive && (
         <ContextMenuItem
           onClick={async () => {
@@ -3346,21 +3355,27 @@ function ShowDetailPage({
         </ContextMenuItem>
       )}
       {(() => {
-        // Show-wide toggle, pivoting like everywhere else: watched is the
-        // default, so the offered action is Mark unwatched unless every
-        // episode is already explicitly flagged.
+        // Show-wide toggle. Fully flagged OR partway through (some episodes
+        // watched/in progress, not all watched) offers Mark watched; an
+        // untouched or fully watched show offers Mark unwatched.
         const allUnwatched =
           episodeIds.length > 0 &&
           episodeIds.every((id) => {
             const w = epWatch.get(id);
             return !!w && !w.watched && w.position_secs == null;
           });
+        const watchedCount = episodeIds.filter((id) => epWatch.get(id)?.watched).length;
+        const anyProgress = episodeIds.some((id) => {
+          const w = epWatch.get(id);
+          return !!w && (w.watched || w.position_secs != null);
+        });
+        const offerWatched = allUnwatched || (anyProgress && watchedCount < episodeIds.length);
         return (
           <ContextMenuItem
             disabled={episodeIds.length === 0}
             onClick={async () => {
               try {
-                await invoke("mark_show_watched", { showId: entry.id, watched: allUnwatched });
+                await invoke("mark_show_watched", { showId: entry.id, watched: offerWatched });
                 loadWatch();
                 onEntryChanged();
               } catch (e) {
@@ -3368,8 +3383,8 @@ function ShowDetailPage({
               }
             }}
           >
-            {allUnwatched ? <Eye size={14} /> : <EyeOff size={14} />}
-            {allUnwatched ? "Mark show watched" : "Mark show unwatched"}
+            {offerWatched ? <Eye size={14} /> : <EyeOff size={14} />}
+            {offerWatched ? "Mark show watched" : "Mark show unwatched"}
           </ContextMenuItem>
         );
       })()}
@@ -4308,6 +4323,7 @@ function PlaylistsView({
         watched: false,
         watch_progress: null,
         unwatched: false,
+        has_progress: false,
       }
     : null;
 

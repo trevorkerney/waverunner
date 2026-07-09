@@ -115,6 +115,11 @@ pub struct MediaEntry {
     /// — the state the grid badges, since watched is the library default.
     #[serde(default)]
     pub unwatched: bool,
+    /// Partway through (movie with a resume point; show with some episodes
+    /// watched/in progress but not all). Counts as unwatched for the menu
+    /// pivot — the offered action is Mark watched — but never badges.
+    #[serde(default)]
+    pub has_progress: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1129,6 +1134,7 @@ pub async fn get_entries(
                         watched: false,
                         watch_progress: None,
                         unwatched: false,
+                        has_progress: false,
                     }
                 })
                 .collect();
@@ -1235,6 +1241,7 @@ pub async fn get_entries(
                         watched: false,
                         watch_progress: None,
                         unwatched: false,
+                        has_progress: false,
                     }
                 })
                 .collect();
@@ -1354,7 +1361,7 @@ pub async fn search_entries(
             let mut entries: Vec<MediaEntry> = rows.into_iter()
                 .map(|(id, title, year, end_year, folder_path, parent_id, entry_type, selected_cover, tmdb_id, season_display)| {
                     let covers = covers_map.remove(&folder_path).unwrap_or_default();
-                    MediaEntry { id, title, year, end_year, folder_path, parent_id, entry_type, covers, selected_cover, child_count: 0, season_display, collection_display: None, role_display: None, tmdb_id, link_id: None, interactive: false, watched: false, watch_progress: None, unwatched: false }
+                    MediaEntry { id, title, year, end_year, folder_path, parent_id, entry_type, covers, selected_cover, child_count: 0, season_display, collection_display: None, role_display: None, tmdb_id, link_id: None, interactive: false, watched: false, watch_progress: None, unwatched: false, has_progress: false }
                 })
                 .collect();
 
@@ -1411,7 +1418,7 @@ pub async fn search_entries(
             rows.into_iter()
                 .map(|(id, title, folder_path, selected_cover)| {
                     let covers = covers_map.remove(&folder_path).unwrap_or_default();
-                    MediaEntry { id, title, year: None, end_year: None, folder_path, parent_id: None, entry_type: "artist".to_string(), covers, selected_cover, child_count: 0, season_display: None, collection_display: None, role_display: None, tmdb_id: None, link_id: None, interactive: false, watched: false, watch_progress: None, unwatched: false }
+                    MediaEntry { id, title, year: None, end_year: None, folder_path, parent_id: None, entry_type: "artist".to_string(), covers, selected_cover, child_count: 0, season_display: None, collection_display: None, role_display: None, tmdb_id: None, link_id: None, interactive: false, watched: false, watch_progress: None, unwatched: false, has_progress: false }
                 })
                 .collect()
         }
@@ -1447,34 +1454,47 @@ async fn mark_entry_flags(
         return Ok(());
     }
 
-    // A show is "explicitly unwatched" when every one of its episodes is.
+    // Show-level rollups: "explicitly unwatched" = every episode flagged;
+    // "has progress" = some episodes watched or in progress, but not all
+    // watched (a fully watched show is simply watched).
     let mut unwatched_shows: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut progress_shows: std::collections::HashSet<i64> = std::collections::HashSet::new();
     for chunk in show_ids.chunks(900) {
         let placeholders = vec!["?"; chunk.len()].join(",");
         let query = format!(
-            "SELECT s.show_id
+            "SELECT s.show_id,
+                    COUNT(e.id),
+                    COALESCE(SUM(CASE WHEN ew.watched = 1 THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN ew.position_secs IS NOT NULL THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN ew.episode_id IS NOT NULL
+                                       AND ew.watched = 0
+                                       AND ew.position_secs IS NULL
+                                      THEN 1 ELSE 0 END), 0)
              FROM season s
              JOIN episode e ON e.season_id = s.id
              LEFT JOIN episode_watch ew ON ew.episode_id = e.id
              WHERE s.show_id IN ({placeholders})
-             GROUP BY s.show_id
-             HAVING COUNT(e.id) > 0
-                AND COUNT(e.id) = SUM(CASE WHEN ew.episode_id IS NOT NULL
-                                            AND ew.watched = 0
-                                            AND ew.position_secs IS NULL
-                                           THEN 1 ELSE 0 END)"
+             GROUP BY s.show_id"
         );
-        let mut q = sqlx::query_as::<_, (i64,)>(&query);
+        let mut q = sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(&query);
         for id in chunk {
             q = q.bind(id);
         }
         let rows = q.fetch_all(pool).await.map_err(|e| e.to_string())?;
-        unwatched_shows.extend(rows.into_iter().map(|(id,)| id));
+        for (show_id, total, watched, in_progress, explicit) in rows {
+            if total > 0 && explicit == total {
+                unwatched_shows.insert(show_id);
+            }
+            if (watched > 0 || in_progress > 0) && watched < total {
+                progress_shows.insert(show_id);
+            }
+        }
     }
-    if !unwatched_shows.is_empty() {
+    if !unwatched_shows.is_empty() || !progress_shows.is_empty() {
         for e in entries.iter_mut() {
-            if e.entry_type == "show" && unwatched_shows.contains(&e.id) {
-                e.unwatched = true;
+            if e.entry_type == "show" {
+                e.unwatched = unwatched_shows.contains(&e.id);
+                e.has_progress = progress_shows.contains(&e.id);
             }
         }
     }
@@ -1514,6 +1534,7 @@ async fn mark_entry_flags(
             e.watched = *watched;
             e.watch_progress = *progress;
             e.unwatched = *unwatched;
+            e.has_progress = progress.is_some();
         }
     }
     Ok(())
@@ -2767,6 +2788,7 @@ pub async fn get_entries_for_genre(
                 watched: false,
                 watch_progress: None,
                 unwatched: false,
+                has_progress: false,
             }
         })
         .collect();
@@ -3549,6 +3571,7 @@ pub async fn get_entries_for_person(
                 watched: false,
                 watch_progress: None,
                 unwatched: false,
+                has_progress: false,
             }
         })
         .collect();
@@ -4844,6 +4867,7 @@ pub async fn get_playlist_contents(
             watched: false,
             watch_progress: None,
             unwatched: false,
+            has_progress: false,
         };
         items.push((sort_order, sort_title.unwrap_or_default(), sort_date, entry));
     }
@@ -4950,6 +4974,7 @@ pub async fn get_playlist_contents(
             watched: false,
             watch_progress: None,
             unwatched: false,
+            has_progress: false,
         };
         items.push((sort_order, sort_title, min_date, entry));
     }
