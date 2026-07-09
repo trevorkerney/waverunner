@@ -190,7 +190,6 @@ pub fn run() {
             watch::get_show_continue,
             watch::mark_watched,
             watch::mark_show_watched,
-            watch::mark_season_watched,
             interactive_session::interactive_start,
             interactive_session::interactive_choose,
             interactive_session::interactive_status,

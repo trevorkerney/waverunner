@@ -319,37 +319,3 @@ pub async fn mark_show_watched(
     Ok(())
 }
 
-/// Mark every episode of a season watched/unwatched at once.
-#[tauri::command]
-pub async fn mark_season_watched(
-    state: State<'_, AppState>,
-    season_id: i64,
-    watched: bool,
-) -> Result<(), String> {
-    if watched {
-        sqlx::query(
-            "INSERT INTO episode_watch (episode_id, position_secs, watched, watched_at, last_played_at)
-             SELECT id, NULL, 1, datetime('now'), datetime('now') FROM episode WHERE season_id = ?1
-             ON CONFLICT(episode_id) DO UPDATE SET
-                position_secs = NULL, watched = 1,
-                watched_at = COALESCE(episode_watch.watched_at, datetime('now'))",
-        )
-        .bind(season_id)
-        .execute(&state.app_db)
-        .await
-        .map_err(|e| e.to_string())?;
-    } else {
-        // Same explicit-unwatched semantics as mark_watched.
-        sqlx::query(
-            "INSERT INTO episode_watch (episode_id, position_secs, watched, watched_at)
-             SELECT id, NULL, 0, NULL FROM episode WHERE season_id = ?1
-             ON CONFLICT(episode_id) DO UPDATE SET
-                position_secs = NULL, watched = 0, watched_at = NULL",
-        )
-        .bind(season_id)
-        .execute(&state.app_db)
-        .await
-        .map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}

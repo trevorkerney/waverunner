@@ -3630,14 +3630,6 @@ function ShowDetailPage({
                 so there's a right-click target even when the season has no metadata */}
             {selectedSeason && !seasonEditing && (() => {
               const episodesNumbered = episodes.length > 0 && episodes.every((e) => e.episode_number != null);
-              // Watched is the default — the season action pivots on every
-              // episode being explicitly flagged unwatched.
-              const seasonAllUnwatched =
-                episodes.length > 0 &&
-                episodes.every((e) => {
-                  const w = epWatch.get(e.id);
-                  return !!w && !w.watched && w.position_secs == null;
-                });
               const totalRuntime = episodes.reduce((sum, e) => sum + (e.runtime ?? 0), 0);
               const years = [...new Set(episodes.map((e) => e.release_date?.slice(0, 4)).filter((y): y is string => !!y))].sort();
               const seasonMeta = [
@@ -3669,21 +3661,6 @@ function ShowDetailPage({
                       <Film size={14} />
                       {bulkEpisodesLoading ? "Loading..." : "Fetch all episodes' details"}
                     </ContextMenuItem>
-                    <ContextMenuSeparator />
-                    <ContextMenuItem
-                      disabled={episodes.length === 0}
-                      onClick={async () => {
-                        try {
-                          await invoke("mark_season_watched", { seasonId: selectedSeason.id, watched: seasonAllUnwatched });
-                          loadWatch();
-                        } catch (e) {
-                          toast.error(String(e));
-                        }
-                      }}
-                    >
-                      {seasonAllUnwatched ? <Eye size={14} /> : <EyeOff size={14} />}
-                      {seasonAllUnwatched ? "Mark season watched" : "Mark season unwatched"}
-                    </ContextMenuItem>
                   </ContextMenuContent>
                 </ContextMenu>
               );
@@ -3712,8 +3689,6 @@ function ShowDetailPage({
                   w && !w.watched && w.position_secs != null && w.duration_secs && w.duration_secs > 0
                     ? Math.min(1, Math.max(0, w.position_secs / w.duration_secs))
                     : null;
-                // Explicitly flagged unwatched — the state worth surfacing.
-                const epUnwatched = !!w && !w.watched && w.position_secs == null;
                 return (
                   <div key={ep.id} className="flex flex-col">
                     <ContextMenu>
@@ -3745,11 +3720,8 @@ function ShowDetailPage({
                           <p className="mt-0.5 text-xs leading-snug text-muted-foreground line-clamp-2">{ep.plot}</p>
                         )}
                       </div>
-                      {/* Watch indicator: eye-off = flagged unwatched, mini
-                          bar = partial. Watched is the default — unbadged. */}
-                      {epUnwatched && (
-                        <EyeOff size={14} className="self-center text-muted-foreground" aria-label="Marked unwatched" />
-                      )}
+                      {/* Watch indicator: mini bar on partially-watched rows.
+                          Watched/unwatched marking lives at the show level. */}
                       {epProgress != null && (
                         <div className="h-1 w-12 self-center overflow-hidden rounded-full bg-muted" title={`${Math.round(epProgress * 100)}% watched`}>
                           <div className="h-full rounded-full bg-primary" style={{ width: `${Math.round(epProgress * 100)}%` }} />
@@ -3783,20 +3755,6 @@ function ShowDetailPage({
                       </Button>
                       </ContextMenuTrigger>
                       <ContextMenuContent>
-                        <ContextMenuItem
-                          onClick={async () => {
-                            try {
-                              await invoke("mark_watched", { kind: "episode", id: ep.id, watched: epUnwatched });
-                              loadWatch();
-                            } catch (e) {
-                              toast.error(String(e));
-                            }
-                          }}
-                        >
-                          {epUnwatched ? <Eye size={14} /> : <EyeOff size={14} />}
-                          {epUnwatched ? "Mark watched" : "Mark unwatched"}
-                        </ContextMenuItem>
-                        <ContextMenuSeparator />
                         <ContextMenuItem
                           onClick={() => handleEpisodeTmdb(ep)}
                           disabled={!canSeasonTmdb || ep.episode_number == null || episodeTmdbLoading === ep.id}
