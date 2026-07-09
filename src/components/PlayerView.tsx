@@ -57,7 +57,7 @@ export function PlayerView({ state, actions }: PlayerViewProps) {
 
   return (
     <div
-      className="relative flex-1 overflow-hidden"
+      className={`relative flex-1 overflow-hidden ${showControls ? "" : "cursor-none"}`}
       style={{ background: state.loading ? "black" : "transparent" }}
       onMouseMove={resetHideTimer}
       onClick={(e) => {

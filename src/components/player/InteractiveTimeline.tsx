@@ -155,7 +155,10 @@ export function InteractiveTimeline({ open, onClose, actions, isPlaying }: Inter
 
   return (
     <div
-      className="absolute inset-x-0 bottom-0 z-30 flex flex-col gap-3 bg-black/85 px-5 pb-5 pt-4 shadow-2xl ring-1 ring-white/10 backdrop-blur-md"
+      // cursor-auto: the timeline swallows mousemove (so the controls' idle
+      // timer doesn't run), which would otherwise inherit the player's
+      // idle cursor-none while browsing cards.
+      className="absolute inset-x-0 bottom-0 z-30 flex cursor-auto flex-col gap-3 bg-black/85 px-5 pb-5 pt-4 shadow-2xl ring-1 ring-white/10 backdrop-blur-md"
       onClick={(e) => e.stopPropagation()}
       onDoubleClick={(e) => e.stopPropagation()}
       onMouseMove={(e) => e.stopPropagation()}
