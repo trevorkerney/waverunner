@@ -58,7 +58,9 @@ export function PlayerView({ state, actions }: PlayerViewProps) {
   return (
     <div
       className={`relative flex-1 overflow-hidden ${showControls ? "" : "cursor-none"}`}
-      style={{ background: state.loading ? "black" : "transparent" }}
+      // Black until mpv has presented a frame — transparent any earlier and
+      // the desktop shows through the window for a beat.
+      style={{ background: state.loading || !state.presenting ? "black" : "transparent" }}
       onMouseMove={resetHideTimer}
       onClick={(e) => {
         if (e.target === e.currentTarget) {

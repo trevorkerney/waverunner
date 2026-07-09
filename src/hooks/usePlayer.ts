@@ -9,6 +9,10 @@ import { applySubtitleStyleToPlayer } from "../lib/subtitleStyle";
 export interface PlayerState {
   isActive: boolean;
   isPlaying: boolean;
+  /** mpv has presented at least one frame of the current file. The player
+   *  backdrop stays black until then — going transparent any earlier flashes
+   *  whatever is behind the window. */
+  presenting: boolean;
   // NOTE: the high-frequency playback position is intentionally NOT here — it
   // lives in an isolated store (subscribePosition/getPosition) so position
   // ticks don't re-render the whole app. Read it with useSyncExternalStore.
@@ -95,6 +99,7 @@ export interface PlayerActions {
 const initialState: PlayerState = {
   isActive: false,
   isPlaying: false,
+  presenting: false,
   duration: 0,
   volume: 100,
   muted: false,
@@ -253,6 +258,8 @@ export function usePlayer(): [PlayerState, PlayerActions] {
           ...prev,
           isActive: true,
           isPlaying: !status.paused,
+          // The surviving mpv instance is already rendering — no black holdback.
+          presenting: true,
           loading: false,
           duration: status.duration,
           volume: Math.round(status.volume),
@@ -312,6 +319,7 @@ export function usePlayer(): [PlayerState, PlayerActions] {
       setState((prev) => ({
         ...prev,
         loading: true,
+        presenting: false,
         isPlaying: true,
         title: episodeTitle(ctx.showTitle, ep),
         context: { ...ctx, index: newIndex },
@@ -391,6 +399,10 @@ export function usePlayer(): [PlayerState, PlayerActions] {
         }
       );
 
+      const unlistenRestart = await listen("mpv-playback-restart", () => {
+        setState((prev) => (prev.presenting ? prev : { ...prev, presenting: true }));
+      });
+
       const unlisten2 = await listen("mpv-file-loaded", () => {
         setState((prev) => ({ ...prev, loading: false }));
         // Resume: jump to the stored position now that a timeline exists.
@@ -412,7 +424,7 @@ export function usePlayer(): [PlayerState, PlayerActions] {
         handleNaturalEnd();
       });
 
-      unlistenRefs.current = [unlisten1, unlisten2, unlisten3];
+      unlistenRefs.current = [unlisten1, unlisten2, unlisten3, unlistenRestart];
     };
 
     setupListeners();
@@ -452,6 +464,7 @@ export function usePlayer(): [PlayerState, PlayerActions] {
     setState((prev) => ({
       ...prev,
       loading: true,
+      presenting: false,
       title,
       isActive: true,
       isPlaying: true,
@@ -485,6 +498,7 @@ export function usePlayer(): [PlayerState, PlayerActions] {
     setState((prev) => ({
       ...prev,
       loading: true,
+      presenting: false,
       title: args.title,
       isActive: true,
       isPlaying: true,
@@ -553,6 +567,7 @@ export function usePlayer(): [PlayerState, PlayerActions] {
     setState((prev) => ({
       ...prev,
       loading: true,
+      presenting: false,
       title,
       isActive: true,
       isPlaying: true,

@@ -673,6 +673,13 @@ fn event_loop(app: &AppHandle, inner: Arc<PlayerInner>) {
                 let _ = inner.mpv.observe_property(3, "pause", mpv::MpvFormat::Flag);
                 let _ = app.emit("mpv-file-loaded", ());
             }
+            EV_PLAYBACK_RESTART => {
+                // First frame actually presented (also fires after seeks). The
+                // frontend keeps its backdrop black until this — dropping to
+                // transparent on FILE_LOADED alone flashes the desktop through
+                // the window before mpv has drawn.
+                let _ = app.emit("mpv-playback-restart", ());
+            }
             _ => {}
         }
     }
