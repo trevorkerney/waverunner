@@ -2545,9 +2545,9 @@ function EntryDetailPage({
         </ContextMenu>
       )}
       <ContextMenu>
-        <ContextMenuTrigger render={<div className="flex min-w-0 flex-1 flex-col gap-4" />}>
+        <ContextMenuTrigger render={<div className="@container flex min-w-0 flex-1 flex-col gap-4" />}>
         <div className="flex items-start justify-between gap-4">
-          <div>
+          <div className="min-w-0">
             {editing ? (
               <div className="flex flex-col gap-2">
                 <input
@@ -2604,7 +2604,9 @@ function EntryDetailPage({
               </>
             )}
           </div>
-          <div className="flex shrink-0 gap-2">
+          {/* Stacks vertically when the info column runs tight (narrow window /
+              wide cover) so the title isn't smushed by a long button row. */}
+          <div className="flex shrink-0 gap-2 @max-xl:flex-col @max-xl:items-stretch">
             {(() => {
               const playMovie = async (startSecs?: number) => {
                 try {
@@ -3388,7 +3390,7 @@ function ShowDetailPage({
         </ContextMenu>
       )}
       <ContextMenu>
-        <ContextMenuTrigger render={<div className="flex min-w-0 flex-1 flex-col gap-4" />}>
+        <ContextMenuTrigger render={<div className="@container flex min-w-0 flex-1 flex-col gap-4" />}>
         <div className="flex items-start justify-between gap-4">
           <div className="min-w-0">
             <h1 className="text-3xl font-bold">{entry.title}</h1>
@@ -3430,7 +3432,9 @@ function ShowDetailPage({
             )}
             <RatingsLine ratings={ratings} />
           </div>
-          <div className="flex shrink-0 gap-2">
+          {/* Stacks vertically when the info column runs tight (narrow window /
+              wide cover) so the title isn't smushed by a long button row. */}
+          <div className="flex shrink-0 gap-2 @max-xl:flex-col @max-xl:items-stretch">
             {(continueTarget != null || firstEpisodeId != null) && !showEditing && (
               <Button
                 size="sm"
