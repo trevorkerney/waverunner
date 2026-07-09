@@ -97,6 +97,7 @@ import {
   Check,
   Eye,
   EyeOff,
+  LayoutGrid,
 } from "lucide-react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -1621,28 +1622,28 @@ function SortableCoverCard({
               )}
             </div>
           )}
-          {isCollection && (
-            <div className="absolute bottom-1 right-1 rounded-sm bg-black/70 px-1.5 py-0.5 text-xs text-white backdrop-blur-sm">
-              Collection
-            </div>
-          )}
-          {entry.interactive && (
-            <div
-              className="absolute bottom-1 right-1 flex items-center gap-1 rounded-sm bg-black/70 px-1.5 py-0.5 text-xs text-white backdrop-blur-sm"
-              title="Branching title — you make choices while it plays"
-            >
-              <GitBranch size={10} />
-              Interactive
-            </div>
-          )}
-          {isWatched && (
-            <div
-              className="absolute right-1 top-1 rounded-full bg-black/70 p-1 text-white backdrop-blur-sm"
-              title="Watched"
-            >
-              <Check size={12} />
-            </div>
-          )}
+          {/* Top-right badge stack: card-type icon (collection / interactive)
+              above the watched check — an interactive movie can carry both. */}
+          <div className="absolute right-1 top-1 flex flex-col items-end gap-1">
+            {isCollection && (
+              <div className="rounded-sm bg-black/70 p-1 text-white backdrop-blur-sm" title="Collection">
+                <LayoutGrid size={12} />
+              </div>
+            )}
+            {entry.interactive && (
+              <div
+                className="rounded-sm bg-black/70 p-1 text-white backdrop-blur-sm"
+                title="Interactive — you make choices while it plays"
+              >
+                <GitBranch size={12} />
+              </div>
+            )}
+            {isWatched && (
+              <div className="rounded-full bg-black/70 p-1 text-white backdrop-blur-sm" title="Watched">
+                <Check size={12} />
+              </div>
+            )}
+          </div>
           {!isWatched && entry.watch_progress != null && (
             <div className="absolute inset-x-0 bottom-0 h-1 bg-black/50">
               <div
