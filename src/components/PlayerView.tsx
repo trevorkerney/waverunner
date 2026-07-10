@@ -62,9 +62,11 @@ export function PlayerView({ state, actions }: PlayerViewProps) {
       // the desktop shows through the window for a beat.
       style={{ background: state.loading || !state.presenting ? "black" : "transparent" }}
       onMouseMove={resetHideTimer}
+      // Clicking the bare video never toggles pause — that belongs to the
+      // play/pause button and the bound key only. A click just wakes the UI
+      // (matters when the cursor sat still long enough to hide it).
       onClick={(e) => {
         if (e.target === e.currentTarget) {
-          actions.togglePause();
           resetHideTimer();
         }
       }}
