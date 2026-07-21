@@ -1178,6 +1178,8 @@ pub async fn interactive_start(
     fresh: Option<bool>,
 ) -> Result<(), String> {
     stop_session(&state);
+    // Video and music never play at once; starting one pauses the other.
+    crate::music_player::pause_music(&state);
     // "Play from beginning": forget the mid-story resume (persistent story
     // memory stays — Reset story is the bigger hammer).
     if fresh.unwrap_or(false) {

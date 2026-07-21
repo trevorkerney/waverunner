@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::Emitter;
 use tauri_plugin_updater::UpdaterExt;
 
-fn generate_sort_title(title: &str, language: &str) -> String {
+pub(crate) fn generate_sort_title(title: &str, language: &str) -> String {
     let articles: &[&str] = match language {
         "en" => &["the ", "a ", "an "],
         "fr" => &["le ", "la ", "les ", "l'", "un ", "une "],
@@ -36,6 +36,10 @@ pub struct Library {
     /// 'local' = read folders from disk. Future: 'jellyfin', 'plex', ... (client mode).
     pub source: String,
     pub default_sort_mode: String,
+    /// Import-wizard stage ('scan' | 'match' | 'review') while setup is
+    /// unfinished; None = fully set up. Unfinished libraries render greyed
+    /// ("Finish setup…") and are not browsable until the wizard completes.
+    pub setup_stage: Option<String>,
 }
 
 /// One tagged source folder of a library (a row of the library_path table).
@@ -656,13 +660,14 @@ pub async fn create_library(
     let cache_base = state.app_data_dir.join("cache").join(&id);
     std::fs::create_dir_all(&cache_base).map_err(|e| e.to_string())?;
 
-    let library = Library {
+    let mut library = Library {
         id: id.clone(),
         name: name.clone(),
         paths: paths.iter().map(|lp| lp.path.clone()).collect(),
         format: format.clone(),
         source: source.clone(),
         default_sort_mode: "alpha".to_string(),
+        setup_stage: None,
     };
 
     sqlx::query(
@@ -707,13 +712,26 @@ pub async fn create_library(
                 }
             }
             "music" => {
+                // Music imports run the multi-step wizard: the setup row keeps
+                // the library hidden (and resumable) until the wizard finishes.
+                // The MusicBrainz pass is NOT auto-spawned — the wizard's match
+                // step drives it in the foreground, if the user elects it.
+                sqlx::query(
+                    "INSERT INTO library_setup (library_id, stage) VALUES (?, 'scan')
+                     ON CONFLICT(library_id) DO UPDATE SET stage = 'scan', updated_at = datetime('now')",
+                )
+                .bind(&id)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
                 sqlx::query("DELETE FROM media_entry WHERE library_id = ?")
                     .bind(&id)
                     .execute(pool)
                     .await
                     .map_err(|e| e.to_string())?;
+                crate::music::clear_issues(pool, &id).await?;
                 for lp in &paths {
-                    scan_music_library(&app, pool, &id, &PathBuf::from(&lp.path), &cache_base, cancel).await.map_err(|e| e.to_string())?;
+                    crate::music::scan_music_library(&app, pool, &id, &PathBuf::from(&lp.path), &cache_base, cancel).await?;
                 }
             }
             _ => return Err(format!("Unsupported library format: {}", format)),
@@ -728,9 +746,29 @@ pub async fn create_library(
                 .execute(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
+            if format == "music" {
+                sqlx::query(
+                    "UPDATE library_setup SET stage = 'match', updated_at = datetime('now') WHERE library_id = ?",
+                )
+                .bind(&id)
+                .execute(&state.app_db)
+                .await
+                .map_err(|e| e.to_string())?;
+                library.setup_stage = Some("match".to_string());
+            }
             Ok(library)
         }
         Err(e) => {
+            if e.contains("cancelled") && format == "music" {
+                // Wizard imports survive a cancelled scan: the library stays,
+                // greyed as "Finish setup…", and resuming re-runs the scan
+                // (a reconciling rescan over whatever landed).
+                let _ = sqlx::query("UPDATE library SET creating = 0 WHERE id = ?")
+                    .bind(&id)
+                    .execute(&state.app_db)
+                    .await;
+                return Err("Library creation cancelled".to_string());
+            }
             delete_cache_for_library(&state.app_data_dir, &id);
             let _ = sqlx::query("DELETE FROM library WHERE id = ?")
                 .bind(&id)
@@ -757,6 +795,17 @@ pub async fn cleanup_incomplete_libraries(
     app_data_dir: &Path,
     app_db: &sqlx::SqlitePool,
 ) -> Result<(), String> {
+    // Wizard imports (a library_setup row exists) survive an app death
+    // mid-scan: they flip back to resumable "Finish setup…" instead of being
+    // deleted — resuming re-runs the scan over whatever landed.
+    sqlx::query(
+        "UPDATE library SET creating = 0 WHERE creating = 1
+           AND EXISTS (SELECT 1 FROM library_setup ls WHERE ls.library_id = library.id)",
+    )
+    .execute(app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+
     let rows: Vec<(String,)> = sqlx::query_as(
         "SELECT id FROM library WHERE creating = 1",
     )
@@ -776,8 +825,10 @@ pub async fn cleanup_incomplete_libraries(
 
 #[tauri::command]
 pub async fn get_libraries(state: tauri::State<'_, AppState>) -> Result<Vec<Library>, String> {
-    let rows: Vec<(String, String, String, String, String)> = sqlx::query_as(
-        "SELECT id, name, format, source, default_sort_mode FROM library WHERE creating = 0 ORDER BY name",
+    let rows: Vec<(String, String, String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT l.id, l.name, l.format, l.source, l.default_sort_mode, ls.stage
+         FROM library l LEFT JOIN library_setup ls ON ls.library_id = l.id
+         WHERE l.creating = 0 ORDER BY l.name",
     )
     .fetch_all(&state.app_db)
     .await
@@ -798,15 +849,53 @@ pub async fn get_libraries(state: tauri::State<'_, AppState>) -> Result<Vec<Libr
 
     Ok(rows
         .into_iter()
-        .map(|(id, name, format, source, default_sort_mode)| Library {
+        .map(|(id, name, format, source, default_sort_mode, setup_stage)| Library {
             paths: paths_by_lib.remove(&id).unwrap_or_default(),
             id,
             name,
             format,
             source,
             default_sort_mode,
+            setup_stage,
         })
         .collect())
+}
+
+/// Advance an unfinished import's wizard stage ('scan' | 'match' | 'review').
+#[tauri::command]
+pub async fn set_library_setup_stage(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    stage: String,
+) -> Result<(), String> {
+    if !["scan", "match", "review"].contains(&stage.as_str()) {
+        return Err(format!("Invalid setup stage: {stage}"));
+    }
+    sqlx::query(
+        "INSERT INTO library_setup (library_id, stage) VALUES (?, ?)
+         ON CONFLICT(library_id) DO UPDATE SET stage = excluded.stage, updated_at = datetime('now')",
+    )
+    .bind(&library_id)
+    .bind(&stage)
+    .execute(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Finish the import wizard: the setup row disappears and the library becomes
+/// fully visible/browsable.
+#[tauri::command]
+pub async fn complete_library_setup(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+) -> Result<(), String> {
+    sqlx::query("DELETE FROM library_setup WHERE library_id = ?")
+        .bind(&library_id)
+        .execute(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -931,6 +1020,7 @@ pub async fn get_entries(
         Some("movie") => Some("movie"),
         Some("show") => Some("show"),
         Some("collection") => Some("collection"),
+        Some("album") => Some("album"),
         Some(other) => return Err(format!("Invalid entry_type_filter: {}", other)),
     };
 
@@ -1198,17 +1288,94 @@ pub async fn get_entries(
             }
         }
         "music" => {
-            let order_clause = match default_sort_mode.as_str() {
-                "custom" => "ORDER BY mef.sort_order ASC, mef.sort_title COLLATE NOCASE ASC",
-                _ => "ORDER BY mef.sort_title COLLATE NOCASE ASC",
-            };
+            // Albums page: EVERY album in the library flat, whatever kind of
+            // release it is — artist name rides collection_display as the card
+            // subtitle. Its sort mode lives in a settings key (a music
+            // library's default_sort_mode belongs to the Artists view).
+            if validated_type == Some("album") {
+                let sort_mode: String = sqlx::query_as::<_, (String,)>(
+                    "SELECT value FROM settings WHERE key = ?",
+                )
+                .bind(format!("music_albums_sort_mode:{library_id}"))
+                .fetch_optional(&state.app_db)
+                .await
+                .map_err(|e| e.to_string())?
+                .map(|(v,)| v)
+                .unwrap_or_else(|| "alpha".to_string());
+                let order_clause = match sort_mode.as_str() {
+                    // Newest first — the music-app convention for date sorts.
+                    "date" => "ORDER BY al.release_date IS NULL, al.release_date DESC, al.sort_title COLLATE NOCASE ASC",
+                    _ => "ORDER BY al.sort_title COLLATE NOCASE ASC",
+                };
+                let query_str = format!(
+                    "SELECT al.id, al.title, al.release_date, al.folder_path, al.selected_cover, me.parent_id, ar.title \
+                     FROM album al \
+                     JOIN media_entry me ON me.id = al.id \
+                     LEFT JOIN artist ar ON ar.id = me.parent_id \
+                     WHERE me.library_id = ? \
+                       AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = al.id) {order_clause}"
+                );
+                let rows: Vec<(i64, String, Option<String>, String, Option<String>, Option<i64>, Option<String>)> =
+                    sqlx::query_as(&query_str)
+                        .bind(&library_id)
+                        .fetch_all(&state.app_db)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                let entries: Vec<MediaEntry> = rows
+                    .into_iter()
+                    .map(|(id, title, release_date, folder_path, selected_cover, parent_id, artist_title)| {
+                        let covers = covers_map.remove(&folder_path).unwrap_or_default();
+                        MediaEntry {
+                            id,
+                            title,
+                            year: release_date.map(|d| d.chars().take(4).collect()),
+                            end_year: None,
+                            folder_path,
+                            parent_id,
+                            entry_type: "album".to_string(),
+                            covers,
+                            selected_cover,
+                            child_count: 0,
+                            season_display: None,
+                            collection_display: artist_title,
+                            role_display: None,
+                            tmdb_id: None,
+                            link_id: None,
+                            interactive: false,
+                            watched: false,
+                            watch_progress: None,
+                            unwatched: false,
+                            has_progress: false,
+                        }
+                    })
+                    .collect();
+                return Ok(EntriesResponse {
+                    entries,
+                    sort_mode,
+                    format,
+                    selected_preset_id: None,
+                    presets: Vec::new(),
+                });
+            }
 
-            let query_str = format!(
-                "SELECT mef.id, mef.title, mef.folder_path, mef.selected_cover \
+            // People-page-style sort vocabulary for the Artists grid:
+            // "alpha" | "credits" (most works first), from a settings key.
+            let artists_sort_mode: String = sqlx::query_as::<_, (String,)>(
+                "SELECT value FROM settings WHERE key = ?",
+            )
+            .bind(format!("music_artists_sort_mode:{library_id}"))
+            .fetch_optional(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?
+            .map(|(v,)| v)
+            .filter(|v| v == "credits")
+            .unwrap_or_else(|| "alpha".to_string());
+
+            let query_str = "SELECT mef.id, mef.title, mef.folder_path, mef.selected_cover \
                  FROM media_entry_full mef \
-                 WHERE mef.library_id = ? AND mef.parent_id IS NULL AND mef.entry_type = 'artist' {}",
-                order_clause
-            );
+                 WHERE mef.library_id = ? AND mef.parent_id IS NULL AND mef.entry_type = 'artist' \
+                 ORDER BY mef.sort_title COLLATE NOCASE ASC"
+                .to_string();
 
             let rows: Vec<(i64, String, String, Option<String>)> =
                 sqlx::query_as(&query_str)
@@ -1217,10 +1384,90 @@ pub async fn get_entries(
                     .await
                     .map_err(|e| e.to_string())?;
 
-            let entries: Vec<MediaEntry> = rows
+            // Work counts per artist, split by release type, for the card
+            // subtitle ("5 albums · 2 EPs · 1 single").
+            let type_rows: Vec<(i64, String, i64)> = sqlx::query_as(
+                "SELECT me.parent_id, al.album_type, COUNT(*) \
+                 FROM album al JOIN media_entry me ON me.id = al.id \
+                 WHERE me.library_id = ? AND me.parent_id IS NOT NULL \
+                   AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = al.id) \
+                 GROUP BY me.parent_id, al.album_type",
+            )
+            .bind(&library_id)
+            .fetch_all(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+            let mut counts_by_artist: std::collections::HashMap<i64, Vec<(String, i64)>> =
+                std::collections::HashMap::new();
+            for (artist_id, album_type, n) in type_rows {
+                counts_by_artist.entry(artist_id).or_default().push((album_type, n));
+            }
+            // Feature credits on other artists' albums ("appears on N") — the
+            // whole subtitle for feature-only artists.
+            let appears_rows: Vec<(i64, i64)> = sqlx::query_as(
+                "SELECT a.id, COUNT(DISTINCT tme.parent_id) \
+                 FROM artist a \
+                 JOIN media_entry ame ON ame.id = a.id \
+                 JOIN artist_names an ON an.artist_id = a.id \
+                 JOIN track_credit tc ON LOWER(tc.name) = LOWER(an.name) \
+                 JOIN media_entry tme ON tme.id = tc.track_id AND tme.library_id = ame.library_id \
+                 JOIN media_entry alme ON alme.id = tme.parent_id \
+                 WHERE ame.library_id = ? AND (alme.parent_id IS NULL OR alme.parent_id != a.id) \
+                   AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = alme.id) \
+                 GROUP BY a.id",
+            )
+            .bind(&library_id)
+            .fetch_all(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+            let appears_by_artist: std::collections::HashMap<i64, i64> =
+                appears_rows.into_iter().collect();
+            let works_display = |id: i64| -> Option<String> {
+                let mut parts: Vec<String> = Vec::new();
+                if let Some(counts) = counts_by_artist.get(&id) {
+                    let count_of = |t: &str| counts.iter().find(|(ty, _)| ty == t).map(|(_, n)| *n).unwrap_or(0);
+                    for (ty, singular, plural) in [
+                        ("album", "album", "albums"),
+                        ("ep", "EP", "EPs"),
+                        ("single", "single", "singles"),
+                        ("compilation", "compilation", "compilations"),
+                    ] {
+                        let n = count_of(ty);
+                        if n > 0 {
+                            parts.push(format!("{n} {}", if n == 1 { singular } else { plural }));
+                        }
+                    }
+                }
+                if let Some(n) = appears_by_artist.get(&id) {
+                    if *n > 0 {
+                        parts.push(format!("appears on {n} {}", if *n == 1 { "album" } else { "albums" }));
+                    }
+                }
+                if parts.is_empty() { None } else { Some(parts.join(" · ")) }
+            };
+
+            // Total works (own + appears-on) rides on child_count so the
+            // frontend can re-sort locally on a mode switch (People-page
+            // snappiness) instead of refetching.
+            let total_works = |id: i64| -> i64 {
+                counts_by_artist
+                    .get(&id)
+                    .map(|v| v.iter().map(|(_, n)| *n).sum::<i64>())
+                    .unwrap_or(0)
+                    + appears_by_artist.get(&id).copied().unwrap_or(0)
+            };
+
+            let mut entries: Vec<MediaEntry> = rows
                 .into_iter()
                 .map(|(id, title, folder_path, selected_cover)| {
-                    let covers = covers_map.remove(&folder_path).unwrap_or_default();
+                    // Folder art first, fetched images appended after.
+                    let mut covers = covers_map.remove(&folder_path).unwrap_or_default();
+                    covers.extend(
+                        covers_map
+                            .remove(&crate::music_art::artist_fetch_rel(id))
+                            .unwrap_or_default(),
+                    );
+                    let collection_display = works_display(id);
                     MediaEntry {
                         id,
                         title,
@@ -1231,9 +1478,9 @@ pub async fn get_entries(
                         entry_type: "artist".to_string(),
                         covers,
                         selected_cover,
-                        child_count: 0,
+                        child_count: total_works(id),
                         season_display: None,
-                        collection_display: None,
+                        collection_display,
                         role_display: None,
                         tmdb_id: None,
                         link_id: None,
@@ -1246,9 +1493,15 @@ pub async fn get_entries(
                 })
                 .collect();
 
+            if artists_sort_mode == "credits" {
+                // Most credited first, ties A–Z — the rows arrive
+                // alphabetical, so a stable sort keeps ties.
+                entries.sort_by_key(|e| std::cmp::Reverse(e.child_count));
+            }
+
             EntriesResponse {
                 entries,
-                sort_mode: default_sort_mode,
+                sort_mode: artists_sort_mode,
                 format,
                 selected_preset_id: None,
                 presets: Vec::new(),
@@ -1402,7 +1655,9 @@ pub async fn search_entries(
             entries
         }
         "music" => {
-            let rows: Vec<(i64, String, String, Option<String>)> =
+            // Artists and albums both match; albums carry their artist as the
+            // card subtitle so mixed results stay readable.
+            let artist_rows: Vec<(i64, String, String, Option<String>)> =
                 sqlx::query_as(
                     "SELECT mef.id, mef.title, mef.folder_path, mef.selected_cover \
                      FROM media_entry_full mef \
@@ -1414,13 +1669,62 @@ pub async fn search_entries(
                 .fetch_all(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
+            let album_rows: Vec<(i64, String, Option<String>, String, Option<String>, Option<i64>, Option<String>)> =
+                sqlx::query_as(
+                    "SELECT al.id, al.title, al.release_date, al.folder_path, al.selected_cover, me.parent_id, ar.title \
+                     FROM album al \
+                     JOIN media_entry me ON me.id = al.id \
+                     LEFT JOIN artist ar ON ar.id = me.parent_id \
+                     WHERE me.library_id = ? AND al.title LIKE ? \
+                       AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = al.id) \
+                     ORDER BY al.sort_title COLLATE NOCASE ASC",
+                )
+                .bind(&library_id)
+                .bind(&like_pattern)
+                .fetch_all(&state.app_db)
+                .await
+                .map_err(|e| e.to_string())?;
 
-            rows.into_iter()
+            let mut results: Vec<MediaEntry> = artist_rows
+                .into_iter()
                 .map(|(id, title, folder_path, selected_cover)| {
-                    let covers = covers_map.remove(&folder_path).unwrap_or_default();
+                    let mut covers = covers_map.remove(&folder_path).unwrap_or_default();
+                    covers.extend(
+                        covers_map
+                            .remove(&crate::music_art::artist_fetch_rel(id))
+                            .unwrap_or_default(),
+                    );
                     MediaEntry { id, title, year: None, end_year: None, folder_path, parent_id: None, entry_type: "artist".to_string(), covers, selected_cover, child_count: 0, season_display: None, collection_display: None, role_display: None, tmdb_id: None, link_id: None, interactive: false, watched: false, watch_progress: None, unwatched: false, has_progress: false }
                 })
-                .collect()
+                .collect();
+            results.extend(album_rows.into_iter().map(
+                    |(id, title, release_date, folder_path, selected_cover, parent_id, artist_title)| {
+                        let covers = covers_map.remove(&folder_path).unwrap_or_default();
+                        MediaEntry {
+                            id,
+                            title,
+                            year: release_date.map(|d| d.chars().take(4).collect()),
+                            end_year: None,
+                            folder_path,
+                            parent_id,
+                            entry_type: "album".to_string(),
+                            covers,
+                            selected_cover,
+                            child_count: 0,
+                            season_display: None,
+                            collection_display: artist_title,
+                            role_display: None,
+                            tmdb_id: None,
+                            link_id: None,
+                            interactive: false,
+                            watched: false,
+                            watch_progress: None,
+                            unwatched: false,
+                            has_progress: false,
+                        }
+                    },
+                ));
+            results
         }
         _ => {
             return Err(format!("Unsupported library format: {}", format));
@@ -2432,7 +2736,11 @@ pub async fn delete_cover(
         }
         "music" => {
             let r: Option<(Option<String>,)> = sqlx::query_as(
-                "SELECT selected_cover FROM artist WHERE id = ?",
+                "SELECT COALESCE(ar.selected_cover, al.selected_cover)
+                 FROM media_entry me
+                 LEFT JOIN artist ar ON ar.id = me.id
+                 LEFT JOIN album al ON al.id = me.id
+                 WHERE me.id = ?",
             )
             .bind(entry_id)
             .fetch_optional(&state.app_db)
@@ -2465,12 +2773,11 @@ pub async fn delete_cover(
                     .bind(&new_val).bind(entry_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
             }
             "music" => {
+                // Blind updates like the video branch — only the matching row bites.
                 sqlx::query("UPDATE artist SET selected_cover = ? WHERE id = ?")
-                    .bind(&new_val)
-                    .bind(entry_id)
-                    .execute(&state.app_db)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                    .bind(&new_val).bind(entry_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
+                sqlx::query("UPDATE album SET selected_cover = ? WHERE id = ?")
+                    .bind(&new_val).bind(entry_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
             }
             _ => {
                 return Err(format!("Unsupported library format: {}", format));
@@ -5894,13 +6201,11 @@ pub async fn rename_entry(
                 .bind(&new_title).bind(&sort_title).bind(entry_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         }
         "music" => {
-            sqlx::query("UPDATE artist SET name = ?, sort_name = ? WHERE id = ?")
-                .bind(&new_title)
-                .bind(&sort_title)
-                .bind(entry_id)
-                .execute(&state.app_db)
-                .await
-                .map_err(|e| e.to_string())?;
+            // Blind updates like the video branch — only the matching row bites.
+            sqlx::query("UPDATE artist SET title = ?, sort_title = ? WHERE id = ?")
+                .bind(&new_title).bind(&sort_title).bind(entry_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
+            sqlx::query("UPDATE album SET title = ?, sort_title = ? WHERE id = ?")
+                .bind(&new_title).bind(&sort_title).bind(entry_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         }
         _ => {
             return Err(format!("Unsupported library format: {}", format));
@@ -6139,12 +6444,11 @@ pub async fn set_cover(
                 .bind(&cover_path).bind(entry_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         }
         "music" => {
+            // Blind updates like the video branch — only the matching row bites.
             sqlx::query("UPDATE artist SET selected_cover = ? WHERE id = ?")
-                .bind(&cover_path)
-                .bind(entry_id)
-                .execute(&state.app_db)
-                .await
-                .map_err(|e| e.to_string())?;
+                .bind(&cover_path).bind(entry_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
+            sqlx::query("UPDATE album SET selected_cover = ? WHERE id = ?")
+                .bind(&cover_path).bind(entry_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         }
         _ => {
             return Err(format!("Unsupported library format: {}", format));
@@ -6234,7 +6538,12 @@ pub async fn rescan_library(
         }
         "music" => {
             let base_paths: Vec<PathBuf> = lib_paths.iter().map(PathBuf::from).collect();
-            rescan_music_library(&app, &state.app_db, &library_id, &base_paths, &cache_base).await?
+            crate::music::rescan_music_library(&app, &state.app_db, &library_id, &base_paths, &cache_base).await?;
+            // The MusicBrainz pass is NOT auto-spawned — the wizard's match
+            // step (or the metadata center) drives it, if the user elects it.
+            // Music surfaces per-file problems via music_scan_issue, not
+            // rescan warnings.
+            Vec::new()
         }
         _ => return Err(format!("Unsupported library format: {}", format)),
     };
@@ -6702,337 +7011,6 @@ async fn rescan_video_library(
     Ok(warnings)
 }
 
-async fn rescan_music_library(
-    app: &tauri::AppHandle,
-    pool: &sqlx::SqlitePool,
-    library_id: &str,
-    base_paths: &[PathBuf],
-    cache_base: &Path,
-) -> Result<Vec<String>, String> {
-    use std::collections::{HashSet, HashMap};
-
-    let artist_type_id: (i64,) =
-        sqlx::query_as("SELECT id FROM media_entry_type WHERE name = 'artist'")
-            .fetch_one(pool)
-            .await
-            .map_err(|e| e.to_string())?;
-    let album_type_id: (i64,) =
-        sqlx::query_as("SELECT id FROM media_entry_type WHERE name = 'album'")
-            .fetch_one(pool)
-            .await
-            .map_err(|e| e.to_string())?;
-    let track_type_id: (i64,) =
-        sqlx::query_as("SELECT id FROM media_entry_type WHERE name = 'track'")
-            .fetch_one(pool)
-            .await
-            .map_err(|e| e.to_string())?;
-
-    // Collect all disk paths from all bases
-    // For music: artist dirs, album dirs, and track files
-    let mut disk_artist_paths: HashSet<String> = HashSet::new();
-    let mut disk_album_paths: HashSet<String> = HashSet::new();
-    let mut disk_track_paths: HashSet<String> = HashSet::new();
-    let mut path_to_base: HashMap<String, PathBuf> = HashMap::new();
-
-    for base_path in base_paths {
-        let artist_dirs = std::fs::read_dir(base_path)
-            .map_err(|e| e.to_string())?
-            .filter_map(|e| e.ok())
-            .filter(|e| is_scannable_dir(e));
-
-        for artist_entry in artist_dirs {
-            let artist_path = artist_entry.path();
-            let artist_rel = artist_path
-                .strip_prefix(base_path)
-                .unwrap_or(&artist_path)
-                .to_string_lossy()
-                .to_string();
-            disk_artist_paths.insert(artist_rel.clone());
-            path_to_base.insert(artist_rel, base_path.clone());
-
-            let album_dirs = std::fs::read_dir(&artist_path)
-                .map_err(|e| e.to_string())?
-                .filter_map(|e| e.ok())
-                .filter(|e| is_scannable_dir(e));
-
-            for album_entry in album_dirs {
-                let album_path = album_entry.path();
-                let album_rel = album_path
-                    .strip_prefix(base_path)
-                    .unwrap_or(&album_path)
-                    .to_string_lossy()
-                    .to_string();
-                disk_album_paths.insert(album_rel.clone());
-                path_to_base.insert(album_rel, base_path.clone());
-
-                let track_files = std::fs::read_dir(&album_path)
-                    .map_err(|e| e.to_string())?
-                    .filter_map(|e| e.ok())
-                    .filter(|e| is_media_file(&e.path(), AUDIO_EXTENSIONS));
-
-                for track_entry in track_files {
-                    let track_rel = track_entry
-                        .path()
-                        .strip_prefix(base_path)
-                        .unwrap_or(&track_entry.path())
-                        .to_string_lossy()
-                        .to_string();
-                    disk_track_paths.insert(track_rel.clone());
-                    path_to_base.insert(track_rel, base_path.clone());
-                }
-            }
-        }
-    }
-
-    // Get all DB entries for this library
-    let db_rows: Vec<(i64, String, String, Option<i64>)> = sqlx::query_as(
-        "SELECT mef.id, COALESCE(mef.folder_path, ''), mef.entry_type, mef.parent_id FROM media_entry_full mef WHERE mef.library_id = ?",
-    )
-    .bind(library_id)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| e.to_string())?;
-
-    // Also get track file_paths
-    let db_tracks: Vec<(i64, String)> = sqlx::query_as(
-        "SELECT me.id, t.file_path FROM media_entry me JOIN track t ON me.id = t.id WHERE me.library_id = ?",
-    )
-    .bind(library_id)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| e.to_string())?;
-
-    let db_track_paths: HashMap<String, i64> = db_tracks.into_iter().map(|(id, p)| (p, id)).collect();
-
-    // Separate DB entries by type
-    let mut db_artist_map: HashMap<String, i64> = HashMap::new();
-    let mut db_album_map: HashMap<String, i64> = HashMap::new();
-    for (id, folder_path, entry_type, _parent_id) in &db_rows {
-        match entry_type.as_str() {
-            "artist" => { db_artist_map.insert(folder_path.clone(), *id); }
-            "album" => { db_album_map.insert(folder_path.clone(), *id); }
-            _ => {}
-        }
-    }
-
-    // Delete removed tracks
-    for (path, id) in &db_track_paths {
-        if !disk_track_paths.contains(path) {
-            sqlx::query("DELETE FROM media_entry WHERE id = ?")
-                .bind(id)
-                .execute(pool)
-                .await
-                .map_err(|e| e.to_string())?;
-        }
-    }
-
-    // Delete removed albums
-    for (path, id) in &db_album_map {
-        if !disk_album_paths.contains(path) {
-            delete_cached_images_for_entry(pool, library_id, cache_base, path).await?;
-            sqlx::query("DELETE FROM media_entry WHERE id = ?")
-                .bind(id)
-                .execute(pool)
-                .await
-                .map_err(|e| e.to_string())?;
-        }
-    }
-
-    // Delete removed artists
-    for (path, id) in &db_artist_map {
-        if !disk_artist_paths.contains(path) {
-            delete_cached_images_for_entry(pool, library_id, cache_base, path).await?;
-            sqlx::query("DELETE FROM media_entry WHERE id = ?")
-                .bind(id)
-                .execute(pool)
-                .await
-                .map_err(|e| e.to_string())?;
-        }
-    }
-
-    // Add new artists
-    for artist_rel in &disk_artist_paths {
-        if db_artist_map.contains_key(artist_rel) {
-            continue;
-        }
-        let base_path = path_to_base.get(artist_rel).unwrap();
-        let full_path = base_path.join(artist_rel);
-        let artist_name = full_path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        let sort_title = generate_sort_title(&artist_name, "en");
-
-        let _ = app.emit("scan-progress", &artist_name);
-
-        let max_order: (i32,) = sqlx::query_as(
-            "SELECT COALESCE(MAX(mef.sort_order), -1) FROM media_entry_full mef WHERE mef.library_id = ? AND mef.entry_type = 'artist'",
-        )
-        .bind(library_id)
-        .fetch_one(pool)
-        .await
-        .map_err(|e| e.to_string())?;
-
-        let result = sqlx::query(
-            "INSERT INTO media_entry (library_id, parent_id, entry_type_id) VALUES (?, NULL, ?)",
-        )
-        .bind(library_id)
-        .bind(artist_type_id.0)
-        .execute(pool)
-        .await
-        .map_err(|e| e.to_string())?;
-
-        let entry_id = result.last_insert_rowid();
-        sqlx::query(
-            "INSERT INTO artist (id, title, sort_title, folder_path, sort_order) VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind(entry_id)
-        .bind(&artist_name)
-        .bind(&sort_title)
-        .bind(artist_rel)
-        .bind(max_order.0 + 1)
-        .execute(pool)
-        .await
-        .map_err(|e| e.to_string())?;
-
-        cache_entry_images(pool, library_id, cache_base, base_path, artist_rel)
-            .await
-            .map_err(|e| e.to_string())?;
-
-        db_artist_map.insert(artist_rel.clone(), entry_id);
-    }
-
-    // Add new albums
-    for album_rel in &disk_album_paths {
-        if db_album_map.contains_key(album_rel) {
-            continue;
-        }
-        let base_path = path_to_base.get(album_rel).unwrap();
-        let full_path = base_path.join(album_rel);
-        let album_name = full_path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        let (album_title, album_year) = parse_folder_name(&album_name);
-        let album_sort_title = generate_sort_title(&album_title, "en");
-
-        // Find parent artist
-        let parent_rel = full_path
-            .parent()
-            .and_then(|p| p.strip_prefix(base_path).ok())
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default();
-
-        let parent_id = db_artist_map.get(&parent_rel).copied();
-
-        let max_order: (i32,) = if let Some(pid) = parent_id {
-            sqlx::query_as(
-                "SELECT COALESCE(MAX(mef.sort_order), -1) FROM media_entry_full mef WHERE mef.parent_id = ?",
-            )
-            .bind(pid)
-            .fetch_one(pool)
-            .await
-            .map_err(|e| e.to_string())?
-        } else {
-            (-1,)
-        };
-
-        let result = sqlx::query(
-            "INSERT INTO media_entry (library_id, parent_id, entry_type_id) VALUES (?, ?, ?)",
-        )
-        .bind(library_id)
-        .bind(parent_id)
-        .bind(album_type_id.0)
-        .execute(pool)
-        .await
-        .map_err(|e| e.to_string())?;
-
-        let entry_id = result.last_insert_rowid();
-        sqlx::query(
-            "INSERT INTO album (id, title, sort_title, folder_path, sort_order, release_date) VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(entry_id)
-        .bind(&album_title)
-        .bind(&album_sort_title)
-        .bind(album_rel)
-        .bind(max_order.0 + 1)
-        .bind(&album_year)
-        .execute(pool)
-        .await
-        .map_err(|e| e.to_string())?;
-
-        cache_entry_images(pool, library_id, cache_base, base_path, album_rel)
-            .await
-            .map_err(|e| e.to_string())?;
-
-        db_album_map.insert(album_rel.clone(), entry_id);
-    }
-
-    // Add new tracks
-    for track_rel in &disk_track_paths {
-        if db_track_paths.contains_key(track_rel) {
-            continue;
-        }
-        let base_path = path_to_base.get(track_rel).unwrap();
-        let full_path = base_path.join(track_rel);
-        let track_name = full_path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        let (track_title, track_number) = parse_song_filename(&track_name);
-        let track_sort_title = generate_sort_title(&track_title, "en");
-
-        // Find parent album
-        let parent_rel = full_path
-            .parent()
-            .and_then(|p| p.strip_prefix(base_path).ok())
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default();
-
-        let parent_id = db_album_map.get(&parent_rel).copied();
-
-        let max_order: (i32,) = if let Some(pid) = parent_id {
-            sqlx::query_as(
-                "SELECT COALESCE(MAX(t.sort_order), -1) FROM track t JOIN media_entry me ON t.id = me.id WHERE me.parent_id = ?",
-            )
-            .bind(pid)
-            .fetch_one(pool)
-            .await
-            .map_err(|e| e.to_string())?
-        } else {
-            (-1,)
-        };
-
-        let result = sqlx::query(
-            "INSERT INTO media_entry (library_id, parent_id, entry_type_id) VALUES (?, ?, ?)",
-        )
-        .bind(library_id)
-        .bind(parent_id)
-        .bind(track_type_id.0)
-        .execute(pool)
-        .await
-        .map_err(|e| e.to_string())?;
-
-        let entry_id = result.last_insert_rowid();
-        sqlx::query(
-            "INSERT INTO track (id, title, sort_title, file_path, sort_order, track_number) VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(entry_id)
-        .bind(&track_title)
-        .bind(&track_sort_title)
-        .bind(track_rel)
-        .bind(max_order.0 + 1)
-        .bind(track_number)
-        .execute(pool)
-        .await
-        .map_err(|e| e.to_string())?;
-    }
-
-    Ok(Vec::new())
-}
 
 /// Walk a library root collecting entry folders, classified with the same rules as
 /// the initial scan: season-pattern subdirs → show, video files → movie, anything
@@ -7093,7 +7071,7 @@ fn collect_video_entries(
 
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "avif", "webp"];
 
-fn is_image_file(path: &Path) -> bool {
+pub(crate) fn is_image_file(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .map(|e| IMAGE_EXTENSIONS.contains(&e.to_lowercase().as_str()))
@@ -7375,7 +7353,7 @@ async fn sync_entry_images(
 }
 
 /// Delete cached images for a specific entry
-async fn delete_cached_images_for_entry(
+pub(crate) async fn delete_cached_images_for_entry(
     pool: &sqlx::SqlitePool,
     library_id: &str,
     cache_base: &Path,
@@ -7394,177 +7372,6 @@ async fn delete_cached_images_for_entry(
     Ok(())
 }
 
-async fn scan_music_library(
-    app: &tauri::AppHandle,
-    pool: &sqlx::SqlitePool,
-    library_id: &str,
-    base_path: &PathBuf,
-    cache_base: &Path,
-    cancel: &AtomicBool,
-) -> Result<(), sqlx::Error> {
-    let artist_type_id: (i64,) =
-        sqlx::query_as("SELECT id FROM media_entry_type WHERE name = 'artist'")
-            .fetch_one(pool)
-            .await?;
-    let album_type_id: (i64,) =
-        sqlx::query_as("SELECT id FROM media_entry_type WHERE name = 'album'")
-            .fetch_one(pool)
-            .await?;
-    let track_type_id: (i64,) =
-        sqlx::query_as("SELECT id FROM media_entry_type WHERE name = 'track'")
-            .fetch_one(pool)
-            .await?;
-
-    let mut artist_dirs: Vec<_> = std::fs::read_dir(base_path)
-        .map_err(|e| sqlx::Error::Protocol(e.to_string()))?
-        .filter_map(|e| e.ok())
-        .filter(|e| is_scannable_dir(e))
-        .collect();
-    artist_dirs.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
-
-    for (i, artist_entry) in artist_dirs.iter().enumerate() {
-        if cancel.load(Ordering::SeqCst) {
-            return Err(sqlx::Error::Protocol("Library creation cancelled".to_string()));
-        }
-        let artist_path = artist_entry.path();
-        let artist_name = artist_entry.file_name().to_string_lossy().to_string();
-        let _ = app.emit("scan-progress", &artist_name);
-
-        let sort_title = generate_sort_title(&artist_name, "en");
-        let rel_path = artist_path
-            .strip_prefix(base_path)
-            .unwrap_or(&artist_path)
-            .to_string_lossy()
-            .to_string();
-
-        // Insert media_entry for artist
-        let result = sqlx::query(
-            "INSERT INTO media_entry (library_id, parent_id, entry_type_id) VALUES (?, NULL, ?)",
-        )
-        .bind(library_id)
-        .bind(artist_type_id.0)
-        .execute(pool)
-        .await?;
-
-        let artist_entry_id = result.last_insert_rowid();
-
-        // Insert artist detail
-        sqlx::query(
-            "INSERT INTO artist (id, title, sort_title, folder_path, sort_order) VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind(artist_entry_id)
-        .bind(&artist_name)
-        .bind(&sort_title)
-        .bind(&rel_path)
-        .bind(i as i32)
-        .execute(pool)
-        .await?;
-
-        cache_entry_images(pool, library_id, cache_base, base_path, &rel_path).await?;
-
-        // Level 2: Albums
-        let mut album_dirs: Vec<_> = std::fs::read_dir(&artist_path)
-            .map_err(|e| sqlx::Error::Protocol(e.to_string()))?
-            .filter_map(|e| e.ok())
-            .filter(|e| is_scannable_dir(e))
-            .collect();
-        album_dirs.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
-
-        for (j, album_entry) in album_dirs.iter().enumerate() {
-            let album_path = album_entry.path();
-            let album_name = album_entry.file_name().to_string_lossy().to_string();
-            let (album_title, album_year) = parse_folder_name(&album_name);
-            let album_sort_title = generate_sort_title(&album_title, "en");
-            let album_rel = album_path
-                .strip_prefix(base_path)
-                .unwrap_or(&album_path)
-                .to_string_lossy()
-                .to_string();
-
-            // Insert media_entry for album (parent = artist)
-            let result = sqlx::query(
-                "INSERT INTO media_entry (library_id, parent_id, entry_type_id) VALUES (?, ?, ?)",
-            )
-            .bind(library_id)
-            .bind(artist_entry_id)
-            .bind(album_type_id.0)
-            .execute(pool)
-            .await?;
-
-            let album_entry_id = result.last_insert_rowid();
-
-            // Insert album detail
-            sqlx::query(
-                "INSERT INTO album (id, title, sort_title, folder_path, sort_order, release_date) VALUES (?, ?, ?, ?, ?, ?)",
-            )
-            .bind(album_entry_id)
-            .bind(&album_title)
-            .bind(&album_sort_title)
-            .bind(&album_rel)
-            .bind(j as i32)
-            .bind(&album_year)
-            .execute(pool)
-            .await?;
-
-            cache_entry_images(pool, library_id, cache_base, base_path, &album_rel).await?;
-
-            // Level 3: Tracks
-            let mut track_files: Vec<_> = std::fs::read_dir(&album_path)
-                .map_err(|e| sqlx::Error::Protocol(e.to_string()))?
-                .filter_map(|e| e.ok())
-                .filter(|e| is_media_file(&e.path(), AUDIO_EXTENSIONS))
-                .collect();
-
-            track_files.sort_by(|a, b| {
-                let (_, a_num) = parse_song_filename(&a.file_name().to_string_lossy());
-                let (_, b_num) = parse_song_filename(&b.file_name().to_string_lossy());
-                match (a_num, b_num) {
-                    (Some(a), Some(b)) => a.cmp(&b),
-                    _ => a.file_name().cmp(&b.file_name()),
-                }
-            });
-
-            for (k, track_entry) in track_files.iter().enumerate() {
-                let track_name = track_entry.file_name().to_string_lossy().to_string();
-                let (track_title, track_number) = parse_song_filename(&track_name);
-                let track_sort_title = generate_sort_title(&track_title, "en");
-                let track_rel = track_entry
-                    .path()
-                    .strip_prefix(base_path)
-                    .unwrap_or(&track_entry.path())
-                    .to_string_lossy()
-                    .to_string();
-
-                // Insert media_entry for track (parent = album)
-                let result = sqlx::query(
-                    "INSERT INTO media_entry (library_id, parent_id, entry_type_id) VALUES (?, ?, ?)",
-                )
-                .bind(library_id)
-                .bind(album_entry_id)
-                .bind(track_type_id.0)
-                .execute(pool)
-                .await?;
-
-                let track_entry_id = result.last_insert_rowid();
-
-                // Insert track detail
-                sqlx::query(
-                    "INSERT INTO track (id, title, sort_title, file_path, sort_order, track_number) VALUES (?, ?, ?, ?, ?, ?)",
-                )
-                .bind(track_entry_id)
-                .bind(&track_title)
-                .bind(&track_sort_title)
-                .bind(&track_rel)
-                .bind(k as i32)
-                .bind(track_number)
-                .execute(pool)
-                .await?;
-            }
-        }
-    }
-
-    Ok(())
-}
 
 /// Whether a video source folder holds movies or shows. The user tags each folder at
 /// library creation (library_path.kind); the scanner classifies by the tag instead of guessing.
@@ -7929,11 +7736,11 @@ const VIDEO_EXTENSIONS: &[&str] = &[
     "mkv", "mp4", "avi", "m4v", "mov", "wmv", "flv", "webm", "ts", "mpg", "mpeg",
 ];
 
-const AUDIO_EXTENSIONS: &[&str] = &[
+pub(crate) const AUDIO_EXTENSIONS: &[&str] = &[
     "flac", "mp3", "m4a", "wav", "aac", "ogg", "opus", "wma", "aiff", "ape",
 ];
 
-fn is_media_file(path: &std::path::Path, extensions: &[&str]) -> bool {
+pub(crate) fn is_media_file(path: &std::path::Path, extensions: &[&str]) -> bool {
     path.is_file()
         && path
             .extension()
@@ -8160,28 +7967,6 @@ mod episode_range_tests {
     }
 }
 
-fn parse_song_filename(name: &str) -> (String, Option<i32>) {
-    let stem = std::path::Path::new(name)
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-
-    // Try leading digits: "01 - Title", "01. Title"
-    let digits: String = stem.chars().take_while(|c| c.is_ascii_digit()).collect();
-    if !digits.is_empty() {
-        if let Ok(n) = digits.parse::<i32>() {
-            let title = stem[digits.len()..]
-                .trim_start_matches(|c: char| c == ' ' || c == '-' || c == '.')
-                .to_string();
-            let title = if title.is_empty() { stem.clone() } else { title };
-            return (title, Some(n));
-        }
-    }
-
-    (stem, None)
-}
-
 /// Folder names that never scan as entries or seasons. Mirrors the Plex/Jellyfin
 /// extras conventions (plus our own covers/backdrops) so media that ships with
 /// featurettes, trailers, webisodes, etc. doesn't produce bogus entries.
@@ -8203,7 +7988,7 @@ const RESERVED_DIRS: &[&str] = &[
     "webisodes",
 ];
 
-fn is_scannable_dir(entry: &std::fs::DirEntry) -> bool {
+pub(crate) fn is_scannable_dir(entry: &std::fs::DirEntry) -> bool {
     let raw = entry.file_name().to_string_lossy().to_lowercase();
     // Releases often prefix extras folders to control sort order ("~featurettes",
     // "_extras", "- trailers"); strip that junk before the reserved-name check.

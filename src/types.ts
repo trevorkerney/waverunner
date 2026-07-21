@@ -6,6 +6,10 @@ export interface Library {
   /** 'local' = read folders from disk. Future: 'jellyfin', 'plex', ... (client mode). */
   source: string;
   default_sort_mode: string;
+  /** Import-wizard stage ('scan' | 'match' | 'review') while setup is
+   *  unfinished; null = fully set up. Unfinished libraries render greyed
+   *  ("Finish setup…") and resume the wizard instead of opening. */
+  setup_stage: string | null;
 }
 
 export interface EntriesResponse {
@@ -128,7 +132,10 @@ export type ViewSpec =
   | { kind: "genre-detail";       libraryId: string; genre: string }
   | { kind: "person-detail";      libraryId: string; personId: number; role: PersonRole; personName: string; personImage: string | null }
   | { kind: "playlists";           libraryId: string }
-  | { kind: "playlist-detail";    libraryId: string; playlistId: number; playlistName: string; collectionId: number | null };
+  | { kind: "playlist-detail";    libraryId: string; playlistId: number; playlistName: string; collectionId: number | null }
+  | { kind: "albums";             libraryId: string }
+  | { kind: "tracks";             libraryId: string }
+  | { kind: "music-issues";       libraryId: string };
 
 // One node in the static complication tree shown for a library.
 export interface ComplicationNode {
@@ -149,15 +156,134 @@ export interface GenreSummary {
   count: number;
 }
 
-// Per-library sidebar counts (get_library_counts).
+// Per-library sidebar counts (get_library_counts / get_music_counts — the
+// music fields are only present for music libraries and vice versa).
 export interface LibraryCounts {
-  movies: number;
-  shows: number;
-  genres: number;
-  people: number;
-  actors: number;
-  directors_creators: number;
-  composers: number;
+  movies?: number;
+  shows?: number;
+  genres?: number;
+  people?: number;
+  actors?: number;
+  directors_creators?: number;
+  composers?: number;
+  artists?: number;
+  albums?: number;
+  tracks?: number;
+  issues?: number;
+}
+
+// ---------- Music ----------
+
+// One album card on an artist page (get_artist_detail).
+export interface MusicAlbumCard {
+  id: number;
+  title: string;
+  year: string | null;
+  covers: string[];
+  selected_cover: string | null;
+  track_count: number;
+  release_count: number;
+  runtime_secs: number;
+  /** Owning artist — set on appears-on cards (another artist's album). */
+  artist_title: string | null;
+}
+
+export interface MusicArtistDetail {
+  id: number;
+  title: string;
+  covers: string[];
+  selected_cover: string | null;
+  album_count: number;
+  track_count: number;
+  albums: MusicAlbumCard[];
+  /** Other artists' albums this artist is credited on (features). */
+  appears_on: MusicAlbumCard[];
+  /** Album-less tracks — the artist page's flat "Tracks" section. */
+  loose_tracks: MusicTrack[];
+  /** User-written biography (nothing fills this automatically yet). */
+  biography: string | null;
+}
+
+// One name in a track's ordered credit list; artist_id set when the library
+// has them as an artist (linkable to their page).
+export interface MusicCredit {
+  name: string;
+  artist_id: number | null;
+}
+
+export interface MusicTrack {
+  id: number;
+  title: string;
+  track_number: number | null;
+  disc_number: number | null;
+  runtime_secs: number | null;
+  artist_name: string | null;
+  /** Absolute path, ready to play. */
+  file_path: string;
+  play_count: number;
+  /** Main artist(s) first, then features — no "feat." framing. */
+  credits: MusicCredit[];
+}
+
+// One owned version of an album (our release = MusicBrainz "release";
+// label null = the plain/unnamed version).
+export interface MusicRelease {
+  id: number;
+  label: string | null;
+  is_default: boolean;
+  disc_count: number;
+  year: string | null;
+  tracks: MusicTrack[];
+}
+
+export interface MusicAlbumDetail {
+  id: number;
+  title: string;
+  year: string | null;
+  /** null = artist-less album (no artist tags anywhere in it). */
+  artist_id: number | null;
+  artist_title: string | null;
+  covers: string[];
+  selected_cover: string | null;
+  genres: string[];
+  releases: MusicRelease[];
+}
+
+// A file the scanner could not read at all (get_music_scan_issues).
+export interface MusicScanIssue {
+  file_path: string;
+  reason: string;
+}
+
+// One row of the library-wide Tracks page (get_music_tracks). Loose tracks
+// simply have null album (and possibly artist) columns.
+export interface LibraryTrackRow {
+  id: number;
+  title: string;
+  /** Display-only label for untitled tracks — never parsed into metadata. */
+  file_name: string;
+  file_path: string;
+  runtime_secs: number | null;
+  artist_name: string | null;
+  artist_id: number | null;
+  album_id: number | null;
+  album_title: string | null;
+  play_count: number;
+  credits: MusicCredit[];
+}
+
+// One item in the frontend-owned play queue.
+export interface MusicQueueItem {
+  trackId: number;
+  title: string;
+  artistName: string | null;
+  albumId: number | null;
+  albumTitle: string | null;
+  /** Cached cover path (full-res convention, same as MediaEntry.covers). */
+  cover: string | null;
+  /** Absolute file path for the backend to load. */
+  path: string;
+  durationSecs: number | null;
 }
 
 // D&C-page subtitle buckets (get_people_in_library, role "director_creator").

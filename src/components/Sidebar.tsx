@@ -1,8 +1,9 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
-import { Trash2, RefreshCw, FolderPlus, ChevronRight, Sparkles, Pencil, Home } from "lucide-react";
+import { Trash2, RefreshCw, FolderPlus, ChevronRight, Sparkles, Pencil, Home, CircleCheck } from "lucide-react";
+import { Spinner } from "@/components/ui/spinner";
 import {
   ContextMenu,
   ContextMenuTrigger,
@@ -18,7 +19,7 @@ import {
   DialogFooter,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import { CreateLibraryDialog } from "@/components/CreateLibraryDialog";
+import { CreateLibraryDialog, type WizardMode } from "@/components/CreateLibraryDialog";
 import { CreatePlaylistDialog } from "@/components/CreatePlaylistDialog";
 import { TmdbBulkMatchDialog } from "@/components/TmdbBulkMatchDialog";
 import { RenameDialog } from "@/components/RenameDialog";
@@ -52,6 +53,8 @@ interface SidebarProps {
   onLibraryRenamed: (libraryId: string, oldName: string, newName: string) => void;
   /** Called after a playlist is created via the sidebar so App.tsx can invalidate caches. */
   onPlaylistChanged: (libraryId: string) => void;
+  /** Opens the App-owned Match-to-MusicBrainz review modal. */
+  onOpenMusicBrainzReview: (libraryId: string) => void;
   /** Per-library playlists to show as children of the "Playlists" sidebar node. */
   sidebarPlaylists: Record<string, PlaylistSummary[]>;
   /** Per-library counts shown dimmed on sidebar nodes. */
@@ -75,6 +78,7 @@ export function Sidebar({
   onLibraryRescanned,
   onLibraryRenamed,
   onPlaylistChanged,
+  onOpenMusicBrainzReview,
   sidebarPlaylists,
   sidebarCounts,
   sidebarGenres,
@@ -83,7 +87,12 @@ export function Sidebar({
 }: SidebarProps) {
   const [width, setWidth] = useState(DEFAULT_WIDTH);
   const [dragging, setDragging] = useState(false);
-  const [dialogOpen, setDialogOpen] = useState(false);
+  // The import wizard (create / resume unfinished setup / rescan), or null.
+  const [wizard, setWizard] = useState<WizardMode | null>(null);
+  const [wizardMinimized, setWizardMinimized] = useState(false);
+  // Minimized-wizard chip: live matching progress, flipping to "ready" when
+  // the pass lands so the user can reopen at the review step.
+  const [chip, setChip] = useState<{ text: string; ready: boolean } | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Library | null>(null);
   // Library whose media is being bulk-matched to TMDB, or null when closed.
   const [tmdbMatchTarget, setTmdbMatchTarget] = useState<Library | null>(null);
@@ -106,6 +115,37 @@ export function Sidebar({
     }
     return null;
   }, []);
+
+  // Feed the minimized-wizard chip from the matching pass's events.
+  useEffect(() => {
+    if (!wizardMinimized) {
+      setChip(null);
+      return;
+    }
+    setChip({ text: "Matching against MusicBrainz…", ready: false });
+    const samples: number[] = [];
+    const unProgress = listen<{ done: number; total: number; name: string }>(
+      "music-enrich-progress",
+      (e) => {
+        samples.push(performance.now());
+        if (samples.length > 30) samples.shift();
+        let eta = "";
+        if (samples.length >= 3) {
+          const avgMs = (samples[samples.length - 1] - samples[0]) / (samples.length - 1);
+          const secs = (avgMs * Math.max(0, e.payload.total - e.payload.done - 1)) / 1000;
+          if (secs >= 60) eta = ` · ~${Math.round(secs / 60)} min left`;
+        }
+        setChip({ text: `Matching ${e.payload.done + 1}/${e.payload.total} — ${e.payload.name}${eta}`, ready: false });
+      },
+    );
+    const unDone = listen("music-enrich-done", () => {
+      setChip({ text: "Matching finished — review ready", ready: true });
+    });
+    return () => {
+      unProgress.then((fn) => fn());
+      unDone.then((fn) => fn());
+    };
+  }, [wizardMinimized]);
 
   const toggleLibExpand = useCallback((libId: string) => {
     setCollapsedLibs((prev) => {
@@ -163,6 +203,48 @@ export function Sidebar({
             libraries.map((lib) => {
               const expanded = !collapsedLibs.has(lib.id);
               const isSelected = selectedLibrary?.id === lib.id;
+              // Unfinished import: greyed, not browsable — clicking resumes
+              // the wizard where it left off.
+              if (lib.setup_stage) {
+                return (
+                  <div key={lib.id} className="flex flex-col">
+                    <ContextMenu>
+                      <ContextMenuTrigger
+                        render={
+                          <button
+                            onClick={() =>
+                              setWizard({
+                                kind: "resume",
+                                libraryId: lib.id,
+                                name: lib.name,
+                                stage: (["scan", "match", "review"].includes(lib.setup_stage!)
+                                  ? lib.setup_stage
+                                  : "scan") as "scan" | "match" | "review",
+                              })
+                            }
+                          />
+                        }
+                        className="flex w-full items-start gap-1 py-1.5 pr-2 pl-1 text-left text-sm font-medium text-muted-foreground/70 transition-colors hover:bg-sidebar-accent/50"
+                      >
+                        <span className="flex h-5 w-4 flex-shrink-0" />
+                        <span className="min-w-0 flex-1 break-words">
+                          {lib.name}
+                          <span className="block text-xs font-normal italic">Finish setup…</span>
+                        </span>
+                      </ContextMenuTrigger>
+                      <ContextMenuContent>
+                        <ContextMenuItem
+                          onClick={() => setDeleteTarget(lib)}
+                          className="text-destructive focus:text-destructive"
+                        >
+                          <Trash2 size={14} />
+                          Delete
+                        </ContextMenuItem>
+                      </ContextMenuContent>
+                    </ContextMenu>
+                  </div>
+                );
+              }
               return (
                 <div key={lib.id} className="flex flex-col">
                   <ContextMenu>
@@ -200,6 +282,12 @@ export function Sidebar({
                       </ContextMenuItem>
                       <ContextMenuItem
                         onClick={async () => {
+                          // Music rescans run through the wizard (scan →
+                          // match → review); video keeps the toast flow.
+                          if (lib.format === "music") {
+                            setWizard({ kind: "rescan", libraryId: lib.id, name: lib.name });
+                            return;
+                          }
                           const toastId = toast.loading("Rescanning...");
                           const unlisten = await listen<string>("scan-progress", (event) => {
                             toast.loading(event.payload, { id: toastId });
@@ -246,6 +334,12 @@ export function Sidebar({
                           Match to TMDB
                         </ContextMenuItem>
                       )}
+                      {lib.format === "music" && (
+                        <ContextMenuItem onClick={() => onOpenMusicBrainzReview(lib.id)}>
+                          <Sparkles size={14} />
+                          Metadata center
+                        </ContextMenuItem>
+                      )}
                       <ContextMenuItem
                         onClick={() => setDeleteTarget(lib)}
                         className="text-destructive focus:text-destructive"
@@ -272,13 +366,28 @@ export function Sidebar({
           )}
           </ContextMenuTrigger>
           <ContextMenuContent>
-            <ContextMenuItem onClick={() => setDialogOpen(true)}>
+            <ContextMenuItem onClick={() => setWizard({ kind: "create" })}>
               <FolderPlus size={14} />
               Create library
             </ContextMenuItem>
           </ContextMenuContent>
         </ContextMenu>
       </aside>
+      {/* Minimized rescan-matching chip: progress → "review ready"; click
+          restores the wizard modal. */}
+      {wizard && wizardMinimized && (
+        <button
+          onClick={() => setWizardMinimized(false)}
+          className="mx-2 mb-2 flex items-center gap-2 rounded-md border border-border bg-sidebar-accent/40 px-2.5 py-2 text-left text-xs text-sidebar-foreground/90 transition-colors hover:bg-sidebar-accent"
+        >
+          {chip?.ready ? (
+            <CircleCheck size={14} className="shrink-0 text-primary" />
+          ) : (
+            <Spinner className="size-3.5 shrink-0" />
+          )}
+          <span className="min-w-0 flex-1 truncate">{chip?.text ?? "Matching against MusicBrainz…"}</span>
+        </button>
+      )}
       {dockActive && <PlayerDock state={playerState} actions={playerActions} />}
       {/* Right-edge border: bg-sidebar underlay + bg-border overlay so the
           translucent border color blends consistently regardless of what sits
@@ -290,9 +399,18 @@ export function Sidebar({
         className="absolute top-0 bottom-0 right-0 z-10 w-2 translate-x-1/2 cursor-col-resize"
       />
       <CreateLibraryDialog
-        open={dialogOpen}
-        onOpenChange={setDialogOpen}
+        open={wizard !== null}
+        mode={wizard ?? { kind: "create" }}
+        minimized={wizardMinimized}
+        onMinimizedChange={setWizardMinimized}
+        onOpenChange={(o) => {
+          if (!o) {
+            setWizard(null);
+            setWizardMinimized(false);
+          }
+        }}
         onCreated={onLibraryCreated}
+        onFinished={() => onLibraryRescanned()}
       />
       <RenameDialog
         open={renameTarget !== null}

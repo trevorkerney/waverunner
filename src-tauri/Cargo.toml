@@ -35,6 +35,7 @@ reqwest = { version = "0.13.2", features = ["json"] }
 libloading = "0.8"
 raw-window-handle = "0.6"
 futures = "0.3.32"
+lofty = "0.22"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

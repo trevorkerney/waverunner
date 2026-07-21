@@ -582,6 +582,329 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .execute(&pool)
     .await?;
 
+    // ── Music releases (versions of an album) ────────────────────────
+    // One row per owned version of an album ("2011 Remaster", "Deluxe
+    // Edition", ...). Our `album` = MusicBrainz "release group", our
+    // `album_release` = MusicBrainz "release" (named to dodge the RELEASE
+    // SQL keyword). label NULL = the plain/unnamed version (loose files in
+    // the album folder). Most albums have exactly one row. The album/track
+    // tables shipped before this model, so version membership and MBIDs
+    // live in side tables (no ALTER migrations).
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS album_release (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            album_id INTEGER NOT NULL,
+            label TEXT,
+            folder_path TEXT NOT NULL,
+            release_date TEXT,
+            mb_release_id TEXT,
+            is_default INTEGER NOT NULL DEFAULT 0,
+            disc_count INTEGER NOT NULL DEFAULT 1,
+            FOREIGN KEY (album_id) REFERENCES album(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_album_release_album ON album_release(album_id)")
+        .execute(&pool)
+        .await?;
+
+    // Which release a track belongs to (track shipped without a release_id
+    // column; side table instead of ALTER).
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS track_release (
+            track_id INTEGER PRIMARY KEY,
+            release_id INTEGER NOT NULL,
+            FOREIGN KEY (track_id) REFERENCES track(id) ON DELETE CASCADE,
+            FOREIGN KEY (release_id) REFERENCES album_release(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_track_release_release ON track_release(release_id)")
+        .execute(&pool)
+        .await?;
+
+    // Per-track tag payload the frozen track table has no columns for:
+    // display artist (may differ from the album artist — features,
+    // compilations), embedded MusicBrainz ids, and technical facts.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS track_meta (
+            track_id INTEGER PRIMARY KEY,
+            artist_name TEXT,
+            mb_recording_id TEXT,
+            codec TEXT,
+            bitrate_kbps INTEGER,
+            sample_rate_hz INTEGER,
+            FOREIGN KEY (track_id) REFERENCES track(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // MusicBrainz release-group id for an album (album table is frozen).
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS album_mb (
+            album_id INTEGER PRIMARY KEY,
+            mb_release_group_id TEXT,
+            FOREIGN KEY (album_id) REFERENCES album(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // ── Track artist credits ──────────────────────────────────────────
+    // Ordered credit list per track, parsed from tags at scan time: main
+    // artist(s) first, then features (from the artist tag's "feat." clause,
+    // multi-value ARTISTS frames, and "(feat. …)" title parentheticals).
+    // Names are display strings; a future MusicBrainz pass can canonicalize
+    // them and create artist entries for feature-only names.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS track_credit (
+            track_id INTEGER NOT NULL,
+            position INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            PRIMARY KEY (track_id, position),
+            FOREIGN KEY (track_id) REFERENCES track(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // ── MusicBrainz artist lookup cache ───────────────────────────────
+    // One row per credit/artist name ever looked up (lowercased key), so the
+    // rate-limited enrichment pass never re-queries settled names. status:
+    // 'matched' (mbid set) | 'notfound'. Transient errors are not cached.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS mb_artist_lookup (
+            name TEXT PRIMARY KEY,
+            mbid TEXT,
+            status TEXT NOT NULL,
+            fetched_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // ── Artist aliases ────────────────────────────────────────────────
+    // Alternate spellings that resolve to an artist ("J Cole" → "J. Cole").
+    // Written by accepted/auto merges; credit rows keep their RAW scanned
+    // names and resolve through this layer, so merges are reversible.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS artist_alias (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            artist_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            FOREIGN KEY (artist_id) REFERENCES artist(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_artist_alias_unique ON artist_alias(artist_id, name)")
+        .execute(&pool)
+        .await?;
+
+    // Every name an artist answers to (title + aliases) — the join surface
+    // for credit → artist resolution.
+    sqlx::query(
+        "CREATE VIEW IF NOT EXISTS artist_names AS
+         SELECT id AS artist_id, title AS name FROM artist
+         UNION
+         SELECT artist_id, name FROM artist_alias",
+    )
+    .execute(&pool)
+    .await?;
+
+    // ── MusicBrainz review queue ──────────────────────────────────────
+    // Suggestions the auto pass could not settle: uncertain album matches,
+    // heuristic-only artist merges, field conflicts. Resolved via the
+    // Match-to-MusicBrainz modal. target_key dedupes per subject; status:
+    // 'pending' | 'accepted' | 'rejected' (rejections double as "never ask
+    // again" and as merge suppression).
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS mb_suggestion (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            library_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            target_key TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE (library_id, kind, target_key),
+            FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // Everything the MusicBrainz pass auto-applied, with before/after values —
+    // the transparency log shown in the modal. Undo restores `before_json`
+    // and writes an mb_suppression row so the pass doesn't reapply.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS mb_change_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            library_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            target_id INTEGER NOT NULL,
+            label TEXT NOT NULL,
+            before_json TEXT,
+            after_json TEXT,
+            undone INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_mb_change_log_library ON mb_change_log(library_id, created_at)")
+        .execute(&pool)
+        .await?;
+
+    // Undone changes must stay undone: the auto pass checks here first.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS mb_suppression (
+            kind TEXT NOT NULL,
+            target_id INTEGER NOT NULL,
+            PRIMARY KEY (kind, target_id)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // Per-album stamp for the MusicBrainz credit fetch (release-level artist
+    // credits — features the tags don't spell out). status: 'matched' |
+    // 'notfound'. Transient errors are not stamped, so they retry.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS mb_credit_fetch (
+            album_id INTEGER PRIMARY KEY,
+            status TEXT NOT NULL,
+            fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (album_id) REFERENCES album(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // ── Music play history ────────────────────────────────────────────
+    // One row per playback START, however brief — recently-played shows all
+    // of these. `scrobbled` flips once the Last.fm rule trips (>=50% of the
+    // track or >=4 minutes, whichever comes first); stats and "real listen"
+    // surfaces read only scrobbled rows. played_secs = furthest position
+    // reached. There is deliberately no resume for music.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS music_play (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            track_id INTEGER NOT NULL,
+            started_at TEXT NOT NULL DEFAULT (datetime('now')),
+            played_secs REAL NOT NULL DEFAULT 0,
+            duration_secs REAL,
+            scrobbled INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (track_id) REFERENCES track(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_music_play_track ON music_play(track_id)")
+        .execute(&pool)
+        .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_music_play_started ON music_play(started_at)")
+        .execute(&pool)
+        .await?;
+
+    // ── Music scan issues ─────────────────────────────────────────────
+    // Only files the scanner literally could not read (corrupt/undecodable)
+    // land here — under-tagged files import via fallbacks instead. Surfaced
+    // in the metadata center. Cleared and rebuilt on every scan/rescan.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS music_scan_issue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            library_id TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_music_scan_issue_library ON music_scan_issue(library_id)")
+        .execute(&pool)
+        .await?;
+
+    // ── Import wizard state ───────────────────────────────────────────
+    // A library under construction: which wizard stage it is at. Rows exist
+    // only while setup is unfinished — completing the wizard DELETEs the row,
+    // and its absence is what makes the library fully visible. Abandoned
+    // setups persist here so the sidebar can show "Finish setup…" and resume.
+    // stage: 'scan' | 'match' | 'review'.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS library_setup (
+            library_id TEXT PRIMARY KEY,
+            stage TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // ── Loose-track containers ────────────────────────────────────────
+    // Album entries marked here are invisible placeholder containers holding
+    // tracks that have no album tag (per-artist), or no artist at all
+    // (per-library, parented at the root). They keep the
+    // artist→album→release→track chain uniform for playback/history/rescan
+    // while the UI renders their tracks as loose tracks and excludes the
+    // container from album grids and counts.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS loose_album (
+            album_id INTEGER PRIMARY KEY,
+            FOREIGN KEY (album_id) REFERENCES album(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // ── Artist image fetch stamps ─────────────────────────────────────
+    // One row per settled fetch attempt (wikidata | deezer | notfound |
+    // has-own). Transient errors are not stamped, so they retry on the next
+    // pass. Deleting the row (the editor's re-fetch) re-runs the fetch.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS artist_image_fetch (
+            artist_id INTEGER PRIMARY KEY,
+            status TEXT NOT NULL,
+            fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (artist_id) REFERENCES artist(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // ── Per-field provenance overrides ────────────────────────────────
+    // The user/external tiers of the field provenance model. The tag tier
+    // lives in the regular columns (written by scans); effective value =
+    // user override, else external override, else column. tier: 'user' |
+    // 'external'. Scans never touch this table; external sources write only
+    // the 'external' tier and only where the user elected them.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS field_override (
+            entity_id INTEGER NOT NULL,
+            field TEXT NOT NULL,
+            tier TEXT NOT NULL,
+            value TEXT,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (entity_id, field, tier),
+            FOREIGN KEY (entity_id) REFERENCES media_entry(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     // ── Playlist tables ───────────────────────────────────────────────
 
     sqlx::query(

@@ -1,16 +1,20 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import "./App.css";
 import { Titlebar } from "@/components/Titlebar";
 import { Sidebar } from "@/components/Sidebar";
 import { MainContent } from "@/components/MainContent";
 import { PlayerView } from "@/components/PlayerView";
 import { usePlayer } from "@/hooks/usePlayer";
+import { useMusicPlayer } from "@/hooks/useMusicPlayer";
+import { NowPlayingBar } from "@/components/player/NowPlayingBar";
+import { MetadataCenterDialog } from "@/components/music/MetadataCenter";
 import { Toaster } from "@/components/ui/sonner";
 import { toast } from "sonner";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { Library, MediaEntry, EntriesResponse, BreadcrumbItem, ViewSpec, PersonInfo, PersonSummary, PersonRole, PlaylistSummary, PlaylistsResponse, PlaylistContents, SortPreset, LibraryCounts, GenreSummary, EntryWatchFlags } from "@/types";
+import { Library, MediaEntry, EntriesResponse, BreadcrumbItem, ViewSpec, PersonInfo, PersonSummary, PersonRole, PlaylistSummary, PlaylistsResponse, PlaylistContents, SortPreset, LibraryCounts, GenreSummary, EntryWatchFlags, MusicQueueItem } from "@/types";
 import { KEYBINDS_SETTING, actionForKey, setRuntimeKeybinds } from "@/lib/playerKeybinds";
 import { viewCacheKey, scopeKeyFor } from "@/lib/complications";
 
@@ -47,38 +51,61 @@ function App() {
   const [selectedEntry, setSelectedEntry] = useState<MediaEntry | null>(null);
   const [loading, setLoading] = useState(false);
   const [playerState, playerActions] = usePlayer();
+  const [musicState, musicActions] = useMusicPlayer();
+  // Match-to-MusicBrainz review modal: opened from the sidebar context menu
+  // or automatically when an enrichment pass leaves items needing review.
+  const [mbReviewLibraryId, setMbReviewLibraryId] = useState<string | null>(null);
 
+  // Video and music are fully mutually exclusive: starting either one STOPS
+  // the other outright (bar/player gone), never just pauses it.
   const handlePlayFile = useCallback(
     async (path: string, title: string, opts?: { watch?: { kind: "movie" | "episode"; id: number }; startSecs?: number }) => {
       try {
+        await musicActions.stop();
         await playerActions.play(path, title, opts);
       } catch (e) {
         toast.error(String(e));
       }
     },
-    [playerActions]
+    [playerActions, musicActions]
   );
 
   const handlePlayEpisode = useCallback(
     async (args: { libraryId: string; showId: number; showTitle: string; startEpisodeId: number; startSecs?: number }) => {
       try {
+        await musicActions.stop();
         await playerActions.playEpisode(args);
       } catch (e) {
         toast.error(String(e));
       }
     },
-    [playerActions]
+    [playerActions, musicActions]
   );
 
   const handlePlayInteractive = useCallback(
     async (args: { libraryId: string; entryId: number; title: string; fresh?: boolean }) => {
       try {
+        await musicActions.stop();
         await playerActions.playInteractive(args);
       } catch (e) {
         toast.error(String(e));
       }
     },
-    [playerActions]
+    [playerActions, musicActions]
+  );
+
+  const handlePlayMusicQueue = useCallback(
+    async (items: MusicQueueItem[], startIndex: number) => {
+      try {
+        if (playerState.isActive) {
+          await playerActions.close();
+        }
+        await musicActions.playQueue(items, startIndex);
+      } catch (e) {
+        toast.error(String(e));
+      }
+    },
+    [playerState.isActive, playerActions, musicActions]
   );
 
   // Detail pages refresh their watch indicators when the player closes —
@@ -329,15 +356,27 @@ function App() {
     }
   }, []);
 
+  // Music libraries have their own counts shape (artists/albums/tracks/issues).
+  const refreshMusicCountsFor = useCallback(async (libraryId: string) => {
+    try {
+      const counts = await invoke<LibraryCounts>("get_music_counts", { libraryId });
+      setSidebarCounts((prev) => ({ ...prev, [libraryId]: counts }));
+    } catch {
+      // swallow — sidebar nodes just render without counts for that library
+    }
+  }, []);
+
   // Populate sidebar counts + genres whenever the libraries list changes.
   useEffect(() => {
     libraries.forEach((lib) => {
       if (lib.format === "video") {
         refreshCountsFor(lib.id);
         refreshGenresFor(lib.id);
+      } else if (lib.format === "music") {
+        refreshMusicCountsFor(lib.id);
       }
     });
-  }, [libraries, refreshCountsFor, refreshGenresFor]);
+  }, [libraries, refreshCountsFor, refreshGenresFor, refreshMusicCountsFor]);
 
   // Auto-update on launch
   useEffect(() => {
@@ -574,6 +613,18 @@ function App() {
         return;
       }
 
+      // These music views fetch their own data inside their page components
+      // (MusicIssuesPage / TracksPage) — just clear grid state and land at top.
+      if (view.kind === "music-issues" || view.kind === "tracks") {
+        setEntries([]);
+        setPeople(null);
+        setPlaylists(null);
+        setGenres(null);
+        setBreadcrumbs(breadcrumb);
+        resetScrollToTop();
+        return;
+      }
+
       // people-list / people-all and playlists produce their own result types; everything else lands as MediaEntry[].
       if (view.kind === "people-list" || view.kind === "people-all") {
         const key = viewCacheKey(view);
@@ -711,11 +762,15 @@ function App() {
             break;
           }
           case "movies-only":
-          case "shows-only": {
+          case "shows-only":
+          case "albums": {
             const res = await invoke<EntriesResponse>("get_entries", {
               libraryId: view.libraryId,
               parentId: null,
-              entryTypeFilter: view.kind === "movies-only" ? "movie" : "show",
+              entryTypeFilter:
+                view.kind === "movies-only" ? "movie"
+                : view.kind === "shows-only" ? "show"
+                : "album",
             });
             entries = res.entries;
             sort_mode = res.sort_mode;
@@ -811,11 +866,14 @@ function App() {
           entries: fresh, sort_mode: fresh_sort,
           selected_preset_id: fresh_selected_preset_id, presets: fresh_presets,
         });
-      } else if (view.kind === "movies-only" || view.kind === "shows-only") {
+      } else if (view.kind === "movies-only" || view.kind === "shows-only" || view.kind === "albums") {
         const res = await invoke<EntriesResponse>("get_entries", {
           libraryId: view.libraryId,
           parentId: null,
-          entryTypeFilter: view.kind === "movies-only" ? "movie" : "show",
+          entryTypeFilter:
+            view.kind === "movies-only" ? "movie"
+            : view.kind === "shows-only" ? "show"
+            : "album",
         });
         fresh = res.entries;
         fresh_sort = res.sort_mode;
@@ -899,6 +957,9 @@ function App() {
 
   const selectLibrary = useCallback(
     (library: Library) => {
+      // Unfinished imports aren't browsable — the sidebar routes their clicks
+      // into the wizard; this guards the launch-default path too.
+      if (library.setup_stage) return;
       // Sidebar library clicks land at the top like other sidebar switches.
       const view: ViewSpec = { kind: "library-root", libraryId: library.id };
       setActiveView(view);
@@ -909,7 +970,7 @@ function App() {
       // always bakes the library name into its label so the user sees "<lib> - All".
       const libRoot: ViewSpec = { kind: "library-root", libraryId: library.id };
       loadView(view, null, [
-        { id: null, title: `${library.name} - All`, view: libRoot },
+        { id: null, title: `${library.name} - ${library.format === "music" ? "Artists" : "All"}`, view: libRoot },
       ], false);
     },
     [loadView]
@@ -950,12 +1011,15 @@ function App() {
       // views keep their own sub-crumbs after. No standalone library button.
       const rootLabel = (kind: ViewSpec["kind"]): string => {
         const section =
-          kind === "library-root" ? "All"
+          kind === "library-root" ? (lib?.format === "music" ? "Artists" : "All")
           : kind === "movies-only" ? "Movies"
           : kind === "shows-only" ? "TV"
           : kind === "people-all" || kind === "people-list" || kind === "person-detail" ? "People"
           : kind === "playlists" || kind === "playlist-detail" ? "Playlists"
           : kind === "genres" ? "Genres"
+          : kind === "albums" ? "Albums"
+          : kind === "tracks" ? "Tracks"
+          : kind === "music-issues" ? "Needs attention"
           : "";
         return section ? `${libLabel} - ${section}` : libLabel;
       };
@@ -1052,6 +1116,12 @@ function App() {
       }
       if (head.entry?.entry_type === "show") {
         return [{ id: null, title: `${libLabel} - TV`, view: { kind: "shows-only", libraryId }, synthetic: true }];
+      }
+      if (head.entry?.entry_type === "album") {
+        return [{ id: null, title: `${libLabel} - Albums`, view: { kind: "albums", libraryId }, synthetic: true }];
+      }
+      if (head.entry?.entry_type === "artist") {
+        return [{ id: null, title: `${libLabel} - Artists`, view: { kind: "library-root", libraryId }, synthetic: true }];
       }
       return [{ id: null, title: `${libLabel} - All`, view: { kind: "library-root", libraryId }, synthetic: true }];
     },
@@ -1196,7 +1266,25 @@ function App() {
         return;
       }
 
-      if (entry.entry_type === "movie" || entry.entry_type === "show") {
+      // Opening an album from its artist page APPENDS to the chain (the artist
+      // crumb must survive: "Lib - Artists > Radiohead > Kid A"). The generic
+      // detail branch below strips entry crumbs, which would eat the artist.
+      if (
+        entry.entry_type === "album" &&
+        breadcrumbs[breadcrumbs.length - 1]?.entry?.entry_type === "artist"
+      ) {
+        if (breadcrumbs[breadcrumbs.length - 1]?.entry?.id === entry.id) return;
+        setSelectedEntry(entry);
+        setBreadcrumbs([...breadcrumbs, { id: entry.id, title: entry.title, entry }]);
+        return;
+      }
+
+      if (
+        entry.entry_type === "movie" ||
+        entry.entry_type === "show" ||
+        entry.entry_type === "artist" ||
+        entry.entry_type === "album"
+      ) {
         if (breadcrumbs[breadcrumbs.length - 1]?.entry?.id === entry.id) return; // already on this page
         // Opening a detail page RESETS the chain to the current location's canonical
         // path: drop all history before the current view's crumb, re-root that crumb
@@ -1363,6 +1451,20 @@ function App() {
     }
   }, []);
 
+  // The MusicBrainz matching pass is wizard/center-driven now (never a silent
+  // background surprise). When one lands, quietly drop the library's caches
+  // and refresh counts so MBID-backed data surfaces on the next view — the
+  // wizard's review step / metadata center handle all user-facing follow-up.
+  useEffect(() => {
+    const unlisten = listen<{ libraryId: string }>("music-enrich-done", (event) => {
+      invalidateCache(event.payload.libraryId);
+      refreshMusicCountsFor(event.payload.libraryId);
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, [invalidateCache, refreshMusicCountsFor]);
+
   const updateCache = useCallback((libraryId: string, parentId: number | null, entries: MediaEntry[], sort_mode: string) => {
     // Merge with existing entry so preset metadata (selected_preset_id, presets) survives
     // mutations that don't touch preset state (rename, cover change, etc).
@@ -1463,6 +1565,50 @@ function App() {
         return;
       }
 
+      // Music Artists page: People-page-style sort vocabulary (alphabetical /
+      // most credited) stored in a settings key. Sorting happens LOCALLY —
+      // entries carry their credit total in child_count — so the switch is as
+      // instant as the People pages; the setting persists in the background
+      // and the backend applies it on the next fresh load.
+      if (activeView?.kind === "library-root" && selectedLibrary.format === "music") {
+        const next = mode === "credits" ? "credits" : "alpha";
+        setSortMode(next);
+        invoke("set_setting", { key: `music_artists_sort_mode:${selectedLibrary.id}`, value: next }).catch(() => {});
+        // Mirrors the backend's generate_sort_title: leading articles stripped.
+        const sortKey = (t: string) => {
+          let s = t.trim().toLowerCase();
+          for (const a of ["the ", "a ", "an "]) {
+            if (s.startsWith(a)) {
+              s = s.slice(a.length).trim();
+              break;
+            }
+          }
+          return s;
+        };
+        setEntries((prev) => {
+          const sorted = [...prev].sort((a, b) =>
+            next === "credits"
+              ? b.child_count - a.child_count || sortKey(a.title).localeCompare(sortKey(b.title))
+              : sortKey(a.title).localeCompare(sortKey(b.title)),
+          );
+          updateCache(selectedLibrary.id, null, sorted, next);
+          return sorted;
+        });
+        return;
+      }
+
+      // Music Albums page: its sort lives in a settings key — a music
+      // library's default_sort_mode belongs to the Artists view, and writing
+      // it from here would silently re-sort that page too.
+      if (activeView?.kind === "albums") {
+        const next = mode === "date" ? "date" : "alpha";
+        setSortMode(next);
+        invoke("set_setting", { key: `music_albums_sort_mode:${selectedLibrary.id}`, value: next }).catch(() => {});
+        viewEntriesCacheRef.current.delete(viewCacheKey(activeView));
+        loadView(activeView, null, breadcrumbs, true, true);
+        return;
+      }
+
       const parentId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
       // Disambiguate library-root / movies-only / shows-only when entry_id is null — all three
       // currently share library.default_sort_mode + have their own *_sort_mode columns.
@@ -1486,7 +1632,7 @@ function App() {
         console.error("Failed to set sort mode:", e);
       }
     },
-    [selectedLibrary, activeView, breadcrumbs, loadEntries, loadView, invalidateCache, saveScrollPosition]
+    [selectedLibrary, activeView, breadcrumbs, loadEntries, loadView, invalidateCache, saveScrollPosition, updateCache]
   );
 
   const updateSortOrder = useCallback(
@@ -2136,6 +2282,13 @@ function App() {
                 ? { kind: "movies-only", libraryId: activeView.libraryId }
                 : { kind: "shows-only", libraryId: activeView.libraryId };
             }
+            // Artist/album details highlight the section they were reached
+            // from (Albums when browsing the albums grid, Artists otherwise).
+            if (selectedEntry?.entry_type === "artist" || selectedEntry?.entry_type === "album") {
+              return activeView.kind === "albums"
+                ? { kind: "albums", libraryId: activeView.libraryId }
+                : { kind: "library-root", libraryId: activeView.libraryId };
+            }
             if (activeView.kind === "person-detail") {
               return activeView.role === "all"
                 ? { kind: "people-all", libraryId: activeView.libraryId }
@@ -2198,12 +2351,18 @@ function App() {
               // Silent in-place refresh — no loading flash; the grid (and any
               // open detail page's backing grid) quietly picks up new metadata.
               refreshGridInPlace();
-              // Counts and genres may have changed after a rescan.
-              refreshCountsFor(selectedLibrary.id);
-              refreshGenresFor(selectedLibrary.id);
+              // Counts and genres may have changed after a rescan. Music
+              // libraries have their own counts shape.
+              if (selectedLibrary.format === "music") {
+                refreshMusicCountsFor(selectedLibrary.id);
+              } else {
+                refreshCountsFor(selectedLibrary.id);
+                refreshGenresFor(selectedLibrary.id);
+              }
             }
           }}
           onPlaylistChanged={handlePlaylistChanged}
+          onOpenMusicBrainzReview={(libraryId) => setMbReviewLibraryId(libraryId)}
           sidebarPlaylists={sidebarPlaylists}
           sidebarCounts={sidebarCounts}
           sidebarGenres={sidebarGenres}
@@ -2294,8 +2453,26 @@ function App() {
           onPlayFile={handlePlayFile}
           onPlayInteractive={handlePlayInteractive}
           onPlayEpisode={handlePlayEpisode}
+          onPlayMusicQueue={handlePlayMusicQueue}
+          musicCurrentTrackId={
+            musicState.isActive ? musicState.queue[musicState.index]?.trackId ?? null : null
+          }
         />
       </div>
+      {/* Persistent music bar — spans under sidebar + content, survives every
+          view switch. Suppressed while the video player takes the window. */}
+      <NowPlayingBar
+        state={musicState}
+        actions={musicActions}
+        hidden={playerState.isActive && !playerState.isMinimized}
+      />
+      <MetadataCenterDialog
+        libraryId={mbReviewLibraryId}
+        open={mbReviewLibraryId !== null}
+        onOpenChange={(o) => {
+          if (!o) setMbReviewLibraryId(null);
+        }}
+      />
       <Toaster position="top-center" />
     </div>
   );

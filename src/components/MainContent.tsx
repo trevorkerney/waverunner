@@ -89,6 +89,7 @@ import {
   ChevronRight,
   User as UserIcon,
   ListMusic,
+  Music2,
   ListPlus,
   Save,
   Clapperboard,
@@ -101,7 +102,7 @@ import {
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
-import { Library, MediaEntry, BreadcrumbItem, MovieDetail, MovieDetailUpdate, SeasonInfo, EpisodeInfo, ShowDetail, SeasonDetailLocal, EpisodeDetailLocal, TmdbSeasonDetail, TmdbEpisodeDetail, TmdbShowFieldSelection, TmdbSeasonFieldSelection, TmdbEpisodeFieldSelection, CastUpdateInfo, CastInfo, RatingInfo, ViewSpec, PersonInfo, PersonSummary, PersonRole, PlaylistSummary, GenreSummary, SortPreset, WatchState, EpisodeWatchInfo, ContinueTarget, ShowEpisodeFlat } from "@/types";
+import { Library, MediaEntry, BreadcrumbItem, MovieDetail, MovieDetailUpdate, SeasonInfo, EpisodeInfo, ShowDetail, SeasonDetailLocal, EpisodeDetailLocal, TmdbSeasonDetail, TmdbEpisodeDetail, TmdbShowFieldSelection, TmdbSeasonFieldSelection, TmdbEpisodeFieldSelection, CastUpdateInfo, CastInfo, RatingInfo, ViewSpec, PersonInfo, PersonSummary, PersonRole, PlaylistSummary, GenreSummary, SortPreset, WatchState, EpisodeWatchInfo, ContinueTarget, ShowEpisodeFlat, MusicQueueItem, MusicAlbumCard } from "@/types";
 import { scopeKeyFor, viewCacheKey } from "@/lib/complications";
 import { ExtrasDialog } from "@/components/ExtrasDialog";
 import { SortPresetSaveDialog } from "@/components/SortPresetSaveDialog";
@@ -123,6 +124,11 @@ import { CreatePlaylistDialog } from "@/components/CreatePlaylistDialog";
 import { CreatePlaylistCollectionDialog } from "@/components/CreatePlaylistCollectionDialog";
 import { AddToPlaylistDialog } from "@/components/AddToPlaylistDialog";
 import { RenameDialog } from "@/components/RenameDialog";
+import { ArtistDetailPage } from "@/components/music/ArtistDetailPage";
+import { ArtistsGrid } from "@/components/music/ArtistsGrid";
+import { AlbumDetailPage } from "@/components/music/AlbumDetailPage";
+import { MusicIssuesPage } from "@/components/music/MusicIssuesPage";
+import { TracksPage } from "@/components/music/TracksPage";
 
 function letterForTitle(title: string): string {
   // Mirrors the backend's generate_sort_title: grids sort with leading English
@@ -241,6 +247,9 @@ interface MainContentProps {
   onPlayFile?: (path: string, title: string, opts?: { watch?: { kind: "movie" | "episode"; id: number }; startSecs?: number }) => void;
   onPlayInteractive?: (args: { libraryId: string; entryId: number; title: string; fresh?: boolean }) => void;
   onPlayEpisode?: (args: { libraryId: string; showId: number; showTitle: string; startEpisodeId: number; startSecs?: number }) => void;
+  onPlayMusicQueue?: (items: MusicQueueItem[], startIndex: number) => void;
+  /** Track id in the now-playing bar, for album-page row highlighting. */
+  musicCurrentTrackId?: number | null;
 }
 
 export function MainContent({
@@ -293,6 +302,8 @@ export function MainContent({
   onPlayFile,
   onPlayInteractive,
   onPlayEpisode,
+  onPlayMusicQueue,
+  musicCurrentTrackId,
 }: MainContentProps) {
   const [coverDialogEntry, setCoverDialogEntry] = useState<MediaEntry | null>(
     null
@@ -342,6 +353,12 @@ export function MainContent({
   }, [coverDialogEntry, entries, selectedEntry]);
   const isSearching = searchResults != null;
   const filteredEntries = isSearching ? searchResults : entries;
+
+  // The music Artists view mirrors People pages: its own two-mode sort
+  // (alphabetical / most credited), letter sections, no presets, no size
+  // slider, and instant (unanimated) sort switches.
+  const isArtistsView =
+    selectedLibrary?.format === "music" && activeView?.kind === "library-root" && !searchResults;
 
   // Jump rail for big grids — letters in alphabetical sort, decades in date sort.
   // Hidden while searching (ranked order) and for grids small enough to scan.
@@ -562,7 +579,9 @@ export function MainContent({
     flipKeysRef.current = keys;
     const listChanged =
       prevKeys.length !== keys.length || keys.some((k, i) => prevKeys[i] !== k);
-    if (!dragging && !justDropped && !resized && !navigated && listChanged) {
+    // Artists view: sort-mode switches snap instantly (People-page behavior) —
+    // no FLIP choreography, just the new order.
+    if (!dragging && !justDropped && !resized && !navigated && listChanged && !isArtistsView) {
       // Counts only cards that actually move, so the stagger cascades across
       // the movers rather than indexing the whole grid.
       let animated = 0;
@@ -926,6 +945,34 @@ export function MainContent({
     );
   }
 
+  if (activeView?.kind === "music-issues") {
+    return (
+      <main className="flex flex-1 flex-col overflow-hidden bg-background">
+        {breadcrumbBar}
+        {/* relative: the page's loading spinner centers absolutely over this box */}
+        <div ref={scrollContainerRef} className="relative flex min-h-0 flex-1 flex-col overflow-y-auto">
+          <MusicIssuesPage libraryId={activeView.libraryId} />
+        </div>
+      </main>
+    );
+  }
+
+  if (activeView?.kind === "tracks") {
+    return (
+      <main className="flex flex-1 flex-col overflow-hidden bg-background">
+        {breadcrumbBar}
+        {/* relative: the page's loading spinner centers absolutely over this box */}
+        <div ref={scrollContainerRef} className="relative flex min-h-0 flex-1 flex-col overflow-y-auto">
+          <TracksPage
+            libraryId={activeView.libraryId}
+            onPlayQueue={(items, startIndex) => onPlayMusicQueue?.(items, startIndex)}
+            currentTrackId={musicCurrentTrackId ?? null}
+          />
+        </div>
+      </main>
+    );
+  }
+
   if (activeView?.kind === "playlists") {
     return (
       <PlaylistsView
@@ -988,6 +1035,9 @@ export function MainContent({
               <DropdownMenuTrigger className="flex h-8 items-center gap-1.5 rounded-md border border-input bg-background px-2.5 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground">
                 <ArrowUpDown size={12} />
                 {(() => {
+                  if (isArtistsView) {
+                    return sortMode === "credits" ? "Most credited" : "A–Z";
+                  }
                   // When a preset is active the dropdown label shows the preset name — the
                   // underlying sort_mode is still 'custom' but the user's mental model is
                   // "I'm on the Chronological preset".
@@ -1003,40 +1053,50 @@ export function MainContent({
                 })()}
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
-                <DropdownMenuItem onClick={() => onSortModeChange("alpha")}>
-                  Alphabetical
-                </DropdownMenuItem>
-                <DropdownMenuItem onClick={() => onSortModeChange("date")}>
-                  Date
-                </DropdownMenuItem>
-                <DropdownMenuItem onClick={() => { onSortModeChange("custom"); onChangePreset(null); }}>
-                  Custom
-                </DropdownMenuItem>
-                {presets.length > 0 && <DropdownMenuSeparator />}
-                {presets.map((p) => (
-                  <DropdownMenuItem
-                    key={p.id}
-                    onClick={() => onChangePreset(p.id)}
-                    className="flex items-center justify-between gap-2"
-                  >
-                    <span className="truncate">{p.name}</span>
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setDeletePresetTarget(p);
-                      }}
-                      className="text-muted-foreground hover:text-destructive"
-                      aria-label={`Delete preset ${p.name}`}
-                    >
-                      <Trash2 size={12} />
-                    </button>
+                {isArtistsView && (
+                  <DropdownMenuItem onClick={() => onSortModeChange("credits")}>
+                    Most credited
                   </DropdownMenuItem>
-                ))}
+                )}
+                <DropdownMenuItem onClick={() => onSortModeChange("alpha")}>
+                  {isArtistsView ? "A–Z" : "Alphabetical"}
+                </DropdownMenuItem>
+                {isArtistsView ? null : (
+                  <>
+                    <DropdownMenuItem onClick={() => onSortModeChange("date")}>
+                      Date
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onClick={() => { onSortModeChange("custom"); onChangePreset(null); }}>
+                      Custom
+                    </DropdownMenuItem>
+                    {presets.length > 0 && <DropdownMenuSeparator />}
+                    {presets.map((p) => (
+                      <DropdownMenuItem
+                        key={p.id}
+                        onClick={() => onChangePreset(p.id)}
+                        className="flex items-center justify-between gap-2"
+                      >
+                        <span className="truncate">{p.name}</span>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setDeletePresetTarget(p);
+                          }}
+                          className="text-muted-foreground hover:text-destructive"
+                          aria-label={`Delete preset ${p.name}`}
+                        >
+                          <Trash2 size={12} />
+                        </button>
+                      </DropdownMenuItem>
+                    ))}
+                  </>
+                )}
               </DropdownMenuContent>
             </DropdownMenu>
             {/* Save-preset button: visible only in pristine custom sort at a sortable scope
                 with items to save. Clicking opens the name dialog. */}
-            {sortMode === "custom"
+            {!isArtistsView
+              && sortMode === "custom"
               && selectedPresetId === null
               && activeView
               && scopeKeyFor(activeView, breadcrumbs[breadcrumbs.length - 1]?.id ?? null) != null
@@ -1052,18 +1112,20 @@ export function MainContent({
               )
             }
             </div>
-            <div className="flex w-32 items-center gap-2">
-              <Slider
-                value={[coverSize]}
-                onValueChange={(v) =>
-                  onCoverSizeChange(Array.isArray(v) ? v[0] : v)
-                }
-                min={100}
-                max={400}
-                step={10}
-                className="w-full"
-              />
-            </div>
+            {!isArtistsView && (
+              <div className="flex w-32 items-center gap-2">
+                <Slider
+                  value={[coverSize]}
+                  onValueChange={(v) =>
+                    onCoverSizeChange(Array.isArray(v) ? v[0] : v)
+                  }
+                  min={100}
+                  max={400}
+                  step={10}
+                  className="w-full"
+                />
+              </div>
+            )}
           </div>}
         </>
       )}
@@ -1075,7 +1137,86 @@ export function MainContent({
       {selectedEntry ? (
         selectedEntry.entry_type === "show"
           ? <ShowDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getCoverUrl={getCoverUrl} getFullCoverUrl={getFullCoverUrl} onEntryChanged={onEntryChanged} onTitleChanged={onTitleChanged} onChangeCover={() => openCoverDialog(selectedEntry, "select")} onAddCover={() => onAddCover(selectedEntry.id)} onDeleteCover={() => openCoverDialog(selectedEntry, "delete")} onPlayEpisode={onPlayEpisode} onPlayFile={onPlayFile} onNavigateToPerson={onNavigateToPerson} onSelectGenre={onSelectGenre} />
+        : selectedEntry.entry_type === "artist"
+          ? <ArtistDetailPage
+              entryId={selectedEntry.id}
+              getCoverUrl={getCoverUrl}
+              getFullCoverUrl={getFullCoverUrl}
+              onOpenAlbum={(album: MusicAlbumCard) => onNavigate({
+                id: album.id,
+                title: album.title,
+                year: album.year,
+                end_year: null,
+                folder_path: "",
+                parent_id: selectedEntry.id,
+                entry_type: "album",
+                covers: album.covers,
+                selected_cover: album.selected_cover,
+                child_count: album.track_count,
+                season_display: null,
+                collection_display: null,
+                tmdb_id: null,
+                link_id: null,
+                interactive: false,
+                watched: false,
+                watch_progress: null,
+                unwatched: false,
+                has_progress: false,
+              })}
+              onPlayQueue={(items, startIndex) => onPlayMusicQueue?.(items, startIndex)}
+              onMetadataChanged={onRescan}
+            />
+        : selectedEntry.entry_type === "album"
+          ? <AlbumDetailPage
+              entryId={selectedEntry.id}
+              getFullCoverUrl={getFullCoverUrl}
+              onNavigateToArtist={(artistId, artistTitle) => onNavigate({
+                id: artistId,
+                title: artistTitle,
+                year: null,
+                end_year: null,
+                folder_path: "",
+                parent_id: null,
+                entry_type: "artist",
+                covers: [],
+                selected_cover: null,
+                child_count: 0,
+                season_display: null,
+                collection_display: null,
+                tmdb_id: null,
+                link_id: null,
+                interactive: false,
+                watched: false,
+                watch_progress: null,
+                unwatched: false,
+                has_progress: false,
+              })}
+              onPlayQueue={(items: MusicQueueItem[], startIndex: number) => onPlayMusicQueue?.(items, startIndex)}
+              currentTrackId={musicCurrentTrackId ?? null}
+              onMetadataChanged={onRescan}
+            />
           : <EntryDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getCoverUrl={getCoverUrl} getFullCoverUrl={getFullCoverUrl} onEntryChanged={onEntryChanged} onTitleChanged={onTitleChanged} onChangeCover={() => openCoverDialog(selectedEntry, "select")} onAddCover={() => onAddCover(selectedEntry.id)} onDeleteCover={() => openCoverDialog(selectedEntry, "delete")} onPlayFile={onPlayFile} onPlayInteractive={onPlayInteractive} onNavigateToPerson={onNavigateToPerson} onSelectGenre={onSelectGenre} />
+      ) : selectedLibrary?.format === "music" && activeView?.kind === "library-root" && !searchResults ? (
+        // Artists page — People-page styling (circles, centered names, works
+        // subtitle) instead of the generic cover grid. Search results keep the
+        // generic grid: they mix artists and albums.
+        loading ? (
+          // Anchored to the content region's `relative` wrapper — flex-1 does
+          // nothing inside the block scroll container, so absolute centering
+          // is what actually matches the People pages visually.
+          <div className="absolute inset-0 flex items-center justify-center">
+            <Spinner className="size-6" />
+          </div>
+        ) : (
+          <ArtistsGrid
+            entries={filteredEntries}
+            getCoverUrl={getCoverUrl}
+            onNavigate={onNavigate}
+            gridRef={gridRef}
+            sortMode={sortMode}
+            letterFor={letterForTitle}
+          />
+        )
       ) : (
       <ContextMenu>
         <ContextMenuTrigger render={<div className="flex min-h-full flex-col" />}>
@@ -1576,9 +1717,19 @@ function SortableCoverCard({
             cover translates above the card's padding). Here the clip box is the
             already-overflow-hidden cover and transforms along with the hover. */}
         <div
-          className="relative self-end overflow-hidden rounded-[3px] bg-muted shadow-md ring-1 ring-foreground/10 transition-[translate,scale] duration-200 group-hover:-translate-y-1 group-hover:scale-[1.04] group-hover:shadow-xl group-hover:ring-foreground/25"
+          className={`relative self-end overflow-hidden bg-muted shadow-md ring-1 ring-foreground/10 transition-[translate,scale] duration-200 group-hover:-translate-y-1 group-hover:scale-[1.04] group-hover:shadow-xl group-hover:ring-foreground/25 ${
+            entry.entry_type === "artist" ? "rounded-full" : "rounded-[3px]"
+          }`}
           style={
-            coverAspect
+            // Artists render as circles: square box, image center-cropped.
+            entry.entry_type === "artist"
+              ? {
+                  width: size - 16,
+                  aspectRatio: "1",
+                  contentVisibility: "auto",
+                  containIntrinsicSize: `${size - 16}px ${size - 16}px`,
+                }
+              : coverAspect
               ? {
                   // Known aspect → reserve the exact box so the image can't shift the row on load.
                   width: size - 16,
@@ -1610,17 +1761,20 @@ function SortableCoverCard({
                 }
               }}
               // With a reserved box the image fills it exactly (real aspect → no crop);
-              // otherwise it keeps its natural height.
-              className={coverAspect ? "pointer-events-none h-full w-full object-cover" : "pointer-events-none w-full"}
-              style={coverAspect ? undefined : { maxHeight: size * 2 }}
+              // otherwise it keeps its natural height. Artists always fill their
+              // circle (center crop).
+              className={coverAspect || entry.entry_type === "artist" ? "pointer-events-none h-full w-full object-cover" : "pointer-events-none w-full"}
+              style={coverAspect || entry.entry_type === "artist" ? undefined : { maxHeight: size * 2 }}
               draggable={false}
             />
           ) : (
-            <div className="flex aspect-[2/3] w-full items-center justify-center">
+            <div className={`flex w-full items-center justify-center ${entry.entry_type === "artist" || entry.entry_type === "album" || entry.entry_type === "track" ? "aspect-square" : "aspect-[2/3]"}`}>
               {entry.entry_type === "movie" ? (
                 <Film size={size * 0.3} className="text-muted-foreground" />
               ) : entry.entry_type === "show" ? (
                 <Tv size={size * 0.3} className="text-muted-foreground" />
+              ) : entry.entry_type === "artist" || entry.entry_type === "album" || entry.entry_type === "track" ? (
+                <Music2 size={size * 0.3} className="text-muted-foreground" />
               ) : (
                 <Folder size={size * 0.3} className="text-muted-foreground" />
               )}
@@ -1691,6 +1845,12 @@ function SortableCoverCard({
               {/* Person-page filmography shows the character ("as …") instead of the usual subtitle */}
               {entry.role_display ? (
                 <p className="text-xs text-muted-foreground">{entry.role_display}</p>
+              ) : entry.entry_type === "album" && (entry.collection_display || entry.year) ? (
+                // Album cards: artist and year on their own lines.
+                <p className="text-xs text-muted-foreground">
+                  {entry.collection_display && <span className="block truncate">{entry.collection_display}</span>}
+                  {entry.year && <span className="block">{entry.year}</span>}
+                </p>
               ) : (entry.season_display || entry.collection_display || entry.year) && (
                 <p className="text-xs text-muted-foreground">{[entry.season_display || entry.collection_display, entry.year && `${entry.year}${entry.end_year ? `–${entry.end_year}` : ""}`].filter(Boolean).join(", ")}</p>
               )}
@@ -1859,21 +2019,28 @@ function DragOverlayCard({
 
   return (
     <div className="flex rotate-1 scale-105 cursor-grabbing flex-col items-center gap-2 rounded-md bg-accent p-2 text-left shadow-2xl">
-      <div className="relative overflow-hidden rounded-[3px] bg-muted shadow-md ring-1 ring-foreground/10 transition-[translate,scale] duration-200 group-hover:-translate-y-1 group-hover:scale-[1.04] group-hover:shadow-xl group-hover:ring-foreground/25" style={{ width: size - 16 }}>
+      <div
+        className={`relative overflow-hidden bg-muted shadow-md ring-1 ring-foreground/10 transition-[translate,scale] duration-200 group-hover:-translate-y-1 group-hover:scale-[1.04] group-hover:shadow-xl group-hover:ring-foreground/25 ${
+          entry.entry_type === "artist" ? "rounded-full" : "rounded-[3px]"
+        }`}
+        style={entry.entry_type === "artist" ? { width: size - 16, aspectRatio: "1" } : { width: size - 16 }}
+      >
         {coverSrc ? (
           <img
             src={coverSrc}
             alt={entry.title}
-            className="pointer-events-none w-full"
-            style={{ maxHeight: size * 2 }}
+            className={entry.entry_type === "artist" ? "pointer-events-none h-full w-full object-cover" : "pointer-events-none w-full"}
+            style={entry.entry_type === "artist" ? undefined : { maxHeight: size * 2 }}
             draggable={false}
           />
         ) : (
-          <div className="flex aspect-[2/3] w-full items-center justify-center">
+          <div className={`flex w-full items-center justify-center ${entry.entry_type === "artist" || entry.entry_type === "album" || entry.entry_type === "track" ? "aspect-square" : "aspect-[2/3]"}`}>
             {entry.entry_type === "movie" ? (
               <Film size={size * 0.3} className="text-muted-foreground" />
             ) : entry.entry_type === "show" ? (
               <Tv size={size * 0.3} className="text-muted-foreground" />
+            ) : entry.entry_type === "artist" || entry.entry_type === "album" || entry.entry_type === "track" ? (
+              <Music2 size={size * 0.3} className="text-muted-foreground" />
             ) : (
               <Folder size={size * 0.3} className="text-muted-foreground" />
             )}
@@ -1882,7 +2049,12 @@ function DragOverlayCard({
       </div>
       <div className="w-full" style={{ maxWidth: size }}>
         <p className="text-sm font-medium">{entry.title}</p>
-        {(entry.season_display || entry.collection_display || entry.year) && (
+        {entry.entry_type === "album" && (entry.collection_display || entry.year) ? (
+          <p className="text-xs text-muted-foreground">
+            {entry.collection_display && <span className="block truncate">{entry.collection_display}</span>}
+            {entry.year && <span className="block">{entry.year}</span>}
+          </p>
+        ) : (entry.season_display || entry.collection_display || entry.year) && (
           <p className="text-xs text-muted-foreground">{[entry.season_display || entry.collection_display, entry.year && `${entry.year}${entry.end_year ? `–${entry.end_year}` : ""}`].filter(Boolean).join(", ")}</p>
         )}
       </div>

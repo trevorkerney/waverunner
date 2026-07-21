@@ -4,6 +4,11 @@ pub mod interactive;
 mod interactive_session;
 mod watch;
 mod mpv;
+mod music;
+mod music_art;
+mod music_edit;
+mod music_mb;
+mod music_player;
 mod player;
 mod rt;
 mod tmdb;
@@ -24,6 +29,8 @@ pub struct AppState {
     pub thumbnailer: Mutex<Option<player::Thumbnailer>>,
     /// Live interactive-title session (branch-graph driver), if one is playing.
     pub interactive: Mutex<Option<Arc<interactive_session::Session>>>,
+    /// Audio-only mpv behind the now-playing bar (created on first play).
+    pub music_player: Mutex<Option<Arc<music_player::MusicInner>>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -57,6 +64,7 @@ pub fn run() {
                 player: Mutex::new(None),
                 thumbnailer: Mutex::new(None),
                 interactive: Mutex::new(None),
+                music_player: Mutex::new(None),
             });
 
             if cfg!(debug_assertions) {
@@ -200,6 +208,39 @@ pub fn run() {
             interactive_session::interactive_skip,
             interactive_session::interactive_debug,
             interactive_session::reset_interactive_story,
+            music::get_artist_detail,
+            music::get_album_detail,
+            music::get_music_scan_issues,
+            music::get_music_counts,
+            music::get_recent_music_plays,
+            music::get_music_tracks,
+            music::get_music_tag_fallbacks,
+            music_edit::get_track_edit,
+            music_edit::set_track_fields,
+            music_edit::reset_track_fields,
+            music_edit::get_album_edit,
+            music_edit::set_album_fields,
+            music_edit::reset_album_fields,
+            music_edit::get_artist_edit,
+            music_edit::set_artist_fields,
+            music_edit::reset_artist_fields,
+            music_edit::write_track_tags,
+            music_art::music_fetch_artist_image,
+            commands::set_library_setup_stage,
+            commands::complete_library_setup,
+            music_mb::music_match_begin,
+            music_mb::music_match_skip,
+            music_mb::music_match_state,
+            music_mb::mb_get_review,
+            music_mb::mb_search_releases,
+            music_mb::mb_apply_album_match,
+            music_mb::mb_resolve_suggestion,
+            music_mb::mb_undo_change,
+            music_player::music_play_track,
+            music_player::music_command,
+            music_player::music_set_property,
+            music_player::music_get_status,
+            music_player::music_stop,
             player::init_player,
             player::get_player_stats,
             player::set_player_region,

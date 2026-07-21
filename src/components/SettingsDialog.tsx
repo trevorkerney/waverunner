@@ -12,7 +12,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
 import { Slider } from "@/components/ui/slider";
-import { Settings, Download, Eye, EyeOff, MonitorPlay, Keyboard, Globe } from "lucide-react";
+import { Settings, Download, Eye, EyeOff, MonitorPlay, Keyboard, Globe, Volume2 } from "lucide-react";
 import {
   SUBTITLE_DEFAULTS,
   applySubtitleStyleToPlayer,
@@ -40,7 +40,8 @@ type SettingsMap = Record<string, string>;
 const categories = [
   { id: "general", label: "General", icon: Settings },
   { id: "tmdb", label: "TMDB/OMDB", icon: Globe },
-  { id: "player", label: "Player", icon: MonitorPlay },
+  { id: "player", label: "Video Player", icon: MonitorPlay },
+  { id: "audio", label: "Audio Player", icon: Volume2 },
   { id: "keybinds", label: "Keybinds", icon: Keyboard },
 ] as const;
 
@@ -121,12 +122,14 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
     }
   }, []);
 
-  // Default playback volume (0–100), defaulting to 50 when unset.
-  const defaultVolume = (() => {
-    const raw = view["default_volume"];
+  // Default playback volumes (0–100), defaulting to 50 when unset.
+  const volumeSetting = (key: string) => {
+    const raw = view[key];
     const n = raw == null ? NaN : parseInt(raw, 10);
     return Number.isNaN(n) ? 50 : Math.max(0, Math.min(100, n));
-  })();
+  };
+  const defaultVolume = volumeSetting("default_volume");
+  const musicDefaultVolume = volumeSetting("music_default_volume");
 
   // Subtitle styling: stage + live-preview on an active player in one step
   // (applySubtitleStyleToPlayer ignores the rejection when no player is open).
@@ -403,6 +406,53 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                   <Switch
                     checked={view["save_artwork_to_source"] === "true"}
                     onCheckedChange={(v) => stageSetting("save_artwork_to_source", v ? "true" : "false")}
+                  />
+                </div>
+              </div>
+            </div>
+          )}
+          {activeCategory === "audio" && (
+            <div className="flex flex-col gap-6">
+              <div>
+                <h3 className="mb-4 text-sm font-semibold">Playback</h3>
+                <div className="flex items-center justify-between gap-4">
+                  <div>
+                    <p className="text-sm">Default volume</p>
+                    <p className="text-xs text-muted-foreground">
+                      Volume music starts at. Adjustments in the now-playing bar last for the
+                      session.
+                    </p>
+                  </div>
+                  <div className="flex w-44 shrink-0 items-center gap-3">
+                    <Slider
+                      value={[musicDefaultVolume]}
+                      onValueChange={(v) => stageSetting("music_default_volume", String(Array.isArray(v) ? v[0] : v))}
+                      min={0}
+                      max={100}
+                      step={5}
+                      className="flex-1"
+                    />
+                    <span className="w-9 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
+                      {musicDefaultVolume}%
+                    </span>
+                  </div>
+                </div>
+              </div>
+              <div>
+                <h3 className="mb-4 text-sm font-semibold">Metadata</h3>
+                <div className="flex items-center justify-between gap-4">
+                  <div>
+                    <p className="text-sm">Allow writing tags to files</p>
+                    <p className="text-xs text-muted-foreground">
+                      Metadata edits are stored in waverunner and never touch your audio files.
+                      With this on, the track editor gains an explicit "also write these tags
+                      into the file" option. Modifying files changes their timestamps (and
+                      breaks torrent seeding for those files).
+                    </p>
+                  </div>
+                  <Switch
+                    checked={view["allow_tag_writeback"] === "true"}
+                    onCheckedChange={(v) => stageSetting("allow_tag_writeback", v ? "true" : "false")}
                   />
                 </div>
               </div>

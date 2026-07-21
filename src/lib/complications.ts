@@ -9,9 +9,66 @@ export function getComplicationsForLibrary(
   switch (library.format) {
     case "video":
       return videoComplications(library.id, playlists, counts, genres);
+    case "music":
+      return musicComplications(library.id, playlists, counts);
     default:
       return [];
   }
+}
+
+function musicComplications(
+  libraryId: string,
+  playlists: PlaylistSummary[],
+  counts?: LibraryCounts,
+): ComplicationNode[] {
+  const playlistChildren: ComplicationNode[] = playlists.map((p) => ({
+    id: `playlist.${p.id}`,
+    label: p.title,
+    iconName: "ListMusic",
+    count: p.root_item_count,
+    view: {
+      kind: "playlist-detail",
+      libraryId,
+      playlistId: p.id,
+      playlistName: p.title,
+      collectionId: null,
+    },
+  }));
+
+  const nodes: ComplicationNode[] = [
+    {
+      id: "artists",
+      label: "Artists",
+      iconName: "Music2",
+      count: counts?.artists,
+      view: { kind: "library-root", libraryId },
+    },
+    {
+      id: "albums",
+      label: "Albums",
+      iconName: "Disc3",
+      count: counts?.albums,
+      view: { kind: "albums", libraryId },
+    },
+    {
+      id: "tracks",
+      label: "Tracks",
+      iconName: "Music",
+      count: counts?.tracks,
+      view: { kind: "tracks", libraryId },
+    },
+    {
+      id: "playlists",
+      label: "Playlists",
+      iconName: "ListMusic",
+      count: playlists.length,
+      view: { kind: "playlists", libraryId },
+      children: playlistChildren,
+    },
+  ];
+  // Universal import: under-tagged files import via fallbacks now, so there
+  // is no needs-attention node — tag issues live in the metadata center.
+  return nodes;
 }
 
 function videoComplications(
@@ -52,7 +109,7 @@ function videoComplications(
       id: "all",
       label: "All",
       iconName: "Library",
-      count: counts ? counts.movies + counts.shows : undefined,
+      count: counts ? (counts.movies ?? 0) + (counts.shows ?? 0) : undefined,
       view: { kind: "library-root", libraryId },
       children: [
         { id: "all.movies", label: "Movies", iconName: "Film", count: counts?.movies, view: { kind: "movies-only", libraryId } },
@@ -105,6 +162,9 @@ export function viewCacheKey(view: ViewSpec): string {
     case "genre-detail":       return `${view.libraryId}:genre:${view.genre}`;
     case "person-detail":      return `${view.libraryId}:person:${view.role}:${view.personId}`;
     case "playlist-detail":    return `${view.libraryId}:playlist:${view.playlistId}:${view.collectionId ?? "root"}`;
+    case "albums":             return `${view.libraryId}:albums`;
+    case "tracks":             return `${view.libraryId}:tracks`;
+    case "music-issues":       return `${view.libraryId}:music-issues`;
   }
 }
 
@@ -132,6 +192,9 @@ export function scopeKeyFor(view: ViewSpec, parentId: number | null): string | n
     case "person-detail":
     case "genres":
     case "genre-detail":
+    case "albums":
+    case "tracks":
+    case "music-issues":
       return null;
   }
 }

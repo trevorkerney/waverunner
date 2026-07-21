@@ -156,6 +156,8 @@ pub fn destroy_player(state: State<'_, AppState>) -> Result<(), String> {
 pub async fn play_file(state: State<'_, AppState>, path: String) -> Result<(), String> {
     // Linear playback replaces any interactive session on this instance.
     crate::interactive_session::stop_session(&state);
+    // Video and music never play at once; starting one pauses the other.
+    crate::music_player::pause_music(&state);
     let inner = current_player(&state)?;
     run_mpv(inner, move |mpv| {
         mpv.command(&["loadfile", &path])?;
@@ -328,9 +330,9 @@ where
         .map_err(|e| e.to_string())?
 }
 
-/// Directories to probe for libmpv, in priority order. Shared by the player
-/// and the thumbnailer.
-fn libmpv_search_dirs(app: &AppHandle) -> Vec<std::path::PathBuf> {
+/// Directories to probe for libmpv, in priority order. Shared by the player,
+/// the thumbnailer, and the music player.
+pub(crate) fn libmpv_search_dirs(app: &AppHandle) -> Vec<std::path::PathBuf> {
     let mut dirs: Vec<std::path::PathBuf> = Vec::new();
     // 1. Tauri resource dir (where `resources` config copies files in production)
     if let Ok(res) = app.path().resource_dir() {
