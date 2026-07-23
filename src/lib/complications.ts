@@ -10,7 +10,7 @@ export function getComplicationsForLibrary(
     case "video":
       return videoComplications(library.id, playlists, counts, genres);
     case "music":
-      return musicComplications(library.id, playlists, counts);
+      return musicComplications(library.id, playlists, counts, genres);
     default:
       return [];
   }
@@ -20,7 +20,16 @@ function musicComplications(
   libraryId: string,
   playlists: PlaylistSummary[],
   counts?: LibraryCounts,
+  genres?: GenreSummary[],
 ): ComplicationNode[] {
+  // Album count per genre (album_genre, tags-derived), alphabetized by the backend.
+  const genreChildren: ComplicationNode[] = (genres ?? []).map((g) => ({
+    id: `genre.${g.name}`,
+    label: g.name,
+    iconName: "Tag",
+    count: g.count,
+    view: { kind: "genre-detail", libraryId, genre: g.name },
+  }));
   const playlistChildren: ComplicationNode[] = playlists.map((p) => ({
     id: `playlist.${p.id}`,
     label: p.title,
@@ -56,6 +65,22 @@ function musicComplications(
       iconName: "Music2",
       count: counts?.tracks,
       view: { kind: "tracks", libraryId },
+    },
+    {
+      id: "sounds",
+      label: "Sounds",
+      iconName: "Waves",
+      count: counts?.sounds,
+      view: { kind: "sounds", libraryId },
+    },
+    {
+      id: "genres",
+      label: "Genres",
+      iconName: "Drama",
+      count: genres?.length,
+      view: { kind: "genres", libraryId },
+      children: genreChildren,
+      defaultCollapsed: true,
     },
     {
       id: "playlists",
@@ -164,6 +189,7 @@ export function viewCacheKey(view: ViewSpec): string {
     case "person-detail":      return `${view.libraryId}:person:${view.role}:${view.personId}`;
     case "playlist-detail":    return `${view.libraryId}:playlist:${view.playlistId}:${view.collectionId ?? "root"}`;
     case "albums":             return `${view.libraryId}:albums`;
+    case "sounds":             return `${view.libraryId}:sounds`;
     case "tracks":             return `${view.libraryId}:tracks`;
     case "music-issues":       return `${view.libraryId}:music-issues`;
   }
@@ -195,6 +221,7 @@ export function scopeKeyFor(view: ViewSpec, parentId: number | null): string | n
     case "genres":
     case "genre-detail":
     case "albums":
+    case "sounds":
     case "tracks":
     case "music-issues":
       return null;

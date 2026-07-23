@@ -114,7 +114,8 @@ export function UpNextPanel({
   useEffect(() => {
     if (tab !== "recent") return;
     let cancelled = false;
-    invoke<RecentPlay[]>("get_recent_music_plays", { libraryId: null, limit: 50 })
+    // The panel's tab is the RAW history — dismissed tracks stay visible here.
+    invoke<RecentPlay[]>("get_recent_music_plays", { libraryId: null, limit: 50, includeDismissed: true })
       .then((rows) => {
         if (!cancelled) setRecent(rows);
       })
@@ -204,7 +205,7 @@ export function UpNextPanel({
         {(
           [
             ["next", "Up next"],
-            ["recent", "Recently played"],
+            ["recent", "Recently listened to"],
           ] as const
         ).map(([key, label]) => (
           <button
@@ -236,6 +237,18 @@ export function UpNextPanel({
                 onDoubleClick={() => void playRecent(p)}
                 title="Double-click to play"
               >
+                {p.cover ? (
+                  <img
+                    src={convertFileSrc(p.cover)}
+                    alt=""
+                    className="size-8 shrink-0 rounded-[2px] object-cover"
+                    draggable={false}
+                  />
+                ) : (
+                  <div className="flex size-8 shrink-0 items-center justify-center rounded-[2px] bg-muted text-muted-foreground">
+                    <Music2 size={14} />
+                  </div>
+                )}
                 <span className="min-w-0 flex-1">
                   <span className="block truncate text-sm">
                     {trackDisplayTitle(p.track_title, p.file_path)}

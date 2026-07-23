@@ -1171,7 +1171,7 @@ export function MainContent({
                   if (isArtistsView) {
                     return sortMode === "credits" ? "Most credited" : "Alphabetical";
                   }
-                  if (activeView?.kind === "albums") {
+                  if (activeView?.kind === "albums" || activeView?.kind === "sounds") {
                     return sortMode === "date" ? "Oldest first"
                       : sortMode === "date-desc" ? "Newest first"
                       : "Alphabetical";
@@ -1201,9 +1201,9 @@ export function MainContent({
                     Most credited
                   </DropdownMenuItem>
                 )}
-                {isArtistsView ? null : activeView?.kind === "albums" ? (
-                  // Albums: both date directions, no custom order or presets —
-                  // its sort is a settings key, not a per-scope sort_order.
+                {isArtistsView ? null : activeView?.kind === "albums" || activeView?.kind === "sounds" ? (
+                  // Albums/Sounds: both date directions, no custom order or
+                  // presets — their sorts are settings keys, not sort_orders.
                   <>
                     <DropdownMenuItem onClick={() => onSortModeChange("date")}>
                       Oldest first

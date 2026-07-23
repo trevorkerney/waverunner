@@ -2,7 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
-import { Trash2, RefreshCw, FolderPlus, ChevronRight, Sparkles, Pencil, Home, CircleCheck } from "lucide-react";
+import { Trash2, RefreshCw, FolderPlus, FolderCog, ChevronRight, Sparkles, Pencil, Home, CircleCheck } from "lucide-react";
+import { open as openFolderPicker } from "@tauri-apps/plugin-dialog";
 import { Spinner } from "@/components/ui/spinner";
 import {
   ContextMenu,
@@ -106,6 +107,8 @@ export function Sidebar({
   const [chip, setChip] = useState<{ text: string; ready: boolean } | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Library | null>(null);
   const [renameTarget, setRenameTarget] = useState<Library | null>(null);
+  // Library whose source folders are being managed (add/remove/repoint).
+  const [manageFoldersTarget, setManageFoldersTarget] = useState<Library | null>(null);
   // Which library to create a playlist inside, or null when the dialog is closed.
   const [createPlaylistFor, setCreatePlaylistFor] = useState<string | null>(null);
   // Track libraries the user has explicitly collapsed; default is expanded.
@@ -343,6 +346,10 @@ export function Sidebar({
                         <RefreshCw size={14} />
                         Rescan
                       </ContextMenuItem>
+                      <ContextMenuItem onClick={() => setManageFoldersTarget(lib)}>
+                        <FolderCog size={14} />
+                        Manage folders…
+                      </ContextMenuItem>
                       <ContextMenuItem
                         onClick={() => {
                           const makingDefault = defaultLibraryId !== lib.id;
@@ -465,6 +472,17 @@ export function Sidebar({
         onCreated={onLibraryCreated}
         onFinished={() => onLibraryRescanned()}
       />
+      <ManageFoldersDialog
+        library={manageFoldersTarget}
+        onOpenChange={(o) => {
+          if (!o) setManageFoldersTarget(null);
+        }}
+        onNeedsRescan={(lib) => {
+          // Adds/removals change nothing until a rescan — run it through
+          // the wizard like any other rescan. (Pure repoints skip this.)
+          setWizard({ kind: "rescan", libraryId: lib.id, name: lib.name, format: lib.format });
+        }}
+      />
       <RenameDialog
         open={renameTarget !== null}
         onOpenChange={(o) => { if (!o) setRenameTarget(null); }}
@@ -519,5 +537,159 @@ export function Sidebar({
         </DialogContent>
       </Dialog>
     </div>
+  );
+}
+
+/** Manage a library's source folders: add (typed) and remove (two-click,
+ *  swept on the next rescan — destructive for that content's history).
+ *  Moves/renames = remove + add (user decision — no repoint operation).
+ *  Operations commit immediately; closing after changes runs the rescan
+ *  wizard via onNeedsRescan. */
+function ManageFoldersDialog({
+  library,
+  onOpenChange,
+  onNeedsRescan,
+}: {
+  library: Library | null;
+  onOpenChange: (open: boolean) => void;
+  onNeedsRescan: (library: Library) => void;
+}) {
+  const [folders, setFolders] = useState<{ path: string; kind: string }[] | null>(null);
+  const [busy, setBusy] = useState(false);
+  // Adds/removals happened — closing should run the rescan wizard.
+  const [needsRescan, setNeedsRescan] = useState(false);
+  // Two-click remove confirmation: the path currently armed.
+  const [confirmRemove, setConfirmRemove] = useState<string | null>(null);
+  const open = library !== null;
+
+  const reload = useCallback(async () => {
+    if (!library) return;
+    try {
+      setFolders(await invoke<{ path: string; kind: string }[]>("get_library_folders", { libraryId: library.id }));
+    } catch (e) {
+      toast.error(String(e));
+    }
+  }, [library]);
+
+  useEffect(() => {
+    if (open) {
+      setFolders(null);
+      setNeedsRescan(false);
+      setConfirmRemove(null);
+      setBusy(false);
+      void reload();
+    }
+  }, [open, reload]);
+
+  const kindLabel = (k: string) =>
+    k === "music" ? "Music" : k === "sounds" ? "Sounds" : k === "movie" ? "Movies" : k === "show" ? "TV" : k;
+
+  const addKinds: string[] = library?.format === "music" ? ["music", "sounds"] : ["movie", "show"];
+
+  const addFolder = async (kind: string) => {
+    if (!library) return;
+    const dir = await openFolderPicker({ directory: true, multiple: false });
+    if (typeof dir !== "string" || !dir) return;
+    setBusy(true);
+    try {
+      await invoke("add_library_paths", { libraryId: library.id, paths: [{ path: dir, kind }] });
+      setNeedsRescan(true);
+      await reload();
+    } catch (e) {
+      toast.error(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const removeFolder = async (path: string) => {
+    if (!library) return;
+    setBusy(true);
+    try {
+      await invoke("remove_library_path", { libraryId: library.id, path });
+      setNeedsRescan(true);
+      setConfirmRemove(null);
+      await reload();
+    } catch (e) {
+      toast.error(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const close = () => {
+    onOpenChange(false);
+    if (needsRescan && library) onNeedsRescan(library);
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={(o) => { if (!o) close(); }}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>Manage folders{library ? ` — ${library.name}` : ""}</DialogTitle>
+          <DialogDescription>
+            Removing a folder deletes its media from the library on the next rescan (including watch
+            and play history).
+          </DialogDescription>
+        </DialogHeader>
+        <div className="grid gap-1 py-1">
+          {folders === null ? (
+            <div className="flex justify-center py-6">
+              <Spinner className="size-5" />
+            </div>
+          ) : (
+            folders.map((f) => (
+              <div key={f.path} className="flex items-center gap-2 rounded-md border px-2 py-1.5">
+                <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                  {kindLabel(f.kind)}
+                </span>
+                <span className="min-w-0 flex-1 truncate text-xs" title={f.path}>
+                  {f.path}
+                </span>
+                {confirmRemove === f.path ? (
+                  <button
+                    onClick={() => void removeFolder(f.path)}
+                    disabled={busy}
+                    className="shrink-0 rounded px-1.5 py-0.5 text-xs font-medium text-destructive hover:bg-destructive/10 disabled:opacity-50"
+                    title="Click again to remove"
+                  >
+                    Remove?
+                  </button>
+                ) : (
+                  <button
+                    onClick={() => setConfirmRemove(f.path)}
+                    disabled={busy}
+                    className="shrink-0 rounded p-1 text-muted-foreground hover:text-destructive disabled:opacity-50"
+                    title="Remove folder"
+                  >
+                    <Trash2 size={14} />
+                  </button>
+                )}
+              </div>
+            ))
+          )}
+          <div className="mt-1 flex gap-2">
+            {addKinds.map((k) => (
+              <Button
+                key={k}
+                variant="ghost"
+                size="sm"
+                onClick={() => void addFolder(k)}
+                disabled={busy}
+                className="justify-start gap-1.5 text-muted-foreground"
+              >
+                <FolderPlus size={14} />
+                Add {kindLabel(k).toLowerCase()} folder
+              </Button>
+            ))}
+          </div>
+        </div>
+        <DialogFooter>
+          <Button onClick={close} disabled={busy}>
+            {needsRescan ? "Done & rescan" : "Done"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }

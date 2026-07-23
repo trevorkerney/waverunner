@@ -687,15 +687,27 @@ pub async fn create_library(
     .map_err(|e| e.to_string())?;
 
     // Store the tagged source folders (replaces the old library.paths JSON blob).
+    // "sounds" folders: library_path.kind carries a baked CHECK constraint on
+    // existing databases, so they store as kind='music' plus a sound_path row
+    // (the scanner reads that to sound-mark everything under the base).
     for (i, lp) in paths.iter().enumerate() {
+        let stored_kind = if lp.kind == "sounds" { "music" } else { lp.kind.as_str() };
         sqlx::query("INSERT INTO library_path (library_id, path, kind, sort_order) VALUES (?, ?, ?, ?)")
             .bind(&id)
             .bind(&lp.path)
-            .bind(&lp.kind)
+            .bind(stored_kind)
             .bind(i as i64)
             .execute(&state.app_db)
             .await
             .map_err(|e| e.to_string())?;
+        if lp.kind == "sounds" {
+            sqlx::query("INSERT OR IGNORE INTO sound_path (library_id, path) VALUES (?, ?)")
+                .bind(&id)
+                .bind(&lp.path)
+                .execute(&state.app_db)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
     }
 
     state.cancel_creation.store(false, Ordering::SeqCst);
@@ -736,7 +748,7 @@ pub async fn create_library(
                     .map_err(|e| e.to_string())?;
                 crate::music::clear_issues(pool, &id).await?;
                 for lp in &paths {
-                    crate::music::scan_music_library(&app, pool, &id, &PathBuf::from(&lp.path), &cache_base, cancel).await?;
+                    crate::music::scan_music_library(&app, pool, &id, &PathBuf::from(&lp.path), &cache_base, cancel, lp.kind == "sounds").await?;
                 }
             }
             _ => return Err(format!("Unsupported library format: {}", format)),
@@ -1020,6 +1032,9 @@ pub async fn get_entries(
         Some("show") => Some("show"),
         Some("collection") => Some("collection"),
         Some("album") => Some("album"),
+        // Sound albums (the Sounds node) — same shape as "album" with the
+        // sound marker flipped.
+        Some("sound") => Some("sound"),
         Some(other) => return Err(format!("Invalid entry_type_filter: {}", other)),
     };
 
@@ -1295,11 +1310,17 @@ pub async fn get_entries(
             // release it is — artist name rides collection_display as the card
             // subtitle. Its sort mode lives in a settings key (a music
             // library's default_sort_mode belongs to the Artists view).
-            if validated_type == Some("album") {
+            if validated_type == Some("album") || validated_type == Some("sound") {
+                let sounds = validated_type == Some("sound");
+                let sort_key = if sounds {
+                    format!("music_sounds_sort_mode:{library_id}")
+                } else {
+                    format!("music_albums_sort_mode:{library_id}")
+                };
                 let sort_mode: String = sqlx::query_as::<_, (String,)>(
                     "SELECT value FROM settings WHERE key = ?",
                 )
-                .bind(format!("music_albums_sort_mode:{library_id}"))
+                .bind(sort_key)
                 .fetch_optional(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?
@@ -1312,13 +1333,19 @@ pub async fn get_entries(
                     "date-desc" => "ORDER BY al.release_date IS NULL, al.release_date DESC, al.sort_title COLLATE NOCASE ASC",
                     _ => "ORDER BY al.sort_title COLLATE NOCASE ASC",
                 };
+                let marker = if sounds {
+                    "AND EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = al.id)"
+                } else {
+                    "AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = al.id)"
+                };
                 let query_str = format!(
                     "SELECT al.id, al.title, al.release_date, al.folder_path, al.selected_cover, me.parent_id, ar.title \
                      FROM album al \
                      JOIN media_entry me ON me.id = al.id \
                      LEFT JOIN artist ar ON ar.id = me.parent_id \
                      WHERE me.library_id = ? \
-                       AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = al.id) {order_clause}"
+                       AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = al.id) \
+                       {marker} {order_clause}"
                 );
                 let rows: Vec<(i64, String, Option<String>, String, Option<String>, Option<i64>, Option<String>)> =
                     sqlx::query_as(&query_str)
@@ -1377,9 +1404,15 @@ pub async fn get_entries(
             .filter(|v| v == "credits")
             .unwrap_or_else(|| "alpha".to_string());
 
+            // Artists whose every child album is sound-marked hide from the
+            // grid (a "Rain Sounds" artist is a folder artifact, not an
+            // artist); childless (feature-only) artists stay.
             let query_str = "SELECT mef.id, mef.title, mef.folder_path, mef.selected_cover \
                  FROM media_entry_full mef \
                  WHERE mef.library_id = ? AND mef.parent_id IS NULL AND mef.entry_type = 'artist' \
+                   AND (NOT EXISTS (SELECT 1 FROM media_entry ch WHERE ch.parent_id = mef.id) \
+                        OR EXISTS (SELECT 1 FROM media_entry ch WHERE ch.parent_id = mef.id \
+                                   AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = ch.id))) \
                  ORDER BY mef.sort_title COLLATE NOCASE ASC"
                 .to_string();
 
@@ -1397,6 +1430,7 @@ pub async fn get_entries(
                  FROM album al JOIN media_entry me ON me.id = al.id \
                  WHERE me.library_id = ? AND me.parent_id IS NOT NULL \
                    AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = al.id) \
+                   AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = al.id) \
                  GROUP BY me.parent_id, al.album_type",
             )
             .bind(&library_id)
@@ -1420,6 +1454,7 @@ pub async fn get_entries(
                  JOIN media_entry alme ON alme.id = tme.parent_id \
                  WHERE ame.library_id = ? AND (alme.parent_id IS NULL OR alme.parent_id != a.id) \
                    AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = alme.id) \
+                   AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = alme.id) \
                  GROUP BY a.id",
             )
             .bind(&library_id)
@@ -1669,6 +1704,9 @@ pub async fn search_entries(
                     "SELECT mef.id, mef.title, mef.folder_path, mef.selected_cover \
                      FROM media_entry_full mef \
                      WHERE mef.library_id = ? AND mef.entry_type = 'artist' AND mef.title LIKE ? \
+                       AND (NOT EXISTS (SELECT 1 FROM media_entry ch WHERE ch.parent_id = mef.id) \
+                            OR EXISTS (SELECT 1 FROM media_entry ch WHERE ch.parent_id = mef.id \
+                                       AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = ch.id))) \
                      ORDER BY mef.sort_title COLLATE NOCASE ASC",
                 )
                 .bind(&library_id)
@@ -1684,6 +1722,7 @@ pub async fn search_entries(
                      LEFT JOIN artist ar ON ar.id = me.parent_id \
                      WHERE me.library_id = ? AND al.title LIKE ? \
                        AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = al.id) \
+                       AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = al.id) \
                      ORDER BY al.sort_title COLLATE NOCASE ASC",
                 )
                 .bind(&library_id)
@@ -3010,7 +3049,19 @@ pub async fn get_genres_in_library(
     state: tauri::State<'_, AppState>,
     library_id: String,
 ) -> Result<Vec<GenreSummary>, String> {
-    let rows: Vec<(String, i64)> = sqlx::query_as(
+    let (format, _paths, _default_sort_mode) = get_library_meta(&state.app_db, &library_id).await?;
+    // Music: genre → album count (album_genre, tags-derived). Hidden loose
+    // containers are excluded like every album surface.
+    let sql = if format == "music" {
+        "SELECT g.name, COUNT(*) AS cnt \
+         FROM genre g \
+         JOIN album_genre ag ON ag.genre_id = g.id \
+         JOIN media_entry me ON me.id = ag.album_id AND me.library_id = ? \
+         WHERE NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = ag.album_id) \
+           AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = ag.album_id) \
+         GROUP BY g.id \
+         ORDER BY g.name COLLATE NOCASE ASC"
+    } else {
         "SELECT g.name, COUNT(*) AS cnt \
          FROM genre g \
          JOIN ( \
@@ -3020,12 +3071,13 @@ pub async fn get_genres_in_library(
          ) gx ON gx.genre_id = g.id \
          JOIN media_entry me ON me.id = gx.eid AND me.library_id = ? \
          GROUP BY g.id \
-         ORDER BY g.name COLLATE NOCASE ASC",
-    )
-    .bind(&library_id)
-    .fetch_all(&state.app_db)
-    .await
-    .map_err(|e| e.to_string())?;
+         ORDER BY g.name COLLATE NOCASE ASC"
+    };
+    let rows: Vec<(String, i64)> = sqlx::query_as(sql)
+        .bind(&library_id)
+        .fetch_all(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(rows
         .into_iter()
         .map(|(name, count)| GenreSummary { name, count })
@@ -3044,6 +3096,59 @@ pub async fn get_entries_for_genre(
     let mut covers_map = get_all_cached_covers(&state.app_db, &library_id)
         .await
         .map_err(|e| e.to_string())?;
+
+    let (format, _paths, _default_sort_mode) = get_library_meta(&state.app_db, &library_id).await?;
+    if format == "music" {
+        // Albums carrying the genre — same card shape the Albums grid uses
+        // (artist subtitle, square art, local date re-sort support).
+        let rows: Vec<(i64, String, Option<String>, String, Option<String>, Option<i64>, Option<String>)> =
+            sqlx::query_as(
+                "SELECT al.id, al.title, al.release_date, al.folder_path, al.selected_cover, me.parent_id, ar.title \
+                 FROM album al \
+                 JOIN media_entry me ON me.id = al.id \
+                 LEFT JOIN artist ar ON ar.id = me.parent_id \
+                 JOIN album_genre ag ON ag.album_id = al.id \
+                 JOIN genre g ON g.id = ag.genre_id \
+                 WHERE me.library_id = ? AND g.name = ? \
+                   AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = al.id) \
+                   AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = al.id) \
+                 ORDER BY al.sort_title COLLATE NOCASE ASC",
+            )
+            .bind(&library_id)
+            .bind(&genre)
+            .fetch_all(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+        return Ok(rows
+            .into_iter()
+            .map(|(id, title, release_date, folder_path, selected_cover, parent_id, artist_title)| {
+                let covers = covers_map.remove(&folder_path).unwrap_or_default();
+                MediaEntry {
+                    id,
+                    title,
+                    year: release_date.as_ref().map(|d| d.chars().take(4).collect()),
+                    end_year: None,
+                    folder_path,
+                    parent_id,
+                    entry_type: "album".to_string(),
+                    covers,
+                    selected_cover,
+                    child_count: 0,
+                    season_display: None,
+                    collection_display: artist_title,
+                    role_display: None,
+                    tmdb_id: None,
+                    link_id: None,
+                    interactive: false,
+                    watched: false,
+                    watch_progress: None,
+                    unwatched: false,
+                    has_progress: false,
+                    sort_date: release_date,
+                }
+            })
+            .collect());
+    }
 
     let show_episode_years = "\
         SELECT SUBSTR(e.release_date, 1, 4) as yr FROM episode e \
@@ -6559,6 +6664,141 @@ pub async fn delete_entry(
     Ok(())
 }
 
+/// The library's source folders with their EFFECTIVE kinds — music bases
+/// flagged in sound_path report as "sounds" (the Manage Folders dialog view).
+#[tauri::command]
+pub async fn get_library_folders(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+) -> Result<Vec<LibraryPath>, String> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT path, kind FROM library_path WHERE library_id = ? ORDER BY sort_order, id",
+    )
+    .bind(&library_id)
+    .fetch_all(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    let sound_paths: std::collections::HashSet<String> =
+        sqlx::query_as::<_, (String,)>("SELECT path FROM sound_path WHERE library_id = ?")
+            .bind(&library_id)
+            .fetch_all(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|(p,)| p)
+            .collect();
+    Ok(rows
+        .into_iter()
+        .map(|(path, kind)| {
+            let kind = if kind == "music" && sound_paths.contains(&path) {
+                "sounds".to_string()
+            } else {
+                kind
+            };
+            LibraryPath { path, kind }
+        })
+        .collect())
+}
+
+/// Append typed source folders to an existing library — music/sounds kinds
+/// for music libraries (sounds folders store as kind='music' plus a
+/// sound_path row, same encoding create_library uses), movie/show for video.
+/// The caller triggers a rescan afterwards; new folders contribute nothing
+/// until it runs.
+#[tauri::command]
+pub async fn add_library_paths(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    paths: Vec<LibraryPath>,
+) -> Result<(), String> {
+    if paths.is_empty() {
+        return Err("At least one folder is required".to_string());
+    }
+    let (format, existing, _default_sort_mode) = get_library_meta(&state.app_db, &library_id).await?;
+    for lp in &paths {
+        let ok = match format.as_str() {
+            "music" => matches!(lp.kind.as_str(), "music" | "sounds"),
+            "video" => matches!(lp.kind.as_str(), "movie" | "show"),
+            _ => false,
+        };
+        if !ok {
+            return Err(format!("Unsupported folder kind '{}' for a {format} library", lp.kind));
+        }
+    }
+    let start: (i64,) = sqlx::query_as(
+        "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM library_path WHERE library_id = ?",
+    )
+    .bind(&library_id)
+    .fetch_one(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    let mut order = start.0;
+    for lp in &paths {
+        let stored_kind = if lp.kind == "sounds" { "music" } else { lp.kind.as_str() };
+        if !existing.contains(&lp.path) {
+            sqlx::query(
+                "INSERT INTO library_path (library_id, path, kind, sort_order) VALUES (?, ?, ?, ?)",
+            )
+            .bind(&library_id)
+            .bind(&lp.path)
+            .bind(stored_kind)
+            .bind(order)
+            .execute(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+            order += 1;
+        }
+        if lp.kind == "sounds" {
+            sqlx::query("INSERT OR IGNORE INTO sound_path (library_id, path) VALUES (?, ?)")
+                .bind(&library_id)
+                .bind(&lp.path)
+                .execute(&state.app_db)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// Remove a source folder. Its media stays in the DB until the next rescan
+/// sweeps everything the walk no longer finds — destructive for that
+/// content's history, which the UI warns about. The last folder can't be
+/// removed (delete the library instead).
+#[tauri::command]
+pub async fn remove_library_path(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    path: String,
+) -> Result<(), String> {
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM library_path WHERE library_id = ?")
+            .bind(&library_id)
+            .fetch_one(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+    if count <= 1 {
+        return Err("A library needs at least one folder — delete the library instead".to_string());
+    }
+    let res = sqlx::query("DELETE FROM library_path WHERE library_id = ? AND path = ?")
+        .bind(&library_id)
+        .bind(&path)
+        .execute(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+    if res.rows_affected() == 0 {
+        return Err("Folder is not part of this library".to_string());
+    }
+    sqlx::query("DELETE FROM sound_path WHERE library_id = ? AND path = ?")
+        .bind(&library_id)
+        .bind(&path)
+        .execute(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// (No repoint/change-location operation — moves are remove + add, by design.)
+
 #[tauri::command]
 pub async fn rescan_library(
     app: tauri::AppHandle,
@@ -6583,7 +6823,21 @@ pub async fn rescan_library(
             rescan_video_library(&app, &state.app_db, &library_id, &typed_bases, &cache_base).await?
         }
         "music" => {
-            let base_paths: Vec<PathBuf> = lib_paths.iter().map(PathBuf::from).collect();
+            // Sounds-typed bases (sound_path rows) sound-mark everything they yield.
+            let sound_paths: std::collections::HashSet<String> = sqlx::query_as::<_, (String,)>(
+                "SELECT path FROM sound_path WHERE library_id = ?",
+            )
+            .bind(&library_id)
+            .fetch_all(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|(p,)| p)
+            .collect();
+            let base_paths: Vec<(PathBuf, bool)> = lib_paths
+                .iter()
+                .map(|p| (PathBuf::from(p), sound_paths.contains(p)))
+                .collect();
             crate::music::rescan_music_library(&app, &state.app_db, &library_id, &base_paths, &cache_base).await?;
             // The MusicBrainz pass is NOT auto-spawned — the wizard's match
             // step (or the metadata center) drives it, if the user elects it.

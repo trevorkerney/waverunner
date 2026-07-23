@@ -89,6 +89,9 @@ export function CreateLibraryDialog({
   const [moviePaths, setMoviePaths] = useState<string[]>([""]);
   const [showPaths, setShowPaths] = useState<string[]>([""]);
   const [musicPaths, setMusicPaths] = useState<string[]>([""]);
+  // Sounds (ambient/rain/etc) folders — optional sibling domain inside a
+  // music library; everything under them is sound-marked at scan time.
+  const [soundsPaths, setSoundsPaths] = useState<string[]>([""]);
   const [format, setFormat] = useState("video");
   // Only 'local' is implemented; 'server' (Jellyfin/Plex/Emby client mode) is
   // shown disabled so the direction is visible in the UI.
@@ -265,8 +268,11 @@ export function CreateLibraryDialog({
   const validMoviePaths = moviePaths.filter((p) => p.trim() !== "");
   const validShowPaths = showPaths.filter((p) => p.trim() !== "");
   const validMusicPaths = musicPaths.filter((p) => p.trim() !== "");
+  const validSoundsPaths = soundsPaths.filter((p) => p.trim() !== "");
   const totalValidPaths =
-    format === "music" ? validMusicPaths.length : validMoviePaths.length + validShowPaths.length;
+    format === "music"
+      ? validMusicPaths.length + validSoundsPaths.length
+      : validMoviePaths.length + validShowPaths.length;
 
   async function handleCancelScan() {
     try {
@@ -281,6 +287,7 @@ export function CreateLibraryDialog({
     setMoviePaths([""]);
     setShowPaths([""]);
     setMusicPaths([""]);
+    setSoundsPaths([""]);
     setFormat("video");
     setSource("local");
     setStep(1);
@@ -418,7 +425,10 @@ export function CreateLibraryDialog({
     try {
       const paths =
         format === "music"
-          ? validMusicPaths.map((path) => ({ path, kind: "music" }))
+          ? [
+              ...validMusicPaths.map((path) => ({ path, kind: "music" })),
+              ...validSoundsPaths.map((path) => ({ path, kind: "sounds" })),
+            ]
           : [
               ...validMoviePaths.map((path) => ({ path, kind: "movie" })),
               ...validShowPaths.map((path) => ({ path, kind: "show" })),
@@ -691,13 +701,22 @@ export function CreateLibraryDialog({
                     </ToggleGroup>
                   </div>
                   {format === "music" ? (
-                    <FolderSection
-                      label="Music folders"
-                      paths={musicPaths}
-                      setPaths={setMusicPaths}
-                      onAutoName={maybeAutoName}
-                      onRowsChange={() => setHeightAnimating(true)}
-                    />
+                    <>
+                      <FolderSection
+                        label="Music folders"
+                        paths={musicPaths}
+                        setPaths={setMusicPaths}
+                        onAutoName={maybeAutoName}
+                        onRowsChange={() => setHeightAnimating(true)}
+                      />
+                      <FolderSection
+                        label="Sounds folders"
+                        paths={soundsPaths}
+                        setPaths={setSoundsPaths}
+                        onAutoName={maybeAutoName}
+                        onRowsChange={() => setHeightAnimating(true)}
+                      />
+                    </>
                   ) : (
                     <>
                       <FolderSection

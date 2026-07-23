@@ -14,6 +14,7 @@ import {
   Tv,
   User,
   Users,
+  Waves,
   type LucideIcon,
 } from "lucide-react";
 import {
@@ -37,6 +38,7 @@ const ICON_MAP: Record<string, LucideIcon> = {
   Tv,
   User,
   Users,
+  Waves,
 };
 
 function getIcon(name: string): LucideIcon {

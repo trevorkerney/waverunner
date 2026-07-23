@@ -1,10 +1,16 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { toast } from "sonner";
-import { Play, Info, Film, Tv, Music2, ChevronLeft, ChevronRight } from "lucide-react";
+import { Play, Info, Film, Tv, Music2, ChevronLeft, ChevronRight, Eye, X } from "lucide-react";
 import { Spinner } from "./ui/spinner";
+import {
+  ContextMenu,
+  ContextMenuTrigger,
+  ContextMenuContent,
+  ContextMenuItem,
+} from "./ui/context-menu";
 import { ContinueWatchingItem, MediaEntry, RecentPlay } from "../types";
-import { trackDisplayTitle } from "./music/musicQueue";
+import { trackDisplayTitle, fmtRelative } from "./music/musicQueue";
 
 interface HomePageProps {
   getCoverUrl: (filePath: string) => string;
@@ -156,6 +162,7 @@ export function HomePage({
   onOpenLibraryTrack,
 }: HomePageProps) {
   const [continueItems, setContinueItems] = useState<ContinueWatchingItem[] | null>(null);
+  const [recentWatched, setRecentWatched] = useState<ContinueWatchingItem[] | null>(null);
   const [recent, setRecent] = useState<RecentPlay[] | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
 
@@ -166,11 +173,16 @@ export function HomePage({
         if (!cancelled) setContinueItems(rows);
       })
       .catch((e) => console.error("Failed to load continue watching:", e));
+    invoke<ContinueWatchingItem[]>("get_recently_watched", { limit: 20 })
+      .then((rows) => {
+        if (!cancelled) setRecentWatched(rows);
+      })
+      .catch((e) => console.error("Failed to load recently watched:", e));
     invoke<RecentPlay[]>("get_recent_music_plays", { libraryId: null, limit: 50 })
       .then((rows) => {
         if (!cancelled) setRecent(rows);
       })
-      .catch((e) => console.error("Failed to load recent plays:", e));
+      .catch((e) => console.error("Failed to load recent listens:", e));
     return () => {
       cancelled = true;
     };
@@ -205,6 +217,55 @@ export function HomePage({
           startSecs: item.position_secs ?? undefined,
         });
       }
+    } catch (e) {
+      toast.error(String(e));
+    }
+  };
+
+  // Mark-watched actions: the backend clears resume points on watched=1, so
+  // the card leaves the rail (or, for a mid-show episode, advances to the
+  // next one) and grid progress bars clear. The window event tells App to
+  // re-patch baked-in watch flags across its caches.
+  const afterWatchChange = () => {
+    window.dispatchEvent(new Event("waverunner:watch-changed"));
+    setReloadKey((k) => k + 1);
+  };
+
+  const markMovieWatched = async (item: ContinueWatchingItem) => {
+    try {
+      await invoke("mark_watched", { kind: "movie", id: item.entry_id, watched: true });
+      afterWatchChange();
+    } catch (e) {
+      toast.error(String(e));
+    }
+  };
+
+  const markEpisodeWatched = async (item: ContinueWatchingItem) => {
+    if (item.episode_id == null) return;
+    try {
+      await invoke("mark_watched", { kind: "episode", id: item.episode_id, watched: true });
+      afterWatchChange();
+    } catch (e) {
+      toast.error(String(e));
+    }
+  };
+
+  // "Remove from recently watched/listened to" — recency dismissals, not data
+  // deletions: watch flags, resume points, and the play log all survive; the
+  // next play/watch resurfaces the item.
+  const dismissWatched = async (item: ContinueWatchingItem) => {
+    try {
+      await invoke("dismiss_recently_watched", { kind: item.kind, id: item.entry_id });
+      setReloadKey((k) => k + 1);
+    } catch (e) {
+      toast.error(String(e));
+    }
+  };
+
+  const dismissListen = async (p: RecentPlay) => {
+    try {
+      await invoke("dismiss_recent_listen", { trackId: p.track_id });
+      setReloadKey((k) => k + 1);
     } catch (e) {
       toast.error(String(e));
     }
@@ -262,8 +323,9 @@ export function HomePage({
     return out;
   })();
 
-  const loading = continueItems == null || recentTiles == null;
-  const empty = !loading && continueItems.length === 0 && recentTiles.length === 0;
+  const loading = continueItems == null || recentWatched == null || recentTiles == null;
+  const empty =
+    !loading && continueItems.length === 0 && recentWatched.length === 0 && recentTiles.length === 0;
 
   return (
     <div className="px-6 pb-8">
@@ -317,10 +379,12 @@ export function HomePage({
                       ? convertFileSrc(item.backdrop)
                       : null;
                   return (
-                    <div
-                      key={`${item.kind}-${item.entry_id}`}
-                      className="group relative aspect-video w-[28rem] shrink-0 overflow-hidden rounded-[3px] bg-muted shadow-md ring-1 ring-foreground/10"
-                    >
+                    <ContextMenu key={`${item.kind}-${item.entry_id}`}>
+                      <ContextMenuTrigger
+                        render={
+                          <div className="group relative aspect-video w-[28rem] shrink-0 overflow-hidden rounded-[3px] bg-muted shadow-md ring-1 ring-foreground/10" />
+                        }
+                      >
                       {wide ? (
                         <img
                           src={wide}
@@ -385,7 +449,103 @@ export function HomePage({
                           <div className="h-full bg-primary" style={{ width: `${progress * 100}%` }} />
                         </div>
                       )}
-                    </div>
+                      </ContextMenuTrigger>
+                      <ContextMenuContent>
+                        {/* Marks the card's actual content (the movie, or the
+                            shown episode) — either way the card leaves the
+                            rail, which lists only in-progress items. */}
+                        <ContextMenuItem
+                          onClick={() =>
+                            void (item.kind === "movie" ? markMovieWatched(item) : markEpisodeWatched(item))
+                          }
+                        >
+                          <Eye size={14} />
+                          Mark as watched
+                        </ContextMenuItem>
+                      </ContextMenuContent>
+                    </ContextMenu>
+                  );
+                })}
+              </HomeRail>
+            </>
+          )}
+
+          {recentWatched.length > 0 && (
+            <>
+              <p
+                className={`mb-2.5 text-sm font-semibold uppercase tracking-wide text-muted-foreground ${
+                  continueItems.length > 0 ? "mt-7" : ""
+                }`}
+              >
+                Recently watched
+              </p>
+              {/* w-40 (160px) 2:3 posters → art is 240px tall, center 120. */}
+              <HomeRail artCenterPx={120}>
+                {recentWatched.map((item) => {
+                  const progress =
+                    item.position_secs != null && item.duration_secs != null && item.duration_secs > 0
+                      ? Math.min(1, item.position_secs / item.duration_secs)
+                      : null;
+                  const epLabel =
+                    item.kind === "show" && item.season_number != null && item.episode_number != null
+                      ? `S${item.season_number} E${item.episode_number}`
+                      : null;
+                  const subtitle = [epLabel, fmtRelative(item.last_played_at)].filter(Boolean).join(" · ");
+                  return (
+                    <ContextMenu key={`rw-${item.kind}-${item.entry_id}`}>
+                      <ContextMenuTrigger
+                        render={
+                          <button
+                            onClick={() => onOpenLibraryEntry?.(item.library_id, fakeVideoEntry(item))}
+                            className="group/rw flex w-40 shrink-0 flex-col text-left"
+                            title={item.kind === "movie" ? "Go to movie page" : "Go to show page"}
+                          />
+                        }
+                      >
+                        <div className="relative aspect-[2/3] w-full overflow-hidden rounded-[3px] bg-muted shadow-md ring-1 ring-foreground/10 transition-[translate,scale] duration-200 group-hover/rw:-translate-y-1 group-hover/rw:scale-[1.03] group-hover/rw:shadow-xl">
+                          {item.cover ? (
+                            <img
+                              src={getCoverUrl(item.cover)}
+                              alt={item.title}
+                              loading="lazy"
+                              decoding="async"
+                              className="h-full w-full object-cover"
+                              draggable={false}
+                            />
+                          ) : (
+                            <div className="flex h-full w-full items-center justify-center text-muted-foreground">
+                              {item.kind === "movie" ? <Film size={32} /> : <Tv size={32} />}
+                            </div>
+                          )}
+                          {progress != null && (
+                            <div className="absolute inset-x-0 bottom-0 h-1 bg-black/60">
+                              <div className="h-full bg-primary" style={{ width: `${progress * 100}%` }} />
+                            </div>
+                          )}
+                        </div>
+                        <p className="mt-1.5 break-words text-sm font-medium" title={item.title}>
+                          {item.title}
+                        </p>
+                        <p className="h-4 truncate text-xs text-muted-foreground">{subtitle}</p>
+                      </ContextMenuTrigger>
+                      <ContextMenuContent>
+                        {/* Only in-progress items have anything to mark. */}
+                        {item.position_secs != null && (
+                          <ContextMenuItem
+                            onClick={() =>
+                              void (item.kind === "movie" ? markMovieWatched(item) : markEpisodeWatched(item))
+                            }
+                          >
+                            <Eye size={14} />
+                            Mark as watched
+                          </ContextMenuItem>
+                        )}
+                        <ContextMenuItem onClick={() => void dismissWatched(item)}>
+                          <X size={14} />
+                          Remove from recently watched
+                        </ContextMenuItem>
+                      </ContextMenuContent>
+                    </ContextMenu>
                   );
                 })}
               </HomeRail>
@@ -396,50 +556,58 @@ export function HomePage({
             <>
               <p
                 className={`mb-2.5 text-sm font-semibold uppercase tracking-wide text-muted-foreground ${
-                  continueItems.length > 0 ? "mt-7" : ""
+                  continueItems.length > 0 || recentWatched.length > 0 ? "mt-7" : ""
                 }`}
               >
-                Recently played
+                Recently listened to
               </p>
               {/* w-44 (176px) square covers → center 88. */}
               <HomeRail artCenterPx={88}>
                 {recentTiles.map((p) => (
-                  <button
-                    key={p.track_id}
-                    onClick={() => openAlbum(p)}
-                    // flex-col: buttons vertically CENTER their content by
-                    // default — when the rail stretches tiles to equal height,
-                    // short-caption tiles would sink their covers off the line.
-                    className="group flex w-44 shrink-0 flex-col text-left"
-                    title={p.album_title ? `Go to "${p.album_title}"` : "Go to track"}
-                  >
-                    <div className="relative aspect-square overflow-hidden rounded-[3px] bg-muted shadow-md ring-1 ring-foreground/10 transition-[translate,scale] duration-200 group-hover:-translate-y-1 group-hover:scale-[1.03] group-hover:shadow-xl">
-                      {p.cover ? (
-                        <img
-                          src={getCoverUrl(p.cover)}
-                          alt=""
-                          loading="lazy"
-                          decoding="async"
-                          className="h-full w-full object-cover"
-                          draggable={false}
+                  <ContextMenu key={p.track_id}>
+                    <ContextMenuTrigger
+                      render={
+                        <button
+                          onClick={() => openAlbum(p)}
+                          // flex-col: buttons vertically CENTER their content by
+                          // default — when the rail stretches tiles to equal height,
+                          // short-caption tiles would sink their covers off the line.
+                          className="group flex w-44 shrink-0 flex-col text-left"
+                          title={p.album_title ? `Go to "${p.album_title}"` : "Go to track"}
                         />
-                      ) : (
-                        <div className="flex h-full w-full items-center justify-center text-muted-foreground">
-                          <Music2 size={32} />
-                        </div>
-                      )}
-                      <div className="absolute inset-0 flex items-center justify-center bg-black/40 opacity-0 transition-opacity group-hover:opacity-100">
-                        <Info size={26} className="text-white/90 drop-shadow" />
+                      }
+                    >
+                      <div className="relative aspect-square w-full overflow-hidden rounded-[3px] bg-muted shadow-md ring-1 ring-foreground/10 transition-[translate,scale] duration-200 group-hover:-translate-y-1 group-hover:scale-[1.03] group-hover:shadow-xl">
+                        {p.cover ? (
+                          <img
+                            src={getCoverUrl(p.cover)}
+                            alt=""
+                            loading="lazy"
+                            decoding="async"
+                            className="h-full w-full object-cover"
+                            draggable={false}
+                          />
+                        ) : (
+                          <div className="flex h-full w-full items-center justify-center text-muted-foreground">
+                            <Music2 size={32} />
+                          </div>
+                        )}
                       </div>
-                    </div>
-                    {/* Titles wrap freely; covers stay aligned because they sit
-                        above the captions (tiles are top-anchored). The artist
-                        row keeps its height even when empty. */}
-                    <p className="mt-1.5 break-words text-sm font-medium">
-                      {trackDisplayTitle(p.track_title, p.file_path)}
-                    </p>
-                    <p className="h-4 truncate text-xs text-muted-foreground">{p.artist_name ?? ""}</p>
-                  </button>
+                      {/* Titles wrap freely; covers stay aligned because they sit
+                          above the captions (tiles are top-anchored). The artist
+                          row keeps its height even when empty. */}
+                      <p className="mt-1.5 break-words text-sm font-medium">
+                        {trackDisplayTitle(p.track_title, p.file_path)}
+                      </p>
+                      <p className="h-4 truncate text-xs text-muted-foreground">{p.artist_name ?? ""}</p>
+                    </ContextMenuTrigger>
+                    <ContextMenuContent>
+                      <ContextMenuItem onClick={() => void dismissListen(p)}>
+                        <X size={14} />
+                        Remove from recently listened to
+                      </ContextMenuItem>
+                    </ContextMenuContent>
+                  </ContextMenu>
                 ))}
               </HomeRail>
             </>

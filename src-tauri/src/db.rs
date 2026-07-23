@@ -833,6 +833,49 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .execute(&pool)
     .await?;
 
+    // ── Recently-listened dismissals ──────────────────────────────────
+    // "Remove from Recently listened to": hides a track's plays UP TO the
+    // dismissal moment from recency surfaces without deleting the play log
+    // (scrobble stats keep everything). A newer play resurfaces the track.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS music_listen_dismiss (
+            track_id INTEGER PRIMARY KEY,
+            dismissed_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (track_id) REFERENCES track(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // ── Sounds domain (ambient/rain/etc inside a music library) ───────
+    // library_path.kind has a baked CHECK ('movie','show','music') on existing
+    // databases, so sounds bases are ordinary kind='music' rows plus a row
+    // here. The scanner stamps albums found under these bases into
+    // sound_album; music surfaces exclude sound-marked albums the same way
+    // they exclude loose containers, and the Sounds node shows only them.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS sound_path (
+            library_id TEXT NOT NULL,
+            path TEXT NOT NULL,
+            PRIMARY KEY (library_id, path),
+            FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // Presence of a row = the album (or loose container) is a SOUND album.
+    // Rebuilt by scan/rescan from folder placement; retyping a folder flips
+    // its albums on the next rescan.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS sound_album (
+            album_id INTEGER PRIMARY KEY,
+            FOREIGN KEY (album_id) REFERENCES album(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     // ── Music scan issues ─────────────────────────────────────────────
     // Only files the scanner literally could not read (corrupt/undecodable)
     // land here — under-tagged files import via fallbacks instead. Surfaced

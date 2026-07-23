@@ -285,8 +285,63 @@ pub async fn get_continue_watching(
     state: State<'_, AppState>,
     limit: Option<i64>,
 ) -> Result<Vec<ContinueWatchingItem>, String> {
+    video_rail(&state, limit.unwrap_or(20).max(1), false).await
+}
+
+/// Watch HISTORY, most recent first — everything played, whatever its state
+/// (in-progress, finished, rewatched). Same card shape as continue-watching;
+/// one card per show.
+#[tauri::command]
+pub async fn get_recently_watched(
+    state: State<'_, AppState>,
+    limit: Option<i64>,
+) -> Result<Vec<ContinueWatchingItem>, String> {
+    video_rail(&state, limit.unwrap_or(20).max(1), true).await
+}
+
+/// "Remove from Recently watched": clears the recency timestamps (the rails'
+/// inclusion signal) while leaving watched flags and resume positions alone —
+/// grid checkmarks/bars and detail-page Resume survive. Note this removes an
+/// in-progress item from Continue Watching too (recency is what put it
+/// there); the next play re-stamps everything.
+#[tauri::command]
+pub async fn dismiss_recently_watched(
+    state: State<'_, AppState>,
+    kind: String,
+    id: i64,
+) -> Result<(), String> {
+    match kind.as_str() {
+        "movie" => {
+            sqlx::query("UPDATE movie_watch SET last_played_at = NULL WHERE entry_id = ?")
+                .bind(id)
+                .execute(&state.app_db)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        "show" => {
+            sqlx::query(
+                "UPDATE episode_watch SET last_played_at = NULL WHERE episode_id IN (
+                    SELECT e.id FROM episode e JOIN season s ON s.id = e.season_id WHERE s.show_id = ?
+                 )",
+            )
+            .bind(id)
+            .execute(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+        }
+        other => return Err(format!("unknown kind '{other}'")),
+    }
+    Ok(())
+}
+
+/// Shared card builder for the Home rails. history=false → strictly
+/// in-progress (continue watching); history=true → any played row.
+async fn video_rail(
+    state: &State<'_, AppState>,
+    cap: i64,
+    history: bool,
+) -> Result<Vec<ContinueWatchingItem>, String> {
     let pool = &state.app_db;
-    let cap = limit.unwrap_or(20).max(1);
     let mut items: Vec<ContinueWatchingItem> = Vec::new();
 
     // The frame captured at player close, keyed the same way it was written.
@@ -300,23 +355,29 @@ pub async fn get_continue_watching(
     let mut covers_cache: std::collections::HashMap<String, std::collections::HashMap<String, Vec<String>>> =
         std::collections::HashMap::new();
 
+    let movie_filter = if history {
+        ""
+    } else {
+        "AND mw.watched = 0 AND mw.position_secs IS NOT NULL"
+    };
+    let movie_sql = format!(
+        "SELECT me.id, me.library_id, m.title, m.folder_path, m.selected_cover,
+                mw.position_secs, mw.duration_secs, mw.last_played_at
+         FROM movie_watch mw
+         JOIN movie m ON m.id = mw.entry_id
+         JOIN media_entry me ON me.id = mw.entry_id
+         WHERE mw.last_played_at IS NOT NULL
+           {movie_filter}
+           AND NOT EXISTS (SELECT 1 FROM interactive_resume ir WHERE ir.entry_id = mw.entry_id)
+         ORDER BY mw.last_played_at DESC
+         LIMIT ?"
+    );
     let movie_rows: Vec<(i64, String, String, String, Option<String>, Option<f64>, Option<f64>, String)> =
-        sqlx::query_as(
-            "SELECT me.id, me.library_id, m.title, m.folder_path, m.selected_cover,
-                    mw.position_secs, mw.duration_secs, mw.last_played_at
-             FROM movie_watch mw
-             JOIN movie m ON m.id = mw.entry_id
-             JOIN media_entry me ON me.id = mw.entry_id
-             WHERE mw.watched = 0 AND mw.position_secs IS NOT NULL
-               AND mw.last_played_at IS NOT NULL
-               AND NOT EXISTS (SELECT 1 FROM interactive_resume ir WHERE ir.entry_id = mw.entry_id)
-             ORDER BY mw.last_played_at DESC
-             LIMIT ?",
-        )
-        .bind(cap)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| e.to_string())?;
+        sqlx::query_as(&movie_sql)
+            .bind(cap)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| e.to_string())?;
 
     for (entry_id, library_id, title, folder_path, selected_cover, position_secs, duration_secs, last_played_at) in movie_rows {
         if !covers_cache.contains_key(&library_id) {
@@ -351,31 +412,43 @@ pub async fn get_continue_watching(
         });
     }
 
-    // Shows with any episode activity, most recent first; each resolves its
-    // continue target the same way the show page does (fully-watched and
-    // never-started shows resolve to None and drop out).
-    let show_rows: Vec<(i64, String, String, String, Option<String>, String)> = sqlx::query_as(
+    // Shows: strictly IN-PROGRESS episodes (position set, unwatched), newest
+    // activity first, one card per show. Deliberately NOT the show page's
+    // continue logic — its first-unwatched fallback surfaces S1E1 for a show
+    // started mid-run, and it makes "mark as watched" unable to clear a card.
+    // The rail is "where you left off", and only a mid-episode is that.
+    let ep_filter = if history {
+        ""
+    } else {
+        "AND ew.position_secs IS NOT NULL AND ew.watched = 0"
+    };
+    let ep_sql = format!(
         "SELECT sh.id, me.library_id, sh.title, sh.folder_path, sh.selected_cover,
-                MAX(ew.last_played_at) as last
+                e.id, se.season_number, e.episode_number, e.title,
+                ew.position_secs, ew.duration_secs, ew.last_played_at
          FROM episode_watch ew
          JOIN episode e ON e.id = ew.episode_id
          JOIN season se ON se.id = e.season_id
          JOIN show sh ON sh.id = se.show_id
          JOIN media_entry me ON me.id = sh.id
          WHERE ew.last_played_at IS NOT NULL
-         GROUP BY sh.id
-         ORDER BY last DESC
-         LIMIT ?",
-    )
-    .bind(cap)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| e.to_string())?;
+           {ep_filter}
+         ORDER BY ew.last_played_at DESC",
+    );
+    let ep_rows: Vec<(i64, String, String, String, Option<String>, i64, Option<i64>, Option<i64>, String, Option<f64>, Option<f64>, String)> =
+        sqlx::query_as(&ep_sql)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| e.to_string())?;
 
-    for (show_id, library_id, title, folder_path, selected_cover, last_played_at) in show_rows {
-        let Some(target) = continue_for_show(pool, show_id).await? else {
-            continue;
-        };
+    let mut seen_shows: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    for (show_id, library_id, title, folder_path, selected_cover, episode_id, season_number, episode_number, episode_title, position_secs, duration_secs, last_played_at) in ep_rows {
+        if !seen_shows.insert(show_id) {
+            continue; // one card per show — the most recent episode wins
+        }
+        if items.len() >= cap as usize * 2 {
+            break; // plenty to merge/sort below
+        }
         if !covers_cache.contains_key(&library_id) {
             let map = crate::commands::get_all_cached_covers(pool, &library_id)
                 .await
@@ -389,16 +462,6 @@ pub async fn get_continue_watching(
                 _ => covers.first().cloned(),
             }
         });
-        let ep: Option<(Option<String>, Option<f64>)> = sqlx::query_as(
-            "SELECT e.title, ew.duration_secs FROM episode e
-             LEFT JOIN episode_watch ew ON ew.episode_id = e.id
-             WHERE e.id = ?",
-        )
-        .bind(target.episode_id)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| e.to_string())?;
-        let (episode_title, duration_secs) = ep.unwrap_or((None, None));
         let backdrop = crate::commands::entry_backdrop(pool, show_id).await?;
         items.push(ContinueWatchingItem {
             kind: "show".into(),
@@ -406,17 +469,17 @@ pub async fn get_continue_watching(
             library_id,
             title,
             cover,
-            // Frames are per-EPISODE — only present when the continue target
-            // is the episode that was actually playing at close.
-            frame: frame_for("episode", target.episode_id),
+            // Frames are per-EPISODE — captured when that episode was the one
+            // playing at close.
+            frame: frame_for("episode", episode_id),
             backdrop,
             last_played_at,
-            position_secs: target.position_secs,
+            position_secs,
             duration_secs,
-            episode_id: Some(target.episode_id),
-            season_number: target.season_number,
-            episode_number: target.episode_number,
-            episode_title: episode_title.filter(|t| !t.is_empty()),
+            episode_id: Some(episode_id),
+            season_number,
+            episode_number,
+            episode_title: Some(episode_title).filter(|t| !t.is_empty()),
         });
     }
 

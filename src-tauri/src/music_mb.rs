@@ -165,7 +165,8 @@ pub async fn music_match_state(
          JOIN media_entry me ON me.id = al.id
          WHERE me.library_id = ?
            AND NOT EXISTS (SELECT 1 FROM mb_credit_fetch f WHERE f.album_id = al.id)
-           AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = al.id)",
+           AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = al.id)
+           AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = al.id)",
     )
     .bind(&library_id)
     .fetch_one(pool)
@@ -275,6 +276,7 @@ async fn enrich_albums(
          WHERE me.library_id = ?
            AND NOT EXISTS (SELECT 1 FROM mb_credit_fetch f WHERE f.album_id = al.id)
            AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = al.id)
+           AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = al.id)
          ORDER BY al.sort_title COLLATE NOCASE",
     )
     .bind(library_id)

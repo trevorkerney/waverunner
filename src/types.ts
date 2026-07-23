@@ -140,6 +140,7 @@ export type ViewSpec =
   | { kind: "playlists";           libraryId: string }
   | { kind: "playlist-detail";    libraryId: string; playlistId: number; playlistName: string; collectionId: number | null }
   | { kind: "albums";             libraryId: string }
+  | { kind: "sounds";             libraryId: string }
   | { kind: "tracks";             libraryId: string }
   | { kind: "music-issues";       libraryId: string };
 
@@ -175,6 +176,7 @@ export interface LibraryCounts {
   artists?: number;
   albums?: number;
   tracks?: number;
+  sounds?: number;
   issues?: number;
 }
 

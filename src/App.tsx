@@ -191,6 +191,14 @@ function App() {
     }
   }, [playerState.isActive]);
 
+  // Watch state changed outside playback (Home's mark-watched menu) — patch
+  // the baked-in flags across grids/caches the same way a player close does.
+  useEffect(() => {
+    const onChanged = () => refreshWatchFlagsRef.current();
+    window.addEventListener("waverunner:watch-changed", onChanged);
+    return () => window.removeEventListener("waverunner:watch-changed", onChanged);
+  }, []);
+
   // Keep webview transparent while player is active (full or minimized), so
   // mpv video shows through the transparent dock/takeover region.
   useEffect(() => {
@@ -445,6 +453,7 @@ function App() {
         refreshGenresFor(lib.id);
       } else if (lib.format === "music") {
         refreshMusicCountsFor(lib.id);
+        refreshGenresFor(lib.id);
       }
     });
   }, [libraries, refreshCountsFor, refreshGenresFor, refreshMusicCountsFor]);
@@ -834,13 +843,15 @@ function App() {
           }
           case "movies-only":
           case "shows-only":
-          case "albums": {
+          case "albums":
+          case "sounds": {
             const res = await invoke<EntriesResponse>("get_entries", {
               libraryId: view.libraryId,
               parentId: null,
               entryTypeFilter:
                 view.kind === "movies-only" ? "movie"
                 : view.kind === "shows-only" ? "show"
+                : view.kind === "sounds" ? "sound"
                 : "album",
             });
             entries = res.entries;
@@ -988,13 +999,14 @@ function App() {
           entries: fresh, sort_mode: fresh_sort,
           selected_preset_id: fresh_selected_preset_id, presets: fresh_presets,
         });
-      } else if (view.kind === "movies-only" || view.kind === "shows-only" || view.kind === "albums") {
+      } else if (view.kind === "movies-only" || view.kind === "shows-only" || view.kind === "albums" || view.kind === "sounds") {
         const res = await invoke<EntriesResponse>("get_entries", {
           libraryId: view.libraryId,
           parentId: null,
           entryTypeFilter:
             view.kind === "movies-only" ? "movie"
             : view.kind === "shows-only" ? "show"
+            : view.kind === "sounds" ? "sound"
             : "album",
         });
         fresh = res.entries;
@@ -1206,6 +1218,7 @@ function App() {
           : kind === "playlists" || kind === "playlist-detail" ? "Playlists"
           : kind === "genres" ? "Genres"
           : kind === "albums" ? "Albums"
+          : kind === "sounds" ? "Sounds"
           : kind === "tracks" ? "Tracks"
           : kind === "music-issues" ? "Needs attention"
           : "";
@@ -1803,10 +1816,14 @@ function App() {
       // LOCALLY (album entries carry sort_date), mirroring the backend's
       // order clauses — the reorder commits on the click frame, with no
       // refetch gap stuttering the start of the FLIP animation.
-      if (activeView?.kind === "albums") {
+      if (activeView?.kind === "albums" || activeView?.kind === "sounds") {
         const next = mode === "date" || mode === "date-desc" ? mode : "alpha";
         setSortMode(next);
-        invoke("set_setting", { key: `music_albums_sort_mode:${selectedLibrary.id}`, value: next }).catch(() => {});
+        const sortKey =
+          activeView.kind === "sounds"
+            ? `music_sounds_sort_mode:${selectedLibrary.id}`
+            : `music_albums_sort_mode:${selectedLibrary.id}`;
+        invoke("set_setting", { key: sortKey, value: next }).catch(() => {});
         const byTitle = (a: MediaEntry, b: MediaEntry) =>
           sortTitleKey(a.title).localeCompare(sortTitleKey(b.title));
         const cmp = (a: MediaEntry, b: MediaEntry): number => {
@@ -2519,8 +2536,8 @@ function App() {
             // Artist/album details highlight the section they were reached
             // from (Albums when browsing the albums grid, Artists otherwise).
             if (selectedEntry?.entry_type === "artist" || selectedEntry?.entry_type === "album") {
-              return activeView.kind === "albums"
-                ? { kind: "albums", libraryId: activeView.libraryId }
+              return activeView.kind === "albums" || activeView.kind === "sounds"
+                ? { kind: activeView.kind, libraryId: activeView.libraryId }
                 : { kind: "library-root", libraryId: activeView.libraryId };
             }
             if (activeView.kind === "person-detail") {
@@ -2591,6 +2608,7 @@ function App() {
               // libraries have their own counts shape.
               if (selectedLibrary.format === "music") {
                 refreshMusicCountsFor(selectedLibrary.id);
+                refreshGenresFor(selectedLibrary.id);
               } else {
                 refreshCountsFor(selectedLibrary.id);
                 refreshGenresFor(selectedLibrary.id);
