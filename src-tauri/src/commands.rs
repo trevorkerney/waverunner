@@ -647,7 +647,7 @@ pub async fn create_library(
     // Each folder's kind must be valid for the library format.
     let valid_kinds: &[&str] = match format.as_str() {
         "video" => &["movie", "show"],
-        "music" => &["music"],
+        "music" => &["music", "sounds"],
         _ => &[],
     };
     for lp in &paths {
