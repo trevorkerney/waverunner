@@ -18,6 +18,13 @@ export function queueFromRelease(detail: MusicAlbumDetail, release: MusicRelease
       t.credits.length > 0
         ? t.credits.map((c) => c.name).join(", ")
         : t.artist_name ?? detail.artist_title,
+    artistId: t.credits.find((c) => c.artist_id != null)?.artist_id ?? detail.artist_id,
+    artists:
+      t.credits.length > 0
+        ? t.credits.map((c) => ({ name: c.name, artistId: c.artist_id }))
+        : (t.artist_name ?? detail.artist_title)
+          ? [{ name: (t.artist_name ?? detail.artist_title)!, artistId: detail.artist_id }]
+          : [],
     albumId: detail.id,
     albumTitle: detail.title,
     cover,
@@ -60,4 +67,21 @@ export function fmtAlbumRuntime(secs: number): string {
   const h = Math.floor(secs / 3600);
   const m = Math.round((secs % 3600) / 60);
   return h > 0 ? `${h} hr ${m} min` : `${m} min`;
+}
+
+/** "3 min ago"-style timestamps for history surfaces. SQLite writes UTC
+ *  without a zone marker, so one is appended before parsing. */
+export function fmtRelative(timestamp: string): string {
+  const then = Date.parse(timestamp.replace(" ", "T") + "Z");
+  if (Number.isNaN(then)) return "";
+  const secs = Math.max(0, Math.floor((Date.now() - then) / 1000));
+  if (secs < 60) return "just now";
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return `${mins} min ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs} hr ago`;
+  const days = Math.floor(hrs / 24);
+  if (days === 1) return "yesterday";
+  if (days < 7) return `${days} days ago`;
+  return new Date(then).toLocaleDateString();
 }

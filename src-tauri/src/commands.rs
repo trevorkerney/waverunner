@@ -124,6 +124,10 @@ pub struct MediaEntry {
     /// pivot — the offered action is Mark watched — but never badges.
     #[serde(default)]
     pub has_progress: bool,
+    /// Full release date (YYYY or YYYY-MM-DD) for client-side date sorting.
+    /// Only music album entries populate it; absent everywhere else.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort_date: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -698,6 +702,19 @@ pub async fn create_library(
     let cancel = &state.cancel_creation;
     let pool = &state.app_db;
 
+    // Both formats run the multi-step import wizard: the setup row keeps the
+    // library hidden (and resumable as "Finish setup…") until the wizard
+    // finishes. External matching (MusicBrainz / TMDB) is NOT auto-spawned —
+    // the wizard's match step drives it in the foreground, if elected.
+    sqlx::query(
+        "INSERT INTO library_setup (library_id, stage) VALUES (?, 'scan')
+         ON CONFLICT(library_id) DO UPDATE SET stage = 'scan', updated_at = datetime('now')",
+    )
+    .bind(&id)
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
     let scan_result: Result<(), String> = async {
         match format.as_str() {
             "video" => {
@@ -712,18 +729,6 @@ pub async fn create_library(
                 }
             }
             "music" => {
-                // Music imports run the multi-step wizard: the setup row keeps
-                // the library hidden (and resumable) until the wizard finishes.
-                // The MusicBrainz pass is NOT auto-spawned — the wizard's match
-                // step drives it in the foreground, if the user elects it.
-                sqlx::query(
-                    "INSERT INTO library_setup (library_id, stage) VALUES (?, 'scan')
-                     ON CONFLICT(library_id) DO UPDATE SET stage = 'scan', updated_at = datetime('now')",
-                )
-                .bind(&id)
-                .execute(pool)
-                .await
-                .map_err(|e| e.to_string())?;
                 sqlx::query("DELETE FROM media_entry WHERE library_id = ?")
                     .bind(&id)
                     .execute(pool)
@@ -746,20 +751,18 @@ pub async fn create_library(
                 .execute(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
-            if format == "music" {
-                sqlx::query(
-                    "UPDATE library_setup SET stage = 'match', updated_at = datetime('now') WHERE library_id = ?",
-                )
-                .bind(&id)
-                .execute(&state.app_db)
-                .await
-                .map_err(|e| e.to_string())?;
-                library.setup_stage = Some("match".to_string());
-            }
+            sqlx::query(
+                "UPDATE library_setup SET stage = 'match', updated_at = datetime('now') WHERE library_id = ?",
+            )
+            .bind(&id)
+            .execute(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+            library.setup_stage = Some("match".to_string());
             Ok(library)
         }
         Err(e) => {
-            if e.contains("cancelled") && format == "music" {
+            if e.contains("cancelled") {
                 // Wizard imports survive a cancelled scan: the library stays,
                 // greyed as "Finish setup…", and resuming re-runs the scan
                 // (a reconciling rescan over whatever landed).
@@ -774,11 +777,7 @@ pub async fn create_library(
                 .bind(&id)
                 .execute(&state.app_db)
                 .await;
-            if e.contains("cancelled") {
-                Err("Library creation cancelled".to_string())
-            } else {
-                Err(e)
-            }
+            Err(e)
         }
     }
 }
@@ -1142,7 +1141,10 @@ pub async fn get_entries(
                 END");
 
             let order_clause: String = match sort_mode.as_str() {
+                // "date" = oldest first (undated lead, SQL NULLs-ASC);
+                // "date-desc" = newest first (undated sink to the bottom).
                 "year" | "date" => format!("ORDER BY {sort_date_expr} ASC, mef.sort_title COLLATE NOCASE ASC"),
+                "date-desc" => format!("ORDER BY {sort_date_expr} DESC, mef.sort_title COLLATE NOCASE ASC"),
                 "custom" => "ORDER BY mef.sort_order ASC, mef.sort_title COLLATE NOCASE ASC".to_string(),
                 _ => "ORDER BY mef.sort_title COLLATE NOCASE ASC".to_string(),
             };
@@ -1225,6 +1227,7 @@ pub async fn get_entries(
                         watch_progress: None,
                         unwatched: false,
                         has_progress: false,
+                        sort_date: None,
                     }
                 })
                 .collect();
@@ -1303,8 +1306,10 @@ pub async fn get_entries(
                 .map(|(v,)| v)
                 .unwrap_or_else(|| "alpha".to_string());
                 let order_clause = match sort_mode.as_str() {
-                    // Newest first — the music-app convention for date sorts.
-                    "date" => "ORDER BY al.release_date IS NULL, al.release_date DESC, al.sort_title COLLATE NOCASE ASC",
+                    // App-wide date vocabulary: "date" = oldest first, "date-desc"
+                    // = newest first. Undated albums sink in both directions.
+                    "date" => "ORDER BY al.release_date IS NULL, al.release_date ASC, al.sort_title COLLATE NOCASE ASC",
+                    "date-desc" => "ORDER BY al.release_date IS NULL, al.release_date DESC, al.sort_title COLLATE NOCASE ASC",
                     _ => "ORDER BY al.sort_title COLLATE NOCASE ASC",
                 };
                 let query_str = format!(
@@ -1328,7 +1333,7 @@ pub async fn get_entries(
                         MediaEntry {
                             id,
                             title,
-                            year: release_date.map(|d| d.chars().take(4).collect()),
+                            year: release_date.as_ref().map(|d| d.chars().take(4).collect()),
                             end_year: None,
                             folder_path,
                             parent_id,
@@ -1346,6 +1351,7 @@ pub async fn get_entries(
                             watch_progress: None,
                             unwatched: false,
                             has_progress: false,
+                            sort_date: release_date,
                         }
                     })
                     .collect();
@@ -1489,6 +1495,7 @@ pub async fn get_entries(
                         watch_progress: None,
                         unwatched: false,
                         has_progress: false,
+                        sort_date: None,
                     }
                 })
                 .collect();
@@ -1614,7 +1621,7 @@ pub async fn search_entries(
             let mut entries: Vec<MediaEntry> = rows.into_iter()
                 .map(|(id, title, year, end_year, folder_path, parent_id, entry_type, selected_cover, tmdb_id, season_display)| {
                     let covers = covers_map.remove(&folder_path).unwrap_or_default();
-                    MediaEntry { id, title, year, end_year, folder_path, parent_id, entry_type, covers, selected_cover, child_count: 0, season_display, collection_display: None, role_display: None, tmdb_id, link_id: None, interactive: false, watched: false, watch_progress: None, unwatched: false, has_progress: false }
+                    MediaEntry { id, title, year, end_year, folder_path, parent_id, entry_type, covers, selected_cover, child_count: 0, season_display, collection_display: None, role_display: None, tmdb_id, link_id: None, interactive: false, watched: false, watch_progress: None, unwatched: false, has_progress: false, sort_date: None }
                 })
                 .collect();
 
@@ -1694,7 +1701,7 @@ pub async fn search_entries(
                             .remove(&crate::music_art::artist_fetch_rel(id))
                             .unwrap_or_default(),
                     );
-                    MediaEntry { id, title, year: None, end_year: None, folder_path, parent_id: None, entry_type: "artist".to_string(), covers, selected_cover, child_count: 0, season_display: None, collection_display: None, role_display: None, tmdb_id: None, link_id: None, interactive: false, watched: false, watch_progress: None, unwatched: false, has_progress: false }
+                    MediaEntry { id, title, year: None, end_year: None, folder_path, parent_id: None, entry_type: "artist".to_string(), covers, selected_cover, child_count: 0, season_display: None, collection_display: None, role_display: None, tmdb_id: None, link_id: None, interactive: false, watched: false, watch_progress: None, unwatched: false, has_progress: false, sort_date: None }
                 })
                 .collect();
             results.extend(album_rows.into_iter().map(
@@ -1703,7 +1710,7 @@ pub async fn search_entries(
                         MediaEntry {
                             id,
                             title,
-                            year: release_date.map(|d| d.chars().take(4).collect()),
+                            year: release_date.as_ref().map(|d| d.chars().take(4).collect()),
                             end_year: None,
                             folder_path,
                             parent_id,
@@ -1721,6 +1728,7 @@ pub async fn search_entries(
                             watch_progress: None,
                             unwatched: false,
                             has_progress: false,
+                            sort_date: release_date,
                         }
                     },
                 ));
@@ -1861,7 +1869,7 @@ async fn entry_backdrop_list(pool: &sqlx::SqlitePool, entry_id: i64) -> Result<V
 
 /// Backdrop to show on a detail page: the user-selected one if it still exists
 /// in the cache, otherwise the first cached backdrop, if any.
-async fn entry_backdrop(pool: &sqlx::SqlitePool, entry_id: i64) -> Result<Option<String>, String> {
+pub(crate) async fn entry_backdrop(pool: &sqlx::SqlitePool, entry_id: i64) -> Result<Option<String>, String> {
     let all = entry_backdrop_list(pool, entry_id).await?;
     if all.is_empty() {
         return Ok(None);
@@ -2289,6 +2297,12 @@ pub async fn apply_tmdb_metadata(
     entry_id: i64,
     fields: TmdbFieldSelection,
 ) -> Result<(), String> {
+    // A match settles the entry — drop any recorded failed-attempt status.
+    let _ = sqlx::query("DELETE FROM tmdb_match_attempt WHERE entry_id = ?")
+        .bind(entry_id)
+        .execute(&state.app_db)
+        .await;
+
     // Collect (person_db_id, tmdb_id) for post-apply profile-image fetch.
     let mut new_people: Vec<(i64, i64, Option<String>)> = Vec::new();
 
@@ -3096,6 +3110,7 @@ pub async fn get_entries_for_genre(
                 watch_progress: None,
                 unwatched: false,
                 has_progress: false,
+                sort_date: None,
             }
         })
         .collect();
@@ -3879,6 +3894,7 @@ pub async fn get_entries_for_person(
                 watch_progress: None,
                 unwatched: false,
                 has_progress: false,
+                sort_date: None,
             }
         })
         .collect();
@@ -4324,7 +4340,7 @@ pub async fn add_media_link(
 
     // Cross-library linking is rejected in v1: the target entry must live in the same library
     // as the parent playlist. Resolve the playlist's library_id from whichever parent is set.
-    // Collections are also rejected — only leaf media (movie/show) can be linked into playlists.
+    // Collections are also rejected — only leaf media (movie/show/track) can be linked into playlists.
     let target_row: Option<(String, String)> = sqlx::query_as(
         "SELECT library_id, entry_type FROM media_entry_full WHERE id = ?",
     )
@@ -4333,8 +4349,8 @@ pub async fn add_media_link(
     .await
     .map_err(|e| e.to_string())?;
     let (target_lib, target_type) = target_row.ok_or("Target media entry not found")?;
-    if target_type != "movie" && target_type != "show" {
-        return Err(format!("Cannot add {target_type} to a playlist — only movies and shows can be linked"));
+    if target_type != "movie" && target_type != "show" && target_type != "track" {
+        return Err(format!("Cannot add {target_type} to a playlist — only movies, shows, and tracks can be linked"));
     }
 
     let parent_lib: Option<(String,)> = if let Some(pid) = parent_playlist_id {
@@ -5093,6 +5109,7 @@ pub async fn get_playlist_contents(
         CASE \
           WHEN mef.entry_type = 'movie' THEN SUBSTR(mef.release_date, 1, 4) \
           WHEN mef.entry_type = 'show' THEN (SELECT MIN(yr) FROM ({show_episode_years})) \
+          WHEN mef.entry_type = 'track' THEN SUBSTR(pal.release_date, 1, 4) \
         END");
     let end_year_expr = format!("\
         CASE WHEN mef.entry_type = 'show' THEN \
@@ -5108,27 +5125,39 @@ pub async fn get_playlist_contents(
         CASE \
           WHEN mef.entry_type = 'movie' THEN mef.release_date \
           WHEN mef.entry_type = 'show' THEN (SELECT MIN(dt) FROM ({show_episode_dates})) \
+          WHEN mef.entry_type = 'track' THEN pal.release_date \
         END");
     // COALESCE(link.selected_cover, target.selected_cover) — the link's own override
     // wins; NULL falls back to whatever the target entry currently shows. The `?`
     // placeholders handle "playlist root" vs "nested collection".
+    // Track links hydrate through their parent album (pal): folder_path keys
+    // the covers map (a track has no folder of its own), the album's cover and
+    // release date fill in, and the display artist becomes the card subtitle
+    // (canonicalized below). Loose tracks link fine — their hidden container
+    // just yields no cover/date.
     let link_query = format!(
         "SELECT ml.id, ml.sort_order, \
                 mef.id, mef.title, \
                 {year_expr} as year, \
                 {end_year_expr} as end_year, \
-                mef.folder_path, mef.parent_id, mef.entry_type, \
-                COALESCE(ml.selected_cover, mef.selected_cover) as selected_cover, \
+                COALESCE(mef.folder_path, pal.folder_path, '') as folder_path, \
+                mef.parent_id, mef.entry_type, \
+                COALESCE(ml.selected_cover, mef.selected_cover, pal.selected_cover) as selected_cover, \
                 mef.sort_title, \
                 {SEASON_DISPLAY_EXPR} as season_display, \
-                {sort_date_expr} as sort_date \
+                {sort_date_expr} as sort_date, \
+                CASE WHEN mef.entry_type = 'track' THEN COALESCE(ptm.artist_name, par.title) END as track_artist \
          FROM media_link ml \
          JOIN media_entry_full mef ON mef.id = ml.target_entry_id \
+         LEFT JOIN album pal ON pal.id = mef.parent_id AND mef.entry_type = 'track' \
+         LEFT JOIN media_entry palme ON palme.id = pal.id \
+         LEFT JOIN artist par ON par.id = palme.parent_id \
+         LEFT JOIN track_meta ptm ON ptm.track_id = mef.id \
          WHERE (ml.parent_playlist_id IS ? AND ml.parent_collection_id IS ?)"
     );
     let link_rows: Vec<(
         i64, i64, i64,
-        String, Option<String>, Option<String>, String, Option<i64>, String, Option<String>, Option<String>, Option<String>, Option<String>,
+        String, Option<String>, Option<String>, String, Option<i64>, String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>,
     )> = sqlx::query_as(&link_query)
         .bind(if parent_collection_id.is_none() { Some(playlist_id) } else { None })
         .bind(parent_collection_id)
@@ -5152,8 +5181,23 @@ pub async fn get_playlist_contents(
     // each item to apply the current sort mode uniformly after merging.
     let mut items: Vec<(i64, String, Option<String>, MediaEntry)> = Vec::new();
 
-    for (link_id, sort_order, id, title, year, end_year, folder_path, parent_id, entry_type, selected_cover, sort_title, season_display, sort_date) in link_rows {
+    // Track subtitles show the display artist under the artist's CURRENT title
+    // (renames propagate) — resolve the maps once, only when tracks are linked.
+    let artist_maps = if link_rows.iter().any(|r| r.8 == "track") {
+        Some(crate::music::artist_resolution_maps(&state.app_db, &library_id).await?)
+    } else {
+        None
+    };
+
+    for (link_id, sort_order, id, title, year, end_year, folder_path, parent_id, entry_type, selected_cover, sort_title, season_display, sort_date, track_artist) in link_rows {
         let covers = covers_map.get(&folder_path).cloned().unwrap_or_default();
+        let collection_display = match (&artist_maps, track_artist) {
+            (Some((by_lower, titles)), Some(name)) if entry_type == "track" => {
+                crate::music::canonical_artist_name(Some(name), by_lower, titles)
+            }
+            (_, name) if entry_type == "track" => name,
+            _ => None,
+        };
         let entry = MediaEntry {
             id,
             title,
@@ -5166,7 +5210,7 @@ pub async fn get_playlist_contents(
             selected_cover,
             child_count: 0,
             season_display,
-            collection_display: None,
+            collection_display,
             role_display: None,
             tmdb_id: None,
             link_id: Some(link_id),
@@ -5175,6 +5219,7 @@ pub async fn get_playlist_contents(
             watch_progress: None,
             unwatched: false,
             has_progress: false,
+            sort_date: None,
         };
         items.push((sort_order, sort_title.unwrap_or_default(), sort_date, entry));
     }
@@ -5282,6 +5327,7 @@ pub async fn get_playlist_contents(
             watch_progress: None,
             unwatched: false,
             has_progress: false,
+            sort_date: None,
         };
         items.push((sort_order, sort_title, min_date, entry));
     }
@@ -6049,7 +6095,7 @@ pub async fn set_sort_mode(
     scope_kind: Option<String>,
     sort_mode: String,
 ) -> Result<(), String> {
-    if !["alpha", "date", "custom"].contains(&sort_mode.as_str()) {
+    if !["alpha", "date", "date-desc", "custom"].contains(&sort_mode.as_str()) {
         return Err("Invalid sort mode".to_string());
     }
 
@@ -7195,7 +7241,7 @@ async fn insert_cached_images(
     Ok(())
 }
 
-async fn get_all_cached_covers(pool: &sqlx::SqlitePool, library_id: &str) -> Result<HashMap<String, Vec<String>>, sqlx::Error> {
+pub(crate) async fn get_all_cached_covers(pool: &sqlx::SqlitePool, library_id: &str) -> Result<HashMap<String, Vec<String>>, sqlx::Error> {
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT entry_folder_path, cached_path FROM cached_images WHERE library_id = ? AND image_type = 'cover' ORDER BY entry_folder_path, source_filename",
     )
@@ -8748,6 +8794,121 @@ pub async fn get_tmdb_bulk_targets(
     })
 }
 
+// ---------- TMDB match attempts (video metadata center) ----------
+
+/// Record the outcome of an automatic match try that DIDN'T settle an entry.
+/// status: "notfound" (no results) | "ambiguous" (no confident winner).
+/// Applying a match later (auto or manual) deletes the row.
+#[tauri::command]
+pub async fn record_tmdb_match_attempt(
+    state: tauri::State<'_, AppState>,
+    entry_id: i64,
+    status: String,
+    detail: Option<String>,
+) -> Result<(), String> {
+    if !matches!(status.as_str(), "notfound" | "ambiguous") {
+        return Err(format!("Invalid match attempt status: {status}"));
+    }
+    sqlx::query(
+        "INSERT INTO tmdb_match_attempt (entry_id, status, detail) VALUES (?, ?, ?)
+         ON CONFLICT(entry_id) DO UPDATE SET status = excluded.status,
+             detail = excluded.detail, attempted_at = datetime('now')",
+    )
+    .bind(entry_id)
+    .bind(&status)
+    .bind(&detail)
+    .execute(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+pub struct VideoUnmatchedRow {
+    pub id: i64,
+    pub title: String,
+    pub year: Option<String>,
+    /// None = never attempted; "notfound" | "ambiguous" otherwise.
+    pub status: Option<String>,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VideoMatchReport {
+    pub movies: Vec<VideoUnmatchedRow>,
+    pub shows: Vec<VideoUnmatchedRow>,
+    pub total_movies: i64,
+    pub matched_movies: i64,
+    pub total_shows: i64,
+    pub matched_shows: i64,
+}
+
+/// The video metadata center's summary: every unmatched movie/show with its
+/// last attempt status, plus matched/total counts for the header line.
+#[tauri::command]
+pub async fn get_video_match_report(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+) -> Result<VideoMatchReport, String> {
+    let movies: Vec<(i64, String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT m.id, m.title, SUBSTR(m.release_date, 1, 4), ma.status, ma.detail \
+         FROM movie m JOIN media_entry me ON me.id = m.id \
+         LEFT JOIN tmdb_match_attempt ma ON ma.entry_id = m.id \
+         WHERE me.library_id = ? AND (m.tmdb_id IS NULL OR m.tmdb_id = '') \
+         ORDER BY m.sort_title COLLATE NOCASE",
+    )
+    .bind(&library_id)
+    .fetch_all(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let shows: Vec<(i64, String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT s.id, s.title, \
+                (SELECT MIN(SUBSTR(e.release_date, 1, 4)) FROM episode e \
+                 JOIN season se ON e.season_id = se.id \
+                 WHERE se.show_id = s.id AND e.release_date IS NOT NULL), \
+                ma.status, ma.detail \
+         FROM show s JOIN media_entry me ON me.id = s.id \
+         LEFT JOIN tmdb_match_attempt ma ON ma.entry_id = s.id \
+         WHERE me.library_id = ? AND (s.tmdb_id IS NULL OR s.tmdb_id = '') \
+         ORDER BY s.sort_title COLLATE NOCASE",
+    )
+    .bind(&library_id)
+    .fetch_all(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let (total_movies, matched_movies): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COALESCE(SUM(CASE WHEN m.tmdb_id IS NOT NULL AND m.tmdb_id != '' THEN 1 ELSE 0 END), 0) \
+         FROM movie m JOIN media_entry me ON me.id = m.id WHERE me.library_id = ?",
+    )
+    .bind(&library_id)
+    .fetch_one(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let (total_shows, matched_shows): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COALESCE(SUM(CASE WHEN s.tmdb_id IS NOT NULL AND s.tmdb_id != '' THEN 1 ELSE 0 END), 0) \
+         FROM show s JOIN media_entry me ON me.id = s.id WHERE me.library_id = ?",
+    )
+    .bind(&library_id)
+    .fetch_one(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let to_row = |(id, title, year, status, detail): (i64, String, Option<String>, Option<String>, Option<String>)| {
+        VideoUnmatchedRow { id, title, year: year.filter(|y| !y.is_empty()), status, detail }
+    };
+    Ok(VideoMatchReport {
+        movies: movies.into_iter().map(to_row).collect(),
+        shows: shows.into_iter().map(to_row).collect(),
+        total_movies,
+        matched_movies,
+        total_shows,
+        matched_shows,
+    })
+}
+
 // ---------- Apply TMDB Show Metadata ----------
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -8771,6 +8932,12 @@ pub async fn apply_tmdb_show_metadata(
     show_id: i64,
     fields: TmdbShowFieldSelection,
 ) -> Result<(), String> {
+    // A match settles the entry — drop any recorded failed-attempt status.
+    let _ = sqlx::query("DELETE FROM tmdb_match_attempt WHERE entry_id = ?")
+        .bind(show_id)
+        .execute(&state.app_db)
+        .await;
+
     let mut new_people: Vec<(i64, i64, Option<String>)> = Vec::new();
 
     // Scalar fields on show table

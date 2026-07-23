@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Play, Music2, Disc3, Pencil } from "lucide-react";
+import { Play, Disc3, Pencil, ListPlus, ListStart, ListEnd } from "lucide-react";
 import { Spinner } from "../ui/spinner";
 import { MusicAlbumDetail, MusicRelease, MusicQueueItem, MusicTrack } from "../../types";
 import {
@@ -16,6 +16,8 @@ import {
   ContextMenuItem,
 } from "../ui/context-menu";
 import { TrackEditDialog, AlbumEditDialog } from "./EditDialogs";
+import { PlayingIndicator } from "./PlayingIndicator";
+import { LoveButton, LoveMenuItem } from "./LoveButton";
 import { albumCover, queueFromRelease, defaultRelease, fmtTrackTime, fmtAlbumRuntime, trackDisplayTitle } from "./musicQueue";
 
 interface AlbumDetailPageProps {
@@ -25,8 +27,19 @@ interface AlbumDetailPageProps {
   onPlayQueue: (items: MusicQueueItem[], startIndex: number) => void;
   /** Track id currently in the now-playing bar, for row highlighting. */
   currentTrackId: number | null;
+  /** Whether that track is actively playing — freezes the equalizer when false. */
+  playing?: boolean;
+  /** One-shot request to scroll a track's row into view and select it (the
+   *  now-playing bar's title link). A fresh nonce re-fires on repeat clicks. */
+  focusRequest?: { trackId: number; nonce: number } | null;
   /** Metadata was edited — the host invalidates its grid caches. */
   onMetadataChanged?: () => void;
+  /** Title changed via an edit — the host patches breadcrumbs/nav state. */
+  onTitleChanged?: (entryId: number, newTitle: string) => void;
+  /** Opens the host's add-to-playlist dialog for a track row. */
+  onAddToPlaylist?: (track: { id: number; title: string }) => void;
+  /** "Play next" / "Add to queue" context items. */
+  onEnqueue?: (items: MusicQueueItem[], mode: "next" | "last") => void;
 }
 
 function releaseLabel(r: MusicRelease): string {
@@ -40,7 +53,12 @@ export function AlbumDetailPage({
   onNavigateToArtist,
   onPlayQueue,
   currentTrackId,
+  playing,
+  focusRequest,
   onMetadataChanged,
+  onTitleChanged,
+  onAddToPlaylist,
+  onEnqueue,
 }: AlbumDetailPageProps) {
   const [detail, setDetail] = useState<MusicAlbumDetail | null>(null);
   const [loading, setLoading] = useState(true);
@@ -54,6 +72,9 @@ export function AlbumDetailPage({
   // Navigations clear the page (spinner); edit-triggered refetches are silent
   // and keep the selected release when it still exists.
   const lastEntryRef = useRef(entryId);
+  // Last loaded title, so a silent post-edit refetch can tell the host about
+  // a rename (breadcrumb label) without firing on ordinary navigations.
+  const lastTitleRef = useRef<string | null>(null);
   useEffect(() => {
     let cancelled = false;
     const navigated = lastEntryRef.current !== entryId;
@@ -63,10 +84,15 @@ export function AlbumDetailPage({
       setDetail(null);
       setReleaseId(null);
       setSelectedTrackId(null);
+      lastTitleRef.current = null;
     }
     invoke<MusicAlbumDetail>("get_album_detail", { entryId })
       .then((d) => {
         if (cancelled) return;
+        if (!navigated && lastTitleRef.current !== null && lastTitleRef.current !== d.title) {
+          onTitleChanged?.(entryId, d.title);
+        }
+        lastTitleRef.current = d.title;
         setDetail(d);
         setReleaseId((prev) =>
           !navigated && prev != null && d.releases.some((r) => r.id === prev)
@@ -87,6 +113,20 @@ export function AlbumDetailPage({
     setReloadKey((k) => k + 1);
     onMetadataChanged?.();
   };
+
+  // Consume the focus request once per nonce: select the row and scroll it to
+  // the viewport center. Waits for detail so the rows exist to scroll to.
+  const focusConsumedRef = useRef(0);
+  useEffect(() => {
+    if (!focusRequest || !detail || focusConsumedRef.current === focusRequest.nonce) return;
+    focusConsumedRef.current = focusRequest.nonce;
+    setSelectedTrackId(focusRequest.trackId);
+    requestAnimationFrame(() => {
+      document
+        .querySelector(`[data-music-track-id="${focusRequest.trackId}"]`)
+        ?.scrollIntoView({ block: "center", behavior: "smooth" });
+    });
+  }, [focusRequest, detail]);
 
   const release = useMemo(
     () => detail?.releases.find((r) => r.id === releaseId) ?? null,
@@ -120,7 +160,20 @@ export function AlbumDetailPage({
   };
 
   return (
-    <div className="px-6 pb-8">
+    <div
+      className="px-6 pb-8"
+      // Clicking empty page space deselects the selected track. Guarded so
+      // clicks on rows (buttons) and any other control never count as
+      // "background" — only genuinely inert space clears the selection.
+      onClick={(e) => {
+        if (
+          selectedTrackId !== null &&
+          !(e.target as HTMLElement).closest("button, [role='link'], [role='menu'], input, textarea, select, img")
+        ) {
+          setSelectedTrackId(null);
+        }
+      }}
+    >
       {/* Header */}
       <div className="flex items-end gap-5 py-6">
         {cover ? (
@@ -132,11 +185,13 @@ export function AlbumDetailPage({
           />
         ) : (
           <div className="flex h-48 w-48 shrink-0 items-center justify-center rounded-md bg-muted text-muted-foreground">
-            <Music2 size={56} />
+            <Disc3 size={56} />
           </div>
         )}
         <div className="min-w-0 pb-1">
-          <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Album</p>
+          <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+            {detail.album_type || "album"}
+          </p>
           <h1 className="group/title flex min-w-0 items-center gap-2 font-heading text-3xl font-bold">
             <span className="truncate">{detail.title}</span>
             <button
@@ -222,7 +277,9 @@ export function AlbumDetailPage({
                   <ContextMenuTrigger
                     render={
                       <button
+                        data-music-track-id={t.id}
                         onClick={() => setSelectedTrackId(t.id)}
+                        onContextMenu={() => setSelectedTrackId(t.id)}
                         onDoubleClick={() => playFrom(queueIndex)}
                         className={`group flex w-full items-center gap-3 rounded-md px-2 py-1.5 text-left ${
                           isSelected ? "bg-accent" : "hover:bg-accent/50"
@@ -243,8 +300,11 @@ export function AlbumDetailPage({
                     />
                   </span>
                   <span className="min-w-0 flex-1">
-                    <span className={`block truncate text-sm ${isCurrent ? "font-semibold" : ""}`}>
-                      {trackDisplayTitle(t.title, t.file_path)}
+                    <span className="flex min-w-0 items-baseline gap-1.5 text-sm">
+                      <span className={`truncate ${isCurrent ? "font-semibold text-primary" : ""}`}>
+                        {trackDisplayTitle(t.title, t.file_path)}
+                      </span>
+                      {isCurrent && <PlayingIndicator paused={!playing} className="shrink-0" />}
                     </span>
                     {/* Full credit list, comma-separated, no "feat." framing —
                         names the library knows as artists link to their pages. */}
@@ -278,15 +338,43 @@ export function AlbumDetailPage({
                       {t.play_count}×
                     </span>
                   )}
+                  <LoveButton trackId={t.id} loved={t.loved} reveal="group-hover:opacity-100" />
                   <span className="w-12 shrink-0 text-right font-mono text-xs text-muted-foreground">
                     {fmtTrackTime(t.runtime_secs)}
                   </span>
                   </ContextMenuTrigger>
                   <ContextMenuContent>
+                    {onEnqueue && (
+                      <>
+                        <ContextMenuItem
+                          onClick={() => onEnqueue([queueFromRelease(detail, release!)[queueIndex]], "next")}
+                        >
+                          <ListStart size={14} />
+                          Play next
+                        </ContextMenuItem>
+                        <ContextMenuItem
+                          onClick={() => onEnqueue([queueFromRelease(detail, release!)[queueIndex]], "last")}
+                        >
+                          <ListEnd size={14} />
+                          Add to queue
+                        </ContextMenuItem>
+                      </>
+                    )}
                     <ContextMenuItem onClick={() => setEditTrackId(t.id)}>
                       <Pencil size={14} />
                       Edit metadata
                     </ContextMenuItem>
+                    <LoveMenuItem resolve={() => ({ id: t.id, loved: t.loved })} />
+                    {onAddToPlaylist && (
+                      <ContextMenuItem
+                        onClick={() =>
+                          onAddToPlaylist({ id: t.id, title: trackDisplayTitle(t.title, t.file_path) })
+                        }
+                      >
+                        <ListPlus size={14} />
+                        Add to playlist
+                      </ContextMenuItem>
+                    )}
                   </ContextMenuContent>
                 </ContextMenu>
               );

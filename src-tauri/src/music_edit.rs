@@ -688,6 +688,120 @@ pub async fn reset_album_fields(
 }
 
 // ---------------------------------------------------------------------------
+// Album combining
+// ---------------------------------------------------------------------------
+
+/// Tag-level identity of an album — what the scanner actually groups by
+/// (majority album_artist + album tags, approximated here by one file's
+/// tags). Directives must be keyed on THIS, not DB titles, which MusicBrainz
+/// or user renames may have rewritten.
+async fn album_tag_identity(
+    pool: &sqlx::SqlitePool,
+    library_id: &str,
+    album_id: i64,
+) -> Result<(String, String), String> {
+    let (rel,): (String,) = sqlx::query_as(
+        "SELECT t.file_path FROM track t JOIN media_entry me ON me.id = t.id
+         WHERE me.parent_id = ? LIMIT 1",
+    )
+    .bind(album_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| "Album has no tracks".to_string())?;
+    let abs = crate::music::resolve_music_path(pool, library_id, &rel).await?;
+    let scanned = crate::music::read_track_at(std::path::Path::new(&abs), &rel)?;
+    Ok((scanned.album_artist.to_lowercase(), scanned.album.to_lowercase()))
+}
+
+/// Combine two albums: record a scan-time directive (so the combine survives
+/// every future rescan — scans group by tags and would re-split a one-shot DB
+/// merge), then the caller rescans to apply it. mode 'merge' folds the
+/// source's tracks into the target's default release (disc numbers kept —
+/// inline Disc N sections); 'versions' adds the source as a version in the
+/// release picker. Merge validates that no (disc, track) slot is claimed by
+/// both albums — colliding albums are alternate cuts and must combine as
+/// versions.
+#[tauri::command]
+pub async fn combine_albums(
+    state: State<'_, AppState>,
+    library_id: String,
+    source_id: i64,
+    target_id: i64,
+    mode: String,
+) -> Result<(), String> {
+    let pool = &state.app_db;
+    if !matches!(mode.as_str(), "merge" | "versions") {
+        return Err(format!("Invalid combine mode: {mode}"));
+    }
+    if source_id == target_id {
+        return Err("An album can't be combined with itself".to_string());
+    }
+    for id in [source_id, target_id] {
+        let ok: Option<(i64,)> = sqlx::query_as(
+            "SELECT al.id FROM album al JOIN media_entry me ON me.id = al.id
+             WHERE al.id = ? AND me.library_id = ?
+               AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = al.id)",
+        )
+        .bind(id)
+        .bind(&library_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        if ok.is_none() {
+            return Err("Album not found in this library".to_string());
+        }
+    }
+
+    if mode == "merge" {
+        // (disc, track) slots must not collide — that shape is a versions case.
+        let slots = |album_id: i64| async move {
+            let rows: Vec<(Option<i64>, Option<i64>)> = sqlx::query_as(
+                "SELECT t.disc_number, t.track_number FROM track t
+                 JOIN media_entry me ON me.id = t.id WHERE me.parent_id = ?",
+            )
+            .bind(album_id)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            Ok::<_, String>(
+                rows.into_iter()
+                    .filter_map(|(d, n)| n.map(|n| (d.unwrap_or(1), n)))
+                    .collect::<std::collections::HashSet<(i64, i64)>>(),
+            )
+        };
+        let a = slots(source_id).await?;
+        let b = slots(target_id).await?;
+        if let Some((d, n)) = a.intersection(&b).next() {
+            return Err(format!(
+                "These albums both have a Disc {d}, Track {n} — combine them as versions instead"
+            ));
+        }
+    }
+
+    let (src_artist, src_title) = album_tag_identity(pool, &library_id, source_id).await?;
+    let (tgt_artist, tgt_title) = album_tag_identity(pool, &library_id, target_id).await?;
+    if src_artist == tgt_artist && src_title == tgt_title {
+        return Err("These albums already share the same tag identity".to_string());
+    }
+
+    sqlx::query(
+        "INSERT INTO album_combine (library_id, source_artist, source_title, target_artist, target_title, mode)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&library_id)
+    .bind(&src_artist)
+    .bind(&src_title)
+    .bind(&tgt_artist)
+    .bind(&tgt_title)
+    .bind(&mode)
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tag write-back (explicit, gated, atomic)
 // ---------------------------------------------------------------------------
 

@@ -185,6 +185,15 @@ pub async fn get_show_continue(
     state: State<'_, AppState>,
     show_id: i64,
 ) -> Result<Option<ContinueTarget>, String> {
+    continue_for_show(&state.app_db, show_id).await
+}
+
+/// get_show_continue's body, callable per show by aggregates (the Home hub's
+/// continue-watching rail).
+pub(crate) async fn continue_for_show(
+    pool: &SqlitePool,
+    show_id: i64,
+) -> Result<Option<ContinueTarget>, String> {
     // A resume point is in-progress regardless of the sticky watched flag —
     // a rewatch of a finished episode still deserves Continue.
     let in_progress: Option<(i64, Option<i64>, Option<i64>, Option<f64>)> = sqlx::query_as(
@@ -197,7 +206,7 @@ pub async fn get_show_continue(
          LIMIT 1",
     )
     .bind(show_id)
-    .fetch_optional(&state.app_db)
+    .fetch_optional(pool)
     .await
     .map_err(|e| e.to_string())?;
     if let Some((episode_id, season_number, episode_number, position_secs)) = in_progress {
@@ -216,7 +225,7 @@ pub async fn get_show_continue(
          LIMIT 1",
     )
     .bind(show_id)
-    .fetch_optional(&state.app_db)
+    .fetch_optional(pool)
     .await
     .map_err(|e| e.to_string())?;
     // Skip the degenerate case: nothing watched at all → plain Play, no label.
@@ -226,7 +235,7 @@ pub async fn get_show_continue(
              JOIN season s ON s.id = e.season_id WHERE s.show_id = ? AND ew.watched = 1 LIMIT 1",
         )
         .bind(show_id)
-        .fetch_optional(&state.app_db)
+        .fetch_optional(pool)
         .await
         .map_err(|e| e.to_string())?;
         if any_watched.is_none() {
@@ -239,6 +248,182 @@ pub async fn get_show_continue(
         episode_number,
         position_secs: None,
     }))
+}
+
+/// One card on the Home hub's continue-watching rail.
+#[derive(Debug, Serialize)]
+pub struct ContinueWatchingItem {
+    /// "movie" | "show"
+    pub kind: String,
+    /// Movie entry or show entry.
+    pub entry_id: i64,
+    pub library_id: String,
+    pub title: String,
+    /// Resolved cached cover path (grid convention), when any.
+    pub cover: Option<String>,
+    /// The frame the user left at (captured on player close), when any.
+    /// Preferred card art; falls back to backdrop, then a cover treatment.
+    pub frame: Option<String>,
+    /// Selected/first cached backdrop for the entry, when any.
+    pub backdrop: Option<String>,
+    pub last_played_at: String,
+    pub position_secs: Option<f64>,
+    pub duration_secs: Option<f64>,
+    // Show-only: the continue target episode.
+    pub episode_id: Option<i64>,
+    pub season_number: Option<i64>,
+    pub episode_number: Option<i64>,
+    pub episode_title: Option<String>,
+}
+
+/// The Home hub's "where you left off" rail, across ALL video libraries:
+/// in-progress movies plus shows with a continue target, most recent activity
+/// first. Interactive titles are skipped — their resume goes through the
+/// branch-graph driver, and a linear resume would be wrong.
+#[tauri::command]
+pub async fn get_continue_watching(
+    state: State<'_, AppState>,
+    limit: Option<i64>,
+) -> Result<Vec<ContinueWatchingItem>, String> {
+    let pool = &state.app_db;
+    let cap = limit.unwrap_or(20).max(1);
+    let mut items: Vec<ContinueWatchingItem> = Vec::new();
+
+    // The frame captured at player close, keyed the same way it was written.
+    let frames_dir = state.app_data_dir.join("cache").join("resume_frames");
+    let frame_for = |kind: &str, id: i64| -> Option<String> {
+        let p = frames_dir.join(format!("{kind}_{id}.jpg"));
+        p.exists().then(|| p.to_string_lossy().to_string())
+    };
+
+    // Per-library cover maps, fetched lazily (the rail usually spans one).
+    let mut covers_cache: std::collections::HashMap<String, std::collections::HashMap<String, Vec<String>>> =
+        std::collections::HashMap::new();
+
+    let movie_rows: Vec<(i64, String, String, String, Option<String>, Option<f64>, Option<f64>, String)> =
+        sqlx::query_as(
+            "SELECT me.id, me.library_id, m.title, m.folder_path, m.selected_cover,
+                    mw.position_secs, mw.duration_secs, mw.last_played_at
+             FROM movie_watch mw
+             JOIN movie m ON m.id = mw.entry_id
+             JOIN media_entry me ON me.id = mw.entry_id
+             WHERE mw.watched = 0 AND mw.position_secs IS NOT NULL
+               AND mw.last_played_at IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM interactive_resume ir WHERE ir.entry_id = mw.entry_id)
+             ORDER BY mw.last_played_at DESC
+             LIMIT ?",
+        )
+        .bind(cap)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    for (entry_id, library_id, title, folder_path, selected_cover, position_secs, duration_secs, last_played_at) in movie_rows {
+        if !covers_cache.contains_key(&library_id) {
+            let map = crate::commands::get_all_cached_covers(pool, &library_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            covers_cache.insert(library_id.clone(), map);
+        }
+        let cover = covers_cache.get(&library_id).and_then(|m| {
+            let covers = m.get(&folder_path)?;
+            match &selected_cover {
+                Some(sel) if covers.contains(sel) => Some(sel.clone()),
+                _ => covers.first().cloned(),
+            }
+        });
+        let backdrop = crate::commands::entry_backdrop(pool, entry_id).await?;
+        items.push(ContinueWatchingItem {
+            kind: "movie".into(),
+            entry_id,
+            library_id,
+            title,
+            cover,
+            frame: frame_for("movie", entry_id),
+            backdrop,
+            last_played_at,
+            position_secs,
+            duration_secs,
+            episode_id: None,
+            season_number: None,
+            episode_number: None,
+            episode_title: None,
+        });
+    }
+
+    // Shows with any episode activity, most recent first; each resolves its
+    // continue target the same way the show page does (fully-watched and
+    // never-started shows resolve to None and drop out).
+    let show_rows: Vec<(i64, String, String, String, Option<String>, String)> = sqlx::query_as(
+        "SELECT sh.id, me.library_id, sh.title, sh.folder_path, sh.selected_cover,
+                MAX(ew.last_played_at) as last
+         FROM episode_watch ew
+         JOIN episode e ON e.id = ew.episode_id
+         JOIN season se ON se.id = e.season_id
+         JOIN show sh ON sh.id = se.show_id
+         JOIN media_entry me ON me.id = sh.id
+         WHERE ew.last_played_at IS NOT NULL
+         GROUP BY sh.id
+         ORDER BY last DESC
+         LIMIT ?",
+    )
+    .bind(cap)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    for (show_id, library_id, title, folder_path, selected_cover, last_played_at) in show_rows {
+        let Some(target) = continue_for_show(pool, show_id).await? else {
+            continue;
+        };
+        if !covers_cache.contains_key(&library_id) {
+            let map = crate::commands::get_all_cached_covers(pool, &library_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            covers_cache.insert(library_id.clone(), map);
+        }
+        let cover = covers_cache.get(&library_id).and_then(|m| {
+            let covers = m.get(&folder_path)?;
+            match &selected_cover {
+                Some(sel) if covers.contains(sel) => Some(sel.clone()),
+                _ => covers.first().cloned(),
+            }
+        });
+        let ep: Option<(Option<String>, Option<f64>)> = sqlx::query_as(
+            "SELECT e.title, ew.duration_secs FROM episode e
+             LEFT JOIN episode_watch ew ON ew.episode_id = e.id
+             WHERE e.id = ?",
+        )
+        .bind(target.episode_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        let (episode_title, duration_secs) = ep.unwrap_or((None, None));
+        let backdrop = crate::commands::entry_backdrop(pool, show_id).await?;
+        items.push(ContinueWatchingItem {
+            kind: "show".into(),
+            entry_id: show_id,
+            library_id,
+            title,
+            cover,
+            // Frames are per-EPISODE — only present when the continue target
+            // is the episode that was actually playing at close.
+            frame: frame_for("episode", target.episode_id),
+            backdrop,
+            last_played_at,
+            position_secs: target.position_secs,
+            duration_secs,
+            episode_id: Some(target.episode_id),
+            season_number: target.season_number,
+            episode_number: target.episode_number,
+            episode_title: episode_title.filter(|t| !t.is_empty()),
+        });
+    }
+
+    // SQLite datetimes sort correctly as strings.
+    items.sort_by(|a, b| b.last_played_at.cmp(&a.last_played_at));
+    items.truncate(cap as usize);
+    Ok(items)
 }
 
 /// Manually flip watched state. Marking watched clears the resume point;

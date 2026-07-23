@@ -7,9 +7,10 @@ import { Sidebar } from "@/components/Sidebar";
 import { MainContent } from "@/components/MainContent";
 import { PlayerView } from "@/components/PlayerView";
 import { usePlayer } from "@/hooks/usePlayer";
-import { useMusicPlayer } from "@/hooks/useMusicPlayer";
+import { useMusicPlayer, currentMusicItem } from "@/hooks/useMusicPlayer";
 import { NowPlayingBar } from "@/components/player/NowPlayingBar";
 import { MetadataCenterDialog } from "@/components/music/MetadataCenter";
+import { VideoMetadataCenterDialog } from "@/components/VideoMetadataCenter";
 import { Toaster } from "@/components/ui/sonner";
 import { toast } from "sonner";
 import { relaunch } from "@tauri-apps/plugin-process";
@@ -17,6 +18,65 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { Library, MediaEntry, EntriesResponse, BreadcrumbItem, ViewSpec, PersonInfo, PersonSummary, PersonRole, PlaylistSummary, PlaylistsResponse, PlaylistContents, SortPreset, LibraryCounts, GenreSummary, EntryWatchFlags, MusicQueueItem } from "@/types";
 import { KEYBINDS_SETTING, actionForKey, setRuntimeKeybinds } from "@/lib/playerKeybinds";
 import { viewCacheKey, scopeKeyFor } from "@/lib/complications";
+
+// Mirrors the backend's generate_sort_title: leading articles stripped,
+// lowercase. Local re-sorts (music Artists / Albums) use it so their order
+// matches what the backend serves on the next fresh load.
+function sortTitleKey(t: string): string {
+  let s = t.trim().toLowerCase();
+  for (const a of ["the ", "a ", "an "]) {
+    if (s.startsWith(a)) {
+      s = s.slice(a.length).trim();
+      break;
+    }
+  }
+  return s;
+}
+
+// One visited page, restorable wholesale by history-true back/forward.
+type NavSnapshot = {
+  view: ViewSpec | null;
+  entry: MediaEntry | null;
+  crumbs: BreadcrumbItem[];
+  search: string;
+};
+
+// Identity key for consecutive-duplicate suppression in the history stack.
+function snapKey(s: NavSnapshot): string {
+  return JSON.stringify([
+    s.view,
+    s.entry?.id ?? null,
+    s.entry?.link_id ?? null,
+    s.search,
+    s.crumbs.map((c) => [c.id, c.title]),
+  ]);
+}
+
+// Minimal MediaEntry for programmatic music navigation (now-playing bar links)
+// — same shape the detail pages use for their cross-navigation stubs.
+function fakeMusicEntry(entryType: "album" | "artist", id: number, title: string): MediaEntry {
+  return {
+    id,
+    title,
+    year: null,
+    end_year: null,
+    folder_path: "",
+    parent_id: null,
+    entry_type: entryType,
+    covers: [],
+    selected_cover: null,
+    child_count: 0,
+    season_display: null,
+    collection_display: null,
+    tmdb_id: null,
+    link_id: null,
+    interactive: false,
+    watched: false,
+    watch_progress: null,
+    unwatched: false,
+    has_progress: false,
+  };
+}
 
 function App() {
   const [libraries, setLibraries] = useState<Library[]>([]);
@@ -32,7 +92,7 @@ function App() {
   // undefined = settings not hydrated yet; null = no default set ("" stored).
   const [defaultLibraryId, setDefaultLibraryId] = useState<string | null | undefined>(undefined);
   const [activeView, setActiveView] = useState<ViewSpec | null>(null);
-  const selectedLibrary = activeView
+  const selectedLibrary = activeView && "libraryId" in activeView
     ? libraries.find((l) => l.id === activeView.libraryId) ?? null
     : null;
   const [entries, setEntries] = useState<MediaEntry[]>([]);
@@ -40,7 +100,6 @@ function App() {
   const [playlists, setPlaylists] = useState<PlaylistSummary[] | null>(null);
   const [genres, setGenres] = useState<GenreSummary[] | null>(null);
   const [breadcrumbs, setBreadcrumbs] = useState<BreadcrumbItem[]>([]);
-  const [forwardStack, setForwardStack] = useState<BreadcrumbItem[]>([]);
   const [sortMode, setSortMode] = useState("alpha");
   const [selectedPresetId, setSelectedPresetId] = useState<number | null>(null);
   const [presets, setPresets] = useState<SortPreset[]>([]);
@@ -55,6 +114,8 @@ function App() {
   // Match-to-MusicBrainz review modal: opened from the sidebar context menu
   // or automatically when an enrichment pass leaves items needing review.
   const [mbReviewLibraryId, setMbReviewLibraryId] = useState<string | null>(null);
+  // Video metadata center (TMDB match review), same shape.
+  const [videoCenterLibraryId, setVideoCenterLibraryId] = useState<string | null>(null);
 
   // Video and music are fully mutually exclusive: starting either one STOPS
   // the other outright (bar/player gone), never just pauses it.
@@ -106,6 +167,16 @@ function App() {
       }
     },
     [playerState.isActive, playerActions, musicActions]
+  );
+
+  // "Play next" / "Add to queue" from context menus. An idle player just
+  // starts playing (the hook handles that); a busy one queues.
+  const handleEnqueueMusic = useCallback(
+    (items: MusicQueueItem[], mode: "next" | "last") => {
+      if (mode === "next") musicActions.enqueueNext(items);
+      else musicActions.enqueueLast(items);
+    },
+    [musicActions]
   );
 
   // Detail pages refresh their watch indicators when the player closes —
@@ -613,9 +684,9 @@ function App() {
         return;
       }
 
-      // These music views fetch their own data inside their page components
-      // (MusicIssuesPage / TracksPage) — just clear grid state and land at top.
-      if (view.kind === "music-issues" || view.kind === "tracks") {
+      // These views fetch their own data inside their page components
+      // (HomePage / MusicIssuesPage / TracksPage) — just clear grid state and land at top.
+      if (view.kind === "home" || view.kind === "music-issues" || view.kind === "tracks") {
         setEntries([]);
         setPeople(null);
         setPlaylists(null);
@@ -837,6 +908,57 @@ function App() {
     [loadView]
   );
 
+  // ── History-true back/forward ──────────────────────────────────────────────
+  // Navigation history is a stack of visited-page SNAPSHOTS (view + detail
+  // entry + breadcrumb chain + search text). Every navigation handler pushes
+  // the page it is LEAVING; back/forward restore snapshots wholesale — "where
+  // you actually were", not a walk of the breadcrumb hierarchy. Breadcrumbs
+  // are pure location display (and clickable shortcuts — a crumb click is
+  // just another navigation).
+  const navStateRef = useRef<NavSnapshot>({ view: null, entry: null, crumbs: [], search: "" });
+  useEffect(() => {
+    navStateRef.current = { view: activeView, entry: selectedEntry, crumbs: breadcrumbs, search };
+  }, [activeView, selectedEntry, breadcrumbs, search]);
+
+  const historyRef = useRef<NavSnapshot[]>([]);
+  const forwardHistRef = useRef<NavSnapshot[]>([]);
+
+  const pushHistory = useCallback(() => {
+    const s = navStateRef.current;
+    if (!s.view) return; // startup — nothing to return to
+    const snap: NavSnapshot = { ...s, crumbs: [...s.crumbs] };
+    // Handlers push before their own "already here" early-outs — dropping
+    // identical consecutive snapshots keeps no-op navigations out of history.
+    const top = historyRef.current[historyRef.current.length - 1];
+    if (!top || snapKey(top) !== snapKey(snap)) {
+      historyRef.current.push(snap);
+      if (historyRef.current.length > 100) historyRef.current.shift();
+    }
+    forwardHistRef.current = [];
+  }, []);
+
+  const applySnapshot = useCallback(
+    (snap: NavSnapshot) => {
+      setSearch(snap.search);
+      if (!snap.view) return;
+      setActiveView(snap.view);
+      if (snap.entry) {
+        // Detail page: restore it directly (the page fetches its own data),
+        // and quietly reload the grid behind it so later actions stay sane.
+        setSelectedEntry(snap.entry);
+        setBreadcrumbs(snap.crumbs);
+        const parentId = snap.crumbs[snap.crumbs.length - 2]?.id ?? null;
+        loadView(snap.view, parentId, snap.crumbs, false, true);
+      } else {
+        setSelectedEntry(null);
+        const last = snap.crumbs[snap.crumbs.length - 1];
+        const parentId = last && !last.view ? last.id ?? null : null;
+        loadView(snap.view, parentId, snap.crumbs, true);
+      }
+    },
+    [loadView]
+  );
+
   // Re-fetch the active grid's entries without touching breadcrumbs, navigating,
   // or flashing the loading state. Fires after detail-page edits and bulk TMDB
   // matching so the grid quietly catches up.
@@ -965,7 +1087,7 @@ function App() {
       setActiveView(view);
       setSelectedEntry(null);
       setSearch("");
-      setForwardStack([]);
+      pushHistory();
       // Clicking the library header lands on library-root. The top-level breadcrumb
       // always bakes the library name into its label so the user sees "<lib> - All".
       const libRoot: ViewSpec = { kind: "library-root", libraryId: library.id };
@@ -976,18 +1098,84 @@ function App() {
     [loadView]
   );
 
+  // The Home hub — a pseudo-library pinned above the real ones. Renders its
+  // own page (continue watching + recently played), no entries to load.
+  const openHome = useCallback(() => {
+    const view: ViewSpec = { kind: "home" };
+    setActiveView(view);
+    setSelectedEntry(null);
+    setSearch("");
+    pushHistory();
+    setBreadcrumbs([{ id: null, title: "Home", view }]);
+  }, []);
+
+  // "Go to page" from a Home card — detail navigation that may cross into a
+  // different library than whatever was last selected. Sets up the target
+  // library's root as the crumb base; Back re-loads its grid via the crumb.
+  // focusTrackId (album navigations): scroll to that track and highlight it,
+  // same one-shot request the now-playing bar's title link uses.
+  const openEntryFromHome = useCallback(
+    (libraryId: string, entry: MediaEntry, focusTrackId?: number) => {
+      const lib = libraries.find((l) => l.id === libraryId);
+      if (!lib || lib.setup_stage) return;
+      // Albums root under the Albums grid (that's what the tile was);
+      // movies/shows root at the library's All.
+      const root: ViewSpec =
+        entry.entry_type === "album"
+          ? { kind: "albums", libraryId }
+          : { kind: "library-root", libraryId };
+      const rootLabel =
+        entry.entry_type === "album"
+          ? `${lib.name} - Albums`
+          : `${lib.name} - ${lib.format === "music" ? "Artists" : "All"}`;
+      setActiveView(root);
+      setSearch("");
+      pushHistory();
+      setSelectedEntry(entry);
+      setBreadcrumbs([
+        { id: null, title: rootLabel, view: root },
+        { id: entry.id, title: entry.title, entry },
+      ]);
+      if (focusTrackId != null && entry.entry_type === "album") {
+        musicFocusNonceRef.current += 1;
+        setMusicFocusRequest({ albumId: entry.id, trackId: focusTrackId, nonce: musicFocusNonceRef.current });
+      }
+    },
+    [libraries]
+  );
+
+  // Album-less recently-played tiles land on the Tracks page instead (there
+  // is no album page for them) — scrolled to the track and highlighted.
+  const openTrackFromHome = useCallback(
+    (libraryId: string, trackId: number) => {
+      const lib = libraries.find((l) => l.id === libraryId);
+      if (!lib || lib.setup_stage) return;
+      const view: ViewSpec = { kind: "tracks", libraryId };
+      setActiveView(view);
+      setSelectedEntry(null);
+      setSearch("");
+      pushHistory();
+      setBreadcrumbs([{ id: null, title: `${lib.name} - Tracks`, view }]);
+      musicFocusNonceRef.current += 1;
+      setTracksFocusRequest({ trackId, nonce: musicFocusNonceRef.current });
+    },
+    [libraries]
+  );
+
   // Open the default library on launch, once libraries AND settings have both
   // loaded. One-shot: later library-list refreshes (rescan, create, delete)
   // must not yank navigation, and a user click always beats a slow settings read.
+  // No user-set default → Home is the default.
   const didAutoSelectRef = useRef(false);
   useEffect(() => {
     if (didAutoSelectRef.current) return;
     if (defaultLibraryId === undefined || libraries.length === 0) return;
     didAutoSelectRef.current = true;
-    if (defaultLibraryId === null || activeView !== null) return;
-    const lib = libraries.find((l) => l.id === defaultLibraryId);
+    if (activeView !== null) return;
+    const lib = defaultLibraryId != null ? libraries.find((l) => l.id === defaultLibraryId) : undefined;
     if (lib) selectLibrary(lib);
-  }, [libraries, defaultLibraryId, activeView, selectLibrary]);
+    else openHome();
+  }, [libraries, defaultLibraryId, activeView, selectLibrary, openHome]);
 
   // "Set as default" / "Unset as default" in a library's sidebar context menu.
   // Unset stores "" (settings rows are blanked, not deleted).
@@ -1004,7 +1192,7 @@ function App() {
       setActiveView(view);
       setSelectedEntry(null);
       setSearch("");
-      setForwardStack([]);
+      pushHistory();
       const lib = libraries.find((l) => l.id === view.libraryId);
       const libLabel = lib?.name ?? "Library";
       // Top-level sidebar views render as a single "<library> - <section>" crumb; deeper
@@ -1165,7 +1353,7 @@ function App() {
       setActiveView(view);
       setSelectedEntry(null);
       setSearch("");
-      setForwardStack([]);
+      pushHistory();
       loadView(view, null, newBreadcrumbs, false);
     },
     [selectedLibrary, breadcrumbs, loadView, collapseLoop, saveScrollPosition]
@@ -1205,7 +1393,7 @@ function App() {
       setActiveView(view);
       setSelectedEntry(null);
       setSearch("");
-      setForwardStack([]);
+      pushHistory();
       loadView(view, null, newBreadcrumbs, false);
     },
     [selectedLibrary, breadcrumbs, loadView, saveScrollPosition]
@@ -1234,7 +1422,7 @@ function App() {
       setActiveView(view);
       setSelectedEntry(null);
       setSearch("");
-      setForwardStack([]);
+      pushHistory();
       loadView(view, null, newBreadcrumbs, false);
     },
     [breadcrumbs, loadView, collapseLoop, saveScrollPosition]
@@ -1243,8 +1431,19 @@ function App() {
   const navigateTo = useCallback(
     (entry: MediaEntry) => {
       if (!selectedLibrary) return;
+      // Already on this exact detail page — a no-op that must not touch
+      // history (the branch-level guards below are now just belt-and-braces).
+      if (
+        (entry.entry_type === "movie" ||
+          entry.entry_type === "show" ||
+          entry.entry_type === "artist" ||
+          entry.entry_type === "album") &&
+        breadcrumbs[breadcrumbs.length - 1]?.entry?.id === entry.id
+      ) {
+        return;
+      }
       saveScrollPosition();
-      setForwardStack([]);
+      pushHistory();
 
       // Playlist-collection nodes live inside a playlist view — drill within it by updating
       // the view's collectionId, so the breadcrumb chain reads "Playlists > PL > Star Wars".
@@ -1286,6 +1485,19 @@ function App() {
         entry.entry_type === "album"
       ) {
         if (breadcrumbs[breadcrumbs.length - 1]?.entry?.id === entry.id) return; // already on this page
+        // Views that render their own page (People/Genres/Playlists/Tracks/…)
+        // early-return in MainContent without ever consulting selectedEntry —
+        // a detail navigation from one of them (e.g. a now-playing bar link)
+        // would update state but keep showing the old page. Retarget the view
+        // at the library root so the detail page actually renders.
+        if (
+          activeView &&
+          ["people-list", "people-all", "genres", "playlists", "tracks", "music-issues"].includes(
+            activeView.kind,
+          )
+        ) {
+          setActiveView({ kind: "library-root", libraryId: selectedLibrary.id });
+        }
         // Opening a detail page RESETS the chain to the current location's canonical
         // path: drop all history before the current view's crumb, re-root that crumb
         // at its sidebar home, append the movie. Without this, alternating
@@ -1315,11 +1527,49 @@ function App() {
     [selectedLibrary, breadcrumbs, activeView, loadEntries, loadView, saveScrollPosition, collapseLoop]
   );
 
+  // Now-playing cover docked up into the sidebar (session state — the bar's
+  // up/down arrow toggles it; art follows the current track automatically).
+  const [musicCoverDocked, setMusicCoverDocked] = useState(false);
+
+  // One-shot "scroll to this track and highlight it" request for the album
+  // page, minted by the now-playing bar's title link. The nonce makes every
+  // click a fresh request (re-clicking while already on the page re-scrolls).
+  const musicFocusNonceRef = useRef(0);
+  const [musicFocusRequest, setMusicFocusRequest] = useState<{
+    albumId: number;
+    trackId: number;
+    nonce: number;
+  } | null>(null);
+
+  // Same one-shot idea for the TRACKS page (album-less tracks from Home).
+  const [tracksFocusRequest, setTracksFocusRequest] = useState<{
+    trackId: number;
+    nonce: number;
+  } | null>(null);
+
+  const openMusicAlbumFromBar = useCallback(
+    (albumId: number, albumTitle: string, trackId?: number) => {
+      if (trackId != null) {
+        musicFocusNonceRef.current += 1;
+        setMusicFocusRequest({ albumId, trackId, nonce: musicFocusNonceRef.current });
+      }
+      navigateTo(fakeMusicEntry("album", albumId, albumTitle));
+    },
+    [navigateTo]
+  );
+
+  const openMusicArtistFromBar = useCallback(
+    (artistId: number, artistName: string) => {
+      navigateTo(fakeMusicEntry("artist", artistId, artistName));
+    },
+    [navigateTo]
+  );
+
   const navigateBreadcrumb = useCallback(
     (index: number) => {
       if (!selectedLibrary) return;
       saveScrollPosition();
-      setForwardStack([]);
+      pushHistory();
       const newBreadcrumbs = breadcrumbs.slice(0, index + 1);
       const target = newBreadcrumbs[newBreadcrumbs.length - 1];
       if (target.view) {
@@ -1348,65 +1598,26 @@ function App() {
     [selectedLibrary, breadcrumbs, loadView, loadEntries, saveScrollPosition]
   );
 
+  // History-true: pop a visited-page snapshot and restore it exactly. The
+  // page being left goes onto the opposite stack, so back/forward are
+  // symmetric — and neither cares what the breadcrumbs claim.
   const goBack = useCallback(() => {
-    if (!selectedLibrary || breadcrumbs.length <= 1) return;
+    if (historyRef.current.length === 0) return;
     saveScrollPosition();
-    const removed = breadcrumbs[breadcrumbs.length - 1];
-    setForwardStack((prev) => [...prev, removed]);
-    const newBreadcrumbs = breadcrumbs.slice(0, -1);
-    const newLast = newBreadcrumbs[newBreadcrumbs.length - 1];
-    if (newLast.view) {
-      // Popping to a distinct-view step (covers "back out of detail within a view"
-      // AND "back from person-detail to people-list" AND "back to sidebar root").
-      setSelectedEntry(null);
-      setActiveView(newLast.view);
-      loadView(newLast.view, null, newBreadcrumbs, true);
-    } else if (selectedEntry) {
-      // Popping out of a movie/show detail page within the current view's grid.
-      setSelectedEntry(null);
-      setBreadcrumbs(newBreadcrumbs);
-      restoreScrollPosition(selectedLibrary.id, scrollKindFor(activeView), newLast.id);
-    } else if (newLast.entry) {
-      // Popping back onto a movie/show detail page (e.g. from a cast member's page).
-      // Restore the detail page + owning view, and quietly reload the grid behind it.
-      const ownerView =
-        [...newBreadcrumbs].reverse().find((c) => c.view)?.view ??
-        ({ kind: "library-root", libraryId: selectedLibrary.id } as ViewSpec);
-      const parentId = newBreadcrumbs[newBreadcrumbs.length - 2]?.id ?? null;
-      setSelectedEntry(newLast.entry);
-      setActiveView(ownerView);
-      setBreadcrumbs(newBreadcrumbs);
-      loadView(ownerView, parentId, newBreadcrumbs, false, true);
-    } else {
-      // Popping to a shallower drill-in (collection chain) within the current view.
-      loadEntries(selectedLibrary, newLast.id, newBreadcrumbs);
-    }
-  }, [selectedLibrary, breadcrumbs, selectedEntry, loadView, loadEntries, saveScrollPosition, restoreScrollPosition, activeView]);
+    const cur = navStateRef.current;
+    if (cur.view) forwardHistRef.current.push({ ...cur, crumbs: [...cur.crumbs] });
+    const snap = historyRef.current.pop()!;
+    applySnapshot(snap);
+  }, [saveScrollPosition, applySnapshot]);
 
   const goForward = useCallback(() => {
-    if (!selectedLibrary || forwardStack.length === 0) return;
+    if (forwardHistRef.current.length === 0) return;
     saveScrollPosition();
-    const next = forwardStack[forwardStack.length - 1];
-    setForwardStack((prev) => prev.slice(0, -1));
-    const newBreadcrumbs = [...breadcrumbs, next];
-    if (next.view) {
-      setSelectedEntry(null);
-      setActiveView(next.view);
-      loadView(next.view, null, newBreadcrumbs, true);
-    } else {
-      // Non-view crumb — either a collection drill-in or a movie/show detail page.
-      // Detail crumbs carry their entry; the entries-list lookup is a fallback for
-      // forward stacks recorded before the crumb was created with one.
-      const forwardEntry = next.entry ?? entries.find((e) => e.id === next.id);
-      if (forwardEntry && forwardEntry.entry_type !== "collection") {
-        setSelectedEntry(forwardEntry);
-        setBreadcrumbs(newBreadcrumbs);
-      } else {
-        setSelectedEntry(null);
-        loadEntries(selectedLibrary, next.id, newBreadcrumbs);
-      }
-    }
-  }, [selectedLibrary, forwardStack, breadcrumbs, entries, loadView, loadEntries, saveScrollPosition]);
+    const cur = navStateRef.current;
+    if (cur.view) historyRef.current.push({ ...cur, crumbs: [...cur.crumbs] });
+    const snap = forwardHistRef.current.pop()!;
+    applySnapshot(snap);
+  }, [saveScrollPosition, applySnapshot]);
 
   const invalidateCache = useCallback((libraryId?: string, parentId?: number | null) => {
     if (libraryId != null && parentId !== undefined) {
@@ -1574,22 +1785,11 @@ function App() {
         const next = mode === "credits" ? "credits" : "alpha";
         setSortMode(next);
         invoke("set_setting", { key: `music_artists_sort_mode:${selectedLibrary.id}`, value: next }).catch(() => {});
-        // Mirrors the backend's generate_sort_title: leading articles stripped.
-        const sortKey = (t: string) => {
-          let s = t.trim().toLowerCase();
-          for (const a of ["the ", "a ", "an "]) {
-            if (s.startsWith(a)) {
-              s = s.slice(a.length).trim();
-              break;
-            }
-          }
-          return s;
-        };
         setEntries((prev) => {
           const sorted = [...prev].sort((a, b) =>
             next === "credits"
-              ? b.child_count - a.child_count || sortKey(a.title).localeCompare(sortKey(b.title))
-              : sortKey(a.title).localeCompare(sortKey(b.title)),
+              ? b.child_count - a.child_count || sortTitleKey(a.title).localeCompare(sortTitleKey(b.title))
+              : sortTitleKey(a.title).localeCompare(sortTitleKey(b.title)),
           );
           updateCache(selectedLibrary.id, null, sorted, next);
           return sorted;
@@ -1599,13 +1799,38 @@ function App() {
 
       // Music Albums page: its sort lives in a settings key — a music
       // library's default_sort_mode belongs to the Artists view, and writing
-      // it from here would silently re-sort that page too.
+      // it from here would silently re-sort that page too. Sorting happens
+      // LOCALLY (album entries carry sort_date), mirroring the backend's
+      // order clauses — the reorder commits on the click frame, with no
+      // refetch gap stuttering the start of the FLIP animation.
       if (activeView?.kind === "albums") {
-        const next = mode === "date" ? "date" : "alpha";
+        const next = mode === "date" || mode === "date-desc" ? mode : "alpha";
         setSortMode(next);
         invoke("set_setting", { key: `music_albums_sort_mode:${selectedLibrary.id}`, value: next }).catch(() => {});
-        viewEntriesCacheRef.current.delete(viewCacheKey(activeView));
-        loadView(activeView, null, breadcrumbs, true, true);
+        const byTitle = (a: MediaEntry, b: MediaEntry) =>
+          sortTitleKey(a.title).localeCompare(sortTitleKey(b.title));
+        const cmp = (a: MediaEntry, b: MediaEntry): number => {
+          if (next === "alpha") return byTitle(a, b);
+          const ad = a.sort_date ?? null;
+          const bd = b.sort_date ?? null;
+          if (ad === null || bd === null) {
+            // Undated albums sink to the bottom in both directions.
+            return ad === bd ? byTitle(a, b) : ad === null ? 1 : -1;
+          }
+          if (ad !== bd) {
+            return next === "date" ? (ad < bd ? -1 : 1) : ad < bd ? 1 : -1;
+          }
+          return byTitle(a, b);
+        };
+        const key = viewCacheKey(activeView);
+        setEntries((prev) => {
+          const sorted = [...prev].sort(cmp);
+          const cached = viewEntriesCacheRef.current.get(key);
+          if (cached) {
+            viewEntriesCacheRef.current.set(key, { ...cached, entries: sorted, sort_mode: next });
+          }
+          return sorted;
+        });
         return;
       }
 
@@ -1774,7 +1999,16 @@ function App() {
     setEntries((prev) => prev.map((e) => (e.id === entryId ? { ...e, title: newTitle } : e)));
     setSelectedEntry((prev) => (prev && prev.id === entryId ? { ...prev, title: newTitle } : prev));
     setBreadcrumbs((prev) => prev.map((b) => (b.id === entryId ? { ...b, title: newTitle } : b)));
-    setForwardStack((prev) => prev.map((b) => (b.id === entryId ? { ...b, title: newTitle } : b)));
+    // History snapshots hold their own crumb/entry copies — patch those too so
+    // going back after a rename shows the new title.
+    const patchStack = (stack: NavSnapshot[]) => {
+      for (const s of stack) {
+        s.crumbs = s.crumbs.map((b) => (b.id === entryId ? { ...b, title: newTitle } : b));
+        if (s.entry && s.entry.id === entryId) s.entry = { ...s.entry, title: newTitle };
+      }
+    };
+    patchStack(historyRef.current);
+    patchStack(forwardHistRef.current);
   }, []);
 
   const renameEntry = useCallback(
@@ -2276,7 +2510,7 @@ function App() {
           //  3. Any grid (a section root, a role list, a specific playlist/genre) is
           //     itself the node to light up.
           activeView={(() => {
-            if (!activeView) return activeView;
+            if (!activeView || activeView.kind === "home") return activeView;
             if (selectedEntry?.entry_type === "movie" || selectedEntry?.entry_type === "show") {
               return selectedEntry.entry_type === "movie"
                 ? { kind: "movies-only", libraryId: activeView.libraryId }
@@ -2312,9 +2546,11 @@ function App() {
               }
               // Clear ALL view state — selectedEntry especially, or MainContent
               // keeps rendering a detail page whose library no longer exists.
+              // History too: snapshots may point into the deleted library.
               setSelectedEntry(null);
               setSearch("");
-              setForwardStack([]);
+              historyRef.current = [];
+              forwardHistRef.current = [];
               setEntries([]);
               setPeople(null);
               setPlaylists(null);
@@ -2363,11 +2599,22 @@ function App() {
           }}
           onPlaylistChanged={handlePlaylistChanged}
           onOpenMusicBrainzReview={(libraryId) => setMbReviewLibraryId(libraryId)}
+          onOpenVideoMetadataCenter={(libraryId) => setVideoCenterLibraryId(libraryId)}
           sidebarPlaylists={sidebarPlaylists}
           sidebarCounts={sidebarCounts}
           sidebarGenres={sidebarGenres}
           playerState={playerState}
           playerActions={playerActions}
+          onOpenHome={openHome}
+          homeActive={activeView?.kind === "home"}
+          dockedMusicCoverUrl={
+            musicCoverDocked && musicState.isActive
+              ? (() => {
+                  const c = currentMusicItem(musicState)?.cover;
+                  return c ? convertFileSrc(c) : null;
+                })()
+              : null
+          }
         />
         <MainContent
           entries={entries}
@@ -2384,12 +2631,13 @@ function App() {
           search={search}
           onSearchChange={setSearch}
           onNavigate={navigateTo}
+          musicFocusRequest={musicFocusRequest}
           onNavigateToPerson={navigateToPerson}
           onTogglePersonFavorite={togglePersonFavorite}
           peopleMode={
             activeView && (activeView.kind === "people-all" || activeView.kind === "people-list")
-              ? peopleModeRef.current.get(viewCacheKey(activeView)) ?? "top"
-              : "top"
+              ? peopleModeRef.current.get(viewCacheKey(activeView)) ?? "all"
+              : "all"
           }
           onPeopleModeChange={(mode) => {
             if (activeView && (activeView.kind === "people-all" || activeView.kind === "people-list")) {
@@ -2454,9 +2702,14 @@ function App() {
           onPlayInteractive={handlePlayInteractive}
           onPlayEpisode={handlePlayEpisode}
           onPlayMusicQueue={handlePlayMusicQueue}
+          onEnqueueMusic={handleEnqueueMusic}
+          onOpenLibraryEntry={openEntryFromHome}
+          onOpenLibraryTrack={openTrackFromHome}
+          musicTracksFocusRequest={tracksFocusRequest}
           musicCurrentTrackId={
-            musicState.isActive ? musicState.queue[musicState.index]?.trackId ?? null : null
+            musicState.isActive ? currentMusicItem(musicState)?.trackId ?? null : null
           }
+          musicPlaying={musicState.isActive && musicState.isPlaying}
         />
       </div>
       {/* Persistent music bar — spans under sidebar + content, survives every
@@ -2464,6 +2717,10 @@ function App() {
       <NowPlayingBar
         state={musicState}
         actions={musicActions}
+        onOpenAlbum={openMusicAlbumFromBar}
+        onOpenArtist={openMusicArtistFromBar}
+        coverDocked={musicCoverDocked}
+        onToggleCoverDock={() => setMusicCoverDocked((v) => !v)}
         hidden={playerState.isActive && !playerState.isMinimized}
       />
       <MetadataCenterDialog
@@ -2471,6 +2728,16 @@ function App() {
         open={mbReviewLibraryId !== null}
         onOpenChange={(o) => {
           if (!o) setMbReviewLibraryId(null);
+        }}
+      />
+      <VideoMetadataCenterDialog
+        libraryId={videoCenterLibraryId}
+        open={videoCenterLibraryId !== null}
+        onOpenChange={(o) => {
+          if (!o) setVideoCenterLibraryId(null);
+        }}
+        onChanged={() => {
+          if (videoCenterLibraryId) invalidateCache(videoCenterLibraryId);
         }}
       />
       <Toaster position="top-center" />

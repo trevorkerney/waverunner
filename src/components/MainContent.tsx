@@ -18,6 +18,7 @@ import {
 import {
   SortableContext,
   rectSortingStrategy,
+  verticalListSortingStrategy,
   useSortable,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
@@ -98,11 +99,16 @@ import {
   Eye,
   EyeOff,
   LayoutGrid,
+  Layers,
+  Disc3,
+  ListStart,
+  ListEnd,
 } from "lucide-react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
-import { Library, MediaEntry, BreadcrumbItem, MovieDetail, MovieDetailUpdate, SeasonInfo, EpisodeInfo, ShowDetail, SeasonDetailLocal, EpisodeDetailLocal, TmdbSeasonDetail, TmdbEpisodeDetail, TmdbShowFieldSelection, TmdbSeasonFieldSelection, TmdbEpisodeFieldSelection, CastUpdateInfo, CastInfo, RatingInfo, ViewSpec, PersonInfo, PersonSummary, PersonRole, PlaylistSummary, GenreSummary, SortPreset, WatchState, EpisodeWatchInfo, ContinueTarget, ShowEpisodeFlat, MusicQueueItem, MusicAlbumCard } from "@/types";
+import { Library, MediaEntry, BreadcrumbItem, MovieDetail, MovieDetailUpdate, SeasonInfo, EpisodeInfo, ShowDetail, SeasonDetailLocal, EpisodeDetailLocal, TmdbSeasonDetail, TmdbEpisodeDetail, TmdbShowFieldSelection, TmdbSeasonFieldSelection, TmdbEpisodeFieldSelection, CastUpdateInfo, CastInfo, RatingInfo, ViewSpec, PersonInfo, PersonSummary, PersonRole, PlaylistSummary, GenreSummary, SortPreset, WatchState, EpisodeWatchInfo, ContinueTarget, ShowEpisodeFlat, MusicQueueItem, MusicAlbumCard, MusicAlbumDetail } from "@/types";
+import { queueFromRelease, defaultRelease } from "@/components/music/musicQueue";
 import { scopeKeyFor, viewCacheKey } from "@/lib/complications";
 import { ExtrasDialog } from "@/components/ExtrasDialog";
 import { SortPresetSaveDialog } from "@/components/SortPresetSaveDialog";
@@ -125,6 +131,9 @@ import { CreatePlaylistCollectionDialog } from "@/components/CreatePlaylistColle
 import { AddToPlaylistDialog } from "@/components/AddToPlaylistDialog";
 import { RenameDialog } from "@/components/RenameDialog";
 import { ArtistDetailPage } from "@/components/music/ArtistDetailPage";
+import { PlaylistTrackList } from "@/components/music/PlaylistTrackList";
+import { HomePage } from "@/components/HomePage";
+import { CombineAlbumsDialog } from "@/components/music/CombineAlbumsDialog";
 import { ArtistsGrid } from "@/components/music/ArtistsGrid";
 import { AlbumDetailPage } from "@/components/music/AlbumDetailPage";
 import { MusicIssuesPage } from "@/components/music/MusicIssuesPage";
@@ -248,8 +257,23 @@ interface MainContentProps {
   onPlayInteractive?: (args: { libraryId: string; entryId: number; title: string; fresh?: boolean }) => void;
   onPlayEpisode?: (args: { libraryId: string; showId: number; showTitle: string; startEpisodeId: number; startSecs?: number }) => void;
   onPlayMusicQueue?: (items: MusicQueueItem[], startIndex: number) => void;
+  /** "Play next" / "Add to queue" from music context menus. */
+  onEnqueueMusic?: (items: MusicQueueItem[], mode: "next" | "last") => void;
+  /** Home-card "Go to page" — cross-library detail navigation (App-owned).
+   *  focusTrackId (albums): scroll to and highlight that track on arrival. */
+  onOpenLibraryEntry?: (libraryId: string, entry: MediaEntry, focusTrackId?: number) => void;
+  /** Album-less Home tiles → the Tracks page, scrolled to the track. */
+  onOpenLibraryTrack?: (libraryId: string, trackId: number) => void;
+  /** One-shot scroll-to-track request for the Tracks page. */
+  musicTracksFocusRequest?: { trackId: number; nonce: number } | null;
   /** Track id in the now-playing bar, for album-page row highlighting. */
   musicCurrentTrackId?: number | null;
+  /** Whether that track is actively playing (false = paused) — freezes the
+   *  row equalizer bars. */
+  musicPlaying?: boolean;
+  /** One-shot scroll-to-track request for the album page (now-playing bar
+   *  title link). The nonce distinguishes repeat clicks. */
+  musicFocusRequest?: { albumId: number; trackId: number; nonce: number } | null;
 }
 
 export function MainContent({
@@ -303,8 +327,16 @@ export function MainContent({
   onPlayInteractive,
   onPlayEpisode,
   onPlayMusicQueue,
+  onEnqueueMusic,
+  onOpenLibraryEntry,
+  onOpenLibraryTrack,
+  musicTracksFocusRequest,
   musicCurrentTrackId,
+  musicPlaying,
+  musicFocusRequest,
 }: MainContentProps) {
+  // Music album being combined into another (the context menu's source).
+  const [combineSource, setCombineSource] = useState<{ id: number; title: string } | null>(null);
   const [coverDialogEntry, setCoverDialogEntry] = useState<MediaEntry | null>(
     null
   );
@@ -371,7 +403,7 @@ export function MainContent({
       const labels = [...seen].sort((a, b) => (a === "#" ? -1 : b === "#" ? 1 : a.localeCompare(b)));
       return { labels, find: (l: string) => filteredEntries.find((e) => letterForTitle(e.title) === l) };
     }
-    if (sortMode === "date" || sortMode === "year") {
+    if (sortMode === "date" || sortMode === "date-desc" || sortMode === "year") {
       // Year buckets (YEAR_RAIL_STEP) in encounter order so the rail follows the sort direction.
       const labels: string[] = [];
       const seen = new Set<string>();
@@ -448,8 +480,9 @@ export function MainContent({
   const [deletePlaylistCollectionTarget, setDeletePlaylistCollectionTarget] = useState<MediaEntry | null>(null);
   const [deletePresetTarget, setDeletePresetTarget] = useState<SortPreset | null>(null);
 
-  // Playlist-related dialog state
-  const [addToPlaylistFor, setAddToPlaylistFor] = useState<MediaEntry | null>(null);
+  // Playlist-related dialog state (id/title is all the dialog needs — track
+  // rows on the music pages funnel in here alongside full grid entries).
+  const [addToPlaylistFor, setAddToPlaylistFor] = useState<{ id: number; title: string } | null>(null);
   const [createCollectionOpen, setCreateCollectionOpen] = useState(false);
   const [renameCollectionFor, setRenameCollectionFor] = useState<MediaEntry | null>(null);
 
@@ -461,6 +494,22 @@ export function MainContent({
       setDeletingId(null);
     }
   }, [onDeleteEntry]);
+
+  // Album-card "Play next" / "Add to queue": the whole default release, in order.
+  const enqueueAlbum = useCallback(
+    async (entry: MediaEntry, mode: "next" | "last") => {
+      if (!onEnqueueMusic) return;
+      try {
+        const detail = await invoke<MusicAlbumDetail>("get_album_detail", { entryId: entry.id });
+        const release = defaultRelease(detail);
+        if (!release || release.tracks.length === 0) return;
+        onEnqueueMusic(queueFromRelease(detail, release), mode);
+      } catch (err) {
+        toast.error(String(err));
+      }
+    },
+    [onEnqueueMusic]
+  );
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { delay: 500, tolerance: 5 } })
@@ -540,7 +589,11 @@ export function MainContent({
       if (!selectedEntry) loadedInViewRef.current = null;
       return;
     }
-    const children = Array.from(grid.children) as HTMLElement[];
+    // Query by [data-flip-id] rather than direct children: ArtistsGrid nests its
+    // cards under letter-section wrappers, and direct-children scanning finds
+    // zero cards there — which silently skipped the page load-in on Artists.
+    // For flat grids this matches grid.children exactly.
+    const children = Array.from(grid.querySelectorAll<HTMLElement>("[data-flip-id]"));
 
     // ── List-change FLIP (drops, deletes, reorders): layout positions ──
     const prev = flipPositionsRef.current;
@@ -567,7 +620,7 @@ export function MainContent({
       loadedInViewRef.current = loadInKey;
       flipKeysRef.current = keys;
       flipPositionsRef.current = next;
-      playDropIn(children.filter((c) => c.dataset.flipId));
+      playDropIn(children);
       return;
     }
 
@@ -582,6 +635,15 @@ export function MainContent({
     // Artists view: sort-mode switches snap instantly (People-page behavior) —
     // no FLIP choreography, just the new order.
     if (!dragging && !justDropped && !resized && !navigated && listChanged && !isArtistsView) {
+      // Animate only movers whose old OR new box crosses the viewport (plus a
+      // margin). A full re-sort moves nearly every card; the offscreen ones can
+      // land instantly — animating them wastes compositor work and drags cards
+      // through the viewport, forcing paints of content-visibility regions
+      // mid-animation. This is what keeps big-grid sort switches smooth.
+      const sc = scrollContainerRef.current;
+      const viewTop = (sc?.scrollTop ?? 0) - 200;
+      const viewBottom = (sc?.scrollTop ?? 0) + (sc?.clientHeight ?? window.innerHeight) + 200;
+      const inView = (r: { y: number; h: number }) => r.y + r.h > viewTop && r.y < viewBottom;
       // Counts only cards that actually move, so the stagger cascades across
       // the movers rather than indexing the whole grid.
       let animated = 0;
@@ -593,7 +655,7 @@ export function MainContent({
         const now = next.get(key)!;
         const dx = old.x - now.x;
         const dy = old.y - now.y;
-        if (dx !== 0 || dy !== 0) {
+        if ((dx !== 0 || dy !== 0) && (inView(old) || inView(now))) {
           child.animate(
             [
               { transform: `translate(${dx}px, ${dy}px)` },
@@ -801,6 +863,13 @@ export function MainContent({
     ? filteredEntries.find((e) => sortableIdFor(e) === dragId) ?? null
     : null;
 
+  // Music playlists render as a track LIST (a cover grid of near-identical
+  // album art reads terribly); everything else keeps the grid. The same
+  // DndContext/SortableContext drives both — only the strategy and the
+  // rendered children change.
+  const isMusicPlaylist =
+    selectedLibrary?.format === "music" && activeView?.kind === "playlist-detail";
+
   // Default drops animate the overlay back to the source card. When the drop
   // went into a container (collection / move-up zone), fly into the target and
   // shrink away instead.
@@ -957,6 +1026,23 @@ export function MainContent({
     );
   }
 
+  if (activeView?.kind === "home") {
+    return (
+      <main className="flex flex-1 flex-col overflow-hidden bg-background">
+        {breadcrumbBar}
+        <div ref={scrollContainerRef} className="relative flex min-h-0 flex-1 flex-col overflow-y-auto">
+          <HomePage
+            getCoverUrl={getCoverUrl}
+            onPlayFile={onPlayFile}
+            onPlayEpisode={(args) => onPlayEpisode?.(args)}
+            onOpenLibraryEntry={onOpenLibraryEntry}
+            onOpenLibraryTrack={onOpenLibraryTrack}
+          />
+        </div>
+      </main>
+    );
+  }
+
   if (activeView?.kind === "tracks") {
     return (
       <main className="flex flex-1 flex-col overflow-hidden bg-background">
@@ -967,6 +1053,53 @@ export function MainContent({
             libraryId={activeView.libraryId}
             onPlayQueue={(items, startIndex) => onPlayMusicQueue?.(items, startIndex)}
             currentTrackId={musicCurrentTrackId ?? null}
+            playing={musicPlaying ?? false}
+            onPlaylistsChanged={() => onPlaylistChanged(activeView.libraryId)}
+            onEnqueue={onEnqueueMusic}
+            getCoverUrl={getCoverUrl}
+            focusRequest={musicTracksFocusRequest ?? null}
+            onNavigateToArtist={(artistId, artistTitle) => onNavigate({
+              id: artistId,
+              title: artistTitle,
+              year: null,
+              end_year: null,
+              folder_path: "",
+              parent_id: null,
+              entry_type: "artist",
+              covers: [],
+              selected_cover: null,
+              child_count: 0,
+              season_display: null,
+              collection_display: null,
+              tmdb_id: null,
+              link_id: null,
+              interactive: false,
+              watched: false,
+              watch_progress: null,
+              unwatched: false,
+              has_progress: false,
+            })}
+            onNavigateToAlbum={(albumId, albumTitle) => onNavigate({
+              id: albumId,
+              title: albumTitle,
+              year: null,
+              end_year: null,
+              folder_path: "",
+              parent_id: null,
+              entry_type: "album",
+              covers: [],
+              selected_cover: null,
+              child_count: 0,
+              season_display: null,
+              collection_display: null,
+              tmdb_id: null,
+              link_id: null,
+              interactive: false,
+              watched: false,
+              watch_progress: null,
+              unwatched: false,
+              has_progress: false,
+            })}
           />
         </div>
       </main>
@@ -1036,7 +1169,12 @@ export function MainContent({
                 <ArrowUpDown size={12} />
                 {(() => {
                   if (isArtistsView) {
-                    return sortMode === "credits" ? "Most credited" : "A–Z";
+                    return sortMode === "credits" ? "Most credited" : "Alphabetical";
+                  }
+                  if (activeView?.kind === "albums") {
+                    return sortMode === "date" ? "Oldest first"
+                      : sortMode === "date-desc" ? "Newest first"
+                      : "Alphabetical";
                   }
                   // When a preset is active the dropdown label shows the preset name — the
                   // underlying sort_mode is still 'custom' but the user's mental model is
@@ -1045,57 +1183,91 @@ export function MainContent({
                     const p = presets.find((p) => p.id === selectedPresetId);
                     if (p) return p.name;
                   }
-                  return sortMode === "alpha"
-                    ? "A\u2013Z"
-                    : sortMode === "date" || sortMode === "year"
-                      ? "Date"
-                      : "Custom";
+                  if (sortMode === "alpha") return "Alphabetical";
+                  if (sortMode === "date-desc") return "Newest first";
+                  if (sortMode === "date" || sortMode === "year") {
+                    // Playlists only have the one date direction — keep its old name.
+                    return activeView?.kind === "playlist-detail" ? "Date" : "Oldest first";
+                  }
+                  return "Custom";
                 })()}
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
+                <DropdownMenuItem onClick={() => onSortModeChange("alpha")}>
+                  Alphabetical
+                </DropdownMenuItem>
                 {isArtistsView && (
                   <DropdownMenuItem onClick={() => onSortModeChange("credits")}>
                     Most credited
                   </DropdownMenuItem>
                 )}
-                <DropdownMenuItem onClick={() => onSortModeChange("alpha")}>
-                  {isArtistsView ? "A–Z" : "Alphabetical"}
-                </DropdownMenuItem>
-                {isArtistsView ? null : (
+                {isArtistsView ? null : activeView?.kind === "albums" ? (
+                  // Albums: both date directions, no custom order or presets —
+                  // its sort is a settings key, not a per-scope sort_order.
                   <>
                     <DropdownMenuItem onClick={() => onSortModeChange("date")}>
-                      Date
+                      Oldest first
                     </DropdownMenuItem>
-                    <DropdownMenuItem onClick={() => { onSortModeChange("custom"); onChangePreset(null); }}>
-                      Custom
+                    <DropdownMenuItem onClick={() => onSortModeChange("date-desc")}>
+                      Newest first
                     </DropdownMenuItem>
-                    {presets.length > 0 && <DropdownMenuSeparator />}
-                    {presets.map((p) => (
-                      <DropdownMenuItem
-                        key={p.id}
-                        onClick={() => onChangePreset(p.id)}
-                        className="flex items-center justify-between gap-2"
-                      >
-                        <span className="truncate">{p.name}</span>
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setDeletePresetTarget(p);
-                          }}
-                          className="text-muted-foreground hover:text-destructive"
-                          aria-label={`Delete preset ${p.name}`}
-                        >
-                          <Trash2 size={12} />
-                        </button>
+                  </>
+                ) : (
+                  <>
+                    {activeView?.kind === "playlist-detail" ? (
+                      // Playlist sort modes are validated backend-side to the old
+                      // single-direction vocabulary; date-desc isn't one of them.
+                      <DropdownMenuItem onClick={() => onSortModeChange("date")}>
+                        Date
                       </DropdownMenuItem>
-                    ))}
+                    ) : (
+                      <>
+                        <DropdownMenuItem onClick={() => onSortModeChange("date")}>
+                          Oldest first
+                        </DropdownMenuItem>
+                        <DropdownMenuItem onClick={() => onSortModeChange("date-desc")}>
+                          Newest first
+                        </DropdownMenuItem>
+                      </>
+                    )}
+                    {/* Custom order (and presets — saved custom orders) is a
+                        playlist-side concept only; library grids sort by rule.
+                        (The playlists LIST never renders this toolbar — its own
+                        dropdown in PlaylistsPage keeps its custom sort.) */}
+                    {activeView?.kind === "playlist-detail" && (
+                      <>
+                        <DropdownMenuItem onClick={() => { onSortModeChange("custom"); onChangePreset(null); }}>
+                          Custom
+                        </DropdownMenuItem>
+                        {presets.length > 0 && <DropdownMenuSeparator />}
+                        {presets.map((p) => (
+                          <DropdownMenuItem
+                            key={p.id}
+                            onClick={() => onChangePreset(p.id)}
+                            className="flex items-center justify-between gap-2"
+                          >
+                            <span className="truncate">{p.name}</span>
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setDeletePresetTarget(p);
+                              }}
+                              className="text-muted-foreground hover:text-destructive"
+                              aria-label={`Delete preset ${p.name}`}
+                            >
+                              <Trash2 size={12} />
+                            </button>
+                          </DropdownMenuItem>
+                        ))}
+                      </>
+                    )}
                   </>
                 )}
               </DropdownMenuContent>
             </DropdownMenu>
             {/* Save-preset button: visible only in pristine custom sort at a sortable scope
                 with items to save. Clicking opens the name dialog. */}
-            {!isArtistsView
+            {activeView?.kind === "playlist-detail"
               && sortMode === "custom"
               && selectedPresetId === null
               && activeView
@@ -1163,8 +1335,34 @@ export function MainContent({
                 unwatched: false,
                 has_progress: false,
               })}
+              onNavigateToArtist={(artistId, artistTitle) => onNavigate({
+                id: artistId,
+                title: artistTitle,
+                year: null,
+                end_year: null,
+                folder_path: "",
+                parent_id: null,
+                entry_type: "artist",
+                covers: [],
+                selected_cover: null,
+                child_count: 0,
+                season_display: null,
+                collection_display: null,
+                tmdb_id: null,
+                link_id: null,
+                interactive: false,
+                watched: false,
+                watch_progress: null,
+                unwatched: false,
+                has_progress: false,
+              })}
               onPlayQueue={(items, startIndex) => onPlayMusicQueue?.(items, startIndex)}
+              currentTrackId={musicCurrentTrackId ?? null}
+              playing={musicPlaying ?? false}
               onMetadataChanged={onRescan}
+              onTitleChanged={onTitleChanged}
+              onAddToPlaylist={(t) => setAddToPlaylistFor(t)}
+              onEnqueue={onEnqueueMusic}
             />
         : selectedEntry.entry_type === "album"
           ? <AlbumDetailPage
@@ -1193,7 +1391,16 @@ export function MainContent({
               })}
               onPlayQueue={(items: MusicQueueItem[], startIndex: number) => onPlayMusicQueue?.(items, startIndex)}
               currentTrackId={musicCurrentTrackId ?? null}
+              playing={musicPlaying ?? false}
+              focusRequest={
+                musicFocusRequest && musicFocusRequest.albumId === selectedEntry.id
+                  ? musicFocusRequest
+                  : null
+              }
               onMetadataChanged={onRescan}
+              onTitleChanged={onTitleChanged}
+              onAddToPlaylist={(t) => setAddToPlaylistFor(t)}
+              onEnqueue={onEnqueueMusic}
             />
           : <EntryDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getCoverUrl={getCoverUrl} getFullCoverUrl={getFullCoverUrl} onEntryChanged={onEntryChanged} onTitleChanged={onTitleChanged} onChangeCover={() => openCoverDialog(selectedEntry, "select")} onAddCover={() => onAddCover(selectedEntry.id)} onDeleteCover={() => openCoverDialog(selectedEntry, "delete")} onPlayFile={onPlayFile} onPlayInteractive={onPlayInteractive} onNavigateToPerson={onNavigateToPerson} onSelectGenre={onSelectGenre} />
       ) : selectedLibrary?.format === "music" && activeView?.kind === "library-root" && !searchResults ? (
@@ -1258,8 +1465,39 @@ export function MainContent({
             {isInsideCollection && <MoveUpDropZone isActive={dragId != null} />}
             <SortableContext
               items={filteredEntries.map(sortableIdFor)}
-              strategy={rectSortingStrategy}
+              strategy={isMusicPlaylist ? verticalListSortingStrategy : rectSortingStrategy}
             >
+              {isMusicPlaylist ? (
+                <div ref={gridRef}>
+                  <PlaylistTrackList
+                    entries={filteredEntries}
+                    getCoverUrl={getCoverUrl}
+                    onPlayQueue={(items, startIndex) => onPlayMusicQueue?.(items, startIndex)}
+                    currentTrackId={musicCurrentTrackId ?? null}
+                    playing={musicPlaying ?? false}
+                    onNavigate={onNavigate}
+                    onRemoveLink={async (linkId) => {
+                      try {
+                        await invoke("remove_media_link", { linkId });
+                        if (selectedLibrary) onPlaylistChanged(selectedLibrary.id);
+                      } catch (err) {
+                        toast.error(String(err));
+                      }
+                    }}
+                    onAddToPlaylist={(t) => setAddToPlaylistFor(t)}
+                    onEnqueue={onEnqueueMusic}
+                    onMetadataChanged={onRescan}
+                    onRenameCollection={(e) => setRenameCollectionFor(e)}
+                    onDeleteCollection={(e) => {
+                      if (e.child_count === 0) {
+                        void deletePlaylistCollection(e.id);
+                      } else {
+                        setDeletePlaylistCollectionTarget(e);
+                      }
+                    }}
+                  />
+                </div>
+              ) : (
               <div
                 ref={gridRef}
                 // gap-2.5: cards carry 8px of their own padding per side, so the
@@ -1281,6 +1519,16 @@ export function MainContent({
                     size={coverSize}
                     onNavigate={onNavigate}
                     onRename={onRenameEntry}
+                    onCombineAlbum={
+                      selectedLibrary?.format === "music"
+                        ? (e) => setCombineSource({ id: e.id, title: e.title })
+                        : undefined
+                    }
+                    onEnqueueAlbum={
+                      selectedLibrary?.format === "music" && onEnqueueMusic
+                        ? (e, mode) => void enqueueAlbum(e, mode)
+                        : undefined
+                    }
                     onChangeCover={() => openCoverDialog(entry, "select")}
                     onAddCover={() => onAddCover(entry.id, {
                       playlistCollection: entry.entry_type === "playlist_collection",
@@ -1323,11 +1571,17 @@ export function MainContent({
                   />
                 ))}
               </div>
+              )}
             </SortableContext>
             <DragOverlay dropAnimation={dropAnimation}>
-              {dragEntry && (
-                <DragOverlayCard entry={dragEntry} size={coverSize} getCoverUrl={getCoverUrl} />
-              )}
+              {dragEntry &&
+                (isMusicPlaylist ? (
+                  <div className="rounded-md border bg-background px-3 py-1.5 text-sm shadow-lg">
+                    {dragEntry.title}
+                  </div>
+                ) : (
+                  <DragOverlayCard entry={dragEntry} size={coverSize} getCoverUrl={getCoverUrl} />
+                ))}
             </DragOverlay>
           </DndContext>
         )}
@@ -1466,6 +1720,18 @@ export function MainContent({
         onSave={onSavePreset}
       />
 
+      {selectedLibrary?.format === "music" && (
+        <CombineAlbumsDialog
+          libraryId={selectedLibrary.id}
+          source={combineSource}
+          open={combineSource !== null}
+          onOpenChange={(o) => {
+            if (!o) setCombineSource(null);
+          }}
+          onDone={onRescan}
+        />
+      )}
+
       {/* Cover Carousel Dialog */}
       {liveCoverDialogEntry && (
         <CoverCarouselDialog
@@ -1571,6 +1837,8 @@ function SortableCoverCard({
   onRemoveLink,
   onRenamePlaylistCollection,
   onDeletePlaylistCollection,
+  onCombineAlbum,
+  onEnqueueAlbum,
   sortableId,
   getCoverUrl,
   getCoverAspect,
@@ -1592,6 +1860,10 @@ function SortableCoverCard({
   onRemoveLink?: (linkId: number) => void;
   onRenamePlaylistCollection?: (entry: MediaEntry) => void;
   onDeletePlaylistCollection?: (entry: MediaEntry) => void;
+  /** Music albums: open the combine-albums dialog with this entry as source. */
+  onCombineAlbum?: (entry: MediaEntry) => void;
+  /** Music albums: queue the whole album ("Play next" / "Add to queue"). */
+  onEnqueueAlbum?: (entry: MediaEntry, mode: "next" | "last") => void;
   /** Overrides the useSortable id. Playlist views need string ids so links and
    *  nested playlist_collections don't collide with each other or with real
    *  media_entry ids. Library views can omit this and the card falls back to entry.id. */
@@ -1737,6 +2009,17 @@ function SortableCoverCard({
                   contentVisibility: "auto",
                   containIntrinsicSize: `${size - 16}px ${Math.round((size - 16) / coverAspect)}px`,
                 }
+              : entry.entry_type === "album" || entry.entry_type === "track"
+              ? {
+                  // Album art is square: reserve 1:1 (center-crop the rare
+                  // non-square cover). The 2:3 poster estimate below would
+                  // collapse by a third on image load and shove the row —
+                  // multiplied across a grid, that's a visible stutter.
+                  width: size - 16,
+                  aspectRatio: "1",
+                  contentVisibility: "auto",
+                  containIntrinsicSize: `${size - 16}px ${size - 16}px`,
+                }
               : {
                   width: size - 16,
                   // Skips layout/paint/decode for offscreen covers; estimates a 2:3 poster.
@@ -1763,8 +2046,8 @@ function SortableCoverCard({
               // With a reserved box the image fills it exactly (real aspect → no crop);
               // otherwise it keeps its natural height. Artists always fill their
               // circle (center crop).
-              className={coverAspect || entry.entry_type === "artist" ? "pointer-events-none h-full w-full object-cover" : "pointer-events-none w-full"}
-              style={coverAspect || entry.entry_type === "artist" ? undefined : { maxHeight: size * 2 }}
+              className={coverAspect || entry.entry_type === "artist" || entry.entry_type === "album" || entry.entry_type === "track" ? "pointer-events-none h-full w-full object-cover" : "pointer-events-none w-full"}
+              style={coverAspect || entry.entry_type === "artist" || entry.entry_type === "album" || entry.entry_type === "track" ? undefined : { maxHeight: size * 2 }}
               draggable={false}
             />
           ) : (
@@ -1773,7 +2056,9 @@ function SortableCoverCard({
                 <Film size={size * 0.3} className="text-muted-foreground" />
               ) : entry.entry_type === "show" ? (
                 <Tv size={size * 0.3} className="text-muted-foreground" />
-              ) : entry.entry_type === "artist" || entry.entry_type === "album" || entry.entry_type === "track" ? (
+              ) : entry.entry_type === "album" ? (
+                <Disc3 size={size * 0.3} className="text-muted-foreground" />
+              ) : entry.entry_type === "artist" || entry.entry_type === "track" ? (
                 <Music2 size={size * 0.3} className="text-muted-foreground" />
               ) : (
                 <Folder size={size * 0.3} className="text-muted-foreground" />
@@ -1848,7 +2133,7 @@ function SortableCoverCard({
               ) : entry.entry_type === "album" && (entry.collection_display || entry.year) ? (
                 // Album cards: artist and year on their own lines.
                 <p className="text-xs text-muted-foreground">
-                  {entry.collection_display && <span className="block truncate">{entry.collection_display}</span>}
+                  {entry.collection_display && <span className="block break-words">{entry.collection_display}</span>}
                   {entry.year && <span className="block">{entry.year}</span>}
                 </p>
               ) : (entry.season_display || entry.collection_display || entry.year) && (
@@ -1926,6 +2211,24 @@ function SortableCoverCard({
               <ContextMenuItem onClick={() => onAddToPlaylist(entry)}>
                 <ListPlus size={14} />
                 Add to playlist
+              </ContextMenuItem>
+            )}
+            {onEnqueueAlbum && entry.link_id == null && entry.entry_type === "album" && (
+              <>
+                <ContextMenuItem onClick={() => onEnqueueAlbum(entry, "next")}>
+                  <ListStart size={14} />
+                  Play next
+                </ContextMenuItem>
+                <ContextMenuItem onClick={() => onEnqueueAlbum(entry, "last")}>
+                  <ListEnd size={14} />
+                  Add to queue
+                </ContextMenuItem>
+              </>
+            )}
+            {onCombineAlbum && entry.link_id == null && entry.entry_type === "album" && (
+              <ContextMenuItem onClick={() => onCombineAlbum(entry)}>
+                <Layers size={14} />
+                Combine with…
               </ContextMenuItem>
             )}
             {(entry.entry_type === "movie" || entry.entry_type === "show") && (
@@ -2039,7 +2342,9 @@ function DragOverlayCard({
               <Film size={size * 0.3} className="text-muted-foreground" />
             ) : entry.entry_type === "show" ? (
               <Tv size={size * 0.3} className="text-muted-foreground" />
-            ) : entry.entry_type === "artist" || entry.entry_type === "album" || entry.entry_type === "track" ? (
+            ) : entry.entry_type === "album" ? (
+              <Disc3 size={size * 0.3} className="text-muted-foreground" />
+            ) : entry.entry_type === "artist" || entry.entry_type === "track" ? (
               <Music2 size={size * 0.3} className="text-muted-foreground" />
             ) : (
               <Folder size={size * 0.3} className="text-muted-foreground" />
@@ -2051,7 +2356,7 @@ function DragOverlayCard({
         <p className="text-sm font-medium">{entry.title}</p>
         {entry.entry_type === "album" && (entry.collection_display || entry.year) ? (
           <p className="text-xs text-muted-foreground">
-            {entry.collection_display && <span className="block truncate">{entry.collection_display}</span>}
+            {entry.collection_display && <span className="block break-words">{entry.collection_display}</span>}
             {entry.year && <span className="block">{entry.year}</span>}
           </p>
         ) : (entry.season_display || entry.collection_display || entry.year) && (
@@ -4546,7 +4851,7 @@ function PlaylistsView({
                     const p = presets.find((p) => p.id === selectedPresetId);
                     if (p) return p.name;
                   }
-                  return sortMode === "alpha" ? "A–Z" : "Custom";
+                  return sortMode === "alpha" ? "Alphabetical" : "Custom";
                 })()}
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
@@ -4757,7 +5062,8 @@ function PlaylistCard({
           />
         }
       >
-        <div className="relative aspect-[2/3] overflow-hidden rounded-[3px] bg-muted shadow-md ring-1 ring-foreground/10 transition-[translate,scale] duration-200 group-hover:-translate-y-1 group-hover:scale-[1.04] group-hover:shadow-xl group-hover:ring-foreground/25">
+        {/* Square, not 2:3 — playlist covers are expected square (album-art shaped). */}
+        <div className="relative aspect-square overflow-hidden rounded-[3px] bg-muted shadow-md ring-1 ring-foreground/10 transition-[translate,scale] duration-200 group-hover:-translate-y-1 group-hover:scale-[1.04] group-hover:shadow-xl group-hover:ring-foreground/25">
           {coverSrc ? (
             <img src={coverSrc} alt={playlist.title} className="h-full w-full object-cover" draggable={false} />
           ) : (

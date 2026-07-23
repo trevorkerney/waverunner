@@ -1,16 +1,20 @@
-import { useState, useRef, useEffect, useSyncExternalStore } from "react";
+import { useState, useRef, useEffect, useSyncExternalStore, type ReactNode } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, X, Music2 } from "lucide-react";
+import { Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, X, Music2, ChevronUp, ChevronDown, Shuffle, Repeat, Repeat1, ListMusic } from "lucide-react";
 import { Slider } from "../ui/slider";
-import { MusicPlayerState, MusicPlayerActions } from "../../hooks/useMusicPlayer";
+import { MusicPlayerState, MusicPlayerActions, currentMusicItem } from "../../hooks/useMusicPlayer";
+import { UpNextPanel } from "./UpNextPanel";
 
 const MARQUEE_PX_PER_SEC = 40;
 const MARQUEE_PAUSE_MS = 2000;
 const MARQUEE_GAP_PX = 40;
 
 /** Single-line text that marquee-scrolls when it overflows instead of
- *  truncating (same treatment as the minimized video dock's title). */
-function MarqueeText({ text, className }: { text: string; className?: string }) {
+ *  truncating (same treatment as the minimized video dock's title). Hovering
+ *  pauses the scroll where it is — the contents can be links. `children`
+ *  renders richer content (link spans); `text` stays the plain string for
+ *  overflow measurement and the tooltip, so keep them in sync. */
+function MarqueeText({ text, children, className }: { text: string; children?: ReactNode; className?: string }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const textRef = useRef<HTMLSpanElement | null>(null);
   const trackRef = useRef<HTMLDivElement | null>(null);
@@ -54,19 +58,31 @@ function MarqueeText({ text, className }: { text: string; className?: string }) 
     };
   }, [overflow, text]);
 
+  const setPaused = (paused: boolean) => {
+    if (trackRef.current) {
+      trackRef.current.style.animationPlayState = paused ? "paused" : "running";
+    }
+  };
+
   return (
-    <div ref={containerRef} className={`marquee min-w-0 ${className ?? ""}`} title={text}>
+    <div
+      ref={containerRef}
+      className={`marquee min-w-0 ${className ?? ""}`}
+      title={text}
+      onMouseEnter={() => setPaused(true)}
+      onMouseLeave={() => setPaused(false)}
+    >
       <div
         ref={trackRef}
         className="inline-flex items-center will-change-transform"
         style={{ gap: overflow ? `${MARQUEE_GAP_PX}px` : 0 }}
       >
         <span ref={textRef} className="inline-block whitespace-nowrap">
-          {text}
+          {children ?? text}
         </span>
         {overflow && (
           <span aria-hidden className="inline-block whitespace-nowrap">
-            {text}
+            {children ?? text}
           </span>
         )}
       </div>
@@ -79,6 +95,15 @@ interface NowPlayingBarProps {
   actions: MusicPlayerActions;
   /** Suppressed while the video player takes over the window. */
   hidden: boolean;
+  /** Title / album-name click → album page. With trackId, the page scrolls to
+   *  that track and highlights it. */
+  onOpenAlbum?: (albumId: number, albumTitle: string, trackId?: number) => void;
+  /** Artist-name click → artist page. */
+  onOpenArtist?: (artistId: number, artistName: string) => void;
+  /** Cover art is parked in the sidebar; the bar's slot shows a grey stand-in
+   *  and the hover button flips to a down arrow. */
+  coverDocked?: boolean;
+  onToggleCoverDock?: () => void;
 }
 
 function fmtTime(secs: number): string {
@@ -93,17 +118,18 @@ function fmtTime(secs: number): string {
 
 /** Persistent bottom bar for music playback. Mounts once in the app shell and
  *  shows whenever a queue is loaded — browsing continues above it. */
-export function NowPlayingBar({ state, actions, hidden }: NowPlayingBarProps) {
+export function NowPlayingBar({ state, actions, hidden, onOpenAlbum, onOpenArtist, coverDocked, onToggleCoverDock }: NowPlayingBarProps) {
   const position = useSyncExternalStore(actions.subscribePosition, actions.getPosition);
   // Local drag values keep both sliders glued to the cursor without waiting on
   // the backend round-trip (same pattern as the video player's overlays).
   const [seekDragValue, setSeekDragValue] = useState<number | null>(null);
   const [volumeDragValue, setVolumeDragValue] = useState<number | null>(null);
   const volumeDragRef = useRef<number | null>(null);
+  const [queueOpen, setQueueOpen] = useState(false);
 
   if (!state.isActive || hidden) return null;
 
-  const current = state.queue[state.index];
+  const current = currentMusicItem(state);
   if (!current) return null;
 
   const duration = state.duration > 0 ? state.duration : current.durationSecs ?? 0;
@@ -141,28 +167,108 @@ export function NowPlayingBar({ state, actions, hidden }: NowPlayingBarProps) {
     <div className="relative z-10 flex h-[4.5rem] shrink-0 items-center gap-3 border-t bg-sidebar px-3">
       {/* What's playing */}
       <div className="flex w-56 min-w-0 items-center gap-2.5">
-        {current.cover ? (
-          <img
-            src={convertFileSrc(current.cover)}
-            alt=""
-            className="h-11 w-11 shrink-0 rounded object-cover"
-            draggable={false}
-          />
-        ) : (
-          <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded bg-muted text-muted-foreground">
-            <Music2 size={20} />
-          </div>
-        )}
+        <div className="group/cover relative h-11 w-11 shrink-0">
+          {current.cover ? (
+            // Shown here even while docked — the art simply appears in both places.
+            <img
+              src={convertFileSrc(current.cover)}
+              alt=""
+              className="h-11 w-11 rounded object-cover"
+              draggable={false}
+            />
+          ) : (
+            <div className="flex h-11 w-11 items-center justify-center rounded bg-muted text-muted-foreground">
+              <Music2 size={20} />
+            </div>
+          )}
+          {current.cover && onToggleCoverDock && (
+            <button
+              onClick={onToggleCoverDock}
+              // Docked: the down arrow is the grey slot's only content — always
+              // visible. Undocked: the up arrow appears on cover hover only.
+              className={`absolute right-0.5 top-0.5 rounded-full bg-black/60 p-0.5 text-white shadow transition-opacity hover:bg-black/80 ${
+                coverDocked ? "" : "opacity-0 group-hover/cover:opacity-100"
+              }`}
+              title={coverDocked ? "Bring cover back down" : "Show cover in sidebar"}
+            >
+              {coverDocked ? <ChevronDown size={12} /> : <ChevronUp size={12} />}
+            </button>
+          )}
+        </div>
         <div className="min-w-0 flex-1">
-          <MarqueeText text={current.title} className="text-sm font-medium" />
-          {subtitle && <MarqueeText text={subtitle} className="text-xs text-muted-foreground" />}
+          <MarqueeText text={current.title} className="text-sm font-medium">
+            {current.albumId != null && onOpenAlbum ? (
+              <span
+                role="link"
+                className="cursor-pointer hover:underline"
+                onClick={() =>
+                  onOpenAlbum(current.albumId!, current.albumTitle ?? current.title, current.trackId)
+                }
+              >
+                {current.title}
+              </span>
+            ) : (
+              current.title
+            )}
+          </MarqueeText>
+          {subtitle && (
+            <MarqueeText text={subtitle} className="text-xs text-muted-foreground">
+              {current.artistName
+                ? // Each credited artist links to their own page; names the
+                  // library doesn't know stay plain text. Old persisted queues
+                  // without the artists array fall back to one link.
+                  (current.artists && current.artists.length > 0
+                    ? current.artists
+                    : [{ name: current.artistName, artistId: current.artistId ?? null }]
+                  ).map((a, i) => (
+                    <span key={`${a.name}-${i}`}>
+                      {i > 0 && ", "}
+                      {a.artistId != null && onOpenArtist ? (
+                        <span
+                          role="link"
+                          className="cursor-pointer hover:underline"
+                          onClick={() => onOpenArtist(a.artistId!, a.name)}
+                        >
+                          {a.name}
+                        </span>
+                      ) : (
+                        a.name
+                      )}
+                    </span>
+                  ))
+                : null}
+              {current.artistName && current.albumTitle ? " — " : null}
+              {current.albumTitle ? (
+                current.albumId != null && onOpenAlbum ? (
+                  <span
+                    role="link"
+                    className="cursor-pointer hover:underline"
+                    onClick={() => onOpenAlbum(current.albumId!, current.albumTitle!)}
+                  >
+                    {current.albumTitle}
+                  </span>
+                ) : (
+                  current.albumTitle
+                )
+              ) : null}
+            </MarqueeText>
+          )}
         </div>
       </div>
 
       {/* Transport + seek — tight gap; the column centers in the fixed-height
           bar, so the leftover space splits evenly above and below. */}
       <div className="flex min-w-0 flex-1 flex-col items-center justify-center gap-0.5">
-        <div className="flex items-center gap-2">
+        {/* translate (not margin) drops the transport row toward the seek bar
+            without reflowing it — the seek bar stays exactly where it was. */}
+        <div className="flex translate-y-0.5 items-center gap-2">
+          <button
+            onClick={() => actions.toggleShuffle()}
+            className={`rounded-full p-1.5 hover:text-foreground ${state.shuffle ? "text-primary" : "text-muted-foreground"}`}
+            title={state.shuffle ? "Shuffle on" : "Shuffle off"}
+          >
+            <Shuffle size={14} />
+          </button>
           <button
             onClick={() => actions.previous()}
             className="rounded-full p-1.5 text-muted-foreground hover:text-foreground"
@@ -183,11 +289,22 @@ export function NowPlayingBar({ state, actions, hidden }: NowPlayingBarProps) {
           </button>
           <button
             onClick={() => actions.next()}
-            disabled={state.index >= state.queue.length - 1}
+            disabled={
+              state.explicitQueue.length === 0 &&
+              state.index >= state.queue.length - 1 &&
+              state.loop !== "all"
+            }
             className="rounded-full p-1.5 text-muted-foreground hover:text-foreground disabled:opacity-30"
             title="Next"
           >
             <SkipForward size={16} fill="currentColor" />
+          </button>
+          <button
+            onClick={() => actions.cycleLoop()}
+            className={`rounded-full p-1.5 hover:text-foreground ${state.loop !== "off" ? "text-primary" : "text-muted-foreground"}`}
+            title={state.loop === "off" ? "Loop off" : state.loop === "all" ? "Looping queue" : "Looping track"}
+          >
+            {state.loop === "one" ? <Repeat1 size={14} /> : <Repeat size={14} />}
           </button>
         </div>
         <div className="flex w-full max-w-2xl items-center gap-2">
@@ -213,8 +330,16 @@ export function NowPlayingBar({ state, actions, hidden }: NowPlayingBarProps) {
       {/* Volume + queue position + close */}
       <div className="flex w-56 items-center justify-end gap-2">
         <span className="text-[10px] text-muted-foreground">
-          {state.index + 1}/{state.queue.length}
+          {state.explicitCurrent ? "queue" : `${state.index + 1}/${state.queue.length}`}
         </span>
+        <button
+          onMouseDown={(e) => e.stopPropagation()}
+          onClick={() => setQueueOpen((v) => !v)}
+          className={`rounded p-1 hover:text-foreground ${queueOpen ? "text-primary" : "text-muted-foreground"}`}
+          title="Up next"
+        >
+          <ListMusic size={16} />
+        </button>
         <button
           onClick={() => actions.toggleMute()}
           className="rounded p-1 text-muted-foreground hover:text-foreground"
@@ -239,6 +364,8 @@ export function NowPlayingBar({ state, actions, hidden }: NowPlayingBarProps) {
           <X size={16} />
         </button>
       </div>
+
+      {queueOpen && <UpNextPanel state={state} actions={actions} onClose={() => setQueueOpen(false)} />}
     </div>
   );
 }

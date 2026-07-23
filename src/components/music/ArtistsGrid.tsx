@@ -45,7 +45,14 @@ export function ArtistsGrid({ entries, getCoverUrl, onNavigate, gridRef, sortMod
             onClick={() => onNavigate(artist)}
             className="group flex flex-col items-center gap-2 overflow-hidden rounded-md p-2 text-center transition-colors hover:bg-accent/40 focus:bg-accent/60 focus:outline-none"
           >
-            <div className="flex h-32 w-32 shrink-0 items-center justify-center overflow-hidden rounded-full bg-muted shadow-md ring-1 ring-foreground/10 transition-all duration-200 group-hover:shadow-lg group-hover:ring-primary/50">
+            {/* content-visibility on the (fixed-size, overflow-hidden) cover box —
+                not the card root, where paint containment would clip the hover
+                shadow — skips layout/paint/decode for every offscreen circle.
+                Same discipline as the video grid's cover cards. */}
+            <div
+              className="flex h-32 w-32 shrink-0 items-center justify-center overflow-hidden rounded-full bg-muted shadow-md ring-1 ring-foreground/10 transition-all duration-200 group-hover:shadow-lg group-hover:ring-primary/50"
+              style={{ contentVisibility: "auto", containIntrinsicSize: "128px 128px" }}
+            >
               {cover ? (
                 <img
                   src={getCoverUrl(cover)}

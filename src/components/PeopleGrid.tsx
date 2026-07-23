@@ -26,7 +26,7 @@ import type { CharacterMatch, DirectorCreatorCounts, PersonRole, PersonSummary, 
 
 // Display labels for the two modes. The persisted values stay "top" | "all"
 // (settings table, people_mode:*) — only the labels changed.
-const MODE_LABELS = { top: "Most credited", all: "A–Z" } as const;
+const MODE_LABELS = { top: "Most credited", all: "Alphabetical" } as const;
 // Cell geometry — virtualization needs row heights known up front. Cards are a
 // fixed base (padding + face + 2-line name reserve) plus a measured number of
 // subtitle lines; each row is sized to its tallest subtitle so credit
@@ -415,7 +415,7 @@ export function PeoplePage({ people, libraryId, role, initialMode, onModeChange,
               {MODE_LABELS[mode]}
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
-              {(["top", "all"] as const).map((m) => (
+              {(["all", "top"] as const).map((m) => (
                 <DropdownMenuItem
                   key={m}
                   onClick={() => {

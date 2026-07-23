@@ -178,3 +178,35 @@ html.player-active #root {
   overflow: hidden;
   white-space: nowrap;
 }
+
+/* Rails (Home page shelves): the native horizontal scrollbar is hidden —
+   discoverability comes from cut-off cards, edge fades, and hover chevrons. */
+.scrollbar-none {
+  scrollbar-width: none;
+}
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
+}
+
+/* Now-playing equalizer bars (PlayingIndicator): spans baseline to cap
+   height — bottom rests on the text baseline (items-baseline row), top meets
+   the capitals. 0.7em approximates cap height where `cap` is unsupported. */
+.eq-icon {
+  height: 0.7em;
+}
+@supports (height: 1cap) {
+  .eq-icon {
+    height: 1cap;
+  }
+}
+
+/* Now-playing equalizer bars (PlayingIndicator) */
+@keyframes eq-bar {
+  0%,
+  100% {
+    transform: scaleY(0.3);
+  }
+  50% {
+    transform: scaleY(1);
+  }
+}

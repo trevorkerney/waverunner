@@ -143,6 +143,25 @@ pub fn destroy_player(state: State<'_, AppState>) -> Result<(), String> {
     crate::interactive_session::stop_session(&state);
     let mut guard = state.player.lock().map_err(|e| e.to_string())?;
     if let Some(inner) = guard.take() {
+        // The player is sitting on the exact frame the user left at — snap it
+        // for the Home hub's continue-watching card before quitting. Keyed by
+        // watch target so the card and the frame can't disagree; "video" skips
+        // subtitles/OSD. Best-effort (EOF-idle or audio-only just fails).
+        if let Ok(watch_guard) = inner.watch.lock() {
+            if let Some(target) = watch_guard.as_ref() {
+                let (kind, id) = match target {
+                    WatchTarget::Movie { entry_id } => ("movie", *entry_id),
+                    WatchTarget::Episode { episode_id } => ("episode", *episode_id),
+                };
+                let dir = state.app_data_dir.join("cache").join("resume_frames");
+                if std::fs::create_dir_all(&dir).is_ok() {
+                    let path = dir.join(format!("{kind}_{id}.jpg"));
+                    let _ = inner
+                        .mpv
+                        .command(&["screenshot-to-file", &path.to_string_lossy(), "video"]);
+                }
+            }
+        }
         // Signal event loop to stop
         inner.shutdown.store(true, Ordering::SeqCst);
         // Send quit command so mpv_wait_event returns SHUTDOWN

@@ -792,9 +792,11 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     // ── Music play history ────────────────────────────────────────────
     // One row per playback START, however brief — recently-played shows all
     // of these. `scrobbled` flips once the Last.fm rule trips (>=50% of the
-    // track or >=4 minutes, whichever comes first); stats and "real listen"
-    // surfaces read only scrobbled rows. played_secs = furthest position
-    // reached. There is deliberately no resume for music.
+    // track or >=4 minutes of accumulated listening, whichever comes first);
+    // stats and "real listen" surfaces read only scrobbled rows. played_secs =
+    // seconds actually listened (seek jumps credit nothing; rows written
+    // before 2026-07-22 hold the old furthest-position metric). There is
+    // deliberately no resume for music.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS music_play (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -816,6 +818,20 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_music_play_started ON music_play(started_at)")
         .execute(&pool)
         .await?;
+
+    // ── Loved tracks ──────────────────────────────────────────────────
+    // Presence of a row = the track is loved. Keyed on the track id, which
+    // rescans preserve by file path — a loved track keeps its heart unless
+    // its file moves out from under it (same durability as play history).
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS track_loved (
+            track_id INTEGER PRIMARY KEY,
+            loved_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (track_id) REFERENCES track(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
 
     // ── Music scan issues ─────────────────────────────────────────────
     // Only files the scanner literally could not read (corrupt/undecodable)
@@ -849,6 +865,48 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             stage TEXT NOT NULL,
             updated_at TEXT NOT NULL DEFAULT (datetime('now')),
             FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // ── Album combine directives ──────────────────────────────────────
+    // "These tag-albums are one album." Applied at scan time (both fresh
+    // scans and rescans), so combines SURVIVE rescans — scans group strictly
+    // by tags and would otherwise re-split them. Identities are lowercased
+    // TAG values (album_artist + album), not DB titles, because that's what
+    // the scanner groups by ('' artist = artist-less). mode: 'merge' (tracks
+    // fold into the target's default release, keeping disc numbers) |
+    // 'versions' (each source release becomes a version of the target).
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS album_combine (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            library_id TEXT NOT NULL,
+            source_artist TEXT NOT NULL,
+            source_title TEXT NOT NULL,
+            target_artist TEXT NOT NULL,
+            target_title TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // ── TMDB match attempts ───────────────────────────────────────────
+    // Outcome of the last automatic TMDB match try for a movie/show entry
+    // that DIDN'T settle it: 'notfound' (no results) or 'ambiguous' (results
+    // but no confident winner). Feeds the video metadata center so unmatched
+    // entries persist past the matching pass instead of evaporating with the
+    // dialog. Applying a match (auto or manual) deletes the row.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS tmdb_match_attempt (
+            entry_id INTEGER PRIMARY KEY,
+            status TEXT NOT NULL,
+            detail TEXT,
+            attempted_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (entry_id) REFERENCES media_entry(id) ON DELETE CASCADE
         )",
     )
     .execute(&pool)

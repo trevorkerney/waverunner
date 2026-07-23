@@ -39,7 +39,7 @@ function musicComplications(
     {
       id: "artists",
       label: "Artists",
-      iconName: "Music2",
+      iconName: "Users",
       count: counts?.artists,
       view: { kind: "library-root", libraryId },
     },
@@ -53,7 +53,7 @@ function musicComplications(
     {
       id: "tracks",
       label: "Tracks",
-      iconName: "Music",
+      iconName: "Music2",
       count: counts?.tracks,
       view: { kind: "tracks", libraryId },
     },
@@ -152,6 +152,7 @@ function videoComplications(
 // Replaces the old `${libraryId}:${parentId}` pattern by including view kind.
 export function viewCacheKey(view: ViewSpec): string {
   switch (view.kind) {
+    case "home":               return "home";
     case "library-root":       return `${view.libraryId}:root`;
     case "movies-only":        return `${view.libraryId}:movies`;
     case "shows-only":         return `${view.libraryId}:shows`;
@@ -176,6 +177,7 @@ export function viewCacheKey(view: ViewSpec): string {
 // which the UI uses to gate the save-preset button.
 export function scopeKeyFor(view: ViewSpec, parentId: number | null): string | null {
   switch (view.kind) {
+    case "home":             return null;
     case "library-root":
       return parentId !== null
         ? `lib-coll:${parentId}`

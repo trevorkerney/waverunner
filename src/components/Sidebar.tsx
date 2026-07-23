@@ -21,7 +21,6 @@ import {
 import { Button } from "@/components/ui/button";
 import { CreateLibraryDialog, type WizardMode } from "@/components/CreateLibraryDialog";
 import { CreatePlaylistDialog } from "@/components/CreatePlaylistDialog";
-import { TmdbBulkMatchDialog } from "@/components/TmdbBulkMatchDialog";
 import { RenameDialog } from "@/components/RenameDialog";
 import { PlayerDock } from "@/components/player/PlayerDock";
 import { PlayerState, PlayerActions } from "@/hooks/usePlayer";
@@ -55,6 +54,8 @@ interface SidebarProps {
   onPlaylistChanged: (libraryId: string) => void;
   /** Opens the App-owned Match-to-MusicBrainz review modal. */
   onOpenMusicBrainzReview: (libraryId: string) => void;
+  /** Opens the App-owned video metadata center (TMDB match review). */
+  onOpenVideoMetadataCenter: (libraryId: string) => void;
   /** Per-library playlists to show as children of the "Playlists" sidebar node. */
   sidebarPlaylists: Record<string, PlaylistSummary[]>;
   /** Per-library counts shown dimmed on sidebar nodes. */
@@ -63,6 +64,12 @@ interface SidebarProps {
   sidebarGenres: Record<string, GenreSummary[]>;
   playerState: PlayerState;
   playerActions: PlayerActions;
+  /** Now-playing album cover, docked up here by the bar's up-arrow (null =
+   *  not docked / nothing playing). Rendered like the minimized video dock. */
+  dockedMusicCoverUrl?: string | null;
+  /** The Home pseudo-library pinned above the real ones. */
+  onOpenHome: () => void;
+  homeActive: boolean;
 }
 
 export function Sidebar({
@@ -79,11 +86,15 @@ export function Sidebar({
   onLibraryRenamed,
   onPlaylistChanged,
   onOpenMusicBrainzReview,
+  onOpenVideoMetadataCenter,
   sidebarPlaylists,
   sidebarCounts,
   sidebarGenres,
   playerState,
   playerActions,
+  dockedMusicCoverUrl,
+  onOpenHome,
+  homeActive,
 }: SidebarProps) {
   const [width, setWidth] = useState(DEFAULT_WIDTH);
   const [dragging, setDragging] = useState(false);
@@ -94,8 +105,6 @@ export function Sidebar({
   // the pass lands so the user can reopen at the review step.
   const [chip, setChip] = useState<{ text: string; ready: boolean } | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Library | null>(null);
-  // Library whose media is being bulk-matched to TMDB, or null when closed.
-  const [tmdbMatchTarget, setTmdbMatchTarget] = useState<Library | null>(null);
   const [renameTarget, setRenameTarget] = useState<Library | null>(null);
   // Which library to create a playlist inside, or null when the dialog is closed.
   const [createPlaylistFor, setCreatePlaylistFor] = useState<string | null>(null);
@@ -116,13 +125,36 @@ export function Sidebar({
     return null;
   }, []);
 
-  // Feed the minimized-wizard chip from the matching pass's events.
+  // Feed the minimized-wizard chip from the matching pass's events —
+  // Tauri events for music (backend pass), window CustomEvents for video
+  // (the TMDB run lives in the frontend).
   useEffect(() => {
     if (!wizardMinimized) {
       setChip(null);
       return;
     }
-    setChip({ text: "Matching against MusicBrainz…", ready: false });
+    const isVideoWizard = wizard != null && wizard.kind !== "create" && wizard.format !== "music";
+    setChip({
+      text: isVideoWizard ? "Matching against TMDB…" : "Matching against MusicBrainz…",
+      ready: false,
+    });
+    const onVideoProgress = (e: Event) => {
+      const d = (e as CustomEvent).detail as {
+        current?: number;
+        total?: number;
+        label?: string;
+        etaSecs?: number | null;
+        done?: boolean;
+      };
+      if (d.done) {
+        setChip({ text: "Matching finished — review ready", ready: true });
+        return;
+      }
+      let eta = "";
+      if (d.etaSecs != null && d.etaSecs >= 60) eta = ` · ~${Math.round(d.etaSecs / 60)} min left`;
+      setChip({ text: `Matching ${d.current}/${d.total} — ${d.label}${eta}`, ready: false });
+    };
+    window.addEventListener("video-match-progress", onVideoProgress);
     const samples: number[] = [];
     const unProgress = listen<{ done: number; total: number; name: string }>(
       "music-enrich-progress",
@@ -144,8 +176,9 @@ export function Sidebar({
     return () => {
       unProgress.then((fn) => fn());
       unDone.then((fn) => fn());
+      window.removeEventListener("video-match-progress", onVideoProgress);
     };
-  }, [wizardMinimized]);
+  }, [wizardMinimized, wizard]);
 
   const toggleLibExpand = useCallback((libId: string) => {
     setCollapsedLibs((prev) => {
@@ -180,6 +213,12 @@ export function Sidebar({
 
   const dockActive = playerState.isActive && playerState.isMinimized;
 
+  // Last docked cover URL, kept so the image is still there to slide away
+  // during the collapse animation after undocking.
+  const lastDockedCoverRef = useRef<string | null>(null);
+  if (dockedMusicCoverUrl) lastDockedCoverRef.current = dockedMusicCoverUrl;
+  const dockImgUrl = dockedMusicCoverUrl ?? lastDockedCoverRef.current;
+
   return (
     <div
       className={`relative flex h-full flex-shrink-0 flex-col text-sidebar-foreground ${dragging ? "" : "transition-[width] duration-200"}`}
@@ -193,8 +232,21 @@ export function Sidebar({
         </div>
         <ContextMenu>
           <ContextMenuTrigger
-            render={<nav className="flex-1 overflow-y-auto py-1" />}
+            render={<nav className="flex-1 overflow-y-auto pb-1" />}
           >
+          {/* Home — the app's front door, pinned above the real libraries.
+              The empty spacer keeps its label flush with the library names. */}
+          <button
+            onClick={onOpenHome}
+            className={`flex w-full items-start gap-1 py-1.5 pr-2 pl-1 text-left text-sm font-medium transition-colors ${
+              homeActive
+                ? "bg-sidebar-accent text-sidebar-accent-foreground"
+                : "text-sidebar-foreground/90 hover:bg-sidebar-accent/50 hover:text-sidebar-foreground"
+            }`}
+          >
+            <span className="flex h-5 w-4 flex-shrink-0" />
+            <span className="min-w-0 flex-1 break-words">Home</span>
+          </button>
           {libraries.length === 0 ? (
             <p className="px-2 py-1.5 text-sm text-muted-foreground whitespace-nowrap">
               No libraries yet
@@ -217,6 +269,7 @@ export function Sidebar({
                                 kind: "resume",
                                 libraryId: lib.id,
                                 name: lib.name,
+                                format: lib.format,
                                 stage: (["scan", "match", "review"].includes(lib.setup_stage!)
                                   ? lib.setup_stage
                                   : "scan") as "scan" | "match" | "review",
@@ -281,35 +334,11 @@ export function Sidebar({
                         Rename
                       </ContextMenuItem>
                       <ContextMenuItem
-                        onClick={async () => {
-                          // Music rescans run through the wizard (scan →
-                          // match → review); video keeps the toast flow.
-                          if (lib.format === "music") {
-                            setWizard({ kind: "rescan", libraryId: lib.id, name: lib.name });
-                            return;
-                          }
-                          const toastId = toast.loading("Rescanning...");
-                          const unlisten = await listen<string>("scan-progress", (event) => {
-                            toast.loading(event.payload, { id: toastId });
-                          });
-                          try {
-                            const warnings = await invoke<string[]>("rescan_library", { libraryId: lib.id });
-                            if (warnings.length > 0) {
-                              toast.warning(`Rescan complete — ${warnings.length} item${warnings.length === 1 ? "" : "s"} skipped`, {
-                                id: toastId,
-                                description: warnings.slice(0, 5).join("  •  ") + (warnings.length > 5 ? `  •  +${warnings.length - 5} more` : ""),
-                                duration: 8000,
-                              });
-                            } else {
-                              toast.success("Rescan complete", { id: toastId });
-                            }
-                            onLibraryRescanned();
-                          } catch (err) {
-                            toast.error(String(err), { id: toastId });
-                          } finally {
-                            unlisten();
-                          }
-                        }}
+                        onClick={() =>
+                          // Rescans run through the wizard for both formats
+                          // (scan → elective match → review, minimizable).
+                          setWizard({ kind: "rescan", libraryId: lib.id, name: lib.name, format: lib.format })
+                        }
                       >
                         <RefreshCw size={14} />
                         Rescan
@@ -328,18 +357,16 @@ export function Sidebar({
                         <Home size={14} />
                         {defaultLibraryId === lib.id ? "Unset as default" : "Set as default"}
                       </ContextMenuItem>
-                      {lib.format === "video" && (
-                        <ContextMenuItem onClick={() => setTmdbMatchTarget(lib)}>
-                          <Sparkles size={14} />
-                          Match to TMDB
-                        </ContextMenuItem>
-                      )}
-                      {lib.format === "music" && (
-                        <ContextMenuItem onClick={() => onOpenMusicBrainzReview(lib.id)}>
-                          <Sparkles size={14} />
-                          Metadata center
-                        </ContextMenuItem>
-                      )}
+                      <ContextMenuItem
+                        onClick={() =>
+                          lib.format === "music"
+                            ? onOpenMusicBrainzReview(lib.id)
+                            : onOpenVideoMetadataCenter(lib.id)
+                        }
+                      >
+                        <Sparkles size={14} />
+                        Metadata center
+                      </ContextMenuItem>
                       <ContextMenuItem
                         onClick={() => setDeleteTarget(lib)}
                         className="text-destructive focus:text-destructive"
@@ -388,6 +415,32 @@ export function Sidebar({
           <span className="min-w-0 flex-1 truncate">{chip?.text ?? "Matching against MusicBrainz…"}</span>
         </button>
       )}
+      {/* Docked now-playing cover — the music bar's up-arrow parks the album
+          art here, video-dock style. Art only; the bar keeps title/controls.
+          The container animates a KNOWN pixel height (square = sidebar width;
+          fr-unit grid transitions stutter with aspect-ratio content) and the
+          full-size image is glued to its top edge, so the artwork physically
+          rides up out of the playback bar and back down into it. The last URL
+          is kept so the art stays visible through the slide-down. */}
+      <div
+        className="relative shrink-0 overflow-hidden transition-[height] duration-300 ease-out"
+        style={{ height: dockedMusicCoverUrl ? width : 0 }}
+      >
+        {dockImgUrl && (
+          // Flush with the sidebar edges on every side, square corners.
+          <img
+            src={dockImgUrl}
+            alt=""
+            draggable={false}
+            className="absolute left-0 top-0 aspect-square w-full object-cover"
+          />
+        )}
+        {/* Top edge line (matches the sidebar/playback-bar borders). The border
+            color is translucent, so like the sidebar's right edge it needs an
+            opaque bg-sidebar underlay to read consistently over the artwork. */}
+        <div className="pointer-events-none absolute inset-x-0 top-0 h-px bg-sidebar" />
+        <div className="pointer-events-none absolute inset-x-0 top-0 h-px bg-border" />
+      </div>
       {dockActive && <PlayerDock state={playerState} actions={playerActions} />}
       {/* Right-edge border: bg-sidebar underlay + bg-border overlay so the
           translucent border color blends consistently regardless of what sits
@@ -426,12 +479,6 @@ export function Sidebar({
             toast.error(String(e));
           }
         }}
-      />
-      <TmdbBulkMatchDialog
-        libraryId={tmdbMatchTarget?.id ?? null}
-        open={tmdbMatchTarget !== null}
-        onOpenChange={(o) => { if (!o) setTmdbMatchTarget(null); }}
-        onApplied={onLibraryRescanned}
       />
       <CreatePlaylistDialog
         libraryId={createPlaylistFor}

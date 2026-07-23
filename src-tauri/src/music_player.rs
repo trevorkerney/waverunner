@@ -8,7 +8,10 @@
 //! Play history: one `music_play` row per playback START (however brief),
 //! written by `music_play_track`; the event loop keeps `played_secs` fresh and
 //! flips `scrobbled` once the Last.fm rule trips (≥50% of the track or ≥4
-//! minutes, whichever comes first). No resume for music — by design.
+//! minutes of ACCUMULATED listening, whichever comes first). Listening is
+//! accumulated from small forward time-pos deltas — a seek is one large jump
+//! and credits nothing, so skipping into a song doesn't count as having
+//! listened up to that point. No resume for music — by design.
 //!
 //! Exclusivity with the video player is symmetric: starting either pauses the
 //! other, nothing auto-resumes.
@@ -28,17 +31,22 @@ use crate::AppState;
 const EV_END_FILE: u32 = 7;
 const EV_FILE_LOADED: u32 = 8;
 
-/// Scrobble once played_secs ≥ min(duration * RATIO, CAP).
+/// Scrobble once listened_secs ≥ min(duration * RATIO, CAP).
 const SCROBBLE_RATIO: f64 = 0.5;
 const SCROBBLE_CAP_SECS: f64 = 240.0;
 /// How often the play-log row is refreshed during playback.
 const LOG_WRITE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+/// A time-pos delta at or above this is a seek, not playback, and credits
+/// nothing. Real ticks arrive many times a second; pauses just stop ticking.
+const MAX_TICK_SECS: f64 = 2.0;
 
 /// The music_play row being written for the current track.
 struct PlayLog {
     row_id: i64,
-    /// Furthest position reached (seeking back doesn't shrink it).
-    max_pos: f64,
+    /// Seconds actually listened (sum of small forward deltas; seeks excluded).
+    listened_secs: f64,
+    /// Last observed time-pos, for delta computation. None until first tick.
+    last_pos: Option<f64>,
     duration: f64,
     scrobbled: bool,
 }
@@ -192,7 +200,8 @@ pub async fn music_play_track(
         .map_err(|e| e.to_string())?;
     *inner.log.lock().map_err(|e| e.to_string())? = Some(PlayLog {
         row_id: res.last_insert_rowid(),
-        max_pos: 0.0,
+        listened_secs: 0.0,
+        last_pos: None,
         duration: 0.0,
         scrobbled: false,
     });
@@ -202,6 +211,59 @@ pub async fn music_play_track(
         mpv.set_property_string("pause", "no")
     })
     .await
+}
+
+/// Append the NEXT queue track to mpv's internal playlist so the transition
+/// happens inside mpv (gapless-audio) instead of via a frontend round-trip —
+/// back-to-back tracks like Parabol→Parabola play seamlessly. Guarded by the
+/// expected current path so a stale in-flight prefetch (user already switched
+/// tracks) can't append the wrong file. Returns:
+///   "appended" — next entry queued, mpv will advance natively.
+///   "stale"    — current file no longer matches; nothing appended.
+///   "eof"      — the current file already ended (keep-open hold) before the
+///                prefetch landed; the frontend should advance normally.
+#[tauri::command]
+pub async fn music_prefetch_next(
+    state: State<'_, AppState>,
+    current_path: String,
+    path: String,
+) -> Result<&'static str, String> {
+    let inner = current_music(&state)?;
+    run_music(inner, move |mpv| {
+        if mpv.get_property_string("path").as_deref() != Some(current_path.as_str()) {
+            return Ok("stale");
+        }
+        if mpv.get_property_string("eof-reached").as_deref() == Some("yes") {
+            return Ok("eof");
+        }
+        mpv.command(&["loadfile", &path, "append"])?;
+        Ok("appended")
+    })
+    .await
+}
+
+/// Swap in a play-history row for a track mpv advanced to NATIVELY (gapless
+/// playlist advance). Playback is already running — this never touches mpv.
+/// Manual starts go through music_play_track instead.
+#[tauri::command]
+pub async fn music_track_started(
+    state: State<'_, AppState>,
+    track_id: i64,
+) -> Result<(), String> {
+    let inner = current_music(&state)?;
+    let res = sqlx::query("INSERT INTO music_play (track_id) VALUES (?)")
+        .bind(track_id)
+        .execute(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+    *inner.log.lock().map_err(|e| e.to_string())? = Some(PlayLog {
+        row_id: res.last_insert_rowid(),
+        listened_secs: 0.0,
+        last_pos: None,
+        duration: 0.0,
+        scrobbled: false,
+    });
+    Ok(())
 }
 
 #[tauri::command]
@@ -333,6 +395,16 @@ fn event_loop(app: &AppHandle, inner: Arc<MusicInner>) {
                 } else {
                     -1
                 };
+                if reason == 0 {
+                    // Natural EOF (native gapless advance follows): drop the
+                    // finished row so the next track's early time-pos can't
+                    // smear it — music_track_started installs the new row.
+                    // Manual switches install theirs in music_play_track, so
+                    // other reasons must NOT clear.
+                    if let Ok(mut guard) = inner.log.lock() {
+                        *guard = None;
+                    }
+                }
                 let _ = app.emit("music-end-file", serde_json::json!({ "reason": reason }));
             }
             EV_FILE_LOADED => {
@@ -344,7 +416,9 @@ fn event_loop(app: &AppHandle, inner: Arc<MusicInner>) {
     }
 }
 
-/// Track max position, throttle DB writes, flip `scrobbled` when the rule trips.
+/// Accumulate listened time, throttle DB writes, flip `scrobbled` when the
+/// rule trips. Only small forward deltas count as listening — a seek shows up
+/// as one large (or negative) jump and credits nothing.
 fn update_play_log(
     app: &AppHandle,
     inner: &Arc<MusicInner>,
@@ -355,9 +429,13 @@ fn update_play_log(
     let mut wrote = false;
     if let Ok(mut guard) = inner.log.lock() {
         if let Some(log) = guard.as_mut() {
-            if pos > log.max_pos {
-                log.max_pos = pos;
+            if let Some(last) = log.last_pos {
+                let delta = pos - last;
+                if delta > 0.0 && delta < MAX_TICK_SECS {
+                    log.listened_secs += delta;
+                }
             }
+            log.last_pos = Some(pos);
             if log.duration <= 0.0 {
                 if let Some(d) = inner.mpv.get_property_double("duration") {
                     log.duration = d;
@@ -366,21 +444,21 @@ fn update_play_log(
             let due = last_write.map_or(true, |t| now.duration_since(t) >= LOG_WRITE_INTERVAL);
             let scrobble_now = !log.scrobbled
                 && log.duration > 0.0
-                && log.max_pos >= (log.duration * SCROBBLE_RATIO).min(SCROBBLE_CAP_SECS);
+                && log.listened_secs >= (log.duration * SCROBBLE_RATIO).min(SCROBBLE_CAP_SECS);
             if due || scrobble_now {
                 if scrobble_now {
                     log.scrobbled = true;
                 }
                 *last_write = Some(now);
                 wrote = true;
-                let (row_id, max_pos, duration, scrobbled) =
-                    (log.row_id, log.max_pos, log.duration, log.scrobbled);
+                let (row_id, listened, duration, scrobbled) =
+                    (log.row_id, log.listened_secs, log.duration, log.scrobbled);
                 let pool = app.state::<AppState>().app_db.clone();
                 tauri::async_runtime::spawn(async move {
                     let _ = sqlx::query(
                         "UPDATE music_play SET played_secs = ?, duration_secs = ?, scrobbled = ? WHERE id = ?",
                     )
-                    .bind(max_pos)
+                    .bind(listened)
                     .bind(if duration > 0.0 { Some(duration) } else { None })
                     .bind(scrobbled as i64)
                     .bind(row_id)
@@ -395,29 +473,33 @@ fn update_play_log(
 
 /// Write the current log row one last time (track ended / was replaced).
 fn flush_play_log(app: &AppHandle, inner: &Arc<MusicInner>) {
-    if let Ok(guard) = inner.log.lock() {
-        if let Some(log) = guard.as_ref() {
-            // A natural EOF means the whole track played — max_pos may lag the
-            // true end by up to one poll, so snap it to the duration when close.
-            let mut max_pos = log.max_pos;
-            let mut scrobbled = log.scrobbled;
+    if let Ok(mut guard) = inner.log.lock() {
+        if let Some(log) = guard.as_mut() {
             if log.duration > 0.0 {
+                // On natural EOF, credit the played tail between the last tick
+                // and the actual end — but only that tail, never a seek gap.
                 if let Some(eof) = inner.mpv.get_property_string("eof-reached") {
                     if eof == "yes" {
-                        max_pos = log.duration;
+                        if let Some(last) = log.last_pos {
+                            let tail = log.duration - last;
+                            if tail > 0.0 && tail < MAX_TICK_SECS {
+                                log.listened_secs += tail;
+                            }
+                        }
                     }
                 }
-                if max_pos >= (log.duration * SCROBBLE_RATIO).min(SCROBBLE_CAP_SECS) {
-                    scrobbled = true;
+                if log.listened_secs >= (log.duration * SCROBBLE_RATIO).min(SCROBBLE_CAP_SECS) {
+                    log.scrobbled = true;
                 }
             }
-            let (row_id, duration) = (log.row_id, log.duration);
+            let (row_id, listened, duration, scrobbled) =
+                (log.row_id, log.listened_secs, log.duration, log.scrobbled);
             let pool = app.state::<AppState>().app_db.clone();
             tauri::async_runtime::spawn(async move {
                 let _ = sqlx::query(
                     "UPDATE music_play SET played_secs = ?, duration_secs = ?, scrobbled = ? WHERE id = ?",
                 )
-                .bind(max_pos)
+                .bind(listened)
                 .bind(if duration > 0.0 { Some(duration) } else { None })
                 .bind(scrobbled as i64)
                 .bind(row_id)

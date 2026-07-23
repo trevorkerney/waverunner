@@ -58,6 +58,9 @@ export interface MediaEntry {
   /** Partway through — counts as unwatched for the menu pivot (offer Mark
    *  watched) but never badges. */
   has_progress: boolean;
+  /** Full release date (YYYY or YYYY-MM-DD) — client-side date sorting for
+   *  music album entries; absent everywhere else. */
+  sort_date?: string | null;
 }
 
 /** Refreshed per-entry watch flags (get_watch_flags) — patched into cached
@@ -123,6 +126,9 @@ export type PersonRole = "actor" | "director_creator" | "composer" | "all";
 // always corresponds to a ViewSpec, and so do drill-downs that originate
 // from the main content (e.g. clicking a person on a people-list view).
 export type ViewSpec =
+  // Home carries no library; the optional-undefined member keeps the
+  // pervasive `view.libraryId` accesses type-legal (they see string | undefined).
+  | { kind: "home";               libraryId?: undefined }
   | { kind: "library-root";       libraryId: string }
   | { kind: "movies-only";        libraryId: string }
   | { kind: "shows-only";         libraryId: string }
@@ -179,6 +185,8 @@ export interface MusicAlbumCard {
   id: number;
   title: string;
   year: string | null;
+  /** Full release date (YYYY or YYYY-MM-DD) — client-side date sorting. */
+  release_date: string | null;
   covers: string[];
   selected_cover: string | null;
   track_count: number;
@@ -221,6 +229,7 @@ export interface MusicTrack {
   /** Absolute path, ready to play. */
   file_path: string;
   play_count: number;
+  loved: boolean;
   /** Main artist(s) first, then features — no "feat." framing. */
   credits: MusicCredit[];
 }
@@ -239,6 +248,8 @@ export interface MusicRelease {
 export interface MusicAlbumDetail {
   id: number;
   title: string;
+  /** "album" | "single" | "ep" | "compilation" | … — drives the page eyebrow. */
+  album_type: string;
   year: string | null;
   /** null = artist-less album (no artist tags anywhere in it). */
   artist_id: number | null;
@@ -268,8 +279,65 @@ export interface LibraryTrackRow {
   artist_id: number | null;
   album_id: number | null;
   album_title: string | null;
+  /** Album display cover (cached path) — the now-playing bar's art. */
+  cover: string | null;
   play_count: number;
+  loved: boolean;
   credits: MusicCredit[];
+}
+
+// Backend row from get_track_queue_items — everything needed to build a
+// MusicQueueItem for tracks outside their album page (playlists).
+export interface TrackQueueInfo {
+  track_id: number;
+  title: string;
+  artist_name: string | null;
+  artist_id: number | null;
+  artists: MusicCredit[];
+  album_id: number | null;
+  album_title: string | null;
+  /** Album display cover (cached path). */
+  cover: string | null;
+  file_path: string;
+  duration_secs: number | null;
+  loved: boolean;
+}
+
+// One card on the Home hub's continue-watching rail (get_continue_watching).
+export interface ContinueWatchingItem {
+  kind: "movie" | "show";
+  entry_id: number;
+  library_id: string;
+  title: string;
+  cover: string | null;
+  /** The frame the user left at (captured on player close) — preferred card art. */
+  frame: string | null;
+  backdrop: string | null;
+  last_played_at: string;
+  position_secs: number | null;
+  duration_secs: number | null;
+  episode_id: number | null;
+  season_number: number | null;
+  episode_number: number | null;
+  episode_title: string | null;
+}
+
+// One row of playback history (get_recent_music_plays) — every start counts.
+export interface RecentPlay {
+  track_id: number;
+  track_title: string;
+  /** For the untitled-track filename fallback (display-only convention). */
+  file_path: string;
+  artist_name: string | null;
+  album_id: number | null;
+  album_title: string | null;
+  /** Album display cover (cached path), for tile surfaces. */
+  cover: string | null;
+  /** For cross-library navigation from global surfaces (Home). */
+  library_id: string;
+  /** SQLite UTC "YYYY-MM-DD HH:MM:SS". */
+  started_at: string;
+  scrobbled: boolean;
 }
 
 // One item in the frontend-owned play queue.
@@ -277,6 +345,12 @@ export interface MusicQueueItem {
   trackId: number;
   title: string;
   artistName: string | null;
+  /** Main credit's artist entry — the now-playing bar's artist link target.
+   *  Optional: queues persisted before this field existed lack it. */
+  artistId?: number | null;
+  /** Every credited artist in display order (id null = not in the library),
+   *  so the bar can link each name individually. Optional like artistId. */
+  artists?: { name: string; artistId: number | null }[];
   albumId: number | null;
   albumTitle: string | null;
   /** Cached cover path (full-res convention, same as MediaEntry.covers). */

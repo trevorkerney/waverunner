@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type Dispatch, type SetStateAction } from "react";
+import { useEffect, useRef, useState, type Dispatch, type MutableRefObject, type SetStateAction } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -24,21 +24,25 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { Spinner } from "@/components/ui/spinner";
+import { Checkbox } from "@/components/ui/checkbox";
 import { MetadataCenter } from "@/components/music/MetadataCenter";
-import type { Library } from "@/types";
+import { VideoMetadataCenter } from "@/components/VideoMetadataCenter";
+import { runBulkMatch } from "@/components/tmdbMatchEngine";
+import type { Library, TmdbBulkTargets } from "@/types";
 import { FolderOpen, Film, Music, Server, HardDrive, Plus, X, Check } from "lucide-react";
 
-/** The import wizard. Setup → Scan → Match → Review for music (the library
- *  stays hidden — "Finish setup…" — until the wizard completes); Setup → Scan
- *  for video (unchanged flow inside the new shell). Clicking outside never
+/** The import wizard: Setup → Scan → Match → Review for BOTH formats. The
+ *  library stays hidden — "Finish setup…" — until the wizard completes.
+ *  External matching (MusicBrainz for music, TMDB for video) is elective:
+ *  the Match step is an election screen with a skip. Clicking outside never
  *  dismisses; the X is step-aware (confirm mid-scan, skip-remaining
  *  mid-match). Rescans reuse the same wizard from the Scan step and may
  *  minimize during matching. */
 
 export type WizardMode =
   | { kind: "create" }
-  | { kind: "resume"; libraryId: string; name: string; stage: "scan" | "match" | "review" }
-  | { kind: "rescan"; libraryId: string; name: string };
+  | { kind: "resume"; libraryId: string; name: string; format: string; stage: "scan" | "match" | "review" }
+  | { kind: "rescan"; libraryId: string; name: string; format: string };
 
 interface CreateLibraryDialogProps {
   open: boolean;
@@ -114,8 +118,13 @@ export function CreateLibraryDialog({
   const [libraryName, setLibraryName] = useState("");
   const initializedRef = useRef(false);
 
-  const isMusicFlow = mode.kind !== "create" || format === "music";
+  // The library format the wizard is actually driving: the picker's value on a
+  // fresh create, the library's known format on resume/rescan.
+  const effFormat = mode.kind === "create" ? format : mode.format;
   const managesSetupRow = mode.kind === "create" || mode.kind === "resume";
+  // Bridge to the video match step: the parent footer's Start/Skip buttons
+  // drive the embedded TMDB run through this handle.
+  const videoMatchRef = useRef<{ start: () => void; cancel: () => void } | null>(null);
 
   // Animate the dialog's height when the content changes size (switching
   // steps or Video ↔ Music folder sections). height:auto can't transition, so
@@ -175,7 +184,7 @@ export function CreateLibraryDialog({
   // Matching progress/completion — active whenever the wizard has a match
   // step in flight (the component stays mounted while minimized).
   useEffect(() => {
-    if (!isOpen || step !== 3 || matchPhase !== "running") return;
+    if (!isOpen || step !== 3 || matchPhase !== "running" || effFormat !== "music") return;
     const unProgress = listen<{ phase: string; done: number; total: number; name: string }>(
       "music-enrich-progress",
       (e) => {
@@ -293,6 +302,12 @@ export function CreateLibraryDialog({
     setStep(3);
     setMatchPhase("elect");
     setHeightAnimating(true);
+    if (effFormat !== "music") {
+      // The video match step loads its own TMDB targets and reports its
+      // workable count through onElectInfo; 0 keeps Start disabled until then.
+      setUncheckedCount(0);
+      return;
+    }
     try {
       const ms = await invoke<{ unchecked: number; running: boolean }>("music_match_state", { libraryId: libId });
       setUncheckedCount(ms.unchecked);
@@ -325,6 +340,10 @@ export function CreateLibraryDialog({
   async function startMatching() {
     if (!libraryId) return;
     setMatchPhase("running");
+    if (effFormat !== "music") {
+      videoMatchRef.current?.start();
+      return;
+    }
     try {
       await invoke("music_match_begin", { libraryId });
     } catch (e) {
@@ -334,6 +353,16 @@ export function CreateLibraryDialog({
   }
 
   async function skipMatching() {
+    if (effFormat !== "music") {
+      if (matchPhase === "elect") {
+        await enterReview();
+      } else {
+        // The run finishes its current item, then its outcome lands and the
+        // step advances to review via onDone.
+        videoMatchRef.current?.cancel();
+      }
+      return;
+    }
     try {
       await invoke("music_match_skip");
     } catch (e) {
@@ -400,14 +429,9 @@ export function CreateLibraryDialog({
         toastIdRef.current = null;
       }
       onCreated();
-      if (format === "music") {
-        setLibraryId(library.id);
-        setLibraryName(library.name);
-        await enterMatch(library.id);
-      } else {
-        onOpenChange(false);
-        resetForm();
-      }
+      setLibraryId(library.id);
+      setLibraryName(library.name);
+      await enterMatch(library.id);
     } catch (e) {
       const msg = String(e);
       if (msg.includes("cancelled")) {
@@ -415,7 +439,7 @@ export function CreateLibraryDialog({
           toast.info("Import paused — finish setup from the sidebar", { id: toastIdRef.current, duration: 3000, action: undefined });
           toastIdRef.current = null;
         }
-        // Music wizard scans survive a cancel: the library stays as
+        // Wizard scans survive a cancel: the library stays as
         // "Finish setup…" and resumes at the scan step.
         onCreated();
         onOpenChange(false);
@@ -442,17 +466,6 @@ export function CreateLibraryDialog({
     if (step === 2) {
       if (!creating) {
         closeWizard();
-        return;
-      }
-      if (!isMusicFlow) {
-        // Video keeps the pre-wizard behavior: detach to a progress toast.
-        if (toastIdRef.current == null) {
-          toastIdRef.current = toast.loading(scanProgress || "Creating library...", {
-            duration: Infinity,
-            action: { label: "Cancel", onClick: handleCancelScan },
-          });
-        }
-        onOpenChange(false);
         return;
       }
       setConfirmExit(true);
@@ -486,10 +499,14 @@ export function CreateLibraryDialog({
     }
     if (step === 3) {
       if (matchPhase === "running") {
-        try {
-          await invoke("music_match_skip");
-        } catch (e) {
-          console.error(e);
+        if (effFormat !== "music") {
+          videoMatchRef.current?.cancel();
+        } else {
+          try {
+            await invoke("music_match_skip");
+          } catch (e) {
+            console.error(e);
+          }
         }
       }
       if (managesSetupRow && libraryId) {
@@ -505,18 +522,12 @@ export function CreateLibraryDialog({
     }
   }
 
-  const showMusicSteps = isMusicFlow;
-  const steps: { n: Step; label: string }[] = showMusicSteps
-    ? [
-        { n: 1, label: "Setup" },
-        { n: 2, label: "Scan" },
-        { n: 3, label: "Match" },
-        { n: 4, label: "Review" },
-      ]
-    : [
-        { n: 1, label: "Setup" },
-        { n: 2, label: "Scan" },
-      ];
+  const steps: { n: Step; label: string }[] = [
+    { n: 1, label: "Setup" },
+    { n: 2, label: "Scan" },
+    { n: 3, label: "Match" },
+    { n: 4, label: "Review" },
+  ];
   const visibleSteps = mode.kind === "create" ? steps : steps.filter((s) => s.n !== 1);
 
   const estMinutes =
@@ -574,7 +585,11 @@ export function CreateLibraryDialog({
 
         {step === 4 && libraryId ? (
           <div className="flex min-h-0 flex-1 flex-col px-4 pt-2">
-            <MetadataCenter libraryId={libraryId} reloadKey={centerReloadKey} />
+            {effFormat === "music" ? (
+              <MetadataCenter libraryId={libraryId} reloadKey={centerReloadKey} />
+            ) : (
+              <VideoMetadataCenter libraryId={libraryId} reloadKey={centerReloadKey} />
+            )}
           </div>
         ) : (
           <div
@@ -714,7 +729,17 @@ export function CreateLibraryDialog({
                 </div>
               )}
 
-              {step === 3 && matchPhase === "elect" && (
+              {step === 3 && effFormat !== "music" && libraryId && (
+                <VideoMatchStep
+                  libraryId={libraryId}
+                  phase={matchPhase}
+                  handle={videoMatchRef}
+                  onElectInfo={(work) => setUncheckedCount(work)}
+                  onDone={() => void enterReview()}
+                />
+              )}
+
+              {step === 3 && effFormat === "music" && matchPhase === "elect" && (
                 <div className="grid gap-4">
                   <div>
                     <p className="text-sm font-medium">Match against MusicBrainz?</p>
@@ -736,7 +761,7 @@ export function CreateLibraryDialog({
                 </div>
               )}
 
-              {step === 3 && matchPhase === "running" && (
+              {step === 3 && effFormat === "music" && matchPhase === "running" && (
                 <div className="flex w-full min-w-0 flex-col items-center gap-3 overflow-hidden py-6 text-center">
                   <Spinner className="size-6" />
                   <p className="w-full min-w-0 truncate px-2 text-sm font-medium">
@@ -765,7 +790,7 @@ export function CreateLibraryDialog({
               <span className="flex-1 text-xs text-muted-foreground">
                 {step === 2
                   ? "Stop the scan and finish setup later?"
-                  : "Skip the remaining matching? Unmatched albums stay available in the metadata center."}
+                  : `Skip the remaining matching? Unmatched ${effFormat === "music" ? "albums" : "items"} stay available in the metadata center.`}
               </span>
               <Button variant="outline" size="sm" onClick={() => setConfirmExit(false)}>
                 Keep going
@@ -786,13 +811,8 @@ export function CreateLibraryDialog({
           ) : step === 2 ? (
             // Progress lives in the step body only — no duplicate line here.
             <div className="flex w-full items-center justify-end gap-2">
-              {!isMusicFlow && (
-                <Button variant="outline" size="sm" onClick={handleCancelScan}>
-                  Cancel
-                </Button>
-              )}
               <Button variant="outline" size="sm" onClick={() => handleDialogClose(false)}>
-                {isMusicFlow ? "Exit" : "Hide"}
+                Exit
               </Button>
             </div>
           ) : step === 3 && matchPhase === "elect" ? (
@@ -821,6 +841,257 @@ export function CreateLibraryDialog({
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  );
+}
+
+/** The wizard's video Match step: elective TMDB matching. Elect phase shows
+ *  the pass checkboxes + request estimate; running phase shows progress + ETA.
+ *  The parent footer drives it (Start/Skip/Skip-remaining) via `handle`; the
+ *  serial run itself is the shared engine (tmdbMatchEngine). Progress is also
+ *  dispatched as window "video-match-progress" events for the sidebar's
+ *  minimized-rescan chip. */
+function VideoMatchStep({
+  libraryId,
+  phase,
+  handle,
+  onElectInfo,
+  onDone,
+}: {
+  libraryId: string;
+  phase: MatchPhase;
+  handle: MutableRefObject<{ start: () => void; cancel: () => void } | null>;
+  /** Workable-unit count for the parent's Start button (0 disables it). */
+  onElectInfo: (work: number) => void;
+  onDone: () => void;
+}) {
+  const [targets, setTargets] = useState<TmdbBulkTargets | null>(null);
+  const [hasToken, setHasToken] = useState(true);
+  const [omdbEnabled, setOmdbEnabled] = useState(false);
+  const [rtEnabled, setRtEnabled] = useState(false);
+  const [doMovies, setDoMovies] = useState(true);
+  const [doShows, setDoShows] = useState(true);
+  const [doSeasons, setDoSeasons] = useState(true);
+  const [doEpisodes, setDoEpisodes] = useState(true);
+  const [doWebisodes, setDoWebisodes] = useState(false);
+  const [doRatings, setDoRatings] = useState(false);
+  const [progress, setProgress] = useState({ current: 0, total: 0, label: "" });
+  const [etaSecs, setEtaSecs] = useState<number | null>(null);
+  const etaTimesRef = useRef<number[]>([]);
+  const cancelRef = useRef(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const [t, settings] = await Promise.all([
+          invoke<TmdbBulkTargets>("get_tmdb_bulk_targets", { libraryId }),
+          invoke<Record<string, string>>("get_settings"),
+        ]);
+        if (cancelled) return;
+        setTargets(t);
+        setHasToken(Boolean(settings["tmdb_api_token"]?.trim()));
+        setOmdbEnabled(settings["omdb_enabled"] === "true" && Boolean(settings["omdb_api_key"]?.trim()));
+        setRtEnabled(settings["rt_scraper_enabled"] === "true");
+        const willDoShows = t.shows.some((s) => !s.tmdb_id);
+        setDoMovies(t.movies.length > 0);
+        setDoShows(willDoShows);
+        setDoSeasons(t.seasons.some((se) => !se.season_done));
+        setDoEpisodes(t.seasons.some((se) => !se.episodes_done));
+      } catch (e) {
+        toast.error(String(e));
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [libraryId]);
+
+  const unmatchedShows = targets?.shows.filter((s) => !s.tmdb_id) ?? [];
+  const matchableShowIds = new Set(
+    (targets?.shows ?? []).filter((s) => s.tmdb_id != null || doShows).map((s) => s.id),
+  );
+  const seasonsNeeding = (targets?.seasons ?? []).filter(
+    (se) => !se.season_done && matchableShowIds.has(se.show_id),
+  );
+  const episodeSeasonsNeeding = (targets?.seasons ?? []).filter(
+    (se) => !se.episodes_done && matchableShowIds.has(se.show_id),
+  );
+  const eligibleWebisodeShows = (targets?.webisodes ?? []).filter((w) =>
+    matchableShowIds.has(w.show_id),
+  );
+  const ratingsCount = (targets?.all_movies.length ?? 0) + (targets?.all_shows.length ?? 0);
+
+  const workCount =
+    (doMovies ? targets?.movies.length ?? 0 : 0) +
+    (doShows ? unmatchedShows.length : 0) +
+    (doSeasons ? seasonsNeeding.length : 0) +
+    (doEpisodes ? episodeSeasonsNeeding.length : 0) +
+    (doWebisodes ? eligibleWebisodeShows.length : 0) +
+    (doRatings ? ratingsCount : 0);
+
+  const apiHits =
+    (doMovies ? (targets?.movies.length ?? 0) * 2 : 0) +
+    (doShows ? unmatchedShows.length * 2 : 0) +
+    (doSeasons ? seasonsNeeding.length : 0) +
+    (doEpisodes ? episodeSeasonsNeeding.length : 0) +
+    (doWebisodes ? eligibleWebisodeShows.length : 0) +
+    (doRatings ? ratingsCount * (rtEnabled ? 3 : 1) : 0);
+
+  // Parent Start button state: no token or nothing selected = disabled.
+  useEffect(() => {
+    onElectInfo(hasToken && targets ? workCount : 0);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasToken, targets, workCount]);
+
+  const emitChip = (detail: Record<string, unknown>) => {
+    window.dispatchEvent(new CustomEvent("video-match-progress", { detail }));
+  };
+
+  const start = async () => {
+    if (!targets) return;
+    cancelRef.current = false;
+    etaTimesRef.current = [];
+    setEtaSecs(null);
+    const total = workCount;
+    let step = 0;
+    const tick = (label: string) => {
+      step++;
+      const times = etaTimesRef.current;
+      times.push(performance.now());
+      if (times.length > 30) times.shift();
+      let eta: number | null = null;
+      if (times.length >= 3) {
+        const avgMs = (times[times.length - 1] - times[0]) / (times.length - 1);
+        eta = Math.round((avgMs * Math.max(0, total - step)) / 1000);
+      }
+      setEtaSecs(eta);
+      setProgress({ current: step, total, label });
+      emitChip({ current: step, total, label, etaSecs: eta, done: false });
+    };
+    const outcome = await runBulkMatch(
+      {
+        targets,
+        doMovies,
+        doShows,
+        doSeasons,
+        doEpisodes,
+        doWebisodes,
+        doRatings,
+        unmatchedShows,
+        seasonsNeeding,
+        episodeSeasonsNeeding,
+        eligibleWebisodeShows,
+      },
+      tick,
+      () => cancelRef.current,
+    );
+    const st = outcome.stats;
+    const matched = st.moviesMatched + st.showsMatched;
+    if (matched > 0 || st.failed > 0) {
+      toast.success(
+        `TMDB matching: ${matched} matched${outcome.review.length > 0 ? `, ${outcome.review.length} need review` : ""}${st.failed > 0 ? `, ${st.failed} failed` : ""}`,
+      );
+    }
+    emitChip({ done: true });
+    onDone();
+  };
+
+  handle.current = {
+    start: () => void start(),
+    cancel: () => {
+      cancelRef.current = true;
+    },
+  };
+
+  if (phase === "running") {
+    return (
+      <div className="flex w-full min-w-0 flex-col items-center gap-3 overflow-hidden py-6 text-center">
+        <Spinner className="size-6" />
+        <p className="w-full min-w-0 truncate px-2 text-sm font-medium">
+          Matching against TMDB
+          {progress.total > 0 ? ` — ${progress.current}/${progress.total}` : "…"}
+        </p>
+        <p className="min-h-4 w-full min-w-0 truncate px-2 text-xs text-muted-foreground">
+          {progress.label || "Starting…"}
+        </p>
+        <p className="min-h-4 text-xs text-muted-foreground">
+          {etaSecs != null ? fmtEta(etaSecs) : ""}
+        </p>
+      </div>
+    );
+  }
+
+  const checkboxRow = (
+    label: string,
+    count: number,
+    checked: boolean,
+    onChange: (v: boolean) => void,
+    note?: string,
+  ) => {
+    const inert = count === 0;
+    return (
+      <label
+        className={`flex items-center gap-3 rounded-md border border-border px-3 py-2 ${
+          inert ? "cursor-not-allowed opacity-50" : "cursor-pointer hover:bg-accent/40"
+        }`}
+      >
+        <Checkbox checked={checked} onCheckedChange={(v) => onChange(v === true)} disabled={inert} />
+        <div className="flex min-w-0 flex-1 items-baseline justify-between gap-2">
+          <span className={`text-sm ${count === 0 ? "text-muted-foreground" : ""}`}>{label}</span>
+          <span className="text-xs text-muted-foreground">
+            {count}
+            {note ? ` ${note}` : ""}
+          </span>
+        </div>
+      </label>
+    );
+  };
+
+  return (
+    <div className="grid gap-4">
+      <div>
+        <p className="text-sm font-medium">Match against TMDB?</p>
+        <p className="mt-1 text-xs text-muted-foreground">
+          Fills in posters, plots, cast, genres and more. Only confident matches are
+          applied automatically — anything ambiguous is set aside for your review.
+          You can also skip this entirely and match later (or never) from the
+          metadata center.
+        </p>
+      </div>
+      {!hasToken && (
+        <p className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+          No TMDB API token configured. Add one in Settings first, or skip for now.
+        </p>
+      )}
+      {targets == null ? (
+        <div className="flex items-center justify-center gap-2 py-4 text-sm text-muted-foreground">
+          <Spinner className="size-4" />
+          Counting unmatched media…
+        </div>
+      ) : (
+        <>
+          <div className="grid gap-2">
+            {checkboxRow("Movies", targets.movies.length, doMovies, setDoMovies, "unmatched")}
+            {checkboxRow("TV shows", unmatchedShows.length, doShows, (v) => {
+              setDoShows(v);
+              if (!v) {
+                setDoSeasons(false);
+                setDoEpisodes(false);
+                setDoWebisodes(false);
+              }
+            }, "unmatched")}
+            {checkboxRow("Seasons", seasonsNeeding.length, doSeasons, setDoSeasons, "to fetch")}
+            {checkboxRow("Episodes", episodeSeasonsNeeding.length, doEpisodes, setDoEpisodes, "season fetches")}
+            {omdbEnabled && checkboxRow("Ratings", ratingsCount, doRatings, setDoRatings, "titles")}
+            {(targets.webisodes.length > 0) &&
+              checkboxRow("Webisodes", eligibleWebisodeShows.length, doWebisodes, setDoWebisodes, "shows (fuzzy matching)")}
+          </div>
+          <p className="text-xs text-muted-foreground">
+            Estimated API requests: <span className="font-medium text-foreground">{apiHits}</span>
+          </p>
+        </>
+      )}
+    </div>
   );
 }
 
