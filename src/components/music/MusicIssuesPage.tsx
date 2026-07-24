@@ -12,10 +12,11 @@ interface MusicIssuesPageProps {
  *  bar and were NOT imported. Fix the tags in a real tagger, then rescan. */
 export function MusicIssuesPage({ libraryId }: MusicIssuesPageProps) {
   const [issues, setIssues] = useState<MusicScanIssue[] | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
-    setIssues(null);
+    if (reloadKey === 0) setIssues(null); // silent refetch after rescans
     invoke<MusicScanIssue[]>("get_music_scan_issues", { libraryId })
       .then((res) => {
         if (!cancelled) setIssues(res);
@@ -27,7 +28,14 @@ export function MusicIssuesPage({ libraryId }: MusicIssuesPageProps) {
     return () => {
       cancelled = true;
     };
-  }, [libraryId]);
+  }, [libraryId, reloadKey]);
+
+  // A rescan rewrites the issue report this page displays.
+  useEffect(() => {
+    const onRescanned = () => setReloadKey((k) => k + 1);
+    window.addEventListener("waverunner:library-rescanned", onRescanned);
+    return () => window.removeEventListener("waverunner:library-rescanned", onRescanned);
+  }, []);
 
   if (issues === null) {
     return (

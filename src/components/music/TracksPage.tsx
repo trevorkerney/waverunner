@@ -220,6 +220,14 @@ export function TracksPage({ libraryId, onPlayQueue, currentTrackId, playing, on
     };
   }, [libraryId, reloadKey]);
 
+  // Rescans change the track list out from under this page — refetch silently
+  // (rows stay visible; only reloadKey 0 shows the loading state).
+  useEffect(() => {
+    const onRescanned = () => setReloadKey((k) => k + 1);
+    window.addEventListener("waverunner:library-rescanned", onRescanned);
+    return () => window.removeEventListener("waverunner:library-rescanned", onRescanned);
+  }, []);
+
   const filtered = useMemo(() => {
     if (!rows) return [];
     const q = filter.trim().toLowerCase();

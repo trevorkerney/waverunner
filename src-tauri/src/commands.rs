@@ -8293,8 +8293,10 @@ pub(crate) fn is_scannable_dir(entry: &std::fs::DirEntry) -> bool {
     // Releases often prefix extras folders to control sort order ("~featurettes",
     // "_extras", "- trailers"); strip that junk before the reserved-name check.
     let name = raw.trim_start_matches(['~', '-', '_', ' ', '.']);
+    // Hidden = the single-leading-dot convention (.git, .stfolder). A leading
+    // ellipsis is a TITLE ("...And Justice for All"), not a hidden folder.
     entry.path().is_dir()
-        && !raw.starts_with('.')
+        && !(raw.starts_with('.') && !raw.starts_with(".."))
         && !RESERVED_DIRS.contains(&name)
 }
 

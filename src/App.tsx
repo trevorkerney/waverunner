@@ -2604,6 +2604,9 @@ function App() {
               // Silent in-place refresh — no loading flash; the grid (and any
               // open detail page's backing grid) quietly picks up new metadata.
               refreshGridInPlace();
+              // Self-fetching pages (Tracks, needs-attention) aren't backed by
+              // the grid caches above — they refetch on this event.
+              window.dispatchEvent(new Event("waverunner:library-rescanned"));
               // Counts and genres may have changed after a rescan. Music
               // libraries have their own counts shape.
               if (selectedLibrary.format === "music") {
@@ -2710,6 +2713,7 @@ function App() {
               invalidateCache(selectedLibrary.id);
               const parentId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
               loadEntries(selectedLibrary, parentId, breadcrumbs);
+              window.dispatchEvent(new Event("waverunner:library-rescanned"));
             }
           }}
           getCoverUrl={getCoverUrl}
