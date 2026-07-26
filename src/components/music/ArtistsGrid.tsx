@@ -31,6 +31,16 @@ export function ArtistsGrid({ entries, getCoverUrl, onNavigate, gridRef, sortMod
     return <p className="p-4 text-sm text-muted-foreground">No artists found.</p>;
   }
 
+  // Subtitle matches the ACTIVE SORT — the backend bakes all three variants
+  // into otherwise-unused display slots so local sort switches need no refetch:
+  //   collection_display — credits mode (per-type breakdown)
+  //   role_display       — alphabetical ("2 releases · 4 appearances · 7 loved")
+  //   season_display     — loved mode ("N loved")
+  const subtitleFor = (artist: MediaEntry) =>
+    sortMode === "credits" ? artist.collection_display
+    : sortMode === "loved" ? artist.season_display
+    : artist.role_display;
+
   const grid = (items: MediaEntry[]) => (
     <div
       className="grid gap-x-3 gap-y-1"
@@ -38,6 +48,7 @@ export function ArtistsGrid({ entries, getCoverUrl, onNavigate, gridRef, sortMod
     >
       {items.map((artist) => {
         const cover = displayCover(artist);
+        const subtitle = subtitleFor(artist);
         return (
           <button
             key={artist.id}
@@ -68,12 +79,12 @@ export function ArtistsGrid({ entries, getCoverUrl, onNavigate, gridRef, sortMod
             </div>
             <div className="flex min-w-0 flex-col items-center">
               <span className="line-clamp-2 text-sm font-medium leading-tight">{artist.title}</span>
-              {artist.collection_display && (
+              {subtitle && (
                 <span
                   className="w-full break-words text-xs leading-tight text-muted-foreground"
-                  title={artist.collection_display}
+                  title={subtitle}
                 >
-                  {artist.collection_display}
+                  {subtitle}
                 </span>
               )}
             </div>

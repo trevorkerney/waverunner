@@ -96,15 +96,22 @@ interface MetadataCenterProps {
   libraryId: string;
   /** Re-fetch trigger — bump to reload (e.g. when the hosting dialog opens). */
   reloadKey?: number;
+  /** Fired after library data changes underneath (match applied, undo,
+   *  suggestion resolved, or a re-run pass landing) so the host can refresh
+   *  the pages behind this panel. */
+  onChanged?: () => void;
 }
 
-export function MetadataCenter({ libraryId, reloadKey = 0 }: MetadataCenterProps) {
+export function MetadataCenter({ libraryId, reloadKey = 0, onChanged }: MetadataCenterProps) {
   const [review, setReview] = useState<MbReview | null>(null);
   const [matchState, setMatchState] = useState<MusicMatchState | null>(null);
   const [fallbacks, setFallbacks] = useState<TagFallbackRow[]>([]);
   const [issues, setIssues] = useState<ScanIssueRow[]>([]);
   const [loading, setLoading] = useState(false);
-  const [busy, setBusy] = useState(false);
+  // Which mutation is in flight ("apply:…", "resolve:…", "undo:…") — the
+  // matching button shows a spinner; everything else just disables.
+  const [busyKey, setBusyKey] = useState<string | null>(null);
+  const busy = busyKey !== null;
   // Live progress of a running matching pass (re-run started here, or a
   // wizard pass still finishing in the background of this view).
   const [progress, setProgress] = useState<{ done: number; total: number; name: string; etaSecs: number | null } | null>(null);
@@ -167,16 +174,19 @@ export function MetadataCenter({ libraryId, reloadKey = 0 }: MetadataCenterProps
     );
     const unDone = listen<{ libraryId: string }>("music-enrich-done", (e) => {
       setProgress(null);
-      if (e.payload.libraryId === libraryId) refresh();
+      if (e.payload.libraryId === libraryId) {
+        refresh();
+        onChanged?.();
+      }
     });
     return () => {
       unProgress.then((fn) => fn());
       unDone.then((fn) => fn());
     };
-  }, [libraryId, refresh]);
+  }, [libraryId, refresh, onChanged]);
 
-  const run = async (fn: () => Promise<void>) => {
-    setBusy(true);
+  const run = async (key: string, fn: () => Promise<void>) => {
+    setBusyKey(key);
     try {
       await fn();
     } catch (e) {
@@ -185,16 +195,21 @@ export function MetadataCenter({ libraryId, reloadKey = 0 }: MetadataCenterProps
       // Refresh even on failure — some errors dismiss the item they were
       // about (e.g. a stale merge suggestion), and the list must show that.
       await refresh();
-      setBusy(false);
+      setBusyKey(null);
+      onChanged?.();
     }
   };
 
   const applyMatch = (albumId: number, releaseId: string) =>
-    run(() => invoke("mb_apply_album_match", { libraryId, albumId, mbReleaseId: releaseId }));
+    run(`apply:${albumId}:${releaseId}`, () =>
+      invoke("mb_apply_album_match", { libraryId, albumId, mbReleaseId: releaseId }),
+    );
   const resolve = (suggestionId: number, accept: boolean) =>
-    run(() => invoke("mb_resolve_suggestion", { libraryId, suggestionId, accept }));
+    run(`resolve:${suggestionId}:${accept}`, () =>
+      invoke("mb_resolve_suggestion", { libraryId, suggestionId, accept }),
+    );
   const undo = (changeId: number) =>
-    run(() => invoke("mb_undo_change", { libraryId, changeId }));
+    run(`undo:${changeId}`, () => invoke("mb_undo_change", { libraryId, changeId }));
 
   const rerunMatching = async () => {
     try {
@@ -339,12 +354,21 @@ export function MetadataCenter({ libraryId, reloadKey = 0 }: MetadataCenterProps
                 <div className="mt-2 flex gap-2">
                   <Button
                     size="sm"
+                    className="gap-1.5"
                     disabled={busy || !picked[s.id]}
                     onClick={() => s.payload.album_id != null && applyMatch(s.payload.album_id, picked[s.id])}
                   >
+                    {busyKey === `apply:${s.payload.album_id}:${picked[s.id]}` && <Spinner className="size-3" />}
                     Apply
                   </Button>
-                  <Button size="sm" variant="outline" disabled={busy} onClick={() => resolve(s.id, false)}>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="gap-1.5"
+                    disabled={busy}
+                    onClick={() => resolve(s.id, false)}
+                  >
+                    {busyKey === `resolve:${s.id}:false` && <Spinner className="size-3" />}
                     None of these
                   </Button>
                 </div>
@@ -369,10 +393,18 @@ export function MetadataCenter({ libraryId, reloadKey = 0 }: MetadataCenterProps
                   <span className="font-medium">“{s.payload.keep_title}”</span>
                 </p>
                 <div className="flex shrink-0 gap-2">
-                  <Button size="sm" disabled={busy} onClick={() => resolve(s.id, true)}>
+                  <Button size="sm" className="gap-1.5" disabled={busy} onClick={() => resolve(s.id, true)}>
+                    {busyKey === `resolve:${s.id}:true` && <Spinner className="size-3" />}
                     Merge
                   </Button>
-                  <Button size="sm" variant="outline" disabled={busy} onClick={() => resolve(s.id, false)}>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="gap-1.5"
+                    disabled={busy}
+                    onClick={() => resolve(s.id, false)}
+                  >
+                    {busyKey === `resolve:${s.id}:false` && <Spinner className="size-3" />}
                     Keep separate
                   </Button>
                 </div>
@@ -392,7 +424,7 @@ export function MetadataCenter({ libraryId, reloadKey = 0 }: MetadataCenterProps
             {review!.unmatched.map((u) => (
               <div key={u.album_id} className="rounded-md border p-3">
                 <div className="flex items-center justify-between gap-3">
-                  <p className="min-w-0 truncate text-sm">
+                  <p className="min-w-0 break-words text-sm">
                     <span className="font-medium">{u.title}</span>
                     {u.artist_title && <span className="text-muted-foreground"> — {u.artist_title}</span>}
                   </p>
@@ -443,10 +475,16 @@ export function MetadataCenter({ libraryId, reloadKey = 0 }: MetadataCenterProps
                           {searchResults.map((c) => (
                             <div key={c.release_id} className="flex items-center justify-between gap-2 rounded px-1.5 py-1 text-sm hover:bg-accent/50">
                               <span className="min-w-0">
-                                <span className="block truncate">{c.title}</span>
+                                <span className="block break-words">{c.title}</span>
                                 <span className="block text-xs text-muted-foreground">{candidateRow(c)}</span>
                               </span>
-                              <Button size="sm" disabled={busy} onClick={() => applyMatch(u.album_id, c.release_id)}>
+                              <Button
+                                size="sm"
+                                className="gap-1.5"
+                                disabled={busy}
+                                onClick={() => applyMatch(u.album_id, c.release_id)}
+                              >
+                                {busyKey === `apply:${u.album_id}:${c.release_id}` && <Spinner className="size-3" />}
                                 Apply
                               </Button>
                             </div>
@@ -487,7 +525,7 @@ export function MetadataCenter({ libraryId, reloadKey = 0 }: MetadataCenterProps
           <div className="overflow-hidden rounded-md border">
             {fallbacks.map((f, i) => (
               <div key={f.track_id} className={`px-3 py-1.5 text-sm ${i > 0 ? "border-t" : ""}`}>
-                <span className="block min-w-0 truncate font-mono text-xs" title={f.file_path}>
+                <span className="block min-w-0 break-all font-mono text-xs">
                   <FileWarning size={12} className="mr-1.5 inline text-muted-foreground" />
                   {f.file_path}
                 </span>
@@ -507,7 +545,7 @@ export function MetadataCenter({ libraryId, reloadKey = 0 }: MetadataCenterProps
           <div className="overflow-hidden rounded-md border">
             {issues.map((iss, i) => (
               <div key={iss.file_path} className={`px-3 py-1.5 text-sm ${i > 0 ? "border-t" : ""}`}>
-                <span className="block min-w-0 truncate font-mono text-xs" title={iss.file_path}>
+                <span className="block min-w-0 break-all font-mono text-xs">
                   <TriangleAlert size={12} className="mr-1.5 inline text-muted-foreground" />
                   {iss.file_path}
                 </span>
@@ -530,7 +568,7 @@ export function MetadataCenter({ libraryId, reloadKey = 0 }: MetadataCenterProps
                 key={c.id}
                 className={`flex items-center justify-between gap-3 px-3 py-1.5 text-sm ${i > 0 ? "border-t" : ""} ${c.undone ? "opacity-50" : ""}`}
               >
-                <span className="min-w-0 truncate" title={c.label}>
+                <span className="min-w-0 break-words">
                   {c.label}
                 </span>
                 {c.undone ? (
@@ -543,7 +581,7 @@ export function MetadataCenter({ libraryId, reloadKey = 0 }: MetadataCenterProps
                     disabled={busy}
                     onClick={() => undo(c.id)}
                   >
-                    <Undo2 size={12} />
+                    {busyKey === `undo:${c.id}` ? <Spinner className="size-3" /> : <Undo2 size={12} />}
                     Undo
                   </Button>
                 )}
@@ -560,10 +598,11 @@ interface MetadataCenterDialogProps {
   libraryId: string | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  onChanged?: () => void;
 }
 
 /** Standalone host — the sidebar's always-available entrance to the center. */
-export function MetadataCenterDialog({ libraryId, open, onOpenChange }: MetadataCenterDialogProps) {
+export function MetadataCenterDialog({ libraryId, open, onOpenChange, onChanged }: MetadataCenterDialogProps) {
   const [reloadKey, setReloadKey] = useState(0);
   useEffect(() => {
     if (open) setReloadKey((k) => k + 1);
@@ -574,7 +613,9 @@ export function MetadataCenterDialog({ libraryId, open, onOpenChange }: Metadata
         <DialogHeader>
           <DialogTitle>Metadata center</DialogTitle>
         </DialogHeader>
-        {libraryId && open && <MetadataCenter libraryId={libraryId} reloadKey={reloadKey} />}
+        {libraryId && open && (
+          <MetadataCenter libraryId={libraryId} reloadKey={reloadKey} onChanged={onChanged} />
+        )}
       </DialogContent>
     </Dialog>
   );

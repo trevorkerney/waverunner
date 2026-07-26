@@ -55,6 +55,10 @@ pub struct MusicInner {
     pub mpv: MpvHandle,
     pub shutdown: Arc<AtomicBool>,
     log: Mutex<Option<PlayLog>>,
+    /// Unpause when the NEXT file finishes loading, not before. Unpausing at
+    /// loadfile time resumes the still-current (old, paused) track for the few
+    /// tens of ms until the swap — an audible blip of the previous song.
+    unpause_on_load: AtomicBool,
 }
 
 // ---------------------------------------------------------------------------
@@ -136,6 +140,7 @@ fn ensure_music_player(
         mpv,
         shutdown: Arc::new(AtomicBool::new(false)),
         log: Mutex::new(None),
+        unpause_on_load: AtomicBool::new(false),
     });
     let mut guard = state.music_player.lock().map_err(|e| e.to_string())?;
     if let Some(existing) = guard.as_ref() {
@@ -206,11 +211,11 @@ pub async fn music_play_track(
         scrobbled: false,
     });
 
-    run_music(inner, move |mpv| {
-        mpv.command(&["loadfile", &path])?;
-        mpv.set_property_string("pause", "no")
-    })
-    .await
+    // Flag BEFORE the loadfile so the event thread can't see the new file's
+    // FileLoaded first. The unpause itself happens there — never here, where
+    // it would resume the outgoing (possibly paused) track for a moment.
+    inner.unpause_on_load.store(true, Ordering::SeqCst);
+    run_music(inner, move |mpv| mpv.command(&["loadfile", &path])).await
 }
 
 /// Append the NEXT queue track to mpv's internal playlist so the transition
@@ -408,6 +413,11 @@ fn event_loop(app: &AppHandle, inner: Arc<MusicInner>) {
                 let _ = app.emit("music-end-file", serde_json::json!({ "reason": reason }));
             }
             EV_FILE_LOADED => {
+                // Deferred unpause from music_play_track — the new file is now
+                // current, so this can't leak audio from the previous one.
+                if inner.unpause_on_load.swap(false, Ordering::SeqCst) {
+                    let _ = inner.mpv.set_property_string("pause", "no");
+                }
                 let _ = inner.mpv.observe_property(3, "pause", MpvFormat::Flag);
                 let _ = app.emit("music-file-loaded", ());
             }

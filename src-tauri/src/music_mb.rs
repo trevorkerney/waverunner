@@ -33,6 +33,29 @@ static CANCEL: AtomicBool = AtomicBool::new(false);
 const MB_MIN_SCORE: i64 = 90;
 const REQUEST_GAP: std::time::Duration = std::time::Duration::from_millis(1100);
 
+/// GET with 503 patience: MusicBrainz sheds load in waves of Service
+/// Unavailable, so wait it out (5s, then 15s) before giving the item up as a
+/// transient failure. Cancellation (skip-remaining) aborts the waits.
+async fn mb_get(
+    client: &reqwest::Client,
+    url: url::Url,
+) -> Result<reqwest::Response, String> {
+    let mut delay = std::time::Duration::from_secs(5);
+    for attempt in 0..3 {
+        let resp = client.get(url.clone()).send().await.map_err(|e| e.to_string())?;
+        if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE
+            && attempt < 2
+            && !CANCEL.load(Ordering::SeqCst)
+        {
+            tokio::time::sleep(delay).await;
+            delay *= 3;
+            continue;
+        }
+        return Ok(resp);
+    }
+    unreachable!("loop always returns by the last attempt")
+}
+
 fn mb_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .user_agent(format!(
@@ -297,7 +320,7 @@ async fn enrich_albums(
         processed = i + 1;
         let _ = app.emit(
             "music-enrich-progress",
-            serde_json::json!({ "phase": "albums", "done": i, "total": total, "name": title }),
+            serde_json::json!({ "libraryId": library_id, "phase": "albums", "done": i, "total": total, "name": title }),
         );
         let candidates = match search_releases(client, &title, artist.as_deref()).await {
             Ok(c) => c,
@@ -410,7 +433,7 @@ async fn search_releases(
         &[("query", query.as_str()), ("fmt", "json"), ("limit", "8")],
     )
     .map_err(|e| e.to_string())?;
-    let resp = client.get(url).send().await.map_err(|e| e.to_string())?;
+    let resp = mb_get(client, url).await?;
     tokio::time::sleep(REQUEST_GAP).await;
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status()));
@@ -483,6 +506,9 @@ struct MbReleaseFull {
     album_type: Option<String>,
     /// Release-group first release date (falls back to the release date).
     date: Option<String>,
+    /// RELEASE-level artist credit ("Drake & Future" → [Drake, Future]).
+    /// Two or more names = a joint album; the pass writes album_artist_credit.
+    album_artists: Vec<String>,
     tracks: Vec<MbTrack>,
 }
 
@@ -495,7 +521,7 @@ async fn fetch_release(
         &[("inc", "recordings+artist-credits+release-groups"), ("fmt", "json")],
     )
     .map_err(|e| e.to_string())?;
-    let resp = client.get(url).send().await.map_err(|e| e.to_string())?;
+    let resp = mb_get(client, url).await?;
     tokio::time::sleep(REQUEST_GAP).await;
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status()));
@@ -536,6 +562,22 @@ async fn fetch_release(
             }
         }
     }
+    // RELEASE-level artist credit — joint albums ("Drake & Future") carry
+    // every owner here, separate from the per-track credits.
+    let album_artists: Vec<String> = body["artist-credit"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|c| {
+            let name = c["name"]
+                .as_str()
+                .or_else(|| c["artist"]["name"].as_str())?
+                .trim()
+                .to_string();
+            (!name.is_empty()).then_some(name)
+        })
+        .collect();
+
     Ok(if tracks.is_empty() {
         None
     } else {
@@ -544,6 +586,7 @@ async fn fetch_release(
             release_group_id: rg["id"].as_str().map(|s| s.to_string()),
             album_type,
             date,
+            album_artists,
             tracks,
         })
     })
@@ -601,6 +644,59 @@ async fn apply_release(
                 &format!("{album_title} — credits on {} tracks", changes.len()),
                 &serde_json::json!(before),
                 &serde_json::json!(after),
+            )
+            .await?;
+        }
+    }
+
+    // Joint albums: MB's release-level artist credit names every owner —
+    // written as album_artist_credit rows so the album lands in each of their
+    // discographies. User-set credits outrank; logged and undoable like every
+    // other application.
+    if full.album_artists.len() >= 2
+        && !suppressed(pool, "album_artists", album_id).await?
+        && !crate::music_edit::has_override(pool, album_id, "artist_credits").await?
+    {
+        let current: Vec<String> = sqlx::query_as::<_, (String,)>(
+            "SELECT name FROM album_artist_credit WHERE album_id = ? ORDER BY position",
+        )
+        .bind(album_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|(n,)| n)
+        .collect();
+        let differs = current.len() != full.album_artists.len()
+            || current
+                .iter()
+                .zip(&full.album_artists)
+                .any(|(a, b)| !a.eq_ignore_ascii_case(b));
+        if differs {
+            sqlx::query("DELETE FROM album_artist_credit WHERE album_id = ?")
+                .bind(album_id)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            for (i, name) in full.album_artists.iter().enumerate() {
+                sqlx::query(
+                    "INSERT INTO album_artist_credit (album_id, position, name) VALUES (?, ?, ?)",
+                )
+                .bind(album_id)
+                .bind(i as i64)
+                .bind(name)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            }
+            log_change(
+                pool,
+                library_id,
+                "album_artists",
+                album_id,
+                &format!("{album_title} — credited to {}", full.album_artists.join(" · ")),
+                &serde_json::json!({ "names": current }),
+                &serde_json::json!({ "names": full.album_artists }),
             )
             .await?;
         }
@@ -821,7 +917,7 @@ async fn enrich_artist_mbids(
         }
         let _ = app.emit(
             "music-enrich-progress",
-            serde_json::json!({ "phase": "artists", "done": i, "total": total, "name": title }),
+            serde_json::json!({ "libraryId": library_id, "phase": "artists", "done": i, "total": total, "name": title }),
         );
         if let Some(mbid) = cached_or_lookup_artist(pool, client, &title).await? {
             sqlx::query(
@@ -885,7 +981,7 @@ async fn lookup_artist(client: &reqwest::Client, name: &str) -> Result<Option<St
         &[("query", query.as_str()), ("fmt", "json"), ("limit", "5")],
     )
     .map_err(|e| e.to_string())?;
-    let resp = client.get(url).send().await.map_err(|e| e.to_string())?;
+    let resp = mb_get(client, url).await?;
     if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
         return Err("rate limited (503)".to_string());
     }
@@ -1421,6 +1517,35 @@ pub async fn mb_undo_change(
                             .await
                             .map_err(|e| e.to_string())?;
                         }
+                    }
+                }
+            }
+        }
+        "album_artists" => {
+            // User-set credits stay put through an MB undo too.
+            if !crate::music_edit::has_override(pool, target_id, "artist_credits").await? {
+                sqlx::query("DELETE FROM album_artist_credit WHERE album_id = ?")
+                    .bind(target_id)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let names: Vec<&str> = before["names"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|n| n.as_str())
+                    .collect();
+                if names.len() >= 2 {
+                    for (i, name) in names.iter().enumerate() {
+                        sqlx::query(
+                            "INSERT INTO album_artist_credit (album_id, position, name) VALUES (?, ?, ?)",
+                        )
+                        .bind(target_id)
+                        .bind(i as i64)
+                        .bind(name)
+                        .execute(pool)
+                        .await
+                        .map_err(|e| e.to_string())?;
                     }
                 }
             }

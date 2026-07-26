@@ -120,8 +120,9 @@ export function CombineAlbumsDialog({
       await invoke("combine_albums", { libraryId, sourceId: source.id, targetId, mode });
       // The directive applies on rescan — run one now to make it real.
       const toastId = toast.loading("Combining — rescanning library…");
-      const unlisten = await listen<string>("scan-progress", (e) => {
-        toast.loading(e.payload, { id: toastId });
+      const unlisten = await listen<{ libraryId: string; folder: string }>("scan-progress", (e) => {
+        if (e.payload.libraryId !== libraryId) return;
+        toast.loading(e.payload.folder, { id: toastId });
       });
       try {
         await invoke("rescan_library", { libraryId });

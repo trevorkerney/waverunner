@@ -7,19 +7,7 @@
 
 ## bugs / needs fixing
 
-allow user to use waverunner while library is being created, but library being created should remain unavailable until its done being created
-
-editing track metadata in detail view on artist page and saving causes page to jump to top. should update in place. also if start scrolling quickly after updating a tracks metadata, the scroll will jump back up to the top (almost like the page is updating again, idk)
-
-add 'Most loved' to artists page sort options
-
-better scroll position on artists/artist/albums/album pages
-
-when setting a tracks artist, user should be able to pick from list of existing artists. I feel like users should also be able to edit album - at first I though this would be weird since tracks are in album folder, but albums are in artist folder, and we can change tracks artists, so nbd.
-
-consider how main artists vs feature artists works. right now it seems like all songs are only able to have 1 main artist, and to make songs have 2 main artists, you basically have to have an artist that IS both of those artists (or 3 or 4 etc). we need to conclude on a system for this
-
-sometimes playing new songs causes a tiny bit of the song before that to play right before the new song comes on. say for instance i had a song playing, then paused it, then came back a bit later and played another. right as the song to be played queues up you hear a little piece of the song playing before, then the new song comes on.
+WHOLE MUSIC SECTION NEEDS CONTEXT MENU IMPROVEMENTS
 
 
 ## changes / small new features

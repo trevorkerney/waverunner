@@ -105,9 +105,8 @@ import {
   ListEnd,
 } from "lucide-react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
-import { Library, MediaEntry, BreadcrumbItem, MovieDetail, MovieDetailUpdate, SeasonInfo, EpisodeInfo, ShowDetail, SeasonDetailLocal, EpisodeDetailLocal, TmdbSeasonDetail, TmdbEpisodeDetail, TmdbShowFieldSelection, TmdbSeasonFieldSelection, TmdbEpisodeFieldSelection, CastUpdateInfo, CastInfo, RatingInfo, ViewSpec, PersonInfo, PersonSummary, PersonRole, PlaylistSummary, GenreSummary, SortPreset, WatchState, EpisodeWatchInfo, ContinueTarget, ShowEpisodeFlat, MusicQueueItem, MusicAlbumCard, MusicAlbumDetail } from "@/types";
+import { Library, MediaEntry, BreadcrumbItem, MovieDetail, MovieDetailUpdate, SeasonInfo, EpisodeInfo, ShowDetail, SeasonDetailLocal, EpisodeDetailLocal, TmdbSeasonDetail, TmdbEpisodeDetail, TmdbShowFieldSelection, TmdbSeasonFieldSelection, TmdbEpisodeFieldSelection, CastUpdateInfo, CastInfo, RatingInfo, ViewSpec, PersonInfo, PersonDetail, PersonSummary, PersonRole, PlaylistSummary, GenreSummary, SortPreset, WatchState, EpisodeWatchInfo, ContinueTarget, ShowEpisodeFlat, MusicQueueItem, MusicAlbumCard, MusicAlbumDetail } from "@/types";
 import { queueFromRelease, defaultRelease } from "@/components/music/musicQueue";
 import { scopeKeyFor, viewCacheKey } from "@/lib/complications";
 import { ExtrasDialog } from "@/components/ExtrasDialog";
@@ -134,10 +133,14 @@ import { ArtistDetailPage } from "@/components/music/ArtistDetailPage";
 import { PlaylistTrackList } from "@/components/music/PlaylistTrackList";
 import { HomePage } from "@/components/HomePage";
 import { CombineAlbumsDialog } from "@/components/music/CombineAlbumsDialog";
+import { EditCharacterNameDialog, type CharacterEditTarget } from "@/components/EditCharacterNameDialog";
+import { TmdbPersonSearchDialog } from "@/components/TmdbPersonSearchDialog";
 import { ArtistsGrid } from "@/components/music/ArtistsGrid";
 import { AlbumDetailPage } from "@/components/music/AlbumDetailPage";
 import { MusicIssuesPage } from "@/components/music/MusicIssuesPage";
 import { TracksPage } from "@/components/music/TracksPage";
+import { LooseTracksSection } from "@/components/music/LooseTracksSection";
+import { NewSoundCollectionDialog } from "@/components/music/MoveToCollectionDialog";
 
 function letterForTitle(title: string): string {
   // Mirrors the backend's generate_sort_title: grids sort with leading English
@@ -220,6 +223,9 @@ interface MainContentProps {
   onPeopleModeChange: (mode: "top" | "all") => void;
   onNavigateToPlaylist: (playlist: PlaylistSummary) => void;
   onPlaylistChanged: (libraryId: string) => void;
+  /** Sound collections were created/deleted/re-membered — the host drops its
+   *  caches and refreshes the grid in place. */
+  onSoundCollectionsChanged?: (libraryId: string) => void;
   onBreadcrumbClick: (index: number) => void;
   selectedLibrary: Library | null;
   hasLibraries: boolean;
@@ -298,6 +304,7 @@ export function MainContent({
   onPeopleModeChange,
   onNavigateToPlaylist,
   onPlaylistChanged,
+  onSoundCollectionsChanged,
   onBreadcrumbClick,
   selectedLibrary,
   hasLibraries,
@@ -337,6 +344,12 @@ export function MainContent({
 }: MainContentProps) {
   // Music album being combined into another (the context menu's source).
   const [combineSource, setCombineSource] = useState<{ id: number; title: string } | null>(null);
+  // Character-name edit (person filmography cards + detail-page cast cards).
+  const [characterEdit, setCharacterEdit] = useState<{
+    personId: number;
+    personName: string;
+    target: CharacterEditTarget;
+  } | null>(null);
   const [coverDialogEntry, setCoverDialogEntry] = useState<MediaEntry | null>(
     null
   );
@@ -494,6 +507,21 @@ export function MainContent({
       setDeletingId(null);
     }
   }, [onDeleteEntry]);
+
+  // Sounds grid: delete a virtual collection (tracks demote to the loose
+  // pool — nothing touches disk, so no confirmation gate).
+  const [newSoundCollectionOpen, setNewSoundCollectionOpen] = useState(false);
+  const deleteSoundCollection = useCallback(
+    async (entry: MediaEntry) => {
+      try {
+        await invoke("delete_sound_collection", { albumId: entry.id });
+        if (selectedLibrary) onSoundCollectionsChanged?.(selectedLibrary.id);
+      } catch (err) {
+        toast.error(String(err));
+      }
+    },
+    [selectedLibrary, onSoundCollectionsChanged],
+  );
 
   // Album-card "Play next" / "Add to queue": the whole default release, in order.
   const enqueueAlbum = useCallback(
@@ -1141,10 +1169,12 @@ export function MainContent({
           {/* Person-detail header */}
           {activeView?.kind === "person-detail" && !selectedEntry && (
             <PersonDetailHeader
+              personId={activeView.personId}
               name={activeView.personName}
               imagePath={activeView.personImage}
               role={activeView.role}
               workCount={entries.length}
+              onPersonChanged={onEntryChanged}
             />
           )}
 
@@ -1164,12 +1194,26 @@ export function MainContent({
               />
             </div>
             <div className="flex items-center gap-1.5">
+            {activeView?.kind === "sounds" && (
+              <button
+                onClick={() => setNewSoundCollectionOpen(true)}
+                className="flex h-8 items-center gap-1.5 rounded-md border border-input bg-background px-2.5 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+              >
+                <FolderPlus size={12} />
+                New collection
+              </button>
+            )}
             <DropdownMenu>
               <DropdownMenuTrigger className="flex h-8 items-center gap-1.5 rounded-md border border-input bg-background px-2.5 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground">
                 <ArrowUpDown size={12} />
                 {(() => {
+                  // Sort mode unknown while a fresh view load is in flight —
+                  // a neutral placeholder beats flashing the wrong label.
+                  if (!sortMode) return "—";
                   if (isArtistsView) {
-                    return sortMode === "credits" ? "Most credited" : "Alphabetical";
+                    return sortMode === "credits" ? "Most credited"
+                      : sortMode === "loved" ? "Most loved"
+                      : "Alphabetical";
                   }
                   if (activeView?.kind === "albums" || activeView?.kind === "sounds") {
                     return sortMode === "date" ? "Oldest first"
@@ -1197,9 +1241,14 @@ export function MainContent({
                   Alphabetical
                 </DropdownMenuItem>
                 {isArtistsView && (
-                  <DropdownMenuItem onClick={() => onSortModeChange("credits")}>
-                    Most credited
-                  </DropdownMenuItem>
+                  <>
+                    <DropdownMenuItem onClick={() => onSortModeChange("credits")}>
+                      Most credited
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onClick={() => onSortModeChange("loved")}>
+                      Most loved
+                    </DropdownMenuItem>
+                  </>
                 )}
                 {isArtistsView ? null : activeView?.kind === "albums" || activeView?.kind === "sounds" ? (
                   // Albums/Sounds: both date directions, no custom order or
@@ -1359,7 +1408,7 @@ export function MainContent({
               onPlayQueue={(items, startIndex) => onPlayMusicQueue?.(items, startIndex)}
               currentTrackId={musicCurrentTrackId ?? null}
               playing={musicPlaying ?? false}
-              onMetadataChanged={onRescan}
+              onMetadataChanged={onEntryChanged}
               onTitleChanged={onTitleChanged}
               onAddToPlaylist={(t) => setAddToPlaylistFor(t)}
               onEnqueue={onEnqueueMusic}
@@ -1397,7 +1446,7 @@ export function MainContent({
                   ? musicFocusRequest
                   : null
               }
-              onMetadataChanged={onRescan}
+              onMetadataChanged={onEntryChanged}
               onTitleChanged={onTitleChanged}
               onAddToPlaylist={(t) => setAddToPlaylistFor(t)}
               onEnqueue={onEnqueueMusic}
@@ -1427,6 +1476,45 @@ export function MainContent({
       ) : (
       <ContextMenu>
         <ContextMenuTrigger render={<div className="flex min-h-full flex-col" />}>
+        {/* Albums page: album-less tracks get a flat list above the grid —
+            their hidden containers never surface as cards, so this is their
+            only album-side home. The Sounds page gets the same section for its
+            loose pool (base-root + misc-folder files), with add-to-collection.
+            Renders nothing when the library has none. */}
+        {(activeView?.kind === "albums" || activeView?.kind === "sounds") && !searchResults && !loading && selectedLibrary && (
+          <LooseTracksSection
+            sounds={activeView.kind === "sounds"}
+            onCollectionsChanged={() => onSoundCollectionsChanged?.(activeView.libraryId)}
+            libraryId={activeView.libraryId}
+            onPlayQueue={(items, startIndex) => onPlayMusicQueue?.(items, startIndex)}
+            currentTrackId={musicCurrentTrackId ?? null}
+            playing={musicPlaying ?? false}
+            onEnqueue={onEnqueueMusic}
+            onPlaylistsChanged={() => onPlaylistChanged(activeView.libraryId)}
+            getCoverUrl={getCoverUrl}
+            onNavigateToArtist={(artistId, artistTitle) => onNavigate({
+              id: artistId,
+              title: artistTitle,
+              year: null,
+              end_year: null,
+              folder_path: "",
+              parent_id: null,
+              entry_type: "artist",
+              covers: [],
+              selected_cover: null,
+              child_count: 0,
+              season_display: null,
+              collection_display: null,
+              tmdb_id: null,
+              link_id: null,
+              interactive: false,
+              watched: false,
+              watch_progress: null,
+              unwatched: false,
+              has_progress: false,
+            })}
+          />
+        )}
         {!selectedLibrary ? (
           <Empty className="border-none min-h-full">
             <EmptyHeader>
@@ -1486,7 +1574,7 @@ export function MainContent({
                     }}
                     onAddToPlaylist={(t) => setAddToPlaylistFor(t)}
                     onEnqueue={onEnqueueMusic}
-                    onMetadataChanged={onRescan}
+                    onMetadataChanged={onEntryChanged}
                     onRenameCollection={(e) => setRenameCollectionFor(e)}
                     onDeleteCollection={(e) => {
                       if (e.child_count === 0) {
@@ -1568,6 +1656,21 @@ export function MainContent({
                         setDeletePlaylistCollectionTarget(e);
                       }
                     } : undefined}
+                    onEditCharacterName={
+                      activeView?.kind === "person-detail" && activeView.role === "actor"
+                        ? (e) =>
+                            setCharacterEdit({
+                              personId: activeView.personId,
+                              personName: activeView.personName,
+                              target: { entryId: e.id, entryType: e.entry_type as "movie" | "show", title: e.title },
+                            })
+                        : undefined
+                    }
+                    onDeleteSoundCollection={
+                      activeView?.kind === "sounds"
+                        ? (e) => void deleteSoundCollection(e)
+                        : undefined
+                    }
                   />
                 ))}
               </div>
@@ -1600,29 +1703,15 @@ export function MainContent({
               </ContextMenuItem>
             )}
             {activeView?.kind !== "playlist-detail" && (
-              <ContextMenuItem onClick={async () => {
+              <ContextMenuItem onClick={() => {
                 if (!selectedLibrary) return;
-                const toastId = toast.loading("Rescanning...");
-                const unlisten = await listen<string>("scan-progress", (event) => {
-                  toast.loading(event.payload, { id: toastId });
-                });
-                try {
-                  const warnings = await invoke<string[]>("rescan_library", { libraryId: selectedLibrary.id });
-                  if (warnings.length > 0) {
-                    toast.warning(`Rescan complete — ${warnings.length} item${warnings.length === 1 ? "" : "s"} skipped`, {
-                      id: toastId,
-                      description: warnings.slice(0, 5).join("  •  ") + (warnings.length > 5 ? `  •  +${warnings.length - 5} more` : ""),
-                      duration: 8000,
-                    });
-                  } else {
-                    toast.success("Rescan complete", { id: toastId });
-                  }
-                  onRescan();
-                } catch (err) {
-                  toast.error(String(err), { id: toastId });
-                } finally {
-                  unlisten();
-                }
+                // Rescans run through the wizard modal — minimize sends the
+                // progress to the library's sidebar row.
+                window.dispatchEvent(
+                  new CustomEvent("waverunner:open-rescan", {
+                    detail: { libraryId: selectedLibrary.id },
+                  }),
+                );
               }}>
                 <RefreshCw size={14} />
                 Rescan
@@ -1732,6 +1821,17 @@ export function MainContent({
         />
       )}
 
+      <EditCharacterNameDialog
+        open={characterEdit !== null}
+        onOpenChange={(o) => {
+          if (!o) setCharacterEdit(null);
+        }}
+        personId={characterEdit?.personId ?? null}
+        personName={characterEdit?.personName ?? ""}
+        target={characterEdit?.target ?? null}
+        onSaved={onEntryChanged}
+      />
+
       {/* Cover Carousel Dialog */}
       {liveCoverDialogEntry && (
         <CoverCarouselDialog
@@ -1780,6 +1880,16 @@ export function MainContent({
         entryTitle={addToPlaylistFor?.title ?? null}
         onAdded={() => {
           if (selectedLibrary) onPlaylistChanged(selectedLibrary.id);
+        }}
+      />
+
+      {/* Sounds toolbar: create an empty virtual collection. */}
+      <NewSoundCollectionDialog
+        libraryId={activeView?.kind === "sounds" ? activeView.libraryId : null}
+        open={newSoundCollectionOpen}
+        onOpenChange={setNewSoundCollectionOpen}
+        onCreated={() => {
+          if (activeView?.kind === "sounds") onSoundCollectionsChanged?.(activeView.libraryId);
         }}
       />
 
@@ -1839,6 +1949,8 @@ function SortableCoverCard({
   onDeletePlaylistCollection,
   onCombineAlbum,
   onEnqueueAlbum,
+  onEditCharacterName,
+  onDeleteSoundCollection,
   sortableId,
   getCoverUrl,
   getCoverAspect,
@@ -1864,6 +1976,10 @@ function SortableCoverCard({
   onCombineAlbum?: (entry: MediaEntry) => void;
   /** Music albums: queue the whole album ("Play next" / "Add to queue"). */
   onEnqueueAlbum?: (entry: MediaEntry, mode: "next" | "last") => void;
+  /** Person filmography (actor pages): edit the character this person plays here. */
+  onEditCharacterName?: (entry: MediaEntry) => void;
+  /** Sounds grid: delete this virtual collection (its tracks demote to loose). */
+  onDeleteSoundCollection?: (entry: MediaEntry) => void;
   /** Overrides the useSortable id. Playlist views need string ids so links and
    *  nested playlist_collections don't collide with each other or with real
    *  media_entry ids. Library views can omit this and the card falls back to entry.id. */
@@ -2231,6 +2347,12 @@ function SortableCoverCard({
                 Combine with…
               </ContextMenuItem>
             )}
+            {onEditCharacterName && (entry.entry_type === "movie" || entry.entry_type === "show") && (
+              <ContextMenuItem onClick={() => onEditCharacterName(entry)}>
+                <UserIcon size={14} />
+                Edit character name
+              </ContextMenuItem>
+            )}
             {(entry.entry_type === "movie" || entry.entry_type === "show") && (
               // Watched is the default; flagged-unwatched and in-progress
               // items offer Mark watched. Shows flip every episode at once.
@@ -2265,6 +2387,17 @@ function SortableCoverCard({
                 and leave the library via rescan. */}
             {entry.link_id == null && entry.entry_type === "collection" && (
               <ContextMenuItem onClick={() => onDelete(entry)} className="text-destructive focus:text-destructive">
+                <Trash2 size={14} />
+                Delete collection
+              </ContextMenuItem>
+            )}
+            {/* Sound collections are virtual — deleting one demotes its tracks
+                to the loose pool; nothing touches disk. */}
+            {onDeleteSoundCollection && entry.link_id == null && entry.entry_type === "album" && (
+              <ContextMenuItem
+                onClick={() => onDeleteSoundCollection(entry)}
+                className="text-destructive focus:text-destructive"
+              >
                 <Trash2 size={14} />
                 Delete collection
               </ContextMenuItem>
@@ -2626,13 +2759,16 @@ function PersonFace({ imagePath, className, iconSize }: { imagePath: string | nu
 function CastCard({
   person,
   onClick,
+  onEditCharacter,
   className = "w-full min-w-0",
 }: {
   person: CastInfo;
   onClick?: () => void;
+  /** When set, right-click offers "Edit character name". */
+  onEditCharacter?: (person: CastInfo) => void;
   className?: string;
 }) {
-  return (
+  const card = (
     <button
       onClick={onClick}
       className={`flex flex-col items-center gap-1.5 rounded-md p-1.5 text-center transition-colors hover:bg-accent/50 ${className}`}
@@ -2644,6 +2780,18 @@ function CastCard({
       )}
     </button>
   );
+  if (!onEditCharacter) return card;
+  return (
+    <ContextMenu>
+      <ContextMenuTrigger render={card} />
+      <ContextMenuContent>
+        <ContextMenuItem onClick={() => onEditCharacter(person)}>
+          <UserIcon size={14} />
+          Edit character name
+        </ContextMenuItem>
+      </ContextMenuContent>
+    </ContextMenu>
+  );
 }
 
 /** Full-width cast grid (movie + show detail pages). Cast is now uncapped, so
@@ -2652,9 +2800,11 @@ function CastCard({
 function CastBand({
   cast,
   onNavigateToPerson,
+  onEditCharacter,
 }: {
   cast: CastInfo[];
   onNavigateToPerson?: (person: PersonInfo, role: PersonRole) => void;
+  onEditCharacter?: (person: CastInfo) => void;
 }) {
   const CAST_MIN_W = 108; // matches the grid's minmax min
   const CAST_GAP_X = 4; // gap-x-1
@@ -2691,6 +2841,7 @@ function CastBand({
             key={c.id}
             person={c}
             onClick={() => onNavigateToPerson?.({ id: c.id, name: c.name, image_path: c.image_path }, "actor")}
+            onEditCharacter={onEditCharacter}
           />
         ))}
       </div>
@@ -2772,6 +2923,8 @@ function EntryDetailPage({
   const [ratings, setRatings] = useState<RatingInfo[]>([]);
   const [omdbEnabled, setOmdbEnabled] = useState(false);
   const [watch, setWatch] = useState<WatchState | null>(null);
+  // Cast member whose character name is being edited (right-click on a cast card).
+  const [characterEditFor, setCharacterEditFor] = useState<CastInfo | null>(null);
   // Entry id everything below has finished loading for. Render is gated on it so
   // the page appears in one piece instead of sections popping in one by one.
   const [loadedId, setLoadedId] = useState<number | null>(null);
@@ -3248,7 +3401,7 @@ function EntryDetailPage({
       {detail && !editing && (detail.cast.length > 0 || detail.studios.length > 0 || detail.tmdb_id || detail.imdb_id || detail.rotten_tomatoes_id) && (
         <div className="flex w-full min-w-0 flex-col gap-5">
           {detail.cast.length > 0 && (
-            <CastBand cast={detail.cast} onNavigateToPerson={onNavigateToPerson} />
+            <CastBand cast={detail.cast} onNavigateToPerson={onNavigateToPerson} onEditCharacter={setCharacterEditFor} />
           )}
 
           {(detail.studios.length > 0 || detail.tmdb_id || detail.imdb_id || detail.rotten_tomatoes_id) && (
@@ -3301,6 +3454,16 @@ function EntryDetailPage({
         entryId={entry.id}
         current={detail?.backdrop ?? null}
         onChanged={loadDetail}
+      />
+      <EditCharacterNameDialog
+        open={characterEditFor !== null}
+        onOpenChange={(o) => {
+          if (!o) setCharacterEditFor(null);
+        }}
+        personId={characterEditFor?.id ?? null}
+        personName={characterEditFor?.name ?? ""}
+        target={{ entryId: entry.id, entryType: "movie", title: entry.title }}
+        onSaved={() => { loadDetail(); onEntryChanged(); }}
       />
     </div>
   );
@@ -3365,6 +3528,8 @@ function ShowDetailPage({
   const [editingEpisodeId, setEditingEpisodeId] = useState<number | null>(null);
   const [episodeDraft, setEpisodeDraft] = useState<TmdbEpisodeFieldSelection>({});
   const [episodeSaving, setEpisodeSaving] = useState(false);
+  // Cast member whose character name is being edited (right-click on a cast card).
+  const [characterEditFor, setCharacterEditFor] = useState<CastInfo | null>(null);
   // Entry id everything below has finished loading for. Render is gated on it so
   // the page appears in one piece instead of sections popping in one by one.
   const [loadedId, setLoadedId] = useState<number | null>(null);
@@ -4409,7 +4574,7 @@ function ShowDetailPage({
       {detail && !showEditing && (detail.cast.length > 0 || detail.studios.length > 0 || detail.tmdb_id || detail.imdb_id) && (
         <div className="flex w-full min-w-0 flex-col gap-5">
           {detail.cast.length > 0 && (
-            <CastBand cast={detail.cast} onNavigateToPerson={onNavigateToPerson} />
+            <CastBand cast={detail.cast} onNavigateToPerson={onNavigateToPerson} onEditCharacter={setCharacterEditFor} />
           )}
           {(detail.studios.length > 0 || detail.tmdb_id || detail.imdb_id) && (
             <p className="text-xs text-muted-foreground/70">
@@ -4442,6 +4607,16 @@ function ShowDetailPage({
         entryYear={entry.year}
         currentDetail={detail}
         onApplied={() => { loadDetail(); onEntryChanged(); }}
+      />
+      <EditCharacterNameDialog
+        open={characterEditFor !== null}
+        onOpenChange={(o) => {
+          if (!o) setCharacterEditFor(null);
+        }}
+        personId={characterEditFor?.id ?? null}
+        personName={characterEditFor?.name ?? ""}
+        target={{ entryId: entry.id, entryType: "show", title: entry.title }}
+        onSaved={() => { loadDetail(); onEntryChanged(); }}
       />
 
       {detail?.tmdb_id && (
@@ -4509,6 +4684,8 @@ function PeopleListEdit<T extends CastUpdateInfo>({
   // Name autocomplete: suggest existing people from the DB as you type, so
   // additions reuse the canonical person row instead of typo-spawning a twin.
   const [suggest, setSuggest] = useState<{ row: number; options: PersonInfo[] } | null>(null);
+  // Row whose person is being picked from TMDB (the per-row search button).
+  const [tmdbPickRow, setTmdbPickRow] = useState<number | null>(null);
   const suggestSeq = useRef(0);
   const suggestTimer = useRef<number | undefined>(undefined);
 
@@ -4597,6 +4774,14 @@ function PeopleListEdit<T extends CastUpdateInfo>({
               placeholder={secondaryLabel}
               className="flex-1 rounded border border-input bg-transparent px-2 py-1 text-sm outline-none"
             />
+            <Button
+              size="sm"
+              variant="ghost"
+              title="Find on TMDB"
+              onClick={() => setTmdbPickRow(i)}
+            >
+              <Search size={14} />
+            </Button>
             <Button size="sm" variant="ghost" onClick={() => remove(i)}>
               <Trash2 size={14} />
             </Button>
@@ -4607,6 +4792,24 @@ function PeopleListEdit<T extends CastUpdateInfo>({
           + Add
         </Button>
       </div>
+      <TmdbPersonSearchDialog
+        open={tmdbPickRow !== null}
+        onOpenChange={(o) => {
+          if (!o) setTmdbPickRow(null);
+        }}
+        title="Find person on TMDB"
+        initialQuery={tmdbPickRow !== null ? items[tmdbPickRow]?.name ?? "" : ""}
+        onPick={(hit) => {
+          if (tmdbPickRow === null) return;
+          // The save path resolves tmdb_id → canonical person row and downloads
+          // the profile image (same machinery as a TMDB metadata apply).
+          update(tmdbPickRow, {
+            name: hit.name,
+            tmdb_id: hit.id,
+            profile_path: hit.profile_path,
+          } as unknown as Partial<T>);
+        }}
+      />
     </div>
   );
 }
@@ -4644,38 +4847,162 @@ function EditField({
 }
 
 function PersonDetailHeader({
+  personId,
   name,
   imagePath,
   role,
   workCount,
+  onPersonChanged,
 }: {
+  personId: number;
+  /** Fallbacks from the navigation snapshot — the fetched record wins once loaded
+   *  (a TMDB match may have canonicalized the name or added an image). */
   name: string;
   imagePath: string | null;
   role: PersonRole;
   workCount: number;
+  /** Fired after a TMDB match/refresh/clear so grids pick up name/image changes. */
+  onPersonChanged: () => void;
 }) {
-  const imageSrc = imagePath ? convertFileSrc(imagePath) : null;
+  const [detail, setDetail] = useState<PersonDetail | null>(null);
+  const [bioExpanded, setBioExpanded] = useState(false);
+  const [matchOpen, setMatchOpen] = useState(false);
+  const [working, setWorking] = useState(false);
+
+  // Whether the collapsed bio actually overflows its clamp — short bios get no
+  // "see more". Measured after render and on resize (clamping is width-driven).
+  const bioRef = useRef<HTMLParagraphElement | null>(null);
+  const [bioClamped, setBioClamped] = useState(false);
+  useEffect(() => {
+    const el = bioRef.current;
+    if (!el || bioExpanded) return;
+    const measure = () => setBioClamped(el.scrollHeight > el.clientHeight + 1);
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [detail?.biography, bioExpanded]);
+
+  const loadPerson = useCallback(() => {
+    invoke<PersonDetail>("get_person_detail", { personId })
+      .then(setDetail)
+      .catch(() => setDetail(null));
+  }, [personId]);
+  useEffect(() => {
+    setDetail(null);
+    setBioExpanded(false);
+    loadPerson();
+  }, [loadPerson]);
+
+  const displayName = detail?.name ?? name;
+  const displayImage = detail?.image_path ?? imagePath;
+  const imageSrc = displayImage ? convertFileSrc(displayImage) : null;
   const roleLabel =
     role === "actor" ? "Actor"
     : role === "director_creator" ? "Director / Creator"
     : role === "composer" ? "Composer"
     : "Credits";
+
+  const runAction = async (command: string) => {
+    setWorking(true);
+    try {
+      await invoke(command, { personId });
+      loadPerson();
+      onPersonChanged();
+    } catch (e) {
+      toast.error(String(e));
+    } finally {
+      setWorking(false);
+    }
+  };
+
   return (
-    <div className="flex items-center gap-4 border-b border-border px-4 py-4">
-      <div className="flex h-24 w-24 flex-shrink-0 items-center justify-center overflow-hidden rounded-full bg-muted">
-        {imageSrc ? (
-          <img src={imageSrc} alt={name} className="h-full w-full object-cover" draggable={false} />
-        ) : (
-          <UserIcon className="h-10 w-10 text-muted-foreground" />
-        )}
-      </div>
-      <div className="flex min-w-0 flex-col">
-        <h1 className="truncate text-2xl font-bold">{name}</h1>
-        <p className="text-sm text-muted-foreground">
-          {roleLabel} · {workCount === 1 ? "1 work" : `${workCount} works`}
-        </p>
-      </div>
-    </div>
+    <>
+      <ContextMenu>
+        <ContextMenuTrigger render={<div className="flex items-center gap-4 border-b border-border px-4 py-4" />}>
+          <div className="flex h-24 w-24 flex-shrink-0 items-center justify-center overflow-hidden rounded-full bg-muted">
+            {imageSrc ? (
+              <img src={imageSrc} alt={displayName} className="h-full w-full object-cover" draggable={false} />
+            ) : (
+              <UserIcon className="h-10 w-10 text-muted-foreground" />
+            )}
+          </div>
+          <div className="flex min-w-0 flex-1 flex-col">
+            <h1 className="truncate text-2xl font-bold">{displayName}</h1>
+            <p className="text-sm text-muted-foreground">
+              {roleLabel} · {workCount === 1 ? "1 work" : `${workCount} works`}
+            </p>
+            {detail?.biography && (
+              <div className="relative mt-1.5 max-w-3xl">
+                <p
+                  ref={bioRef}
+                  className={`whitespace-pre-line text-sm text-muted-foreground ${bioExpanded ? "" : "line-clamp-3"}`}
+                >
+                  {detail.biography}
+                  {bioExpanded && (
+                    <button
+                      onClick={() => setBioExpanded(false)}
+                      className="ml-1.5 text-sm font-medium text-foreground"
+                    >
+                      …see less
+                    </button>
+                  )}
+                </p>
+                {!bioExpanded && bioClamped && (
+                  <button
+                    onClick={() => setBioExpanded(true)}
+                    // Sits over the clamp point: opaque background hides the text
+                    // underneath, the leading ellipsis reads as the cut.
+                    className="absolute bottom-0 right-0 bg-background pl-1.5 text-sm font-medium text-foreground"
+                  >
+                    …see more
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+        </ContextMenuTrigger>
+        <ContextMenuContent>
+          <ContextMenuItem disabled={working} onClick={() => setMatchOpen(true)}>
+            <Search size={14} />
+            {detail?.tmdb_id ? "Re-match to TMDB…" : "Match to TMDB…"}
+          </ContextMenuItem>
+          <ContextMenuItem
+            disabled={working || !detail?.tmdb_id}
+            onClick={() => void runAction("refresh_tmdb_person")}
+          >
+            <RefreshCw size={14} />
+            Refresh from TMDB
+          </ContextMenuItem>
+          <ContextMenuItem
+            disabled={working || !detail?.tmdb_id}
+            onClick={() => void runAction("clear_tmdb_person_match")}
+          >
+            <Trash2 size={14} />
+            Clear TMDB match
+          </ContextMenuItem>
+          {detail?.tmdb_id && (
+            <>
+              <ContextMenuSeparator />
+              <p className="px-2 py-1 text-[11px] text-muted-foreground">
+                Matched to TMDB {detail.tmdb_id}
+              </p>
+            </>
+          )}
+        </ContextMenuContent>
+      </ContextMenu>
+      <TmdbPersonSearchDialog
+        open={matchOpen}
+        onOpenChange={setMatchOpen}
+        title="Match to TMDB"
+        initialQuery={displayName}
+        onPick={async (hit) => {
+          await invoke("apply_tmdb_person_match", { personId, tmdbId: hit.id });
+          loadPerson();
+          onPersonChanged();
+        }}
+      />
+    </>
   );
 }
 

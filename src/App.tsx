@@ -458,10 +458,34 @@ function App() {
     });
   }, [libraries, refreshCountsFor, refreshGenresFor, refreshMusicCountsFor]);
 
-  // Auto-update on launch
+  // Update check on launch. Never downloads on its own — the toast offers the
+  // update and nothing happens until the user clicks Download (dismissing it
+  // skips the update for this session).
   useEffect(() => {
     const endpoint =
       "https://github.com/trevorkerney/waverunner/releases/latest/download/latest.json";
+    const downloadAndOfferRestart = async () => {
+      toast(`Downloading update…`, {
+        duration: Infinity,
+        id: "auto-update",
+        action: undefined,
+      });
+      try {
+        await invoke("download_and_install_update", { endpoint });
+        toast("Update ready", {
+          description: "Restart to apply the update.",
+          duration: Infinity,
+          id: "auto-update",
+          action: { label: "Restart", onClick: () => relaunch() },
+        });
+      } catch (e) {
+        toast.error("Update failed", {
+          description: String(e),
+          id: "auto-update",
+          duration: 6000,
+        });
+      }
+    };
     (async () => {
       try {
         const settings = await invoke<Record<string, string>>("get_settings");
@@ -472,16 +496,9 @@ function App() {
         );
         if (!result) return;
         toast(`Update v${result.version} available`, {
-          description: "Downloading...",
           duration: Infinity,
           id: "auto-update",
-        });
-        await invoke("download_and_install_update", { endpoint });
-        toast("Update ready", {
-          description: "Restart to apply the update.",
-          duration: Infinity,
-          id: "auto-update",
-          action: { label: "Restart", onClick: () => relaunch() },
+          action: { label: "Download", onClick: () => void downloadAndOfferRestart() },
         });
       } catch {
         // Silent fail — don't bother user if update check fails
@@ -583,9 +600,12 @@ function App() {
 
   const saveScrollPosition = useCallback(() => {
     const container = scrollContainerRef.current;
-    if (!selectedLibrary || !container) return;
+    if (!container) return;
+    // Home is libraryless — it gets a fixed key; everything else is scoped to
+    // the selected library.
+    if (!selectedLibrary && activeView?.kind !== "home") return;
     const parentId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
-    const key = `${selectedLibrary.id}:${scrollKindFor(activeView)}:${parentId}`;
+    const key = `${activeView?.kind === "home" ? "home" : selectedLibrary!.id}:${scrollKindFor(activeView)}:${parentId}`;
     // Anchor to the card currently at the top of the viewport so restore can
     // re-find it by id. A raw scrollTop drifts on the way back because off-screen
     // cards above are height-estimated (content-visibility) and never render to
@@ -611,29 +631,43 @@ function App() {
     const key = `${libraryId}:${kind}:${parentId}`;
     const saved = scrollCacheRef.current.get(key);
     if (!scrollContainerRef.current) return;
-    // Re-align the anchored card to where it sat when we left. As content-
-    // visibility cards above it finish laying out they can nudge it, so settle
-    // over a few frames until the adjustment stops (or we give up). Falls back to
-    // the raw scrollTop when there's no anchor (e.g. non-grid views).
-    const applyAnchor = (): { aligned: boolean; delta: number } => {
-      const c = scrollContainerRef.current;
-      if (!c) return { aligned: true, delta: 0 };
-      if (!saved) { c.scrollTop = 0; return { aligned: true, delta: 0 }; }
-      if (!saved.anchorId) { c.scrollTop = saved.scrollTop; return { aligned: true, delta: 0 }; }
-      const el = c.querySelector<HTMLElement>(`[data-flip-id="${window.CSS.escape(saved.anchorId)}"]`);
-      if (!el) { c.scrollTop = saved.scrollTop; return { aligned: false, delta: Infinity }; }
-      const before = c.scrollTop;
-      const cTop = c.getBoundingClientRect().top;
-      const elTop = el.getBoundingClientRect().top;
-      c.scrollTop += (elTop - cTop) - saved.anchorDelta;
-      return { aligned: true, delta: Math.abs(c.scrollTop - before) };
-    };
+    // Two restore strategies, both patient about content that isn't there yet:
+    //  - Anchored (grids): re-align the card that sat at the top of the
+    //    viewport. content-visibility cards above it settle over a few frames
+    //    and nudge it, so re-align until the adjustment stops.
+    //  - Raw offset (detail pages, Tracks, Home — no [data-flip-id] anchors):
+    //    these pages fetch their own data AFTER mounting, so the container is
+    //    near-empty on the first frames and an early scrollTop write just
+    //    clamps to 0. Wait until the page has grown enough to hold the target
+    //    (bounded — content may legitimately have shrunk since the save).
+    const MAX_FRAMES = 120; // ~2s at 60fps — the async-content upper bound
     let attempts = 0;
+    let alignFrames = 0;
     const settle = () => {
-      if (!scrollContainerRef.current) return;
-      const { aligned, delta } = applyAnchor();
+      const c = scrollContainerRef.current;
+      if (!c) return;
+      if (!saved) { c.scrollTop = 0; return; }
       attempts++;
-      if (attempts < 8 && (!aligned || delta > 1)) requestAnimationFrame(settle);
+      if (saved.anchorId) {
+        const el = c.querySelector<HTMLElement>(`[data-flip-id="${window.CSS.escape(saved.anchorId)}"]`);
+        if (el) {
+          const before = c.scrollTop;
+          const cTop = c.getBoundingClientRect().top;
+          c.scrollTop += (el.getBoundingClientRect().top - cTop) - saved.anchorDelta;
+          alignFrames++;
+          if (alignFrames < 8 && Math.abs(c.scrollTop - before) > 1) requestAnimationFrame(settle);
+          return;
+        }
+        // Anchor not in the DOM (yet): fall through to the raw-offset wait —
+        // if the content is still loading the anchor may appear on a later
+        // frame and the branch above takes over.
+      }
+      const reachable = c.scrollHeight - c.clientHeight >= saved.scrollTop - 1;
+      if (reachable || attempts >= MAX_FRAMES) {
+        c.scrollTop = saved.scrollTop;
+        return;
+      }
+      requestAnimationFrame(settle);
     };
     // Double rAF: first waits for React commit, second for layout/paint.
     requestAnimationFrame(() => requestAnimationFrame(settle));
@@ -650,6 +684,10 @@ function App() {
     });
   }, []);
 
+  // Monotonic id of the newest loadView call — older in-flight loads bail
+  // instead of committing stale results over the current view.
+  const loadSeqRef = useRef(0);
+
   const loadView = useCallback(
     async (
       view: ViewSpec,
@@ -661,6 +699,12 @@ function App() {
       // so the user doesn't see an empty flash while the fetch runs.
       inPlace: boolean = false,
     ) => {
+      // Latest-wins guard: two loads can be in flight (fast navigation), and
+      // the OLDER fetch resolving last would stomp the newer view's grid —
+      // e.g. the Artists page rendering album entries. Every await below must
+      // re-check before committing state.
+      const seq = ++loadSeqRef.current;
+      const stale = () => loadSeqRef.current !== seq;
       // Genres produce their own result type. (Display is intentionally basic for now — iterating.)
       if (view.kind === "genres") {
         setEntries([]);
@@ -682,6 +726,7 @@ function App() {
             libraryId: view.libraryId,
           });
           genresCacheRef.current.set(view.libraryId, res);
+          if (stale()) return;
           setGenres(res);
           if (restoreScroll) restoreScrollPosition(view.libraryId, scrollKindFor(view), breadcrumb[breadcrumb.length - 1]?.id ?? null);
           else resetScrollToTop();
@@ -694,14 +739,24 @@ function App() {
       }
 
       // These views fetch their own data inside their page components
-      // (HomePage / MusicIssuesPage / TracksPage) — just clear grid state and land at top.
+      // (HomePage / MusicIssuesPage / TracksPage) — just clear grid state.
+      // Scroll restores like any grid (the restore waits out the self-fetch);
+      // Home is libraryless and keys under a fixed "home" prefix.
       if (view.kind === "home" || view.kind === "music-issues" || view.kind === "tracks") {
         setEntries([]);
         setPeople(null);
         setPlaylists(null);
         setGenres(null);
         setBreadcrumbs(breadcrumb);
-        resetScrollToTop();
+        if (restoreScroll) {
+          restoreScrollPosition(
+            view.kind === "home" ? "home" : view.libraryId,
+            scrollKindFor(view),
+            breadcrumb[breadcrumb.length - 1]?.id ?? null,
+          );
+        } else {
+          resetScrollToTop();
+        }
         return;
       }
 
@@ -738,6 +793,7 @@ function App() {
             .map((p) => p.image_path);
           await preloadImages(topFaces);
           peopleCacheRef.current.set(key, res);
+          if (stale()) return;
           setPeople(res);
           if (restoreScroll) restoreScrollPosition(view.libraryId, scrollKindFor(view), null);
           else resetScrollToTop();
@@ -766,8 +822,12 @@ function App() {
           return;
         }
         setBreadcrumbs(breadcrumb);
-        setPlaylists(null);
-        setLoading(true);
+        // In-place refreshes (sort change) keep the current cards visible while
+        // the re-sorted list loads — same no-spinner behavior as the entry grids.
+        if (!inPlace) {
+          setPlaylists(null);
+          setLoading(true);
+        }
         try {
           const res = await invoke<PlaylistsResponse>("get_playlists", {
             libraryId: view.libraryId,
@@ -779,11 +839,14 @@ function App() {
             presets: res.presets,
             selectedPresetId: res.selected_preset_id,
           });
+          if (stale()) return;
           setPlaylists(res.playlists);
           setPresets(res.presets);
           setSelectedPresetId(res.selected_preset_id);
-          if (restoreScroll) restoreScrollPosition(view.libraryId, scrollKindFor(view), breadcrumb[breadcrumb.length - 1]?.id ?? null);
-          else resetScrollToTop();
+          if (!inPlace) {
+            if (restoreScroll) restoreScrollPosition(view.libraryId, scrollKindFor(view), breadcrumb[breadcrumb.length - 1]?.id ?? null);
+            else resetScrollToTop();
+          }
         } catch (e) {
           console.error("Failed to load playlists:", e);
         } finally {
@@ -823,6 +886,11 @@ function App() {
         setBreadcrumbs(breadcrumb);
         setEntries([]);
         setLoading(true);
+        // This view's persisted sort rides in the response — until it lands the
+        // mode is UNKNOWN, and showing the previous view's (or the "alpha"
+        // default) flashes a wrong label in the toolbar. "" renders as a
+        // placeholder in the sort dropdowns.
+        setSortMode("");
       }
       try {
         let entries: MediaEntry[];
@@ -893,6 +961,7 @@ function App() {
         }
         await preloadCovers(entries);
         cache.set(cacheKey, { entries, sort_mode, selected_preset_id, presets: view_presets });
+        if (stale()) return;
         setEntries(entries);
         setSortMode(sort_mode);
         setSelectedPresetId(selected_preset_id);
@@ -960,6 +1029,14 @@ function App() {
         setBreadcrumbs(snap.crumbs);
         const parentId = snap.crumbs[snap.crumbs.length - 2]?.id ?? null;
         loadView(snap.view, parentId, snap.crumbs, false, true);
+        // Detail pages scroll in the same container as grids and save under
+        // the detail crumb's id — restore where the user left the PAGE
+        // (the patient restore waits out the page's own data fetch).
+        restoreScrollPosition(
+          snap.view.libraryId ?? "home",
+          scrollKindFor(snap.view),
+          snap.crumbs[snap.crumbs.length - 1]?.id ?? null,
+        );
       } else {
         setSelectedEntry(null);
         const last = snap.crumbs[snap.crumbs.length - 1];
@@ -967,7 +1044,7 @@ function App() {
         loadView(snap.view, parentId, snap.crumbs, true);
       }
     },
-    [loadView]
+    [loadView, restoreScrollPosition, scrollKindFor]
   );
 
   // Re-fetch the active grid's entries without touching breadcrumbs, navigating,
@@ -1113,13 +1190,39 @@ function App() {
   // The Home hub — a pseudo-library pinned above the real ones. Renders its
   // own page (continue watching + recently played), no entries to load.
   const openHome = useCallback(() => {
+    saveScrollPosition(); // the page being left, for its return trip
     const view: ViewSpec = { kind: "home" };
     setActiveView(view);
     setSelectedEntry(null);
     setSearch("");
     pushHistory();
     setBreadcrumbs([{ id: null, title: "Home", view }]);
-  }, []);
+  }, [saveScrollPosition]);
+
+  // Libraries with a scan/rescan in flight. Mid-scan the DB is genuinely
+  // inconsistent (albums reconciling, tracks reparenting), so these libraries
+  // lock in the sidebar and anyone browsing one gets bounced to Home. Driven
+  // by backend scan-state beacons so EVERY scan entry point (wizard create,
+  // wizard rescan, grid context menu, combine-albums, manage-folders) counts.
+  const [scanningLibs, setScanningLibs] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    const unlisten = listen<{ libraryId: string; state: string }>("scan-state", (event) => {
+      const { libraryId, state: scanState } = event.payload;
+      setScanningLibs((prev) => {
+        const next = new Set(prev);
+        if (scanState === "started") next.add(libraryId);
+        else next.delete(libraryId);
+        return next;
+      });
+      if (scanState === "started") {
+        const v = navStateRef.current.view;
+        if (v && "libraryId" in v && v.libraryId === libraryId) openHome();
+      }
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, [openHome]);
 
   // "Go to page" from a Home card — detail navigation that may cross into a
   // different library than whatever was last selected. Sets up the target
@@ -1129,7 +1232,8 @@ function App() {
   const openEntryFromHome = useCallback(
     (libraryId: string, entry: MediaEntry, focusTrackId?: number) => {
       const lib = libraries.find((l) => l.id === libraryId);
-      if (!lib || lib.setup_stage) return;
+      if (!lib || lib.setup_stage || scanningLibs.has(libraryId)) return;
+      saveScrollPosition(); // Home's scroll, for the return trip
       // Albums root under the Albums grid (that's what the tile was);
       // movies/shows root at the library's All.
       const root: ViewSpec =
@@ -1153,7 +1257,7 @@ function App() {
         setMusicFocusRequest({ albumId: entry.id, trackId: focusTrackId, nonce: musicFocusNonceRef.current });
       }
     },
-    [libraries]
+    [libraries, saveScrollPosition, scanningLibs]
   );
 
   // Album-less recently-played tiles land on the Tracks page instead (there
@@ -1161,7 +1265,8 @@ function App() {
   const openTrackFromHome = useCallback(
     (libraryId: string, trackId: number) => {
       const lib = libraries.find((l) => l.id === libraryId);
-      if (!lib || lib.setup_stage) return;
+      if (!lib || lib.setup_stage || scanningLibs.has(libraryId)) return;
+      saveScrollPosition(); // Home's scroll, for the return trip
       const view: ViewSpec = { kind: "tracks", libraryId };
       setActiveView(view);
       setSelectedEntry(null);
@@ -1171,7 +1276,7 @@ function App() {
       musicFocusNonceRef.current += 1;
       setTracksFocusRequest({ trackId, nonce: musicFocusNonceRef.current });
     },
-    [libraries]
+    [libraries, saveScrollPosition, scanningLibs]
   );
 
   // Open the default library on launch, once libraries AND settings have both
@@ -1560,22 +1665,57 @@ function App() {
     nonce: number;
   } | null>(null);
 
+  // Bar links must work from ANYWHERE — another library's pages, Home — so
+  // they resolve the entry's owning library first and switch context when it
+  // isn't the selected one. (navigateTo assumes the entry belongs to
+  // selectedLibrary; fed a music entry while a video library is selected it
+  // threads music crumbs onto the video chain — "Videos - Genres > Album".)
+  const openMusicEntryFromBar = useCallback(
+    async (entry: MediaEntry) => {
+      let libId: string | null = null;
+      try {
+        libId = await invoke<string | null>("get_entry_library", { entryId: entry.id });
+      } catch {
+        /* resolution is best-effort; fall through to the no-op below */
+      }
+      if (!libId) return; // entry vanished (rescan) — dead click beats a broken page
+      if (selectedLibrary?.id === libId) {
+        navigateTo(entry);
+        return;
+      }
+      // Cross-library jump (or from Home): open the detail page on a canonical
+      // chain rooted in the music library ("Music - Artists > X") — the same
+      // shape navigateTo builds when that library is already selected.
+      saveScrollPosition();
+      pushHistory();
+      const crumb: BreadcrumbItem = { id: entry.id, title: entry.title, entry };
+      setActiveView({
+        kind: entry.entry_type === "album" ? "albums" : "library-root",
+        libraryId: libId,
+      });
+      setSelectedEntry(entry);
+      setSearch("");
+      setBreadcrumbs([...canonicalPrefix(crumb, libId), crumb]);
+    },
+    [selectedLibrary, navigateTo, canonicalPrefix, saveScrollPosition, pushHistory]
+  );
+
   const openMusicAlbumFromBar = useCallback(
     (albumId: number, albumTitle: string, trackId?: number) => {
       if (trackId != null) {
         musicFocusNonceRef.current += 1;
         setMusicFocusRequest({ albumId, trackId, nonce: musicFocusNonceRef.current });
       }
-      navigateTo(fakeMusicEntry("album", albumId, albumTitle));
+      void openMusicEntryFromBar(fakeMusicEntry("album", albumId, albumTitle));
     },
-    [navigateTo]
+    [openMusicEntryFromBar]
   );
 
   const openMusicArtistFromBar = useCallback(
     (artistId: number, artistName: string) => {
-      navigateTo(fakeMusicEntry("artist", artistId, artistName));
+      void openMusicEntryFromBar(fakeMusicEntry("artist", artistId, artistName));
     },
-    [navigateTo]
+    [openMusicEntryFromBar]
   );
 
   const navigateBreadcrumb = useCallback(
@@ -1689,6 +1829,7 @@ function App() {
     };
   }, [invalidateCache, refreshMusicCountsFor]);
 
+
   const updateCache = useCallback((libraryId: string, parentId: number | null, entries: MediaEntry[], sort_mode: string) => {
     // Merge with existing entry so preset metadata (selected_preset_id, presets) survives
     // mutations that don't touch preset state (rename, cover change, etc).
@@ -1790,19 +1931,35 @@ function App() {
       }
 
       // Music Artists page: People-page-style sort vocabulary (alphabetical /
-      // most credited) stored in a settings key. Sorting happens LOCALLY —
-      // entries carry their credit total in child_count — so the switch is as
-      // instant as the People pages; the setting persists in the background
-      // and the backend applies it on the next fresh load.
+      // most credited / most loved) stored in a settings key. Sorting happens
+      // LOCALLY — credits ride in child_count, loved counts are one cheap
+      // fetch — so the switch is as instant as the People pages; the setting
+      // persists in the background and the backend applies it on fresh loads.
       if (activeView?.kind === "library-root" && selectedLibrary.format === "music") {
-        const next = mode === "credits" ? "credits" : "alpha";
+        const next = mode === "credits" ? "credits" : mode === "loved" ? "loved" : "alpha";
         setSortMode(next);
         invoke("set_setting", { key: `music_artists_sort_mode:${selectedLibrary.id}`, value: next }).catch(() => {});
+        const byTitle = (a: MediaEntry, b: MediaEntry) =>
+          sortTitleKey(a.title).localeCompare(sortTitleKey(b.title));
+        let lovedByArtist: Map<number, number> | null = null;
+        if (next === "loved") {
+          try {
+            const rows = await invoke<[number, number][]>("get_artist_loved_counts", {
+              libraryId: selectedLibrary.id,
+            });
+            lovedByArtist = new Map(rows);
+          } catch (e) {
+            console.error("Failed to load loved counts:", e);
+            lovedByArtist = new Map();
+          }
+        }
         setEntries((prev) => {
           const sorted = [...prev].sort((a, b) =>
             next === "credits"
-              ? b.child_count - a.child_count || sortTitleKey(a.title).localeCompare(sortTitleKey(b.title))
-              : sortTitleKey(a.title).localeCompare(sortTitleKey(b.title)),
+              ? b.child_count - a.child_count || byTitle(a, b)
+              : next === "loved"
+                ? (lovedByArtist!.get(b.id) ?? 0) - (lovedByArtist!.get(a.id) ?? 0) || byTitle(a, b)
+                : byTitle(a, b),
           );
           updateCache(selectedLibrary.id, null, sorted, next);
           return sorted;
@@ -2159,6 +2316,46 @@ function App() {
     [selectedLibrary, breadcrumbs, invalidateCache]
   );
 
+  // Patch one entry's fields in EVERY place a copy can live: the live grid,
+  // every cached list for the library (root cache + per-view caches like
+  // albums/movies-only), the open detail page, and search results. Cover and
+  // metadata mutations must go through this or the old value resurfaces when
+  // navigating back to a view whose cached copy went stale. Link-backed
+  // copies keep their own pinned covers, so they're skipped.
+  const patchEntryEverywhere = useCallback(
+    (parentId: number | null, patch: (e: MediaEntry) => MediaEntry) => {
+      if (!selectedLibrary) return;
+      const guarded = (e: MediaEntry) => (e.link_id == null ? patch(e) : e);
+      const libPrefix = `${selectedLibrary.id}:`;
+      for (const [key, val] of entryCacheRef.current.entries()) {
+        if (key.startsWith(libPrefix)) {
+          entryCacheRef.current.set(key, { ...val, entries: val.entries.map(guarded) });
+        }
+      }
+      for (const [key, val] of viewEntriesCacheRef.current.entries()) {
+        if (key.startsWith(libPrefix)) {
+          viewEntriesCacheRef.current.set(key, { ...val, entries: val.entries.map(guarded) });
+        }
+      }
+      setEntries((prev) => {
+        const updated = prev.map(guarded);
+        // Write the live list to the cache slot matching the ACTIVE view — writing a
+        // filtered view's list into the root slot would poison the root grid.
+        if (activeView && activeView.kind !== "library-root") {
+          cacheSetMerging(viewEntriesCacheRef.current, viewCacheKey(activeView), updated, sortMode);
+        } else {
+          updateCache(selectedLibrary.id, parentId, updated, sortMode);
+        }
+        return updated;
+      });
+      setSelectedEntry((prev) => (prev ? guarded(prev) : prev));
+      // The search grid renders searchResults, a parallel list over the same
+      // entries — patch its copy too or the change only shows after re-searching.
+      setSearchResults((prev) => (prev ? prev.map(guarded) : prev));
+    },
+    [selectedLibrary, activeView, sortMode, updateCache, cacheSetMerging],
+  );
+
   const setCover = useCallback(
     async (
       entryId: number,
@@ -2223,40 +2420,9 @@ function App() {
       const parentId = last?.id === entryId
         ? (breadcrumbs[breadcrumbs.length - 2]?.id ?? null)
         : (last?.id ?? null);
-      // Every cached list for this library holds its own copy of the entry (root
-      // cache + per-view caches like movies-only/shows-only) — patch them all, or
-      // the old cover resurfaces when navigating back to a view whose copy went
-      // stale. Link-backed copies keep their own pinned covers.
-      const patchCover = (e: MediaEntry) =>
-        e.id === entryId && e.link_id == null ? { ...e, selected_cover: coverPath } : e;
-      const libPrefix = `${selectedLibrary.id}:`;
-      for (const [key, val] of entryCacheRef.current.entries()) {
-        if (key.startsWith(libPrefix)) {
-          entryCacheRef.current.set(key, { ...val, entries: val.entries.map(patchCover) });
-        }
-      }
-      for (const [key, val] of viewEntriesCacheRef.current.entries()) {
-        if (key.startsWith(libPrefix)) {
-          viewEntriesCacheRef.current.set(key, { ...val, entries: val.entries.map(patchCover) });
-        }
-      }
-      setEntries((prev) => {
-        const updated = prev.map(patchCover);
-        // Write the live list to the cache slot matching the ACTIVE view — writing a
-        // filtered view's list into the root slot would poison the root grid.
-        if (activeView && activeView.kind !== "library-root") {
-          cacheSetMerging(viewEntriesCacheRef.current, viewCacheKey(activeView), updated, sortMode);
-        } else {
-          updateCache(selectedLibrary.id, parentId, updated, sortMode);
-        }
-        return updated;
-      });
-      setSelectedEntry((prev) =>
-        prev && prev.id === entryId ? { ...prev, selected_cover: coverPath } : prev
+      patchEntryEverywhere(parentId, (e) =>
+        e.id === entryId ? { ...e, selected_cover: coverPath } : e,
       );
-      // The search grid renders searchResults, a parallel list over the same
-      // entries — patch its copy too or the change only shows after re-searching.
-      setSearchResults((prev) => (prev ? prev.map(patchCover) : prev));
       try {
         await invoke("set_cover", {
           libraryId: selectedLibrary.id,
@@ -2269,7 +2435,7 @@ function App() {
         loadEntries(selectedLibrary, parentId, breadcrumbs);
       }
     },
-    [selectedLibrary, activeView, breadcrumbs, sortMode, loadEntries, loadView, invalidateCache, updateCache, cacheSetMerging]
+    [selectedLibrary, activeView, breadcrumbs, sortMode, loadEntries, loadView, invalidateCache, cacheSetMerging, patchEntryEverywhere]
   );
 
   const addCover = useCallback(
@@ -2313,21 +2479,15 @@ function App() {
           entryId,
           sourcePath: selected,
         });
-        const updateEntry = (e: MediaEntry) =>
-          e.id === entryId
-            ? { ...e, covers: [...e.covers, newCoverPath], selected_cover: newCoverPath }
-            : e;
         const last = breadcrumbs[breadcrumbs.length - 1];
         const parentId = last?.id === entryId
           ? (breadcrumbs[breadcrumbs.length - 2]?.id ?? null)
           : (last?.id ?? null);
-        setEntries((prev) => {
-          const updated = prev.map(updateEntry);
-          updateCache(selectedLibrary!.id, parentId, updated, sortMode);
-          return updated;
-        });
-        setSelectedEntry((prev) => (prev && prev.id === entryId ? updateEntry(prev) : prev));
-        setSearchResults((prev) => (prev ? prev.map(updateEntry) : prev));
+        patchEntryEverywhere(parentId, (e) =>
+          e.id === entryId
+            ? { ...e, covers: [...e.covers, newCoverPath], selected_cover: newCoverPath }
+            : e,
+        );
         await invoke("set_cover", {
           libraryId: selectedLibrary!.id,
           entryId,
@@ -2337,7 +2497,7 @@ function App() {
         toast.error(String(e));
       }
     },
-    [selectedLibrary, activeView, breadcrumbs, sortMode, updateCache]
+    [selectedLibrary, breadcrumbs, patchEntryEverywhere]
   );
 
   const deleteCover = useCallback(
@@ -2378,26 +2538,20 @@ function App() {
           entryId,
           coverPath,
         });
-        const updateEntry = (e: MediaEntry) =>
-          e.id === entryId
-            ? { ...e, covers: e.covers.filter((c) => c !== coverPath), selected_cover: newSelected }
-            : e;
         const last = breadcrumbs[breadcrumbs.length - 1];
         const parentId = last?.id === entryId
           ? (breadcrumbs[breadcrumbs.length - 2]?.id ?? null)
           : (last?.id ?? null);
-        setEntries((prev) => {
-          const updated = prev.map(updateEntry);
-          updateCache(selectedLibrary.id, parentId, updated, sortMode);
-          return updated;
-        });
-        setSelectedEntry((prev) => (prev && prev.id === entryId ? updateEntry(prev) : prev));
-        setSearchResults((prev) => (prev ? prev.map(updateEntry) : prev));
+        patchEntryEverywhere(parentId, (e) =>
+          e.id === entryId
+            ? { ...e, covers: e.covers.filter((c) => c !== coverPath), selected_cover: newSelected }
+            : e,
+        );
       } catch (e) {
         toast.error(String(e));
       }
     },
-    [selectedLibrary, activeView, breadcrumbs, sortMode, updateCache]
+    [selectedLibrary, activeView, breadcrumbs, sortMode, patchEntryEverywhere]
   );
 
   useEffect(() => {
@@ -2598,9 +2752,12 @@ function App() {
               );
             }
           }}
-          onLibraryRescanned={() => {
-            if (selectedLibrary) {
-              invalidateCache(selectedLibrary.id);
+          onLibraryRescanned={(libId) => {
+            // Prefer the wizard-reported library — the SELECTED one can be
+            // anything by completion time (rescans bounce the user to Home).
+            const lib = (libId && libraries.find((l) => l.id === libId)) || selectedLibrary;
+            if (lib) {
+              invalidateCache(lib.id);
               // Silent in-place refresh — no loading flash; the grid (and any
               // open detail page's backing grid) quietly picks up new metadata.
               refreshGridInPlace();
@@ -2609,12 +2766,12 @@ function App() {
               window.dispatchEvent(new Event("waverunner:library-rescanned"));
               // Counts and genres may have changed after a rescan. Music
               // libraries have their own counts shape.
-              if (selectedLibrary.format === "music") {
-                refreshMusicCountsFor(selectedLibrary.id);
-                refreshGenresFor(selectedLibrary.id);
+              if (lib.format === "music") {
+                refreshMusicCountsFor(lib.id);
+                refreshGenresFor(lib.id);
               } else {
-                refreshCountsFor(selectedLibrary.id);
-                refreshGenresFor(selectedLibrary.id);
+                refreshCountsFor(lib.id);
+                refreshGenresFor(lib.id);
               }
             }
           }}
@@ -2628,11 +2785,14 @@ function App() {
           playerActions={playerActions}
           onOpenHome={openHome}
           homeActive={activeView?.kind === "home"}
-          dockedMusicCoverUrl={
+          scanningLibs={scanningLibs}
+          dockedMusic={
             musicCoverDocked && musicState.isActive
               ? (() => {
                   const c = currentMusicItem(musicState)?.cover;
-                  return c ? convertFileSrc(c) : null;
+                  // coverUrl null = docked but artless — the dock shows a
+                  // placeholder instead of collapsing.
+                  return { coverUrl: c ? convertFileSrc(c) : null };
                 })()
               : null
           }
@@ -2670,6 +2830,15 @@ function App() {
           onNavigateToPlaylist={navigateToPlaylist}
           onSelectGenre={navigateToGenre}
           onPlaylistChanged={handlePlaylistChanged}
+          onSoundCollectionsChanged={(libId) => {
+            // Same recipe as a rescan landing: drop caches, refresh the grid
+            // silently, and let self-fetching surfaces (loose sections, open
+            // collection pages) refetch off the event.
+            invalidateCache(libId);
+            refreshGridInPlace();
+            window.dispatchEvent(new Event("waverunner:library-rescanned"));
+            refreshMusicCountsFor(libId);
+          }}
           onBreadcrumbClick={navigateBreadcrumb}
           selectedLibrary={selectedLibrary}
           hasLibraries={libraries.length > 0}
@@ -2709,12 +2878,17 @@ function App() {
             }
           }}
           onRescan={() => {
-            if (selectedLibrary) {
-              invalidateCache(selectedLibrary.id);
+            if (!selectedLibrary) return;
+            invalidateCache(selectedLibrary.id);
+            // Only reload the grid if the user is still somewhere inside this
+            // library — a rescan bounces them to Home, and reloading then
+            // would stomp Home's breadcrumbs/entries with the stale view.
+            const cur = navStateRef.current.view;
+            if (cur && "libraryId" in cur && cur.libraryId === selectedLibrary.id) {
               const parentId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
               loadEntries(selectedLibrary, parentId, breadcrumbs);
-              window.dispatchEvent(new Event("waverunner:library-rescanned"));
             }
+            window.dispatchEvent(new Event("waverunner:library-rescanned"));
           }}
           getCoverUrl={getCoverUrl}
           getCoverAspect={getCoverAspect}
@@ -2750,6 +2924,17 @@ function App() {
         open={mbReviewLibraryId !== null}
         onOpenChange={(o) => {
           if (!o) setMbReviewLibraryId(null);
+        }}
+        onChanged={() => {
+          // A match/undo landed behind the dialog — same recipe as a rescan:
+          // drop caches, silently refresh the grid, and let self-fetching
+          // pages (Tracks, open album/artist details) refetch off the event.
+          if (!mbReviewLibraryId) return;
+          invalidateCache(mbReviewLibraryId);
+          refreshGridInPlace();
+          window.dispatchEvent(new Event("waverunner:library-rescanned"));
+          refreshMusicCountsFor(mbReviewLibraryId);
+          refreshGenresFor(mbReviewLibraryId);
         }}
       />
       <VideoMetadataCenterDialog

@@ -55,6 +55,8 @@ export function VideoMetadataCenter({
   const [loading, setLoading] = useState(true);
   const [reviewing, setReviewing] = useState<{ kind: "movie" | "show"; row: UnmatchedRow } | null>(null);
   const [reviewingDetail, setReviewingDetail] = useState<MovieDetail | ShowDetail | null>(null);
+  // Row whose Match… button is fetching its detail — that button shows a spinner.
+  const [openingId, setOpeningId] = useState<number | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -72,6 +74,7 @@ export function VideoMetadataCenter({
   }, [refresh, reloadKey]);
 
   const openReview = useCallback(async (kind: "movie" | "show", row: UnmatchedRow) => {
+    setOpeningId(row.id);
     try {
       if (kind === "movie") {
         setReviewingDetail(await invoke<MovieDetail>("get_movie_detail", { entryId: row.id }));
@@ -81,6 +84,8 @@ export function VideoMetadataCenter({
       setReviewing({ kind, row });
     } catch (e) {
       toast.error(String(e));
+    } finally {
+      setOpeningId(null);
     }
   }, []);
 
@@ -109,7 +114,14 @@ export function VideoMetadataCenter({
                   {row.year ? ` (${row.year})` : ""}
                 </span>
                 <span className={`shrink-0 text-xs ${st.className}`}>{st.text}</span>
-                <Button size="sm" variant="outline" onClick={() => void openReview(kind, row)}>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="gap-1.5"
+                  disabled={openingId !== null}
+                  onClick={() => void openReview(kind, row)}
+                >
+                  {openingId === row.id && <Spinner className="size-3" />}
                   Match…
                 </Button>
               </div>

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Play, Music2, Pencil, LayoutGrid, List, ArrowUpDown, Disc3, ListPlus, ListStart, ListEnd } from "lucide-react";
+import { Play, Music2, Pencil, Scissors, LayoutGrid, List, ArrowUpDown, Disc3, ListPlus, ListStart, ListEnd } from "lucide-react";
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -14,7 +14,7 @@ import {
   ContextMenuContent,
   ContextMenuItem,
 } from "../ui/context-menu";
-import { TrackEditDialog, ArtistEditDialog } from "./EditDialogs";
+import { TrackEditDialog, ArtistEditDialog, SplitArtistDialog } from "./EditDialogs";
 import { PlayingIndicator } from "./PlayingIndicator";
 import { LoveButton, LoveMenuItem } from "./LoveButton";
 import { MusicArtistDetail, MusicAlbumCard, MusicAlbumDetail, MusicQueueItem, MusicTrack } from "../../types";
@@ -74,6 +74,7 @@ export function ArtistDetailPage({
   const [loading, setLoading] = useState(true);
   const [editTrackId, setEditTrackId] = useState<number | null>(null);
   const [editArtistOpen, setEditArtistOpen] = useState(false);
+  const [splitArtistOpen, setSplitArtistOpen] = useState(false);
   const [reloadKey, setReloadKey] = useState(0);
   const [viewMode, setViewMode] = useState<"grid" | "list">(cachedArtistView ?? "grid");
   const [sortDir, setSortDir] = useState<"date" | "date-desc">(cachedArtistSort ?? "date");
@@ -158,6 +159,14 @@ export function ArtistDetailPage({
       cancelled = true;
     };
   }, [entryId, reloadKey]);
+
+  // A metadata-center apply/undo (or rescan) landed while this page is open —
+  // silently refetch so per-album credit lines and subtitles update in place.
+  useEffect(() => {
+    const onRescanned = () => setReloadKey((k) => k + 1);
+    window.addEventListener("waverunner:library-rescanned", onRescanned);
+    return () => window.removeEventListener("waverunner:library-rescanned", onRescanned);
+  }, []);
 
   // Any detail refresh (navigation or silent post-edit refetch) invalidates the
   // per-release details so the list view reflects edits.
@@ -254,7 +263,7 @@ export function ArtistDetailPage({
                 <section key={album.id}>
                   <div className="flex items-center gap-5">
                     <div
-                      className="group/cover relative h-40 w-40 shrink-0 cursor-pointer overflow-hidden rounded-[3px] bg-muted shadow-sm"
+                      className="group/cover relative h-56 w-56 shrink-0 cursor-pointer overflow-hidden rounded-[3px] bg-muted shadow-sm"
                       onClick={() => onOpenAlbum(album)}
                     >
                       {albumCoverPath ? (
@@ -294,21 +303,26 @@ export function ArtistDetailPage({
                         {album.title}
                       </button>
                       <p className="mt-0.5 text-sm text-muted-foreground">
-                        {onlyCredited && album.artist_title && (
+                        {/* Album-page parity: every credited owner, linked —
+                            even when it's just the artist whose page this is. */}
+                        {album.artists.length > 0 && (
                           <>
-                            {d?.artist_id != null && onNavigateToArtist ? (
-                              <span
-                                role="link"
-                                className="cursor-pointer hover:underline"
-                                onClick={() =>
-                                  onNavigateToArtist(d.artist_id!, d.artist_title ?? album.artist_title!)
-                                }
-                              >
-                                {d.artist_title ?? album.artist_title}
+                            {album.artists.map((a, ai) => (
+                              <span key={`${a.name}-${ai}`}>
+                                {ai > 0 && " · "}
+                                {a.artist_id != null && onNavigateToArtist ? (
+                                  <span
+                                    role="link"
+                                    className="cursor-pointer font-medium text-foreground hover:underline"
+                                    onClick={() => onNavigateToArtist(a.artist_id!, a.name)}
+                                  >
+                                    {a.name}
+                                  </span>
+                                ) : (
+                                  <span className="font-medium text-foreground">{a.name}</span>
+                                )}
                               </span>
-                            ) : (
-                              album.artist_title
-                            )}
+                            ))}
                             {" · "}
                           </>
                         )}
@@ -470,6 +484,13 @@ export function ArtistDetailPage({
               title="Edit artist metadata"
             >
               <Pencil size={16} />
+            </button>
+            <button
+              onClick={() => setSplitArtistOpen(true)}
+              className="shrink-0 rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/title:opacity-100"
+              title="Split into multiple artists"
+            >
+              <Scissors size={16} />
             </button>
           </h1>
           <p className="mt-1 text-sm text-muted-foreground">
@@ -901,6 +922,12 @@ export function ArtistDetailPage({
         open={editArtistOpen}
         onOpenChange={setEditArtistOpen}
         onSaved={handleSaved}
+      />
+      <SplitArtistDialog
+        artistId={splitArtistOpen ? entryId : null}
+        artistName={detail?.title ?? ""}
+        open={splitArtistOpen}
+        onOpenChange={setSplitArtistOpen}
       />
     </div>
   );

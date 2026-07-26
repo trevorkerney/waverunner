@@ -164,7 +164,10 @@ export function NowPlayingBar({ state, actions, hidden, onOpenAlbum, onOpenArtis
   const subtitle = [current.artistName, current.albumTitle].filter(Boolean).join(" — ");
 
   return (
-    <div className="relative z-10 flex h-[4.5rem] shrink-0 items-center gap-3 border-t bg-sidebar px-3">
+    <div
+      data-now-playing-bar
+      className="relative z-10 flex h-[4.5rem] shrink-0 items-center gap-3 border-t bg-sidebar px-3"
+    >
       {/* What's playing */}
       <div className="flex w-56 min-w-0 items-center gap-2.5">
         <div className="group/cover relative h-11 w-11 shrink-0">
@@ -181,7 +184,9 @@ export function NowPlayingBar({ state, actions, hidden, onOpenAlbum, onOpenArtis
               <Music2 size={20} />
             </div>
           )}
-          {current.cover && onToggleCoverDock && (
+          {/* Artless tracks dock too — the sidebar shows its no-cover
+              placeholder, so the toggle can't depend on having art. */}
+          {onToggleCoverDock && (
             <button
               onClick={onToggleCoverDock}
               // Docked: the down arrow is the grey slot's only content — always

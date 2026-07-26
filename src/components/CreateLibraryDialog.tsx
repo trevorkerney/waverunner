@@ -98,7 +98,6 @@ export function CreateLibraryDialog({
   const [source, setSource] = useState("local");
   const [creating, setCreating] = useState(creatingGlobal);
   const [scanProgress, setScanProgress] = useState("");
-  const toastIdRef = useRef<string | number | null>(null);
 
   const [step, setStep] = useState<Step>(1);
   const [matchPhase, setMatchPhase] = useState<MatchPhase>("elect");
@@ -109,6 +108,9 @@ export function CreateLibraryDialog({
     phase: string;
     etaSecs: number | null;
   } | null>(null);
+  // Last-known done/total per music match sub-phase (albums → artists →
+  // images), feeding the sub-stepper under the main timeline.
+  const [subProgress, setSubProgress] = useState<Record<string, { done: number; total: number }>>({});
   // Rolling per-step timestamps for the time-remaining estimate: average gap
   // between recent steps × steps left. Reset when the pass changes phase
   // (albums → artists) since their per-step costs differ.
@@ -150,9 +152,15 @@ export function CreateLibraryDialog({
       return;
     }
     const measure = () => {
-      // Ceil, not offsetHeight: rounding down leaves the content a sub-pixel
-      // taller than the wrapper, which is enough to summon a scrollbar at rest.
-      const h = Math.ceil(formEl.getBoundingClientRect().height);
+      // Computed style, not getBoundingClientRect: the dialog opens under a
+      // scale() animation, and a rect measured mid-animation reads ~5% short —
+      // pinning the wrapper too small and summoning a scrollbar until the next
+      // remeasure. Computed height is the untransformed layout value, still
+      // fractional (offsetHeight rounds down — sub-pixel scrollbar at rest).
+      const styled = parseFloat(getComputedStyle(formEl).height);
+      const h = Math.ceil(
+        Number.isFinite(styled) && styled > 0 ? styled : formEl.getBoundingClientRect().height,
+      );
       if (prevFormHeightRef.current !== null && Math.abs(prevFormHeightRef.current - h) > 1) {
         setHeightAnimating(true);
       }
@@ -175,11 +183,8 @@ export function CreateLibraryDialog({
 
   useEffect(() => {
     if (!creating) return;
-    const unlisten = listen<string>("scan-progress", (event) => {
-      setScanProgress(event.payload);
-      if (toastIdRef.current != null) {
-        toast.loading(event.payload, { id: toastIdRef.current, duration: Infinity });
-      }
+    const unlisten = listen<{ libraryId: string; folder: string }>("scan-progress", (event) => {
+      setScanProgress(event.payload.folder);
     });
     return () => { unlisten.then((fn) => fn()); };
   }, [creating]);
@@ -211,6 +216,10 @@ export function CreateLibraryDialog({
           phase: e.payload.phase,
           etaSecs,
         });
+        setSubProgress((prev) => ({
+          ...prev,
+          [e.payload.phase]: { done: e.payload.done, total: e.payload.total },
+        }));
       },
     );
     const unDone = listen<{ libraryId: string; error?: string }>("music-enrich-done", async (e) => {
@@ -238,6 +247,7 @@ export function CreateLibraryDialog({
     initializedRef.current = true;
     setConfirmExit(false);
     setMatchProgress(null);
+    setSubProgress({});
     if (mode.kind === "create") {
       setStep(1);
       setLibraryId(null);
@@ -390,6 +400,10 @@ export function CreateLibraryDialog({
         return;
       }
       onFinished?.(libId);
+    } else if (libId) {
+      // Rescans have no setup row but their caller still needs the completion
+      // signal — without it the app's caches stay stale until a hard refresh.
+      onFinished?.(libId);
     }
     onCreated();
     closeWizard();
@@ -434,10 +448,6 @@ export function CreateLibraryDialog({
               ...validShowPaths.map((path) => ({ path, kind: "show" })),
             ];
       const library = await invoke<Library>("create_library", { name, paths, format, source });
-      if (toastIdRef.current != null) {
-        toast.success(`Library "${name}" created`, { id: toastIdRef.current, duration: 4000, action: undefined });
-        toastIdRef.current = null;
-      }
       onCreated();
       setLibraryId(library.id);
       setLibraryName(library.name);
@@ -445,18 +455,11 @@ export function CreateLibraryDialog({
     } catch (e) {
       const msg = String(e);
       if (msg.includes("cancelled")) {
-        if (toastIdRef.current != null) {
-          toast.info("Import paused — finish setup from the sidebar", { id: toastIdRef.current, duration: 3000, action: undefined });
-          toastIdRef.current = null;
-        }
         // Wizard scans survive a cancel: the library stays as
         // "Finish setup…" and resumes at the scan step.
         onCreated();
         onOpenChange(false);
         resetForm();
-      } else if (toastIdRef.current != null) {
-        toast.error(msg, { id: toastIdRef.current, duration: 4000, action: undefined });
-        toastIdRef.current = null;
       } else {
         toast.error(msg);
       }
@@ -478,10 +481,21 @@ export function CreateLibraryDialog({
         closeWizard();
         return;
       }
+      // X = minimize, always. Cancelling a create scan is the footer's
+      // explicit Exit button (with its confirm) — never the X.
+      if (onMinimizedChange) {
+        onMinimizedChange(true);
+        return;
+      }
       setConfirmExit(true);
       return;
     }
     if (step === 3) {
+      // X = minimize; ending matching early is the Skip buttons' job.
+      if (onMinimizedChange) {
+        onMinimizedChange(true);
+        return;
+      }
       setConfirmExit(true);
       return;
     }
@@ -500,11 +514,9 @@ export function CreateLibraryDialog({
         // create_library's error path closes the wizard.
         return;
       }
-      // Resume/rescan scans have no cancel path — detach to a toast.
-      if (toastIdRef.current == null) {
-        toastIdRef.current = toast.loading(scanProgress || "Scanning…", { duration: Infinity });
-      }
-      onOpenChange(false);
+      // Resume/rescan scans have no cancel path — hide the modal; the
+      // sidebar chip carries the progress.
+      onMinimizedChange?.(true);
       return;
     }
     if (step === 3) {
@@ -525,6 +537,10 @@ export function CreateLibraryDialog({
         } catch (e) {
           console.error(e);
         }
+        onFinished?.(libraryId);
+      } else if (libraryId) {
+        // Skip-and-exit on a rescan still finished a scan — signal completion
+        // so caches invalidate.
         onFinished?.(libraryId);
       }
       onCreated();
@@ -551,12 +567,15 @@ export function CreateLibraryDialog({
         : `Finish setup — ${libraryName}`;
 
   return (
-    // Outside clicks never dismiss the wizard (only the X / Escape, both of
-    // which route through handleDialogClose's step-aware rules).
+    // Outside clicks MINIMIZE a running wizard (steps 2+); the setup form
+    // (step 1) ignores them. X/Escape route through handleDialogClose.
     <Dialog
       open={isOpen && !minimized}
       onOpenChange={(o, details) => {
-        if (!o && details.reason === "outside-press") return;
+        if (!o && details.reason === "outside-press") {
+          if (step !== 1) onMinimizedChange?.(true);
+          return;
+        }
         handleDialogClose(o);
       }}
     >
@@ -591,6 +610,49 @@ export function CreateLibraryDialog({
               </div>
             ))}
           </div>
+          {/* Match sub-stages (music): albums → artists → images, each with its
+              own done/total so the counter doesn't look like it resets. */}
+          {step === 3 && matchPhase === "running" && effFormat === "music" && (
+            <div className="mt-1 flex items-center justify-center gap-2 text-[11px]">
+              {(
+                [
+                  ["albums", "Albums"],
+                  ["artists", "Artists"],
+                  ["artist-images", "Images"],
+                ] as const
+              ).map(([key, label], i, arr) => {
+                const p = subProgress[key];
+                const currentIdx = arr.findIndex(([k]) => k === matchProgress?.phase);
+                const idx = i;
+                const state =
+                  currentIdx === -1 ? "pending"
+                  : idx < currentIdx ? "done"
+                  : idx === currentIdx ? "current"
+                  : "pending";
+                return (
+                  <span key={key} className="flex items-center gap-2">
+                    {i > 0 && <span className="h-px w-3 bg-border" />}
+                    <span
+                      className={
+                        state === "current"
+                          ? "text-foreground"
+                          : state === "done"
+                            ? "text-primary"
+                            : "text-muted-foreground"
+                      }
+                    >
+                      {label}
+                      {state === "done" && p
+                        ? ` ${p.total}/${p.total}`
+                        : state === "current" && p
+                          ? ` ${Math.min(p.done + 1, p.total)}/${p.total}`
+                          : ""}
+                    </span>
+                  </span>
+                );
+              })}
+            </div>
+          )}
         </DialogHeader>
 
         {step === 4 && libraryId ? (
@@ -603,10 +665,13 @@ export function CreateLibraryDialog({
           </div>
         ) : (
           <div
+            // Scrolling only exists for step 1 (folder lists can outgrow a
+            // small window). Steps 2/3 are fixed-size progress views — hiding
+            // overflow there kills the phantom sub-pixel scrollbar for good.
             className={`min-h-0 transition-[height] duration-300 ease-in-out ${
-              heightAnimating ? "overflow-hidden" : "overflow-y-auto overflow-x-hidden"
+              heightAnimating || step !== 1 ? "overflow-hidden" : "overflow-y-auto overflow-x-hidden"
             }`}
-            style={{ height: formHeight != null ? `${formHeight}px` : undefined }}
+            style={{ height: formHeight != null ? `${formHeight + 2}px` : undefined }}
             onTransitionEnd={(e) => {
               if (e.propertyName === "height") setHeightAnimating(false);
             }}
@@ -828,11 +893,14 @@ export function CreateLibraryDialog({
               </Button>
             </>
           ) : step === 2 ? (
-            // Progress lives in the step body only — no duplicate line here.
+            // The X (and outside clicks) minimize — the only footer action is
+            // create's Exit, which cancels the scan and leaves it resumable.
             <div className="flex w-full items-center justify-end gap-2">
-              <Button variant="outline" size="sm" onClick={() => handleDialogClose(false)}>
-                Exit
-              </Button>
+              {mode.kind === "create" && (
+                <Button variant="outline" size="sm" onClick={() => setConfirmExit(true)}>
+                  Exit
+                </Button>
+              )}
             </div>
           ) : step === 3 && matchPhase === "elect" ? (
             <>
@@ -845,11 +913,6 @@ export function CreateLibraryDialog({
             </>
           ) : step === 3 ? (
             <div className="flex w-full items-center justify-end gap-2">
-              {mode.kind === "rescan" && onMinimizedChange && (
-                <Button variant="outline" size="sm" onClick={() => onMinimizedChange(true)}>
-                  Minimize
-                </Button>
-              )}
               <Button variant="outline" size="sm" onClick={() => void skipMatching()}>
                 Skip remaining
               </Button>
@@ -963,7 +1026,10 @@ function VideoMatchStep({
   }, [hasToken, targets, workCount]);
 
   const emitChip = (detail: Record<string, unknown>) => {
-    window.dispatchEvent(new CustomEvent("video-match-progress", { detail }));
+    // libraryId lets the sidebar put the progress line on the right row.
+    window.dispatchEvent(
+      new CustomEvent("video-match-progress", { detail: { libraryId, ...detail } }),
+    );
   };
 
   const start = async () => {

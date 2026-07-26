@@ -28,7 +28,7 @@ use lofty::probe::Probe;
 use lofty::tag::{Accessor, ItemKey};
 use serde::Serialize;
 use sqlx::SqlitePool;
-use tauri::{Emitter, State};
+use tauri::State;
 
 use crate::commands::{
     delete_cached_images_for_entry, generate_sort_title, is_image_file, is_media_file,
@@ -76,6 +76,12 @@ pub struct ScannedTrack {
     /// album/container this lands in gets sound-marked and excluded from
     /// music surfaces. Set by scan_base from the base's type, not by tags.
     pub sound: bool,
+    /// Set by apply_artist_splits when `album_artist` matched a split (user
+    /// directive or ';' multi-value): the full ordered member list. The album
+    /// these tracks form gets them as album_artist_credit rows; album_artist
+    /// itself is rewritten to members[0] (the canonical parent). Empty = the
+    /// album artist is a single artist, no credit rows written.
+    pub album_artist_credits: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -338,6 +344,7 @@ fn read_track(abs: &Path, rel: &str, disc_folder_no: Option<i64>) -> Result<Scan
             .unwrap_or(false),
         credits,
         sound: false,
+        album_artist_credits: Vec::new(),
     })
 }
 
@@ -589,21 +596,15 @@ pub fn scan_base(
         match read_track(&abs, &rel, disc_no) {
             Ok(mut t) => {
                 t.sound = sound;
-                // Sounds bases: folders are truth (tags-as-truth is a MUSIC
-                // principle; ambient packs are routinely untagged). An
-                // album-less sound file adopts its folder name as the album so
-                // every sounds folder surfaces as a browsable sound album
-                // instead of vanishing into loose tracks.
-                if sound && t.album.trim().is_empty() && !folder_rel.is_empty() {
-                    let leaf = folder_rel
-                        .replace('\\', "/")
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or("")
-                        .to_string();
-                    if !leaf.is_empty() {
-                        t.album = leaf;
-                    }
+                // Sounds are fully virtual: no tag- or folder-derived albums.
+                // Every sound track pools into the library's sound loose
+                // container; apply_sound_homes then places it in a virtual
+                // collection (folder-mimicked once, user-directed after).
+                // Clearing the artist too keeps sounds from spawning artist
+                // pages and routes everything through the one root container.
+                if sound {
+                    t.album = String::new();
+                    t.album_artist = String::new();
                 }
                 let folder_abs = if folder_rel.is_empty() {
                     base.to_path_buf()
@@ -1224,6 +1225,7 @@ async fn insert_album(
         }
     }
 
+    write_album_credits(pool, album_entry_id, album, true).await?;
     link_album_genres(pool, album_entry_id, album).await?;
     sync_music_covers(
         pool,
@@ -1379,6 +1381,7 @@ async fn reconcile_album(
         }
     }
 
+    write_album_credits(pool, album_entry_id, album, write_credits).await?;
     link_album_genres(pool, album_entry_id, album).await?;
     sync_music_covers(
         pool,
@@ -1533,6 +1536,389 @@ async fn reconcile_loose_tracks(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Sound collections (virtual)
+// ---------------------------------------------------------------------------
+
+/// Reserved "misc" folder check (junk-stripped, case-insensitive — `_misc`,
+/// `~Misc`, `MISC` all match, mirroring is_scannable_dir's prefix rules):
+/// files under such a component, or at a base root, stay loose instead of
+/// folder-mimicking into a collection.
+fn is_misc_component(name: &str) -> bool {
+    name.trim_start_matches(['~', '-', '_', ' ', '.'])
+        .eq_ignore_ascii_case("misc")
+}
+
+/// Find (by case-insensitive title) or create a virtual sound collection.
+/// `folder` anchors cover art to a source folder when the collection is being
+/// folder-mimicked; user-created collections pass None and stay artless.
+pub(crate) async fn ensure_sound_collection(
+    pool: &SqlitePool,
+    library_id: &str,
+    cache_base: &Path,
+    title: &str,
+    folder: Option<(&str, &Path)>,
+) -> Result<i64, String> {
+    let existing: Option<(i64,)> = sqlx::query_as(
+        "SELECT al.id FROM album al
+         JOIN media_entry me ON me.id = al.id
+         JOIN sound_collection sc ON sc.album_id = al.id
+         WHERE me.library_id = ? AND LOWER(al.title) = LOWER(?)",
+    )
+    .bind(library_id)
+    .bind(title)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    if let Some((id,)) = existing {
+        return Ok(id);
+    }
+    let album_type = entry_type_id(pool, "album").await?;
+    let res = sqlx::query(
+        "INSERT INTO media_entry (library_id, parent_id, entry_type_id) VALUES (?, NULL, ?)",
+    )
+    .bind(library_id)
+    .bind(album_type)
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let id = res.last_insert_rowid();
+    sqlx::query(
+        "INSERT INTO album (id, title, sort_title, folder_path, sort_order) VALUES (?, ?, ?, ?, 0)",
+    )
+    .bind(id)
+    .bind(title)
+    .bind(generate_sort_title(title, "en"))
+    .bind(folder.map(|(rel, _)| rel).unwrap_or(""))
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    sqlx::query(
+        "INSERT INTO album_release (album_id, label, folder_path, is_default) VALUES (?, NULL, '', 1)",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    sqlx::query("INSERT INTO sound_album (album_id) VALUES (?)")
+        .bind(id)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    sqlx::query("INSERT INTO sound_collection (album_id) VALUES (?)")
+        .bind(id)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Some((rel, abs)) = folder {
+        sync_music_covers(pool, library_id, cache_base, rel, &desired_covers(abs, None)).await?;
+    }
+    Ok(id)
+}
+
+/// Reparent a sound track onto a collection or loose container: media_entry
+/// parent plus the track_release row onto the target's default release.
+async fn reparent_sound_track(
+    pool: &SqlitePool,
+    track_id: i64,
+    album_id: i64,
+) -> Result<(), String> {
+    sqlx::query("UPDATE media_entry SET parent_id = ? WHERE id = ?")
+        .bind(album_id)
+        .bind(track_id)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    let release: Option<(i64,)> =
+        sqlx::query_as("SELECT id FROM album_release WHERE album_id = ? AND is_default = 1")
+            .bind(album_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    if let Some((release_id,)) = release {
+        sqlx::query(
+            "INSERT INTO track_release (track_id, release_id) VALUES (?, ?)
+             ON CONFLICT(track_id) DO UPDATE SET release_id = excluded.release_id",
+        )
+        .bind(track_id)
+        .bind(release_id)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Place every sound track. All sound tracks arrive pooled in the loose
+/// container after a scan/rescan; this pass then applies, in order of
+/// authority: an existing sound_track_home row (NULL = explicitly loose,
+/// id = that collection — the USER's word, never overridden), else
+/// folder-mimicking — the track's leaf source folder becomes a collection
+/// (created on demand), while base-root and misc-folder files stay loose.
+/// Mimicked placements write a home row, so they only ever happen once per
+/// track; a pre-collections library migrates by the same rule.
+pub(crate) async fn apply_sound_homes(
+    pool: &SqlitePool,
+    library_id: &str,
+    cache_base: &Path,
+) -> Result<(), String> {
+    let tracks: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT t.id, t.file_path FROM track t
+         JOIN media_entry me ON me.id = t.id
+         JOIN loose_album la ON la.album_id = me.parent_id
+         JOIN sound_album sa ON sa.album_id = me.parent_id
+         WHERE me.library_id = ?",
+    )
+    .bind(library_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    if tracks.is_empty() {
+        return Ok(());
+    }
+    let homes: HashMap<i64, Option<i64>> = sqlx::query_as::<_, (i64, Option<i64>)>(
+        "SELECT sth.track_id, sth.album_id FROM sound_track_home sth
+         JOIN media_entry me ON me.id = sth.track_id WHERE me.library_id = ?",
+    )
+    .bind(library_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .into_iter()
+    .collect();
+    let collections: HashSet<i64> = sqlx::query_as::<_, (i64,)>(
+        "SELECT sc.album_id FROM sound_collection sc
+         JOIN media_entry me ON me.id = sc.album_id WHERE me.library_id = ?",
+    )
+    .bind(library_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .into_iter()
+    .map(|(id,)| id)
+    .collect();
+
+    // folder_rel → collection id, so a folder's files share one create.
+    let mut mimic_cache: HashMap<String, i64> = HashMap::new();
+    for (track_id, rel) in tracks {
+        match homes.get(&track_id) {
+            Some(Some(album_id)) if collections.contains(album_id) => {
+                reparent_sound_track(pool, track_id, *album_id).await?;
+            }
+            Some(Some(_)) => {
+                // Directive points at a vanished collection — demote to loose.
+                sqlx::query("UPDATE sound_track_home SET album_id = NULL WHERE track_id = ?")
+                    .bind(track_id)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            Some(None) => {} // explicitly loose — already in the container
+            None => {
+                let norm = rel.replace('\\', "/");
+                let mut comps: Vec<&str> = norm.split('/').filter(|c| !c.is_empty()).collect();
+                comps.pop(); // file name
+                if comps.is_empty() || comps.iter().any(|c| is_misc_component(c)) {
+                    continue; // root or misc — stays loose, stays row-less
+                }
+                let leaf = (*comps.last().unwrap()).to_string();
+                let folder_rel = comps.join("/");
+                let album_id = match mimic_cache.get(&folder_rel) {
+                    Some(id) => *id,
+                    None => {
+                        // Source folder for cover art — best-effort (skipped
+                        // when the path doesn't resolve against any base).
+                        let abs_folder = resolve_music_path(pool, library_id, &rel)
+                            .await
+                            .ok()
+                            .and_then(|f| Path::new(&f).parent().map(|p| p.to_path_buf()));
+                        let id = ensure_sound_collection(
+                            pool,
+                            library_id,
+                            cache_base,
+                            &leaf,
+                            abs_folder.as_deref().map(|abs| (folder_rel.as_str(), abs)),
+                        )
+                        .await?;
+                        mimic_cache.insert(folder_rel.clone(), id);
+                        id
+                    }
+                };
+                sqlx::query(
+                    "INSERT OR REPLACE INTO sound_track_home (track_id, album_id) VALUES (?, ?)",
+                )
+                .bind(track_id)
+                .bind(album_id)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+                reparent_sound_track(pool, track_id, album_id).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+pub struct SoundCollectionRow {
+    pub id: i64,
+    pub title: String,
+}
+
+/// The library's virtual sound collections, A–Z — the move-to-collection
+/// picker's option list.
+#[tauri::command]
+pub async fn list_sound_collections(
+    state: State<'_, AppState>,
+    library_id: String,
+) -> Result<Vec<SoundCollectionRow>, String> {
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT al.id, al.title FROM album al
+         JOIN media_entry me ON me.id = al.id
+         JOIN sound_collection sc ON sc.album_id = al.id
+         WHERE me.library_id = ?
+         ORDER BY al.sort_title COLLATE NOCASE",
+    )
+    .bind(&library_id)
+    .fetch_all(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(rows.into_iter().map(|(id, title)| SoundCollectionRow { id, title }).collect())
+}
+
+/// Create an empty virtual collection. Names are unique per library
+/// (case-insensitive) — ensure_ finds an existing one, which the caller
+/// experiences as "already exists".
+#[tauri::command]
+pub async fn create_sound_collection(
+    state: State<'_, AppState>,
+    library_id: String,
+    title: String,
+) -> Result<i64, String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err("Collection name can't be empty".to_string());
+    }
+    let dup: Option<(i64,)> = sqlx::query_as(
+        "SELECT al.id FROM album al
+         JOIN media_entry me ON me.id = al.id
+         JOIN sound_collection sc ON sc.album_id = al.id
+         WHERE me.library_id = ? AND LOWER(al.title) = LOWER(?)",
+    )
+    .bind(&library_id)
+    .bind(title)
+    .fetch_optional(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    if dup.is_some() {
+        return Err(format!("A collection named \"{title}\" already exists"));
+    }
+    // No folder → cache_base is never touched; empty path stands in.
+    ensure_sound_collection(&state.app_db, &library_id, Path::new(""), title, None).await
+}
+
+/// Delete a collection: members demote to loose (their home rows pin them
+/// there — the source folder can't re-mimic them back), then the entry goes.
+#[tauri::command]
+pub async fn delete_sound_collection(
+    state: State<'_, AppState>,
+    album_id: i64,
+) -> Result<(), String> {
+    let pool = &state.app_db;
+    let library_id: String = sqlx::query_as::<_, (String,)>(
+        "SELECT me.library_id FROM media_entry me
+         JOIN sound_collection sc ON sc.album_id = me.id
+         WHERE me.id = ?",
+    )
+    .bind(album_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .map(|(id,)| id)
+    .ok_or_else(|| "Not a sound collection".to_string())?;
+    let members: Vec<(i64,)> = sqlx::query_as("SELECT id FROM media_entry WHERE parent_id = ?")
+        .bind(album_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !members.is_empty() {
+        let (container_id, _) = ensure_loose_container(pool, &library_id, None, true).await?;
+        for (track_id,) in members {
+            sqlx::query(
+                "INSERT OR REPLACE INTO sound_track_home (track_id, album_id) VALUES (?, NULL)",
+            )
+            .bind(track_id)
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            reparent_sound_track(pool, track_id, container_id).await?;
+        }
+    }
+    sqlx::query("DELETE FROM media_entry WHERE id = ?")
+        .bind(album_id)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Move a sound track into a collection (or None = out to loose). Writes the
+/// home directive — the user's word — and reparents immediately.
+#[tauri::command]
+pub async fn move_sound_track(
+    state: State<'_, AppState>,
+    track_id: i64,
+    collection_id: Option<i64>,
+) -> Result<(), String> {
+    let pool = &state.app_db;
+    let library_id: String =
+        sqlx::query_as::<_, (String,)>("SELECT library_id FROM media_entry WHERE id = ?")
+            .bind(track_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?
+            .map(|(id,)| id)
+            .ok_or_else(|| "Track no longer exists".to_string())?;
+    match collection_id {
+        Some(cid) => {
+            let valid: Option<(i64,)> = sqlx::query_as(
+                "SELECT sc.album_id FROM sound_collection sc
+                 JOIN media_entry me ON me.id = sc.album_id
+                 WHERE sc.album_id = ? AND me.library_id = ?",
+            )
+            .bind(cid)
+            .bind(&library_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            if valid.is_none() {
+                return Err("Collection no longer exists".to_string());
+            }
+            sqlx::query(
+                "INSERT OR REPLACE INTO sound_track_home (track_id, album_id) VALUES (?, ?)",
+            )
+            .bind(track_id)
+            .bind(cid)
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            reparent_sound_track(pool, track_id, cid).await?;
+        }
+        None => {
+            sqlx::query(
+                "INSERT OR REPLACE INTO sound_track_home (track_id, album_id) VALUES (?, NULL)",
+            )
+            .bind(track_id)
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            let (container_id, _) = ensure_loose_container(pool, &library_id, None, true).await?;
+            reparent_sound_track(pool, track_id, container_id).await?;
+        }
+    }
+    Ok(())
+}
+
 async fn write_issues(
     pool: &SqlitePool,
     library_id: &str,
@@ -1629,6 +2015,165 @@ fn album_artist_of(album: &ScannedAlbum) -> String {
 /// most common casing becomes the display title). Folder placement plays no
 /// part — this is what makes numbered/misfiled folders group correctly.
 /// Material naming no artist at all comes back separately as orphans.
+/// User split directives for one library: lowercased source string → ordered
+/// member names ("jay-z & kanye west" → [JAY-Z, Kanye West]).
+pub(crate) type ArtistSplits = HashMap<String, Vec<String>>;
+
+pub(crate) async fn load_artist_splits(
+    pool: &SqlitePool,
+    library_id: &str,
+) -> Result<ArtistSplits, String> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT source_name, members FROM artist_split WHERE library_id = ?",
+    )
+    .bind(library_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(src, members)| {
+            let list: Vec<String> = serde_json::from_str(&members).ok()?;
+            (list.len() >= 2).then(|| (src.to_lowercase(), list))
+        })
+        .collect())
+}
+
+/// The member list a raw artist-name string resolves to, or None when it's a
+/// single artist. Split directives win; the ';' multi-value tag convention
+/// ("Drake; Future") splits automatically — it's an explicit separator, unlike
+/// '&'/',' which legitimately appear inside band names.
+fn split_members(splits: &ArtistSplits, name: &str) -> Option<Vec<String>> {
+    if let Some(m) = splits.get(&name.to_lowercase()) {
+        return Some(m.clone());
+    }
+    if name.contains(';') {
+        let parts: Vec<String> = name
+            .split(';')
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect();
+        if parts.len() >= 2 {
+            return Some(parts);
+        }
+    }
+    None
+}
+
+/// Rewrite scanned data through the split directives BEFORE artist grouping:
+/// a split album-artist re-homes under its first member (full list preserved
+/// for album_artist_credit rows), and any track credit that IS a split source
+/// expands into the members in place.
+pub(crate) fn apply_artist_splits(
+    splits: &ArtistSplits,
+    albums: &mut [ScannedAlbum],
+    loose: &mut [ScannedTrack],
+) {
+    // Note: even with no directives, the ';' multi-value convention applies.
+    let fix_track = |t: &mut ScannedTrack| {
+        if let Some(members) = split_members(splits, &t.album_artist) {
+            t.album_artist = members[0].clone();
+            t.album_artist_credits = members;
+        }
+        if t.credits.iter().any(|c| split_members(splits, c).is_some()) {
+            let mut expanded: Vec<String> = Vec::new();
+            for c in t.credits.drain(..) {
+                match split_members(splits, &c) {
+                    Some(members) => {
+                        for m in members {
+                            if !expanded.iter().any(|e| e.eq_ignore_ascii_case(&m)) {
+                                expanded.push(m);
+                            }
+                        }
+                    }
+                    None => {
+                        if !expanded.iter().any(|e| e.eq_ignore_ascii_case(&c)) {
+                            expanded.push(c);
+                        }
+                    }
+                }
+            }
+            t.credits = expanded;
+        }
+    };
+    for album in albums.iter_mut() {
+        for release in album.releases.iter_mut() {
+            for t in release.tracks.iter_mut() {
+                fix_track(t);
+            }
+        }
+    }
+    for t in loose.iter_mut() {
+        fix_track(t);
+    }
+}
+
+/// The ordered multi-artist credit for an album, majority-voted across its
+/// tracks (same casing rule as album_artist_of). Empty = single-artist album.
+fn album_credit_names(album: &ScannedAlbum) -> Vec<String> {
+    let mut counts: HashMap<String, (usize, Vec<String>)> = HashMap::new();
+    for r in &album.releases {
+        for t in &r.tracks {
+            if t.album_artist_credits.len() >= 2 {
+                let key = t
+                    .album_artist_credits
+                    .iter()
+                    .map(|n| n.to_lowercase())
+                    .collect::<Vec<_>>()
+                    .join("\u{1f}");
+                let e = counts.entry(key).or_insert((0, t.album_artist_credits.clone()));
+                e.0 += 1;
+            }
+        }
+    }
+    counts
+        .into_values()
+        .max_by_key(|(n, _)| *n)
+        .map(|(_, names)| names)
+        .unwrap_or_default()
+}
+
+/// Stamp the album's multi-artist credit rows to match the scan (delete-then-
+/// insert; single-artist albums carry no rows and read their parent instead).
+/// `overwrite: false` (MB-matched albums, whose credits are authoritative)
+/// only fills a gap — scan-derived joint credits land when no rows exist, and
+/// existing MB-written rows are never clobbered by a tag re-parse.
+async fn write_album_credits(
+    pool: &SqlitePool,
+    album_id: i64,
+    album: &ScannedAlbum,
+    overwrite: bool,
+) -> Result<(), String> {
+    let names = album_credit_names(album);
+    if !overwrite {
+        let existing: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM album_artist_credit WHERE album_id = ?")
+                .bind(album_id)
+                .fetch_one(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        if existing > 0 || names.len() < 2 {
+            return Ok(());
+        }
+    } else {
+        sqlx::query("DELETE FROM album_artist_credit WHERE album_id = ?")
+            .bind(album_id)
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    for (i, name) in names.iter().enumerate() {
+        sqlx::query("INSERT INTO album_artist_credit (album_id, position, name) VALUES (?, ?, ?)")
+            .bind(album_id)
+            .bind(i as i64)
+            .bind(name)
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 pub fn group_by_artist(
     albums: Vec<ScannedAlbum>,
     loose: Vec<ScannedTrack>,
@@ -1805,10 +2350,18 @@ pub async fn ensure_credit_artists(pool: &SqlitePool, library_id: &str) -> Resul
     let rows: Vec<(String,)> = sqlx::query_as(
         "SELECT tc.name FROM track_credit tc
          JOIN media_entry me ON me.id = tc.track_id
-         WHERE me.library_id = ?
+         WHERE me.library_id = ?1
            AND NOT EXISTS (
                SELECT 1 FROM artist_names an JOIN media_entry ame ON ame.id = an.artist_id
                WHERE ame.library_id = me.library_id AND LOWER(an.name) = LOWER(tc.name)
+           )
+         UNION ALL
+         SELECT ac.name FROM album_artist_credit ac
+         JOIN media_entry me ON me.id = ac.album_id
+         WHERE me.library_id = ?1
+           AND NOT EXISTS (
+               SELECT 1 FROM artist_names an JOIN media_entry ame ON ame.id = an.artist_id
+               WHERE ame.library_id = me.library_id AND LOWER(an.name) = LOWER(ac.name)
            )",
     )
     .bind(library_id)
@@ -2053,10 +2606,14 @@ pub async fn scan_music_library(
 ) -> Result<(), String> {
     let mut issues = Vec::new();
     let ScanOutput { albums, loose } = scan_base(base_path, sound, &mut issues, Some(cancel), |folder| {
-        let _ = app.emit("scan-progress", folder);
+        crate::commands::emit_scan_progress(app, library_id, folder);
     })?;
     write_issues(pool, library_id, &issues).await?;
-    let albums = group_sibling_albums(albums);
+    let mut albums = group_sibling_albums(albums);
+    let mut loose = loose;
+    // Split directives + ';' multi-value album artists re-home BEFORE grouping.
+    let splits = load_artist_splits(pool, library_id).await?;
+    apply_artist_splits(&splits, &mut albums, &mut loose);
     let (mut artists, mut orphans) = group_by_artist(albums, loose);
     apply_album_combines(pool, library_id, &mut artists, &mut orphans).await?;
 
@@ -2065,7 +2622,7 @@ pub async fn scan_music_library(
         if cancel.load(Ordering::SeqCst) {
             return Err("Library creation cancelled".to_string());
         }
-        let _ = app.emit("scan-progress", &artist.title);
+        crate::commands::emit_scan_progress(app, library_id, &artist.title);
         let artist_id = match find_artist_by_title(pool, library_id, &artist.title).await? {
             Some(id) => id,
             None => {
@@ -2084,15 +2641,16 @@ pub async fn scan_music_library(
         for (j, album) in sorted.iter().enumerate() {
             // Inserting is the other slow half (cover decode + thumbnailing),
             // so it reports per album too.
-            let _ = app.emit(
-                "scan-progress",
-                format!("{} — {}", artist.title, album_title_of(album)),
+            crate::commands::emit_scan_progress(
+                app,
+                library_id,
+                &format!("{} — {}", artist.title, album_title_of(album)),
             );
             insert_album(pool, library_id, cache_base, Some(artist_id), album, start.0 + j as i64)
                 .await?;
         }
         if !artist.loose.is_empty() {
-            let _ = app.emit("scan-progress", format!("{} — loose tracks", artist.title));
+            crate::commands::emit_scan_progress(app, library_id, &format!("{} — loose tracks", artist.title));
             let (container_id, release_id) =
                 ensure_loose_container(pool, library_id, Some(artist_id), sound).await?;
             let mut none = HashMap::new();
@@ -2104,11 +2662,11 @@ pub async fn scan_music_library(
     // Material naming no artist at all: albums at the root, artist-less loose
     // tracks under the library-root container.
     for (j, album) in orphans.albums.iter().enumerate() {
-        let _ = app.emit("scan-progress", album_title_of(album));
+        crate::commands::emit_scan_progress(app, library_id, &album_title_of(album));
         insert_album(pool, library_id, cache_base, None, album, j as i64).await?;
     }
     if !orphans.loose.is_empty() {
-        let _ = app.emit("scan-progress", "loose tracks");
+        crate::commands::emit_scan_progress(app, library_id, "loose tracks");
         let (container_id, release_id) = ensure_loose_container(pool, library_id, None, sound).await?;
         let mut none = HashMap::new();
         reconcile_loose_tracks(pool, library_id, container_id, release_id, &orphans.loose, &mut none)
@@ -2117,6 +2675,9 @@ pub async fn scan_music_library(
 
     // Featured names without a page of their own become artists too.
     ensure_credit_artists(pool, library_id).await?;
+    // Sound tracks pooled loose above get their collections (folder-mimicked
+    // or directive-placed).
+    apply_sound_homes(pool, library_id, cache_base).await?;
     Ok(())
 }
 
@@ -2141,13 +2702,16 @@ pub async fn rescan_music_library(
     for (base_path, sound) in base_paths {
         let mut issues = Vec::new();
         let out = scan_base(base_path, *sound, &mut issues, None, |folder| {
-            let _ = app.emit("scan-progress", folder);
+            crate::commands::emit_scan_progress(app, library_id, folder);
         })?;
         all_albums.extend(out.albums);
         all_loose.extend(out.loose);
         write_issues(pool, library_id, &issues).await?;
     }
-    let albums = group_sibling_albums(all_albums);
+    let mut albums = group_sibling_albums(all_albums);
+    let mut all_loose = all_loose;
+    let splits = load_artist_splits(pool, library_id).await?;
+    apply_artist_splits(&splits, &mut albums, &mut all_loose);
     let (mut artists, mut orphans) = group_by_artist(albums, all_loose);
     apply_album_combines(pool, library_id, &mut artists, &mut orphans).await?;
 
@@ -2167,10 +2731,14 @@ pub async fn rescan_music_library(
     // is already known, so a change of default edition doesn't orphan history.
     // Loose containers are excluded: their folder_path is '' and would collide
     // with genuine root-folder albums; they're claimed via loose_album instead.
+    // Virtual sound collections are excluded like loose containers: they're
+    // never folder-claimed (a mimicked folder_path is an ART anchor, not an
+    // identity) and never swept — they live until the user deletes them.
     let db_albums: Vec<(i64, String)> = sqlx::query_as(
         "SELECT al.id, al.folder_path FROM album al
          JOIN media_entry me ON me.id = al.id WHERE me.library_id = ?
-           AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = al.id)",
+           AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = al.id)
+           AND NOT EXISTS (SELECT 1 FROM sound_collection sc WHERE sc.album_id = al.id)",
     )
     .bind(library_id)
     .fetch_all(pool)
@@ -2179,7 +2747,8 @@ pub async fn rescan_music_library(
     let db_release_folders: Vec<(i64, String)> = sqlx::query_as(
         "SELECT ar.album_id, ar.folder_path FROM album_release ar
          JOIN media_entry me ON me.id = ar.album_id WHERE me.library_id = ?
-           AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = ar.album_id)",
+           AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = ar.album_id)
+           AND NOT EXISTS (SELECT 1 FROM sound_collection sc WHERE sc.album_id = ar.album_id)",
     )
     .bind(library_id)
     .fetch_all(pool)
@@ -2261,7 +2830,7 @@ pub async fn rescan_music_library(
     };
 
     for artist in artists {
-        let _ = app.emit("scan-progress", &artist.title);
+        crate::commands::emit_scan_progress(app, library_id, &artist.title);
         let artist_id = match artist_by_lower.get(&artist.title.to_lowercase()) {
             Some(id) => {
                 let parent = artist_common_parent(&artist);
@@ -2313,9 +2882,10 @@ pub async fn rescan_music_library(
         let mut sorted = artist.albums;
         sorted.sort_by_key(album_sort_key);
         for (j, album) in sorted.iter().enumerate() {
-            let _ = app.emit(
-                "scan-progress",
-                format!("{} — {}", artist.title, album_title_of(album)),
+            crate::commands::emit_scan_progress(
+                app,
+                library_id,
+                &format!("{} — {}", artist.title, album_title_of(album)),
             );
             // Only claim an entry once — if two DB albums merged into one
             // scanned album, the first wins and the other empties out
@@ -2352,7 +2922,7 @@ pub async fn rescan_music_library(
         }
 
         if !artist.loose.is_empty() {
-            let _ = app.emit("scan-progress", format!("{} — loose tracks", artist.title));
+            crate::commands::emit_scan_progress(app, library_id, &format!("{} — loose tracks", artist.title));
             // Bases differ in type across a rescan, so a mixed list splits
             // into the music container and the sound-marked one.
             let (sound_loose, music_loose): (Vec<_>, Vec<_>) =
@@ -2379,7 +2949,7 @@ pub async fn rescan_music_library(
     // Material naming no artist: albums live at the root, artist-less loose
     // tracks under the library-root container.
     for (j, album) in orphans.albums.iter().enumerate() {
-        let _ = app.emit("scan-progress", album_title_of(album));
+        crate::commands::emit_scan_progress(app, library_id, &album_title_of(album));
         let target = claim_album(album, &seen_album_ids);
         match target {
             Some(album_id) => {
@@ -2405,7 +2975,7 @@ pub async fn rescan_music_library(
         }
     }
     if !orphans.loose.is_empty() {
-        let _ = app.emit("scan-progress", "loose tracks");
+        crate::commands::emit_scan_progress(app, library_id, "loose tracks");
         let (sound_loose, music_loose): (Vec<_>, Vec<_>) =
             orphans.loose.into_iter().partition(|t| t.sound);
         for (loose, sound) in [(music_loose, false), (sound_loose, true)] {
@@ -2477,6 +3047,11 @@ pub async fn rescan_music_library(
             }
         }
     }
+    // Joint-name credits preserved inside MB-matched albums (reconcile keeps
+    // MB-tier credits) split in place, so a split-away artist can't survive
+    // through them.
+    apply_splits_to_stored_credits(pool, library_id, &splits).await?;
+
     // 3. Artists left childless (tag renamed away, or everything under them
     //    vanished) — UNLESS they're still credited somewhere.
     sweep_orphan_artists(pool, library_id, cache_base).await?;
@@ -2484,6 +3059,11 @@ pub async fn rescan_music_library(
     // Featured names without a page of their own become artists too (runs
     // after the sweeps so it sees the final credit set).
     ensure_credit_artists(pool, library_id).await?;
+
+    // Sound tracks pooled loose above get their collections back (home
+    // directives win; new/never-placed files folder-mimic once). Runs after
+    // the sweeps so vanished-collection directives demote cleanly.
+    apply_sound_homes(pool, library_id, cache_base).await?;
 
     Ok(())
 }
@@ -2496,6 +3076,82 @@ pub async fn rescan_music_library(
 /// cleanup is deliberately shallow: the folder usually still exists and holds
 /// live album caches (only the TAG changed), so only the artist's own covers
 /// pair goes — and only when no surviving artist shares the folder.
+/// Expand STORED track-credit rows that are themselves a split source ("A & B"
+/// as one credit → the members, in place). The scan-time expansion only
+/// reaches credits being rewritten — reconcile preserves MB-tier credits
+/// untouched, so joint strings inside MB-matched albums would otherwise keep
+/// the joint artist alive forever.
+async fn apply_splits_to_stored_credits(
+    pool: &SqlitePool,
+    library_id: &str,
+    splits: &ArtistSplits,
+) -> Result<(), String> {
+    for (source_lower, members) in splits {
+        let rows: Vec<(i64, i64)> = sqlx::query_as(
+            "SELECT tc.track_id, tc.position FROM track_credit tc
+             JOIN media_entry me ON me.id = tc.track_id
+             WHERE me.library_id = ?1 AND LOWER(tc.name) = ?2",
+        )
+        .bind(library_id)
+        .bind(source_lower)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        for (track_id, position) in rows {
+            let existing: Vec<String> = sqlx::query_as::<_, (String,)>(
+                "SELECT name FROM track_credit WHERE track_id = ?",
+            )
+            .bind(track_id)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|(n,)| n)
+            .collect();
+            sqlx::query("DELETE FROM track_credit WHERE track_id = ? AND position = ?")
+                .bind(track_id)
+                .bind(position)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            // First member takes the vacated slot; the rest append past BOTH
+            // the remaining max and the vacated slot (when the joint string
+            // was the only credit, MAX is empty and appending at 0 would
+            // collide with the slot the first member just took).
+            let max_remaining: i64 = sqlx::query_scalar::<_, Option<i64>>(
+                "SELECT MAX(position) FROM track_credit WHERE track_id = ?",
+            )
+            .bind(track_id)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| e.to_string())?
+            .unwrap_or(-1);
+            let mut next_pos: i64 = std::cmp::max(max_remaining + 1, position + 1);
+            let mut first = true;
+            for member in members {
+                if existing.iter().any(|e| e.eq_ignore_ascii_case(member)) {
+                    continue;
+                }
+                let pos = if first { position } else { next_pos };
+                if !first {
+                    next_pos += 1;
+                }
+                sqlx::query(
+                    "INSERT INTO track_credit (track_id, position, name) VALUES (?, ?, ?)",
+                )
+                .bind(track_id)
+                .bind(pos)
+                .bind(member)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+                first = false;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn sweep_orphan_artists(
     pool: &SqlitePool,
     library_id: &str,
@@ -2511,6 +3167,12 @@ pub(crate) async fn sweep_orphan_artists(
                JOIN media_entry tme ON tme.id = tc.track_id
                JOIN artist_names an ON an.artist_id = a.id
                WHERE tme.library_id = me.library_id AND LOWER(tc.name) = LOWER(an.name)
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM album_artist_credit ac
+               JOIN media_entry ame2 ON ame2.id = ac.album_id
+               JOIN artist_names an2 ON an2.artist_id = a.id
+               WHERE ame2.library_id = me.library_id AND LOWER(ac.name) = LOWER(an2.name)
            )",
     )
     .bind(library_id)
@@ -2570,6 +3232,10 @@ pub struct AlbumCard {
     pub runtime_secs: i64,
     /// Owning artist — set on appears-on cards (another artist's album).
     pub artist_title: Option<String>,
+    /// Full artist credit for the album header line: the album_artist_credit
+    /// rows when multi-artist, else the single owner. Each linkable when the
+    /// library has that artist.
+    pub artists: Vec<CreditView>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2790,7 +3456,10 @@ pub async fn get_artist_detail(
                               WHERE me2.parent_id = al.id AND ar2.is_default = 1), 0)
              FROM album al
              JOIN media_entry me ON me.id = al.id
-             WHERE me.parent_id = ?
+             WHERE (me.parent_id = ?1
+                    OR EXISTS (SELECT 1 FROM album_artist_credit ac
+                               WHERE ac.album_id = al.id
+                                 AND LOWER(ac.name) IN (SELECT LOWER(name) FROM artist_names WHERE artist_id = ?1)))
                AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = al.id)
                AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = al.id)
              ORDER BY al.sort_order, al.release_date, al.sort_title COLLATE NOCASE",
@@ -2800,13 +3469,42 @@ pub async fn get_artist_detail(
         .await
         .map_err(|e| e.to_string())?;
 
+    // Album-level credits + name→artist resolution for the per-album artist
+    // lines (multi-artist albums list every owner; the rest show this artist).
+    let self_title_for_cards = title.clone();
+    let (artist_by_lower, artist_titles) = artist_resolution_maps(pool, &library_id).await?;
+    let credit_rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT ac.album_id, ac.name FROM album_artist_credit ac
+         JOIN media_entry me ON me.id = ac.album_id
+         WHERE me.library_id = ? ORDER BY ac.album_id, ac.position",
+    )
+    .bind(&library_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let mut credits_by_album: HashMap<i64, Vec<String>> = HashMap::new();
+    for (aid, name) in credit_rows {
+        credits_by_album.entry(aid).or_default().push(name);
+    }
+    let album_artists = |album_id: i64, owner: Option<(&str, i64)>| -> Vec<CreditView> {
+        match credits_by_album.get(&album_id) {
+            Some(names) if names.len() >= 2 => names
+                .iter()
+                .map(|n| credit_view(n.clone(), &artist_by_lower, &artist_titles))
+                .collect(),
+            _ => owner
+                .map(|(name, id)| vec![CreditView { name: name.to_string(), artist_id: Some(id) }])
+                .unwrap_or_default(),
+        }
+    };
+
     let mut albums = Vec::new();
     let mut track_count = 0;
     for (id, title, release_date, folder, sel, tracks, releases, runtime) in album_rows {
         track_count += tracks;
         albums.push(AlbumCard {
             id,
-            title,
+            title: title.clone(),
             year: release_date.as_ref().map(|d| d.chars().take(4).collect()),
             release_date,
             covers: covers_for(pool, &library_id, &folder).await?,
@@ -2815,6 +3513,7 @@ pub async fn get_artist_detail(
             release_count: releases,
             runtime_secs: runtime,
             artist_title: None,
+            artists: album_artists(id, Some((&self_title_for_cards, entry_id))),
         });
     }
 
@@ -2835,6 +3534,9 @@ pub async fn get_artist_detail(
              WHERE ame.library_id = ?2
                AND LOWER(tc.name) IN (SELECT LOWER(name) FROM artist_names WHERE artist_id = ?1)
                AND (ame.parent_id IS NULL OR ame.parent_id != ?1)
+               AND NOT EXISTS (SELECT 1 FROM album_artist_credit ac
+                               WHERE ac.album_id = al.id
+                                 AND LOWER(ac.name) IN (SELECT LOWER(name) FROM artist_names WHERE artist_id = ?1))
                AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = al.id)
                AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = al.id)
              ORDER BY al.release_date, al.sort_title COLLATE NOCASE",
@@ -2846,6 +3548,16 @@ pub async fn get_artist_detail(
         .map_err(|e| e.to_string())?;
     let mut appears_on = Vec::new();
     for (id, atitle, release_date, folder, sel, owner, credited_tracks) in appears_rows {
+        let artists = match credits_by_album.get(&id) {
+            Some(names) if names.len() >= 2 => names
+                .iter()
+                .map(|n| credit_view(n.clone(), &artist_by_lower, &artist_titles))
+                .collect(),
+            _ => owner
+                .clone()
+                .map(|o| vec![credit_view(o, &artist_by_lower, &artist_titles)])
+                .unwrap_or_default(),
+        };
         appears_on.push(AlbumCard {
             id,
             title: atitle,
@@ -2857,6 +3569,7 @@ pub async fn get_artist_detail(
             release_count: 1,
             runtime_secs: 0,
             artist_title: owner,
+            artists,
         });
     }
 
@@ -2923,10 +3636,19 @@ pub struct AlbumDetail {
     /// None = artist-less album (lives at the library root).
     pub artist_id: Option<i64>,
     pub artist_title: Option<String>,
+    /// Multi-artist albums: the full ordered credit ("Drake · Future"), each
+    /// linkable when the library has that artist. Empty = single artist —
+    /// the header shows artist_title as before.
+    pub artist_credits: Vec<CreditView>,
     pub covers: Vec<String>,
     pub selected_cover: Option<String>,
     pub genres: Vec<String>,
     pub releases: Vec<ReleaseView>,
+    /// Sound-side entry (a virtual collection) — the page swaps its music
+    /// affordances (MB, credits) for collection ones (move tracks, etc.).
+    pub is_sound: bool,
+    /// Owning library — collection dialogs (move/create) are library-scoped.
+    pub library_id: String,
 }
 
 /// Resolve a track's library-relative file path to an absolute one by probing
@@ -3014,6 +3736,19 @@ pub async fn get_album_detail(
     // linking credits to their pages — displayed under current artist titles.
     let (artist_by_lower, artist_titles) = artist_resolution_maps(pool, &library_id).await?;
 
+    // Multi-artist album credit (empty for single-artist albums).
+    let album_credit_rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT name FROM album_artist_credit WHERE album_id = ? ORDER BY position",
+    )
+    .bind(entry_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let artist_credits: Vec<CreditView> = album_credit_rows
+        .into_iter()
+        .map(|(n,)| credit_view(n, &artist_by_lower, &artist_titles))
+        .collect();
+
     // All credits for the album's tracks, grouped per track in order.
     let credit_rows: Vec<(i64, String)> = sqlx::query_as(
         "SELECT tc.track_id, tc.name FROM track_credit tc
@@ -3075,6 +3810,15 @@ pub async fn get_album_detail(
         });
     }
 
+    let is_sound: bool = sqlx::query_as::<_, (i64,)>(
+        "SELECT EXISTS(SELECT 1 FROM sound_album sa WHERE sa.album_id = ?)",
+    )
+    .bind(entry_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .0 != 0;
+
     Ok(AlbumDetail {
         id: entry_id,
         title,
@@ -3082,10 +3826,13 @@ pub async fn get_album_detail(
         year: release_date.map(|d| d.chars().take(4).collect()),
         artist_id: parent_id,
         artist_title,
+        artist_credits,
         covers: covers_for(pool, &library_id, &folder_path).await?,
         selected_cover,
         genres: genres.into_iter().map(|(g,)| g).collect(),
         releases,
+        is_sound,
+        library_id,
     })
 }
 
@@ -3170,6 +3917,12 @@ pub struct LibraryTrackRow {
 pub async fn get_music_tracks(
     state: State<'_, AppState>,
     library_id: String,
+    // Only tracks living in loose containers — the Albums page's
+    // "Loose tracks" section. Omitted/false = every track (the Tracks page).
+    loose_only: Option<bool>,
+    // true = the SOUNDS side of the library (sound-marked containers) instead
+    // of music. Pairs with loose_only for the Sounds page's loose section.
+    sounds: Option<bool>,
 ) -> Result<Vec<LibraryTrackRow>, String> {
     let pool = &state.app_db;
 
@@ -3206,8 +3959,18 @@ pub async fn get_music_tracks(
         .await
         .map_err(|e| e.to_string())?;
 
+    let loose_clause = if loose_only.unwrap_or(false) {
+        "AND EXISTS (SELECT 1 FROM loose_album lo WHERE lo.album_id = me.parent_id)"
+    } else {
+        ""
+    };
+    let sound_clause = if sounds.unwrap_or(false) {
+        "AND EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = me.parent_id)"
+    } else {
+        "AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = me.parent_id)"
+    };
     let rows: Vec<(i64, String, String, Option<i64>, Option<String>, Option<i64>, Option<String>, i64, Option<i64>, i64, i64, Option<String>, Option<String>)> =
-        sqlx::query_as(
+        sqlx::query_as(&format!(
             "SELECT t.id, t.title, t.file_path, t.runtime, tm.artist_name,
                     al.id, al.title, COALESCE((SELECT 1 FROM loose_album la WHERE la.album_id = al.id), 0),
                     alme.parent_id,
@@ -3220,9 +3983,10 @@ pub async fn get_music_tracks(
              LEFT JOIN media_entry alme ON alme.id = me.parent_id
              LEFT JOIN album al ON al.id = alme.id
              WHERE me.library_id = ?
-               AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = me.parent_id)
+               {sound_clause}
+               {loose_clause}
              ORDER BY t.sort_title = '', t.sort_title COLLATE NOCASE, t.file_path COLLATE NOCASE",
-        )
+        ))
         .bind(&library_id)
         .fetch_all(pool)
         .await
@@ -3419,6 +4183,37 @@ pub async fn set_track_loved(
     Ok(())
 }
 
+/// Loved-track count per artist (track → parent album/container → parent
+/// artist). Sound-marked containers are excluded, matching every other
+/// artists-grid aggregate. Backs the Artists page "Most loved" sort — both the
+/// backend order on fresh loads and the frontend's instant local re-sort.
+pub(crate) async fn artist_loved_counts(
+    pool: &SqlitePool,
+    library_id: &str,
+) -> Result<Vec<(i64, i64)>, String> {
+    sqlx::query_as(
+        "SELECT alme.parent_id, COUNT(*) \
+         FROM track_loved tl \
+         JOIN media_entry tme ON tme.id = tl.track_id AND tme.library_id = ? \
+         JOIN media_entry alme ON alme.id = tme.parent_id \
+         WHERE alme.parent_id IS NOT NULL \
+           AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = alme.id) \
+         GROUP BY alme.parent_id",
+    )
+    .bind(library_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_artist_loved_counts(
+    state: State<'_, AppState>,
+    library_id: String,
+) -> Result<Vec<(i64, i64)>, String> {
+    artist_loved_counts(&state.app_db, &library_id).await
+}
+
 #[derive(Debug, Serialize)]
 pub struct TagFallbackRow {
     pub track_id: i64,
@@ -3525,6 +4320,7 @@ mod tests {
             flag_compilation: false,
             credits: vec![],
             sound: false,
+        album_artist_credits: Vec::new(),
         };
         ScannedAlbum {
             folder_rel: format!("Artist\\{folder}"),
@@ -3617,6 +4413,7 @@ mod tests {
             flag_compilation: false,
             credits: credits.iter().map(|c| c.to_string()).collect(),
             sound: false,
+        album_artist_credits: Vec::new(),
         }
     }
 
@@ -3980,6 +4777,7 @@ mod tests {
                 flag_compilation: false,
             credits: vec![],
             sound: false,
+        album_artist_credits: Vec::new(),
             };
             (t, folder.to_string(), PathBuf::from(format!(r"X:\m\{folder}")))
         };

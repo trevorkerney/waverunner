@@ -438,24 +438,6 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                   </div>
                 </div>
               </div>
-              <div>
-                <h3 className="mb-4 text-sm font-semibold">Metadata</h3>
-                <div className="flex items-center justify-between gap-4">
-                  <div>
-                    <p className="text-sm">Allow writing tags to files</p>
-                    <p className="text-xs text-muted-foreground">
-                      Metadata edits are stored in waverunner and never touch your audio files.
-                      With this on, the track editor gains an explicit "also write these tags
-                      into the file" option. Modifying files changes their timestamps (and
-                      breaks torrent seeding for those files).
-                    </p>
-                  </div>
-                  <Switch
-                    checked={view["allow_tag_writeback"] === "true"}
-                    onCheckedChange={(v) => stageSetting("allow_tag_writeback", v ? "true" : "false")}
-                  />
-                </div>
-              </div>
             </div>
           )}
           {activeCategory === "player" && (

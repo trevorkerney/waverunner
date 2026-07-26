@@ -178,11 +178,16 @@ export function UpNextPanel({
     if (from >= 0 && to >= 0) actions.moveQueued(from, to);
   };
 
-  // Light-dismiss: any click outside the panel closes it (the bar's queue
-  // button stops propagation so it toggles instead of insta-reopening).
+  // Light-dismiss: a click outside the panel closes it — but clicks on the
+  // playback bar itself (play/seek/volume) don't count as leaving; the panel
+  // stays up while the user works the controls. (The bar's queue button stops
+  // propagation so it toggles instead of insta-reopening.)
   useEffect(() => {
     const onDown = (ev: MouseEvent) => {
-      if (panelRef.current && ev.target instanceof Node && !panelRef.current.contains(ev.target)) {
+      if (!(ev.target instanceof Node) || !panelRef.current) return;
+      const inBar =
+        ev.target instanceof Element && ev.target.closest("[data-now-playing-bar]") !== null;
+      if (!panelRef.current.contains(ev.target) && !inBar) {
         onClose();
       }
     };

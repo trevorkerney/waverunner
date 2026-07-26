@@ -4,9 +4,8 @@
 //! columns, so every read path stays untouched. Scan/reconcile and the
 //! MusicBrainz pass re-stomp (or skip) overridden fields — see the reapply
 //! hooks — so a rescan can never clobber a user edit. Media files stay
-//! read-only: the only thing that ever writes tags into a file is
-//! write_track_tags, which is gated behind the default-off
-//! `allow_tag_writeback` setting and an explicit per-save user action.
+//! read-only: metadata is fully virtual and audio files are never modified
+//! (tag write-back existed briefly and was removed by design).
 //!
 //! Track fields: title, credits (ordered artist list), track_number,
 //! disc_number. Album fields: title, release_date, album_type.
@@ -14,10 +13,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use lofty::config::WriteOptions;
-use lofty::file::{AudioFile, TaggedFileExt};
+use lofty::file::TaggedFileExt;
 use lofty::probe::Probe;
-use lofty::tag::{ItemKey, ItemValue, TagItem};
+use lofty::tag::ItemKey;
 use serde::Serialize;
 use sqlx::SqlitePool;
 use tauri::State;
@@ -30,7 +28,7 @@ use crate::AppState;
 // ---------------------------------------------------------------------------
 
 const TRACK_FIELDS: &[&str] = &["title", "credits", "track_number", "disc_number"];
-const ALBUM_FIELDS: &[&str] = &["title", "release_date", "album_type", "genres"];
+const ALBUM_FIELDS: &[&str] = &["title", "release_date", "album_type", "genres", "artist_credits"];
 const ARTIST_FIELDS: &[&str] = &["title"];
 
 /// User-tier override values for an entity, keyed by field. Values are stored
@@ -207,6 +205,28 @@ pub(crate) async fn reapply_album_overrides(
                 .map_err(|e| e.to_string())?;
         }
     }
+    if let Some(raw) = overrides.get("artist_credits") {
+        let names: Vec<String> = serde_json::from_str(raw).unwrap_or_default();
+        sqlx::query("DELETE FROM album_artist_credit WHERE album_id = ?")
+            .bind(album_id)
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        // A single name means "one owner" — no credit rows, parent displays.
+        if names.len() >= 2 {
+            for (i, name) in names.iter().enumerate() {
+                sqlx::query(
+                    "INSERT INTO album_artist_credit (album_id, position, name) VALUES (?, ?, ?)",
+                )
+                .bind(album_id)
+                .bind(i as i64)
+                .bind(name)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            }
+        }
+    }
     if let Some(raw) = overrides.get("genres") {
         let genres: Vec<String> = serde_json::from_str(raw).unwrap_or_default();
         sqlx::query("DELETE FROM album_genre WHERE album_id = ?")
@@ -312,6 +332,152 @@ pub struct TrackEditView {
     pub file_name: String,
     /// What the file's tags actually say right now (None = unreadable).
     pub file_tags: Option<FileTagValues>,
+}
+
+/// Record an artist-split directive: this artist's NAME is really several
+/// artists ("JAY-Z & Kanye West" → [JAY-Z, Kanye West]). The directive is
+/// applied on every scan — members[0] becomes the canonical owner of the
+/// joint albums, the full list becomes their album-level credit, and matching
+/// track credits split the same way. The caller follows up with a rescan,
+/// which performs the actual migration (reparenting, credit rewrite, sweeping
+/// the now-empty joint entry). Returns the library id for that rescan call.
+#[tauri::command]
+pub async fn split_artist(
+    state: State<'_, AppState>,
+    artist_id: i64,
+    members: Vec<String>,
+) -> Result<String, String> {
+    let pool = &state.app_db;
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT me.library_id, a.title FROM artist a JOIN media_entry me ON me.id = a.id WHERE a.id = ?",
+    )
+    .bind(artist_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let (library_id, source_name) = row.ok_or("Artist not found")?;
+
+    let members: Vec<String> = members
+        .into_iter()
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty())
+        .collect();
+    if members.len() < 2 {
+        return Err("A split needs at least two artists".to_string());
+    }
+    if members.iter().any(|m| m.eq_ignore_ascii_case(&source_name)) {
+        return Err("A split member can't be the artist being split".to_string());
+    }
+
+    // The joint entry may answer to several names (title + tag-variant
+    // aliases like "A/B" next to "A & B") — a directive per name, or the
+    // variant-tagged albums resurrect the joint artist on rescan.
+    let mut source_names: Vec<String> = sqlx::query_as::<_, (String,)>(
+        "SELECT name FROM artist_names WHERE artist_id = ?",
+    )
+    .bind(artist_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .into_iter()
+    .map(|(n,)| n)
+    .collect();
+    if !source_names.iter().any(|n| n.eq_ignore_ascii_case(&source_name)) {
+        source_names.push(source_name);
+    }
+    let members_json = serde_json::to_string(&members).map_err(|e| e.to_string())?;
+    for name in &source_names {
+        if members.iter().any(|m| m.eq_ignore_ascii_case(name)) {
+            continue; // never map a member's own name onto the split
+        }
+        sqlx::query(
+            "INSERT INTO artist_split (library_id, source_name, members) VALUES (?, ?, ?)
+             ON CONFLICT(library_id, source_name) DO UPDATE SET members = excluded.members",
+        )
+        .bind(&library_id)
+        .bind(name)
+        .bind(&members_json)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(library_id)
+}
+
+/// Existing-artist suggestions scoped by an ARTIST's library (the split
+/// dialog's member rows). Excludes the artist being split.
+#[tauri::command]
+pub async fn search_artist_options(
+    state: State<'_, AppState>,
+    artist_id: i64,
+    query: String,
+) -> Result<Vec<String>, String> {
+    let pool = &state.app_db;
+    let library_id: Option<(String,)> =
+        sqlx::query_as("SELECT library_id FROM media_entry WHERE id = ?")
+            .bind(artist_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    let (library_id,) = library_id.ok_or("Artist not found")?;
+    let q = query.trim();
+    if q.is_empty() {
+        return Ok(Vec::new());
+    }
+    let escaped = q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+    let substr = format!("%{escaped}%");
+    let prefix = format!("{escaped}%");
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT a.title FROM artist a \
+         JOIN media_entry me ON me.id = a.id \
+         WHERE me.library_id = ?1 AND a.id != ?2 AND a.title LIKE ?3 ESCAPE '\\' \
+         ORDER BY CASE WHEN a.title LIKE ?4 ESCAPE '\\' THEN 0 ELSE 1 END, \
+                  a.title COLLATE NOCASE \
+         LIMIT 8",
+    )
+    .bind(&library_id)
+    .bind(artist_id)
+    .bind(&substr)
+    .bind(&prefix)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(rows.into_iter().map(|(t,)| t).collect())
+}
+
+/// Existing-artist suggestions for the track editor's artist rows — canonical
+/// artist titles in the track's own library, prefix matches first. Picking one
+/// means the credit resolves to that artist page instead of typo-spawning a twin.
+#[tauri::command]
+pub async fn search_track_artist_options(
+    state: State<'_, AppState>,
+    track_id: i64,
+    query: String,
+) -> Result<Vec<String>, String> {
+    let pool = &state.app_db;
+    let (library_id, _rel) = track_context(pool, track_id).await?;
+    let q = query.trim();
+    if q.is_empty() {
+        return Ok(Vec::new());
+    }
+    let escaped = q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+    let substr = format!("%{escaped}%");
+    let prefix = format!("{escaped}%");
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT a.title FROM artist a \
+         JOIN media_entry me ON me.id = a.id \
+         WHERE me.library_id = ?1 AND a.title LIKE ?2 ESCAPE '\\' \
+         ORDER BY CASE WHEN a.title LIKE ?3 ESCAPE '\\' THEN 0 ELSE 1 END, \
+                  a.title COLLATE NOCASE \
+         LIMIT 8",
+    )
+    .bind(&library_id)
+    .bind(&substr)
+    .bind(&prefix)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(rows.into_iter().map(|(t,)| t).collect())
 }
 
 #[tauri::command]
@@ -501,6 +667,9 @@ pub struct AlbumEditView {
     pub release_date: Option<String>,
     pub album_type: String,
     pub genres: Vec<String>,
+    /// Current artist credit: the album_artist_credit rows when multi-artist,
+    /// else the owning artist alone. The editor's artist rows start here.
+    pub artist_credits: Vec<String>,
     pub overridden: Vec<String>,
 }
 
@@ -524,6 +693,30 @@ pub async fn get_album_edit(
     .fetch_all(pool)
     .await
     .map_err(|e| e.to_string())?;
+    let mut artist_credits: Vec<String> = sqlx::query_as::<_, (String,)>(
+        "SELECT name FROM album_artist_credit WHERE album_id = ? ORDER BY position",
+    )
+    .bind(album_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .into_iter()
+    .map(|(n,)| n)
+    .collect();
+    if artist_credits.is_empty() {
+        // Single-owner album: prefill with the parent artist so adding a
+        // co-artist is one row away.
+        let owner: Option<(String,)> = sqlx::query_as(
+            "SELECT a.title FROM artist a JOIN media_entry me ON me.parent_id = a.id WHERE me.id = ?",
+        )
+        .bind(album_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        if let Some((t,)) = owner {
+            artist_credits.push(t);
+        }
+    }
     let overrides = user_overrides(pool, album_id).await?;
     Ok(AlbumEditView {
         id: album_id,
@@ -531,6 +724,7 @@ pub async fn get_album_edit(
         release_date,
         album_type,
         genres: genres.into_iter().map(|(g,)| g).collect(),
+        artist_credits,
         overridden: overrides.into_keys().collect(),
     })
 }
@@ -548,7 +742,7 @@ pub async fn set_album_fields(
         if !ALBUM_FIELDS.contains(&field.as_str()) {
             return Err(format!("Unknown album field: {field}"));
         }
-        let stored = if field == "genres" {
+        let stored = if field == "genres" || field == "artist_credits" {
             let names: Vec<String> = value
                 .as_array()
                 .map(|a| {
@@ -572,6 +766,19 @@ pub async fn set_album_fields(
         upsert_override(pool, album_id, field, &stored).await?;
     }
     reapply_album_overrides(pool, album_id).await?;
+    if fields.contains_key("artist_credits") {
+        // Newly credited co-artists get pages (and the album in their
+        // discography) immediately.
+        let library_id: Option<(String,)> =
+            sqlx::query_as("SELECT library_id FROM media_entry WHERE id = ?")
+                .bind(album_id)
+                .fetch_optional(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        if let Some((lib,)) = library_id {
+            crate::music::ensure_credit_artists(pool, &lib).await?;
+        }
+    }
     Ok(())
 }
 
@@ -798,128 +1005,5 @@ pub async fn combine_albums(
     .execute(pool)
     .await
     .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Tag write-back (explicit, gated, atomic)
-// ---------------------------------------------------------------------------
-
-/// Write a track's current effective metadata into the audio file's tags.
-/// Only runs when the `allow_tag_writeback` setting is "true" AND the user
-/// explicitly asked (the editor's "also write to file" option). The write is
-/// atomic: edit a temp copy, then swap it in with a backup of the original.
-/// Overrides are kept — the user tier stays authoritative either way.
-#[tauri::command]
-pub async fn write_track_tags(state: State<'_, AppState>, track_id: i64) -> Result<(), String> {
-    let pool = &state.app_db;
-    let enabled: Option<(String,)> =
-        sqlx::query_as("SELECT value FROM settings WHERE key = 'allow_tag_writeback'")
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| e.to_string())?;
-    if enabled.map(|(v,)| v) != Some("true".to_string()) {
-        return Err("Writing tags to files is disabled (Settings → Audio Player)".to_string());
-    }
-
-    let (library_id, rel) = track_context(pool, track_id).await?;
-    let (title, track_number, disc_number): (String, Option<i64>, Option<i64>) =
-        sqlx::query_as("SELECT title, track_number, disc_number FROM track WHERE id = ?")
-            .bind(track_id)
-            .fetch_one(pool)
-            .await
-            .map_err(|e| e.to_string())?;
-    let credits: Vec<(String,)> =
-        sqlx::query_as("SELECT name FROM track_credit WHERE track_id = ? ORDER BY position")
-            .bind(track_id)
-            .fetch_all(pool)
-            .await
-            .map_err(|e| e.to_string())?;
-    let credits: Vec<String> = credits.into_iter().map(|(n,)| n).collect();
-
-    let abs = resolve_abs(pool, &library_id, &rel).await?;
-    tauri::async_runtime::spawn_blocking(move || {
-        write_tags_atomically(&abs, &title, &credits, track_number, disc_number)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
-fn write_tags_atomically(
-    abs: &Path,
-    title: &str,
-    credits: &[String],
-    track_number: Option<i64>,
-    disc_number: Option<i64>,
-) -> Result<(), String> {
-    use lofty::tag::Accessor;
-
-    let dir = abs.parent().ok_or_else(|| "Invalid file path".to_string())?;
-    let name = abs
-        .file_name()
-        .ok_or_else(|| "Invalid file path".to_string())?
-        .to_string_lossy()
-        .to_string();
-    let tmp = dir.join(format!(".wr-tmp-{name}"));
-    let bak = dir.join(format!(".wr-bak-{name}"));
-
-    // Work on a copy; the original is untouched until the final swap.
-    std::fs::copy(abs, &tmp).map_err(|e| format!("copy failed: {e}"))?;
-    let result = (|| -> Result<(), String> {
-        let mut tagged = Probe::open(&tmp)
-            .map_err(|e| e.to_string())?
-            .read()
-            .map_err(|e| e.to_string())?;
-        if tagged.primary_tag_mut().is_none() {
-            let tt = tagged.primary_tag_type();
-            tagged.insert_tag(lofty::tag::Tag::new(tt));
-        }
-        let tag = tagged.primary_tag_mut().expect("tag just ensured");
-
-        if title.is_empty() {
-            tag.remove_key(&ItemKey::TrackTitle);
-        } else {
-            tag.set_title(title.to_string());
-        }
-        match track_number {
-            Some(n) => tag.set_track(n as u32),
-            None => tag.remove_track(),
-        }
-        match disc_number {
-            Some(n) => tag.set_disk(n as u32),
-            None => tag.remove_disk(),
-        }
-        if !credits.is_empty() {
-            // Display string + multi-value ARTISTS frames (the Picard shape
-            // the scanner's credit parser prefers).
-            tag.set_artist(credits.join(", "));
-            tag.remove_key(&ItemKey::TrackArtists);
-            for c in credits {
-                tag.push(TagItem::new(
-                    ItemKey::TrackArtists,
-                    ItemValue::Text(c.clone()),
-                ));
-            }
-        }
-
-        tagged
-            .save_to_path(&tmp, WriteOptions::default())
-            .map_err(|e| format!("tag write failed: {e}"))
-    })();
-
-    if let Err(e) = result {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-
-    // Swap: original → backup, temp → original, drop backup. On any failure,
-    // put the original back.
-    std::fs::rename(abs, &bak).map_err(|e| format!("backup failed: {e}"))?;
-    if let Err(e) = std::fs::rename(&tmp, abs) {
-        let _ = std::fs::rename(&bak, abs);
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("swap failed (original restored): {e}"));
-    }
-    let _ = std::fs::remove_file(&bak);
     Ok(())
 }

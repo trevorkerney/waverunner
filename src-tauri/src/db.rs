@@ -140,6 +140,18 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .execute(&pool)
     .await?;
 
+    // Extended person fields live in a side table — `person` predates them in
+    // shipped databases and this schema only ever creates, never alters.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS person_meta (
+            person_id INTEGER PRIMARY KEY,
+            biography TEXT,
+            FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS person_image (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -823,6 +835,38 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     // Presence of a row = the track is loved. Keyed on the track id, which
     // rescans preserve by file path — a loved track keeps its heart unless
     // its file moves out from under it (same durability as play history).
+    // Ordered album-level artist credits ("Drake · Future"). Only written for
+    // albums with MORE than one credited artist — single-artist albums read
+    // their parent artist as before. Fed by artist splits and multi-value
+    // album-artist tags; display joins names via artist_names for links.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS album_artist_credit (
+            album_id INTEGER NOT NULL,
+            position INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            PRIMARY KEY (album_id, position),
+            FOREIGN KEY (album_id) REFERENCES album(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // User directive: this album-artist STRING is really several artists
+    // ("JAY-Z & Kanye West" → [JAY-Z, Kanye West]). Applied on every scan —
+    // members[0] becomes the canonical parent, the full list becomes the
+    // album's artist credits, and matching track credits split the same way.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS artist_split (
+            library_id TEXT NOT NULL,
+            source_name TEXT NOT NULL COLLATE NOCASE,
+            members TEXT NOT NULL,
+            PRIMARY KEY (library_id, source_name),
+            FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS track_loved (
             track_id INTEGER PRIMARY KEY,
@@ -871,6 +915,35 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
         "CREATE TABLE IF NOT EXISTS sound_album (
             album_id INTEGER PRIMARY KEY,
             FOREIGN KEY (album_id) REFERENCES album(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // Virtual sound COLLECTIONS: the user-facing grouping for sounds. A row
+    // marks an album entry as a collection — never folder-claimed by rescans,
+    // never swept, lives until the user deletes it. Folder-mimicked at first
+    // scan (folder_path kept for cover art), user-created afterwards.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS sound_collection (
+            album_id INTEGER PRIMARY KEY,
+            FOREIGN KEY (album_id) REFERENCES album(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // Where a sound track lives, decided once by folder-mimicking or by the
+    // user. album_id NULL = explicitly loose. NO row = never placed — the
+    // scan folder-mimics it (this is how new files auto-organize and how a
+    // pre-collections library migrates). Reapplied after every scan/rescan,
+    // so source moves/renames never override a user's placement.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS sound_track_home (
+            track_id INTEGER PRIMARY KEY,
+            album_id INTEGER,
+            FOREIGN KEY (track_id) REFERENCES track(id) ON DELETE CASCADE,
+            FOREIGN KEY (album_id) REFERENCES album(id) ON DELETE SET NULL
         )",
     )
     .execute(&pool)

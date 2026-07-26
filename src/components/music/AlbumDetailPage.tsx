@@ -16,6 +16,7 @@ import {
   ContextMenuItem,
 } from "../ui/context-menu";
 import { TrackEditDialog, AlbumEditDialog } from "./EditDialogs";
+import { MoveToCollectionDialog } from "./MoveToCollectionDialog";
 import { PlayingIndicator } from "./PlayingIndicator";
 import { LoveButton, LoveMenuItem } from "./LoveButton";
 import { albumCover, queueFromRelease, defaultRelease, fmtTrackTime, fmtAlbumRuntime, trackDisplayTitle } from "./musicQueue";
@@ -67,6 +68,8 @@ export function AlbumDetailPage({
   const [selectedTrackId, setSelectedTrackId] = useState<number | null>(null);
   const [editTrackId, setEditTrackId] = useState<number | null>(null);
   const [editAlbumOpen, setEditAlbumOpen] = useState(false);
+  // Sound collections: track being moved to another collection (or to loose).
+  const [moveFor, setMoveFor] = useState<{ id: number; title: string } | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
 
   // Navigations clear the page (spinner); edit-triggered refetches are silent
@@ -113,6 +116,14 @@ export function AlbumDetailPage({
     setReloadKey((k) => k + 1);
     onMetadataChanged?.();
   };
+
+  // A metadata-center apply/undo (or rescan) landed while this page is open —
+  // silently refetch so the credit line, title, and covers update in place.
+  useEffect(() => {
+    const onRescanned = () => setReloadKey((k) => k + 1);
+    window.addEventListener("waverunner:library-rescanned", onRescanned);
+    return () => window.removeEventListener("waverunner:library-rescanned", onRescanned);
+  }, []);
 
   // Consume the focus request once per nonce: select the row and scroll it to
   // the viewport center. Waits for detail so the rows exist to scroll to.
@@ -180,11 +191,11 @@ export function AlbumDetailPage({
           <img
             src={getFullCoverUrl(cover)}
             alt=""
-            className="h-48 w-48 shrink-0 rounded-md object-cover shadow-md"
+            className="h-80 w-80 shrink-0 rounded-md object-cover shadow-md"
             draggable={false}
           />
         ) : (
-          <div className="flex h-48 w-48 shrink-0 items-center justify-center rounded-md bg-muted text-muted-foreground">
+          <div className="flex h-80 w-80 shrink-0 items-center justify-center rounded-md bg-muted text-muted-foreground">
             <Disc3 size={56} />
           </div>
         )}
@@ -203,22 +214,43 @@ export function AlbumDetailPage({
             </button>
           </h1>
           <p className="mt-1 truncate text-sm text-muted-foreground">
-            {detail.artist_id != null && detail.artist_title != null && (
+            {/* Multi-artist albums show the full credit, each name linking to
+                its artist page; single-artist albums keep the lone owner. */}
+            {detail.artist_credits.length >= 2 ? (
+              detail.artist_credits.map((c, i) => (
+                <span key={`${c.name}-${i}`}>
+                  {i > 0 && " · "}
+                  {c.artist_id != null ? (
+                    <button
+                      className="font-medium text-foreground hover:underline"
+                      onClick={() => onNavigateToArtist(c.artist_id!, c.name)}
+                    >
+                      {c.name}
+                    </button>
+                  ) : (
+                    <span className="font-medium text-foreground">{c.name}</span>
+                  )}
+                </span>
+              ))
+            ) : detail.artist_id != null && detail.artist_title != null ? (
               <button
                 className="font-medium text-foreground hover:underline"
                 onClick={() => onNavigateToArtist(detail.artist_id!, detail.artist_title!)}
               >
                 {detail.artist_title}
               </button>
-            )}
+            ) : null}
             {(() => {
+              const hasArtist =
+                detail.artist_credits.length >= 2 ||
+                (detail.artist_id != null && detail.artist_title != null);
               const parts = [
                 detail.year,
                 release ? `${release.tracks.length} tracks` : null,
                 fmtAlbumRuntime(totalSecs) || null,
               ].filter(Boolean);
               // No leading separator on artist-less albums.
-              return detail.artist_id != null && detail.artist_title != null
+              return hasArtist
                 ? parts.map((part) => ` · ${part}`).join("")
                 : parts.join(" · ");
             })()}
@@ -360,6 +392,16 @@ export function AlbumDetailPage({
                         </ContextMenuItem>
                       </>
                     )}
+                    {detail.is_sound && (
+                      <ContextMenuItem
+                        onClick={() =>
+                          setMoveFor({ id: t.id, title: trackDisplayTitle(t.title, t.file_path) })
+                        }
+                      >
+                        <ListPlus size={14} />
+                        Move to collection…
+                      </ContextMenuItem>
+                    )}
                     <ContextMenuItem onClick={() => setEditTrackId(t.id)}>
                       <Pencil size={14} />
                       Edit metadata
@@ -396,6 +438,18 @@ export function AlbumDetailPage({
         onOpenChange={setEditAlbumOpen}
         onSaved={handleSaved}
       />
+      {detail?.is_sound && (
+        <MoveToCollectionDialog
+          libraryId={detail.library_id}
+          track={moveFor}
+          open={moveFor != null}
+          onOpenChange={(o) => {
+            if (!o) setMoveFor(null);
+          }}
+          allowLoose
+          onMoved={handleSaved}
+        />
+      )}
     </div>
   );
 }

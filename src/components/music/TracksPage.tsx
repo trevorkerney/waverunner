@@ -44,7 +44,7 @@ interface TracksPageProps {
  *  visibly delays the context menu (it waits on the commit that the
  *  right-click's select triggered). Handlers take the index so they stay
  *  referentially stable. */
-const TrackRow = memo(function TrackRow({
+export const TrackRow = memo(function TrackRow({
   t,
   index,
   isCurrent,

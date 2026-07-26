@@ -727,6 +727,10 @@ pub async fn create_library(
     .await
     .map_err(|e| e.to_string())?;
 
+    // Lifecycle events drive the frontend's scanning state (sidebar lock +
+    // bounce-to-Home) independent of any modal being open.
+    emit_scan_state(&app, &id, &name, "started");
+
     let scan_result: Result<(), String> = async {
         match format.as_str() {
             "video" => {
@@ -755,6 +759,8 @@ pub async fn create_library(
         }
         Ok(())
     }.await;
+
+    emit_scan_state(&app, &id, &name, if scan_result.is_ok() { "finished" } else { "failed" });
 
     match scan_result {
         Ok(()) => {
@@ -792,6 +798,27 @@ pub async fn create_library(
             Err(e)
         }
     }
+}
+
+/// Per-folder scan progress, tagged with the library so the sidebar can show
+/// it on the right row (and concurrent scans don't interleave text).
+pub(crate) fn emit_scan_progress(app: &tauri::AppHandle, library_id: &str, folder: &str) {
+    let _ = app.emit(
+        "scan-progress",
+        serde_json::json!({ "libraryId": library_id, "folder": folder }),
+    );
+}
+
+/// Scan lifecycle beacon: `{ libraryId, name, state: "started"|"finished"|"failed" }`.
+/// The frontend uses it to lock the library's sidebar row while a scan runs
+/// and to bounce the user to Home if they're inside the library. `name` lets
+/// the sidebar label a mid-CREATION library (hidden from get_libraries until
+/// its scan lands) with its real name.
+pub(crate) fn emit_scan_state(app: &tauri::AppHandle, library_id: &str, name: &str, scan_state: &str) {
+    let _ = app.emit(
+        "scan-state",
+        serde_json::json!({ "libraryId": library_id, "name": name, "state": scan_state }),
+    );
 }
 
 #[tauri::command]
@@ -870,6 +897,22 @@ pub async fn get_libraries(state: tauri::State<'_, AppState>) -> Result<Vec<Libr
             setup_stage,
         })
         .collect())
+}
+
+/// Which library an entry belongs to — the now-playing bar's links resolve
+/// this so they can switch library context when clicked from another
+/// library's pages (or from Home). None = the entry no longer exists.
+#[tauri::command]
+pub async fn get_entry_library(
+    state: tauri::State<'_, AppState>,
+    entry_id: i64,
+) -> Result<Option<String>, String> {
+    sqlx::query_as::<_, (String,)>("SELECT library_id FROM media_entry WHERE id = ?")
+        .bind(entry_id)
+        .fetch_optional(&state.app_db)
+        .await
+        .map(|r| r.map(|(id,)| id))
+        .map_err(|e| e.to_string())
 }
 
 /// Advance an unfinished import's wizard stage ('scan' | 'match' | 'review').
@@ -1353,10 +1396,28 @@ pub async fn get_entries(
                         .fetch_all(&state.app_db)
                         .await
                         .map_err(|e| e.to_string())?;
+                // Multi-artist albums subtitle with the full credit instead of
+                // just the parent ("JAY-Z · Kanye West").
+                let credit_rows: Vec<(i64, String)> = sqlx::query_as(
+                    "SELECT ac.album_id, ac.name FROM album_artist_credit ac                      JOIN media_entry me ON me.id = ac.album_id                      WHERE me.library_id = ? ORDER BY ac.album_id, ac.position",
+                )
+                .bind(&library_id)
+                .fetch_all(&state.app_db)
+                .await
+                .map_err(|e| e.to_string())?;
+                let mut credits_by_album: std::collections::HashMap<i64, Vec<String>> =
+                    std::collections::HashMap::new();
+                for (aid, name) in credit_rows {
+                    credits_by_album.entry(aid).or_default().push(name);
+                }
                 let entries: Vec<MediaEntry> = rows
                     .into_iter()
                     .map(|(id, title, release_date, folder_path, selected_cover, parent_id, artist_title)| {
                         let covers = covers_map.remove(&folder_path).unwrap_or_default();
+                        let credit_display = credits_by_album
+                            .remove(&id)
+                            .filter(|names| names.len() >= 2)
+                            .map(|names| names.join(" · "));
                         MediaEntry {
                             id,
                             title,
@@ -1369,7 +1430,7 @@ pub async fn get_entries(
                             selected_cover,
                             child_count: 0,
                             season_display: None,
-                            collection_display: artist_title,
+                            collection_display: credit_display.or(artist_title),
                             role_display: None,
                             tmdb_id: None,
                             link_id: None,
@@ -1392,7 +1453,8 @@ pub async fn get_entries(
             }
 
             // People-page-style sort vocabulary for the Artists grid:
-            // "alpha" | "credits" (most works first), from a settings key.
+            // "alpha" | "credits" (most works) | "loved" (most loved tracks),
+            // from a settings key.
             let artists_sort_mode: String = sqlx::query_as::<_, (String,)>(
                 "SELECT value FROM settings WHERE key = ?",
             )
@@ -1401,7 +1463,7 @@ pub async fn get_entries(
             .await
             .map_err(|e| e.to_string())?
             .map(|(v,)| v)
-            .filter(|v| v == "credits")
+            .filter(|v| v == "credits" || v == "loved")
             .unwrap_or_else(|| "alpha".to_string());
 
             // Artists whose every child album is sound-marked hide from the
@@ -1442,6 +1504,31 @@ pub async fn get_entries(
             for (artist_id, album_type, n) in type_rows {
                 counts_by_artist.entry(artist_id).or_default().push((album_type, n));
             }
+            // Co-owned albums (album-level credit, parent is another member)
+            // count toward the member's own release totals too.
+            let credit_count_rows: Vec<(i64, String, i64)> = sqlx::query_as(
+                "SELECT an.artist_id, al.album_type, COUNT(DISTINCT al.id) \
+                 FROM album_artist_credit ac \
+                 JOIN album al ON al.id = ac.album_id \
+                 JOIN media_entry me ON me.id = al.id \
+                 JOIN artist_names an ON LOWER(an.name) = LOWER(ac.name) \
+                 JOIN media_entry ame ON ame.id = an.artist_id AND ame.library_id = me.library_id \
+                 WHERE me.library_id = ? AND (me.parent_id IS NULL OR me.parent_id != an.artist_id) \
+                   AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = al.id) \
+                   AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = al.id) \
+                 GROUP BY an.artist_id, al.album_type",
+            )
+            .bind(&library_id)
+            .fetch_all(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+            for (artist_id, album_type, n) in credit_count_rows {
+                let entry = counts_by_artist.entry(artist_id).or_default();
+                match entry.iter_mut().find(|(ty, _)| *ty == album_type) {
+                    Some((_, existing)) => *existing += n,
+                    None => entry.push((album_type, n)),
+                }
+            }
             // Feature credits on other artists' albums ("appears on N") — the
             // whole subtitle for feature-only artists.
             let appears_rows: Vec<(i64, i64)> = sqlx::query_as(
@@ -1453,6 +1540,9 @@ pub async fn get_entries(
                  JOIN media_entry tme ON tme.id = tc.track_id AND tme.library_id = ame.library_id \
                  JOIN media_entry alme ON alme.id = tme.parent_id \
                  WHERE ame.library_id = ? AND (alme.parent_id IS NULL OR alme.parent_id != a.id) \
+                   AND NOT EXISTS (SELECT 1 FROM album_artist_credit ac2 \
+                                   WHERE ac2.album_id = alme.id \
+                                     AND LOWER(ac2.name) IN (SELECT LOWER(name) FROM artist_names WHERE artist_id = a.id)) \
                    AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = alme.id) \
                    AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = alme.id) \
                  GROUP BY a.id",
@@ -1481,7 +1571,7 @@ pub async fn get_entries(
                 }
                 if let Some(n) = appears_by_artist.get(&id) {
                     if *n > 0 {
-                        parts.push(format!("appears on {n} {}", if *n == 1 { "album" } else { "albums" }));
+                        parts.push(format!("{n} appearance{}", if *n == 1 { "" } else { "s" }));
                     }
                 }
                 if parts.is_empty() { None } else { Some(parts.join(" · ")) }
@@ -1498,6 +1588,36 @@ pub async fn get_entries(
                     + appears_by_artist.get(&id).copied().unwrap_or(0)
             };
 
+            // Loved-track counts feed the "loved" sort AND two subtitle variants.
+            let loved_by_artist: std::collections::HashMap<i64, i64> =
+                crate::music::artist_loved_counts(&state.app_db, &library_id)
+                    .await?
+                    .into_iter()
+                    .collect();
+
+            // Alphabetical-mode subtitle: "2 releases · 4 appearances · 7 loved"
+            // (zero parts omitted). The detailed per-type breakdown stays the
+            // credits-mode subtitle.
+            let alpha_display = |id: i64| -> Option<String> {
+                let releases: i64 = counts_by_artist
+                    .get(&id)
+                    .map(|v| v.iter().map(|(_, n)| *n).sum::<i64>())
+                    .unwrap_or(0);
+                let appears = appears_by_artist.get(&id).copied().unwrap_or(0);
+                let loved = loved_by_artist.get(&id).copied().unwrap_or(0);
+                let mut parts: Vec<String> = Vec::new();
+                if releases > 0 {
+                    parts.push(format!("{releases} release{}", if releases == 1 { "" } else { "s" }));
+                }
+                if appears > 0 {
+                    parts.push(format!("{appears} appearance{}", if appears == 1 { "" } else { "s" }));
+                }
+                if loved > 0 {
+                    parts.push(format!("{loved} loved"));
+                }
+                if parts.is_empty() { None } else { Some(parts.join(" · ")) }
+            };
+
             let mut entries: Vec<MediaEntry> = rows
                 .into_iter()
                 .map(|(id, title, folder_path, selected_cover)| {
@@ -1508,7 +1628,20 @@ pub async fn get_entries(
                             .remove(&crate::music_art::artist_fetch_rel(id))
                             .unwrap_or_default(),
                     );
+                    // The card subtitle depends on the ACTIVE SORT, and sort
+                    // switches happen locally without a refetch — so all three
+                    // variants ride along in otherwise-unused display slots:
+                    //   collection_display — credits mode (per-type breakdown)
+                    //   role_display       — alpha mode (releases/appearances/loved)
+                    //   season_display     — loved mode ("N loved")
                     let collection_display = works_display(id);
+                    let role_display = alpha_display(id);
+                    // Always present, "0 loved" included — an all-blank grid in
+                    // loved mode reads as broken rather than as "nothing loved".
+                    let season_display = Some(format!(
+                        "{} loved",
+                        loved_by_artist.get(&id).copied().unwrap_or(0)
+                    ));
                     MediaEntry {
                         id,
                         title,
@@ -1520,9 +1653,9 @@ pub async fn get_entries(
                         covers,
                         selected_cover,
                         child_count: total_works(id),
-                        season_display: None,
+                        season_display,
                         collection_display,
-                        role_display: None,
+                        role_display,
                         tmdb_id: None,
                         link_id: None,
                         interactive: false,
@@ -1539,6 +1672,11 @@ pub async fn get_entries(
                 // Most credited first, ties A–Z — the rows arrive
                 // alphabetical, so a stable sort keeps ties.
                 entries.sort_by_key(|e| std::cmp::Reverse(e.child_count));
+            } else if artists_sort_mode == "loved" {
+                // Most loved tracks first, ties A–Z (stable sort again).
+                entries.sort_by_key(|e| {
+                    std::cmp::Reverse(loved_by_artist.get(&e.id).copied().unwrap_or(0))
+                });
             }
 
             EntriesResponse {
@@ -3670,6 +3808,345 @@ pub async fn search_persons(
         .into_iter()
         .map(|(id, name, image_path)| PersonInfo { id, name, image_path })
         .collect())
+}
+
+// ---------- Person identity: character names, bio, TMDB matching ----------
+
+/// Mass-update a person's character name (cast role) for a given work. Movies hit the
+/// single `movie_cast` row. Shows update across `show_cast`, all `season_cast` rows for
+/// that person on that show, and all `episode_cast` rows for that person on that show
+/// — the user can't see the layered structure, so we keep it consistent everywhere.
+///
+/// Empty `new_role` stores `NULL` (treated as "no character name" by the label code).
+///
+/// See [count_person_role_variants] — used by the frontend to warn when this update
+/// would clobber multiple distinct existing values (voice actors playing several
+/// characters across episodes).
+#[tauri::command]
+pub async fn update_person_cast_role(
+    state: tauri::State<'_, AppState>,
+    person_id: i64,
+    entry_id: i64,
+    entry_type: String,
+    new_role: String,
+) -> Result<(), String> {
+    let trimmed = new_role.trim();
+    let value: Option<&str> = if trimmed.is_empty() { None } else { Some(trimmed) };
+
+    match entry_type.as_str() {
+        "movie" => {
+            sqlx::query("UPDATE movie_cast SET role = ? WHERE movie_id = ? AND person_id = ?")
+                .bind(value)
+                .bind(entry_id)
+                .bind(person_id)
+                .execute(&state.app_db)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        "show" => {
+            sqlx::query("UPDATE show_cast SET role = ? WHERE show_id = ? AND person_id = ?")
+                .bind(value)
+                .bind(entry_id)
+                .bind(person_id)
+                .execute(&state.app_db)
+                .await
+                .map_err(|e| e.to_string())?;
+            sqlx::query(
+                "UPDATE season_cast SET role = ? \
+                 WHERE person_id = ? AND season_id IN (SELECT id FROM season WHERE show_id = ?)",
+            )
+            .bind(value)
+            .bind(person_id)
+            .bind(entry_id)
+            .execute(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+            sqlx::query(
+                "UPDATE episode_cast SET role = ? \
+                 WHERE person_id = ? AND episode_id IN ( \
+                   SELECT e.id FROM episode e JOIN season s ON s.id = e.season_id \
+                   WHERE s.show_id = ?)",
+            )
+            .bind(value)
+            .bind(person_id)
+            .bind(entry_id)
+            .execute(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+        }
+        other => return Err(format!("Unsupported entry_type for character edit: {}", other)),
+    }
+
+    Ok(())
+}
+
+/// Count of *distinct non-null* role values currently stored across a person's cast rows
+/// for a given work. Used by the character-edit dialog to warn when saving will replace
+/// multiple existing names with one — typically a voice actor or anthology guest playing
+/// different characters across episodes.
+#[tauri::command]
+pub async fn count_person_role_variants(
+    state: tauri::State<'_, AppState>,
+    person_id: i64,
+    entry_id: i64,
+    entry_type: String,
+) -> Result<i64, String> {
+    match entry_type.as_str() {
+        "movie" => {
+            let row: (i64,) = sqlx::query_as(
+                "SELECT COUNT(DISTINCT role) FROM movie_cast \
+                 WHERE movie_id = ? AND person_id = ? AND role IS NOT NULL AND role != ''",
+            )
+            .bind(entry_id)
+            .bind(person_id)
+            .fetch_one(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+            Ok(row.0)
+        }
+        "show" => {
+            let row: (i64,) = sqlx::query_as(
+                "SELECT COUNT(DISTINCT role) FROM ( \
+                   SELECT role FROM show_cast WHERE show_id = ? AND person_id = ? AND role IS NOT NULL AND role != '' \
+                   UNION ALL \
+                   SELECT sec.role FROM season_cast sec JOIN season s ON s.id = sec.season_id \
+                     WHERE s.show_id = ? AND sec.person_id = ? AND sec.role IS NOT NULL AND sec.role != '' \
+                   UNION ALL \
+                   SELECT ec.role FROM episode_cast ec \
+                     JOIN episode e ON e.id = ec.episode_id \
+                     JOIN season s ON s.id = e.season_id \
+                     WHERE s.show_id = ? AND ec.person_id = ? AND ec.role IS NOT NULL AND ec.role != '' \
+                 )",
+            )
+            .bind(entry_id)
+            .bind(person_id)
+            .bind(entry_id)
+            .bind(person_id)
+            .bind(entry_id)
+            .bind(person_id)
+            .fetch_one(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+            Ok(row.0)
+        }
+        other => Err(format!("Unsupported entry_type for role variant count: {}", other)),
+    }
+}
+
+/// First stored character name for a person on a work — the character-edit dialog's
+/// pre-fill. Shows fall through show → season → episode cast (alphabetically first
+/// when several distinct names exist). NULL when nothing is recorded.
+#[tauri::command]
+pub async fn get_person_cast_role(
+    state: tauri::State<'_, AppState>,
+    person_id: i64,
+    entry_id: i64,
+    entry_type: String,
+) -> Result<Option<String>, String> {
+    match entry_type.as_str() {
+        "movie" => sqlx::query_scalar(
+            "SELECT role FROM movie_cast WHERE movie_id = ? AND person_id = ?",
+        )
+        .bind(entry_id)
+        .bind(person_id)
+        .fetch_optional(&state.app_db)
+        .await
+        .map(|r: Option<Option<String>>| r.flatten())
+        .map_err(|e| e.to_string()),
+        "show" => sqlx::query_scalar(
+            "SELECT COALESCE( \
+               (SELECT role FROM show_cast WHERE show_id = ?1 AND person_id = ?2 AND role IS NOT NULL AND role != ''), \
+               (SELECT MIN(sec.role) FROM season_cast sec JOIN season s ON s.id = sec.season_id \
+                  WHERE s.show_id = ?1 AND sec.person_id = ?2 AND sec.role IS NOT NULL AND sec.role != ''), \
+               (SELECT MIN(ec.role) FROM episode_cast ec \
+                  JOIN episode e ON e.id = ec.episode_id JOIN season s ON s.id = e.season_id \
+                  WHERE s.show_id = ?1 AND ec.person_id = ?2 AND ec.role IS NOT NULL AND ec.role != ''))",
+        )
+        .bind(entry_id)
+        .bind(person_id)
+        .fetch_one(&state.app_db)
+        .await
+        .map_err(|e| e.to_string()),
+        other => Err(format!("Unsupported entry_type for cast role lookup: {}", other)),
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct PersonDetail {
+    pub id: i64,
+    pub name: String,
+    pub image_path: Option<String>,
+    pub tmdb_id: Option<i64>,
+    pub biography: Option<String>,
+}
+
+/// Read a single person record (biography rides in the person_meta side table).
+/// Used by the person-detail page header and as a refresh after match actions.
+#[tauri::command]
+pub async fn get_person_detail(
+    state: tauri::State<'_, AppState>,
+    person_id: i64,
+) -> Result<PersonDetail, String> {
+    let row: Option<(i64, String, Option<String>, Option<i64>, Option<String>)> = sqlx::query_as(
+        "SELECT p.id, p.name, p.image_path, p.tmdb_id, pm.biography \
+         FROM person p LEFT JOIN person_meta pm ON pm.person_id = p.id \
+         WHERE p.id = ?",
+    )
+    .bind(person_id)
+    .fetch_optional(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    let (id, name, image_path, tmdb_id, biography) = row.ok_or("Person not found")?;
+    Ok(PersonDetail { id, name, image_path, tmdb_id, biography })
+}
+
+#[derive(Debug, Serialize)]
+pub struct TmdbPersonSearchResult {
+    pub id: i64,
+    pub name: String,
+    pub profile_path: Option<String>,
+    pub known_for_department: Option<String>,
+    pub known_for_summary: Option<String>,
+}
+
+/// TMDB person search for the match dialog / picker's "From TMDB" section.
+#[tauri::command]
+pub async fn search_tmdb_person(
+    state: tauri::State<'_, AppState>,
+    query: String,
+) -> Result<Vec<TmdbPersonSearchResult>, String> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Ok(Vec::new());
+    }
+    let token: String = sqlx::query_scalar("SELECT value FROM settings WHERE key = 'tmdb_api_token'")
+        .fetch_optional(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "No TMDB API token configured. Add one in settings.".to_string())?;
+    let client = reqwest::Client::new();
+    let response = crate::tmdb::search_person(&client, &token, q).await?;
+    Ok(response
+        .results
+        .into_iter()
+        .map(|hit| {
+            let summary: Option<String> = {
+                let titles: Vec<String> = hit
+                    .known_for
+                    .iter()
+                    .take(3)
+                    .filter_map(|k| k.title.clone().or_else(|| k.name.clone()))
+                    .collect();
+                if titles.is_empty() { None } else { Some(titles.join(", ")) }
+            };
+            TmdbPersonSearchResult {
+                id: hit.id,
+                name: hit.name,
+                profile_path: hit.profile_path,
+                known_for_department: hit.known_for_department,
+                known_for_summary: summary,
+            }
+        })
+        .collect())
+}
+
+/// Internal helper — fetches /person/{tmdb_id} and writes tmdb_id + canonical name to
+/// `person`, biography to `person_meta`. Kicks off a profile image download when the
+/// person has none. Used by both apply_tmdb_person_match and refresh_tmdb_person.
+async fn fetch_and_apply_tmdb_person(
+    pool: &SqlitePool,
+    app_data_dir: &Path,
+    person_id: i64,
+    tmdb_id: i64,
+    token: &str,
+) -> Result<(), String> {
+    let client = reqwest::Client::new();
+    let detail = crate::tmdb::get_person_detail(&client, token, tmdb_id).await?;
+    let bio: Option<String> = detail.biography.as_ref().and_then(|b| {
+        let t = b.trim();
+        if t.is_empty() { None } else { Some(t.to_string()) }
+    });
+    sqlx::query("UPDATE person SET tmdb_id = ?, name = ? WHERE id = ?")
+        .bind(tmdb_id)
+        .bind(&detail.name)
+        .bind(person_id)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    sqlx::query(
+        "INSERT INTO person_meta (person_id, biography) VALUES (?, ?) \
+         ON CONFLICT(person_id) DO UPDATE SET biography = excluded.biography",
+    )
+    .bind(person_id)
+    .bind(bio.as_deref())
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    // Reuse the shared image-download path — it skips the work when the person
+    // already has an image, and handles missing profile_path gracefully.
+    process_person_images(pool, app_data_dir, vec![(person_id, tmdb_id, detail.profile_path)]).await;
+    Ok(())
+}
+
+/// Attach a TMDB record to an existing person. Writes tmdb_id, updates name to the
+/// canonical TMDB spelling, pulls biography, and downloads the profile image if the
+/// person has none locally.
+#[tauri::command]
+pub async fn apply_tmdb_person_match(
+    state: tauri::State<'_, AppState>,
+    person_id: i64,
+    tmdb_id: i64,
+) -> Result<(), String> {
+    let token: String = sqlx::query_scalar("SELECT value FROM settings WHERE key = 'tmdb_api_token'")
+        .fetch_optional(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "No TMDB API token configured. Add one in settings.".to_string())?;
+    fetch_and_apply_tmdb_person(&state.app_db, &state.app_data_dir, person_id, tmdb_id, &token).await
+}
+
+/// Re-pull TMDB data for a person that's already matched. Errors if the person has no
+/// tmdb_id (caller shouldn't expose the action in that state).
+#[tauri::command]
+pub async fn refresh_tmdb_person(
+    state: tauri::State<'_, AppState>,
+    person_id: i64,
+) -> Result<(), String> {
+    let tmdb_id: Option<Option<i64>> = sqlx::query_scalar("SELECT tmdb_id FROM person WHERE id = ?")
+        .bind(person_id)
+        .fetch_optional(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+    let tmdb_id = tmdb_id
+        .flatten()
+        .ok_or_else(|| "Person is not matched to TMDB.".to_string())?;
+    let token: String = sqlx::query_scalar("SELECT value FROM settings WHERE key = 'tmdb_api_token'")
+        .fetch_optional(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "No TMDB API token configured. Add one in settings.".to_string())?;
+    fetch_and_apply_tmdb_person(&state.app_db, &state.app_data_dir, person_id, tmdb_id, &token).await
+}
+
+/// Nulls the person's tmdb_id and biography. Keeps image_path + person_image rows (the
+/// previously-fetched portrait still belongs to this person; removing it is a
+/// separate UX we haven't surfaced).
+#[tauri::command]
+pub async fn clear_tmdb_person_match(
+    state: tauri::State<'_, AppState>,
+    person_id: i64,
+) -> Result<(), String> {
+    sqlx::query("UPDATE person SET tmdb_id = NULL WHERE id = ?")
+        .bind(person_id)
+        .execute(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+    sqlx::query("DELETE FROM person_meta WHERE person_id = ?")
+        .bind(person_id)
+        .execute(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -6810,45 +7287,57 @@ pub async fn rescan_library(
     let cache_base = state.app_data_dir.join("cache").join(&library_id);
     std::fs::create_dir_all(&cache_base).map_err(|e| e.to_string())?;
 
+    let lib_name: String = sqlx::query_scalar("SELECT name FROM library WHERE id = ?")
+        .bind(&library_id)
+        .fetch_optional(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
+    emit_scan_state(&app, &library_id, &lib_name, "started");
+
     // Returns per-item warnings (skipped episodes/seasons/shows). A bad item no
     // longer aborts the whole rescan — it's logged here and surfaced to the user.
-    let warnings = match format.as_str() {
-        "video" => {
-            // Video rescan classifies by each folder's movie/show tag, so pull the typed paths.
-            let typed = get_library_typed_paths(&state.app_db, &library_id).await?;
-            let typed_bases: Vec<(PathBuf, ScanKind)> = typed
-                .iter()
-                .map(|lp| (PathBuf::from(&lp.path), if lp.kind == "show" { ScanKind::Show } else { ScanKind::Movie }))
+    let rescan_result: Result<Vec<String>, String> = async {
+        match format.as_str() {
+            "video" => {
+                // Video rescan classifies by each folder's movie/show tag, so pull the typed paths.
+                let typed = get_library_typed_paths(&state.app_db, &library_id).await?;
+                let typed_bases: Vec<(PathBuf, ScanKind)> = typed
+                    .iter()
+                    .map(|lp| (PathBuf::from(&lp.path), if lp.kind == "show" { ScanKind::Show } else { ScanKind::Movie }))
+                    .collect();
+                rescan_video_library(&app, &state.app_db, &library_id, &typed_bases, &cache_base).await
+            }
+            "music" => {
+                // Sounds-typed bases (sound_path rows) sound-mark everything they yield.
+                let sound_paths: std::collections::HashSet<String> = sqlx::query_as::<_, (String,)>(
+                    "SELECT path FROM sound_path WHERE library_id = ?",
+                )
+                .bind(&library_id)
+                .fetch_all(&state.app_db)
+                .await
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(|(p,)| p)
                 .collect();
-            rescan_video_library(&app, &state.app_db, &library_id, &typed_bases, &cache_base).await?
+                let base_paths: Vec<(PathBuf, bool)> = lib_paths
+                    .iter()
+                    .map(|p| (PathBuf::from(p), sound_paths.contains(p)))
+                    .collect();
+                crate::music::rescan_music_library(&app, &state.app_db, &library_id, &base_paths, &cache_base).await?;
+                // The MusicBrainz pass is NOT auto-spawned — the wizard's match
+                // step (or the metadata center) drives it, if the user elects it.
+                // Music surfaces per-file problems via music_scan_issue, not
+                // rescan warnings.
+                Ok(Vec::new())
+            }
+            _ => Err(format!("Unsupported library format: {}", format)),
         }
-        "music" => {
-            // Sounds-typed bases (sound_path rows) sound-mark everything they yield.
-            let sound_paths: std::collections::HashSet<String> = sqlx::query_as::<_, (String,)>(
-                "SELECT path FROM sound_path WHERE library_id = ?",
-            )
-            .bind(&library_id)
-            .fetch_all(&state.app_db)
-            .await
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .map(|(p,)| p)
-            .collect();
-            let base_paths: Vec<(PathBuf, bool)> = lib_paths
-                .iter()
-                .map(|p| (PathBuf::from(p), sound_paths.contains(p)))
-                .collect();
-            crate::music::rescan_music_library(&app, &state.app_db, &library_id, &base_paths, &cache_base).await?;
-            // The MusicBrainz pass is NOT auto-spawned — the wizard's match
-            // step (or the metadata center) drives it, if the user elects it.
-            // Music surfaces per-file problems via music_scan_issue, not
-            // rescan warnings.
-            Vec::new()
-        }
-        _ => return Err(format!("Unsupported library format: {}", format)),
-    };
+    }
+    .await;
 
-    Ok(warnings)
+    emit_scan_state(&app, &library_id, &lib_name, if rescan_result.is_ok() { "finished" } else { "failed" });
+    rescan_result
 }
 
 async fn rescan_video_library(
@@ -6948,7 +7437,7 @@ async fn rescan_video_library(
             .to_string_lossy()
             .to_string();
 
-        let _ = app.emit("scan-progress", &folder_name);
+        emit_scan_progress(app, library_id, &folder_name);
 
         // Per-entry isolation: a failure adding one new movie/show is recorded
         // and skipped, not propagated up to abort the whole rescan.
@@ -7756,7 +8245,7 @@ async fn scan_video_dir(
         .to_string_lossy()
         .to_string();
 
-    let _ = app.emit("scan-progress", &name);
+    emit_scan_progress(app, library_id, &name);
 
     let subdirs: Vec<_> = std::fs::read_dir(dir)
         .map_err(|e| sqlx::Error::Protocol(e.to_string()))?

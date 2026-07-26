@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
 import {
@@ -19,7 +19,7 @@ import {
   SelectContent,
   SelectItem,
 } from "@/components/ui/select";
-import { Undo2 } from "lucide-react";
+import { Undo2, X } from "lucide-react";
 
 /** Metadata editors — the user tier of the provenance model. Edits are stored
  *  as overrides in waverunner's database (files stay untouched) and survive
@@ -53,29 +53,62 @@ interface TrackEditDialogProps {
 export function TrackEditDialog({ trackId, open, onOpenChange, onSaved }: TrackEditDialogProps) {
   const [view, setView] = useState<TrackEditView | null>(null);
   const [title, setTitle] = useState("");
-  const [artistsText, setArtistsText] = useState("");
+  // One artist per row, main artist first — replaces the old free-text
+  // textarea so existing artists can be picked instead of retyped.
+  const [artistRows, setArtistRows] = useState<string[]>([""]);
   const [trackNo, setTrackNo] = useState("");
   const [discNo, setDiscNo] = useState("");
-  const [writebackAllowed, setWritebackAllowed] = useState(false);
-  const [writeToFile, setWriteToFile] = useState(false);
   const [busy, setBusy] = useState(false);
+
+  // Existing-artist suggestions for the row being typed in.
+  const [suggest, setSuggest] = useState<{ row: number; options: string[] } | null>(null);
+  const suggestSeq = useRef(0);
+  const suggestTimer = useRef<number | undefined>(undefined);
+  const queryArtists = (row: number, q: string) => {
+    window.clearTimeout(suggestTimer.current);
+    const trimmed = q.trim();
+    if (trimmed.length < 2 || trackId == null) {
+      setSuggest(null);
+      return;
+    }
+    const seq = ++suggestSeq.current;
+    suggestTimer.current = window.setTimeout(async () => {
+      try {
+        const options = await invoke<string[]>("search_track_artist_options", {
+          trackId,
+          query: trimmed,
+        });
+        if (suggestSeq.current === seq) {
+          setSuggest(options.length > 0 ? { row, options } : null);
+        }
+      } catch {
+        /* suggestions are best-effort */
+      }
+    }, 150);
+  };
+  // Hide names already taken by OTHER rows — the row being typed in must keep
+  // its own match visible, or the suggestion vanishes the moment the name is
+  // fully typed out.
+  const visibleOptions = (row: number): string[] => {
+    if (!suggest || suggest.row !== row) return [];
+    const taken = new Set(
+      artistRows.filter((_, i) => i !== row).map((a) => a.trim().toLowerCase()).filter(Boolean),
+    );
+    return suggest.options.filter((name) => !taken.has(name.toLowerCase()));
+  };
 
   useEffect(() => {
     if (!open || trackId == null) return;
     setView(null);
-    setWriteToFile(false);
+    setSuggest(null);
     (async () => {
       try {
-        const [v, settings] = await Promise.all([
-          invoke<TrackEditView>("get_track_edit", { trackId }),
-          invoke<Record<string, string>>("get_settings"),
-        ]);
+        const v = await invoke<TrackEditView>("get_track_edit", { trackId });
         setView(v);
         setTitle(v.title);
-        setArtistsText(v.credits.join("\n"));
+        setArtistRows(v.credits.length > 0 ? v.credits : [""]);
         setTrackNo(v.track_number != null ? String(v.track_number) : "");
         setDiscNo(v.disc_number != null ? String(v.disc_number) : "");
-        setWritebackAllowed(settings["allow_tag_writeback"] === "true");
       } catch (e) {
         toast.error(String(e));
         onOpenChange(false);
@@ -86,8 +119,7 @@ export function TrackEditDialog({ trackId, open, onOpenChange, onSaved }: TrackE
 
   const save = async () => {
     if (!view || trackId == null) return;
-    const artists = artistsText
-      .split("\n")
+    const artists = artistRows
       .map((s) => s.trim())
       .filter(Boolean);
     const fields: Record<string, unknown> = {};
@@ -104,10 +136,6 @@ export function TrackEditDialog({ trackId, open, onOpenChange, onSaved }: TrackE
     try {
       if (Object.keys(fields).length > 0) {
         await invoke("set_track_fields", { trackId, fields });
-      }
-      if (writeToFile) {
-        await invoke("write_track_tags", { trackId });
-        toast.success("Tags written to file");
       }
       onSaved();
       onOpenChange(false);
@@ -162,14 +190,68 @@ export function TrackEditDialog({ trackId, open, onOpenChange, onSaved }: TrackE
               )}
             </div>
             <div className="grid gap-1.5">
-              <Label htmlFor="te-artists">Artists (one per line, main artist first)</Label>
-              <textarea
-                id="te-artists"
-                value={artistsText}
-                onChange={(e) => setArtistsText(e.target.value)}
-                rows={Math.min(6, Math.max(2, artistsText.split("\n").length))}
-                className="w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-xs outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50"
-              />
+              <Label>Artists (main artist first)</Label>
+              <div className="flex flex-col gap-1">
+                {artistRows.map((name, i) => {
+                  const options = visibleOptions(i);
+                  return (
+                    <div key={i} className="flex gap-1">
+                      <div className="relative flex-1">
+                        <input
+                          value={name}
+                          onChange={(e) => {
+                            const next = artistRows.slice();
+                            next[i] = e.target.value;
+                            setArtistRows(next);
+                            queryArtists(i, e.target.value);
+                          }}
+                          // Delayed so a click on a suggestion (onMouseDown) wins the race.
+                          onBlur={() => setTimeout(() => setSuggest((s) => (s?.row === i ? null : s)), 100)}
+                          placeholder={i === 0 ? "Main artist" : "Additional artist"}
+                          className="w-full rounded border border-input bg-transparent px-2 py-1 text-sm outline-none"
+                        />
+                        {options.length > 0 && (
+                          <div className="absolute left-0 right-0 top-full z-20 mt-1 max-h-56 overflow-y-auto rounded-md border border-border bg-popover p-1 shadow-md">
+                            {options.map((option) => (
+                              <button
+                                key={option}
+                                type="button"
+                                onMouseDown={(e) => {
+                                  e.preventDefault();
+                                  const next = artistRows.slice();
+                                  next[i] = option;
+                                  setArtistRows(next);
+                                  setSuggest(null);
+                                }}
+                                className="flex w-full items-center rounded px-2 py-1 text-left text-sm hover:bg-accent"
+                              >
+                                <span className="truncate">{option}</span>
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                      {artistRows.length > 1 && (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          onClick={() => setArtistRows(artistRows.filter((_, idx) => idx !== i))}
+                        >
+                          <X size={14} />
+                        </Button>
+                      )}
+                    </div>
+                  );
+                })}
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="w-fit"
+                  onClick={() => setArtistRows([...artistRows, ""])}
+                >
+                  + Add artist
+                </Button>
+              </div>
               {ft && ft.artists.length > 0 && (
                 <p className="text-xs text-muted-foreground">File tag: {ft.artists.join(", ")}</p>
               )}
@@ -194,19 +276,8 @@ export function TrackEditDialog({ trackId, open, onOpenChange, onSaved }: TrackE
                 />
               </div>
             </div>
-            {writebackAllowed && (
-              <label className="flex cursor-pointer items-center gap-2 text-sm">
-                <input
-                  type="checkbox"
-                  checked={writeToFile}
-                  onChange={(e) => setWriteToFile(e.target.checked)}
-                />
-                Also write these tags into the file
-              </label>
-            )}
             <p className="text-xs text-muted-foreground">
-              Edits are saved in waverunner and survive rescans; your files stay untouched
-              {writebackAllowed ? " unless you tick the write option" : ""}.
+              Edits are saved in waverunner and survive rescans; your files stay untouched.
             </p>
           </div>
         )}
@@ -235,6 +306,8 @@ interface AlbumEditView {
   release_date: string | null;
   album_type: string;
   genres: string[];
+  /** Current artist credit (multi-artist rows, else the owning artist). */
+  artist_credits: string[];
   overridden: string[];
 }
 
@@ -258,11 +331,50 @@ export function AlbumEditDialog({ albumId, open, onOpenChange, onSaved }: AlbumE
   const [date, setDate] = useState("");
   const [type, setType] = useState("album");
   const [genresText, setGenresText] = useState("");
+  // Album-level artist credit rows — a joint album ("Drake & Future") lists
+  // every owner here and shows in each of their discographies.
+  const [artistRows, setArtistRows] = useState<string[]>([""]);
   const [busy, setBusy] = useState(false);
+
+  const [suggest, setSuggest] = useState<{ row: number; options: string[] } | null>(null);
+  const suggestSeq = useRef(0);
+  const suggestTimer = useRef<number | undefined>(undefined);
+  const queryArtists = (row: number, q: string) => {
+    window.clearTimeout(suggestTimer.current);
+    const trimmed = q.trim();
+    if (trimmed.length < 2 || albumId == null) {
+      setSuggest(null);
+      return;
+    }
+    const seq = ++suggestSeq.current;
+    suggestTimer.current = window.setTimeout(async () => {
+      try {
+        // Library-scoped artist suggestions; resolves via any entry id.
+        const options = await invoke<string[]>("search_artist_options", {
+          artistId: albumId,
+          query: trimmed,
+        });
+        if (suggestSeq.current === seq) {
+          setSuggest(options.length > 0 ? { row, options } : null);
+        }
+      } catch {
+        /* best-effort */
+      }
+    }, 150);
+  };
+  const visibleOptions = (row: number): string[] => {
+    if (!suggest || suggest.row !== row) return [];
+    // Other rows only — the typed row keeps its own exact match visible.
+    const taken = new Set(
+      artistRows.filter((_, i) => i !== row).map((a) => a.trim().toLowerCase()).filter(Boolean),
+    );
+    return suggest.options.filter((name) => !taken.has(name.toLowerCase()));
+  };
 
   useEffect(() => {
     if (!open || albumId == null) return;
     setView(null);
+    setSuggest(null);
     (async () => {
       try {
         const v = await invoke<AlbumEditView>("get_album_edit", { albumId });
@@ -271,6 +383,7 @@ export function AlbumEditDialog({ albumId, open, onOpenChange, onSaved }: AlbumE
         setDate(v.release_date ?? "");
         setType(v.album_type);
         setGenresText(v.genres.join("\n"));
+        setArtistRows(v.artist_credits.length > 0 ? v.artist_credits : [""]);
       } catch (e) {
         toast.error(String(e));
         onOpenChange(false);
@@ -290,6 +403,10 @@ export function AlbumEditDialog({ albumId, open, onOpenChange, onSaved }: AlbumE
       .map((s) => s.trim())
       .filter(Boolean);
     if (JSON.stringify(genres) !== JSON.stringify(view.genres)) fields.genres = genres;
+    const artists = artistRows.map((a) => a.trim()).filter(Boolean);
+    if (JSON.stringify(artists) !== JSON.stringify(view.artist_credits)) {
+      fields.artist_credits = artists;
+    }
     setBusy(true);
     try {
       if (Object.keys(fields).length > 0) {
@@ -359,6 +476,69 @@ export function AlbumEditDialog({ albumId, open, onOpenChange, onSaved }: AlbumE
                     ))}
                   </SelectContent>
                 </Select>
+              </div>
+            </div>
+            <div className="grid gap-1.5">
+              <Label>Artists (all credited owners, first is primary)</Label>
+              <div className="flex flex-col gap-1">
+                {artistRows.map((name, i) => {
+                  const options = visibleOptions(i);
+                  return (
+                    <div key={i} className="flex gap-1">
+                      <div className="relative flex-1">
+                        <input
+                          value={name}
+                          onChange={(e) => {
+                            const next = artistRows.slice();
+                            next[i] = e.target.value;
+                            setArtistRows(next);
+                            queryArtists(i, e.target.value);
+                          }}
+                          onBlur={() => setTimeout(() => setSuggest((s) => (s?.row === i ? null : s)), 100)}
+                          placeholder={i === 0 ? "Primary artist" : "Co-artist"}
+                          className="w-full rounded border border-input bg-transparent px-2 py-1 text-sm outline-none"
+                        />
+                        {options.length > 0 && (
+                          <div className="absolute left-0 right-0 top-full z-20 mt-1 max-h-56 overflow-y-auto rounded-md border border-border bg-popover p-1 shadow-md">
+                            {options.map((option) => (
+                              <button
+                                key={option}
+                                type="button"
+                                onMouseDown={(e) => {
+                                  e.preventDefault();
+                                  const next = artistRows.slice();
+                                  next[i] = option;
+                                  setArtistRows(next);
+                                  setSuggest(null);
+                                }}
+                                className="flex w-full items-center rounded px-2 py-1 text-left text-sm hover:bg-accent"
+                              >
+                                <span className="truncate">{option}</span>
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                      {artistRows.length > 1 && (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          onClick={() => setArtistRows(artistRows.filter((_, idx) => idx !== i))}
+                        >
+                          <X size={14} />
+                        </Button>
+                      )}
+                    </div>
+                  );
+                })}
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="w-fit"
+                  onClick={() => setArtistRows([...artistRows, ""])}
+                >
+                  + Add artist
+                </Button>
               </div>
             </div>
             <div className="grid gap-1.5">
@@ -539,6 +719,194 @@ export function ArtistEditDialog({ artistId, open, onOpenChange, onSaved }: Arti
           </Button>
           <Button disabled={busy || !view} onClick={save}>
             Save
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Split artist — "JAY-Z & Kanye West" is really two artists
+// ---------------------------------------------------------------------------
+
+/** Best-guess member prefill: try the explicit separators a joint name is
+ *  usually written with. The user confirms or corrects — nothing splits
+ *  without their say-so ("Earth, Wind & Fire" stays whole forever unless
+ *  they split it themselves). */
+function guessSplitMembers(name: string): string[] {
+  for (const sep of [";", " & ", " x ", " X ", ", ", " and "]) {
+    const parts = name
+      .split(sep)
+      .map((p) => p.trim())
+      .filter(Boolean);
+    if (parts.length >= 2) return parts;
+  }
+  return ["", ""];
+}
+
+/** Record a split directive for a joint-named artist entry, then kick a
+ *  rescan to migrate: albums re-home under the first member (full list as
+ *  the album's artist credit), matching track credits split, and the joint
+ *  entry sweeps away. Rescan-proof — the directive re-applies every scan. */
+export function SplitArtistDialog({
+  artistId,
+  artistName,
+  open,
+  onOpenChange,
+}: {
+  artistId: number | null;
+  artistName: string;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const [members, setMembers] = useState<string[]>(["", ""]);
+  const [busy, setBusy] = useState(false);
+
+  // Existing-artist suggestions per member row.
+  const [suggest, setSuggest] = useState<{ row: number; options: string[] } | null>(null);
+  const suggestSeq = useRef(0);
+  const suggestTimer = useRef<number | undefined>(undefined);
+  const queryArtists = (row: number, q: string) => {
+    window.clearTimeout(suggestTimer.current);
+    const trimmed = q.trim();
+    if (trimmed.length < 2 || artistId == null) {
+      setSuggest(null);
+      return;
+    }
+    const seq = ++suggestSeq.current;
+    suggestTimer.current = window.setTimeout(async () => {
+      try {
+        const options = await invoke<string[]>("search_artist_options", {
+          artistId,
+          query: trimmed,
+        });
+        if (suggestSeq.current === seq) {
+          setSuggest(options.length > 0 ? { row, options } : null);
+        }
+      } catch {
+        /* best-effort */
+      }
+    }, 150);
+  };
+  const visibleOptions = (row: number): string[] => {
+    if (!suggest || suggest.row !== row) return [];
+    // Other rows only — the typed row keeps its own exact match visible.
+    const taken = new Set(
+      members.filter((_, i) => i !== row).map((m) => m.trim().toLowerCase()).filter(Boolean),
+    );
+    return suggest.options.filter((name) => !taken.has(name.toLowerCase()));
+  };
+
+  useEffect(() => {
+    if (!open) return;
+    setMembers(guessSplitMembers(artistName));
+    setSuggest(null);
+  }, [open, artistName]);
+
+  const apply = async () => {
+    if (artistId == null) return;
+    const list = members.map((m) => m.trim()).filter(Boolean);
+    if (list.length < 2) {
+      toast.error("A split needs at least two artists");
+      return;
+    }
+    setBusy(true);
+    try {
+      const libraryId = await invoke<string>("split_artist", { artistId, members: list });
+      onOpenChange(false);
+      // The migration is a rescan — run through the wizard modal (the user
+      // can minimize it to the sidebar's progress row); the wizard's
+      // completion callback handles the post-rescan refresh.
+      window.dispatchEvent(
+        new CustomEvent("waverunner:open-rescan", { detail: { libraryId } }),
+      );
+    } catch (e) {
+      toast.error(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>Split artist</DialogTitle>
+        </DialogHeader>
+        <div className="grid gap-3">
+          <p className="text-sm text-muted-foreground">
+            <span className="font-medium text-foreground">{artistName}</span> is really these
+            artists. Their joint albums move under the first artist and credit every member;
+            matching track credits split the same way. This survives rescans.
+          </p>
+          <div className="flex flex-col gap-1">
+            {members.map((name, i) => {
+              const options = visibleOptions(i);
+              return (
+                <div key={i} className="flex gap-1">
+                  <div className="relative flex-1">
+                    <input
+                      value={name}
+                      onChange={(e) => {
+                        const next = members.slice();
+                        next[i] = e.target.value;
+                        setMembers(next);
+                        queryArtists(i, e.target.value);
+                      }}
+                      onBlur={() => setTimeout(() => setSuggest((s) => (s?.row === i ? null : s)), 100)}
+                      placeholder={i === 0 ? "First artist (owns the albums)" : "Artist"}
+                      className="w-full rounded border border-input bg-transparent px-2 py-1 text-sm outline-none"
+                    />
+                    {options.length > 0 && (
+                      <div className="absolute left-0 right-0 top-full z-20 mt-1 max-h-56 overflow-y-auto rounded-md border border-border bg-popover p-1 shadow-md">
+                        {options.map((option) => (
+                          <button
+                            key={option}
+                            type="button"
+                            onMouseDown={(e) => {
+                              e.preventDefault();
+                              const next = members.slice();
+                              next[i] = option;
+                              setMembers(next);
+                              setSuggest(null);
+                            }}
+                            className="flex w-full items-center rounded px-2 py-1 text-left text-sm hover:bg-accent"
+                          >
+                            <span className="truncate">{option}</span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  {members.length > 2 && (
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => setMembers(members.filter((_, idx) => idx !== i))}
+                    >
+                      <X size={14} />
+                    </Button>
+                  )}
+                </div>
+              );
+            })}
+            <Button
+              size="sm"
+              variant="outline"
+              className="w-fit"
+              onClick={() => setMembers([...members, ""])}
+            >
+              + Add artist
+            </Button>
+          </div>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" disabled={busy} onClick={() => onOpenChange(false)}>
+            Cancel
+          </Button>
+          <Button disabled={busy} onClick={apply}>
+            {busy ? "Splitting…" : "Split & rescan"}
           </Button>
         </DialogFooter>
       </DialogContent>

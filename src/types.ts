@@ -196,6 +196,9 @@ export interface MusicAlbumCard {
   runtime_secs: number;
   /** Owning artist — set on appears-on cards (another artist's album). */
   artist_title: string | null;
+  /** Full artist credit for the album's header line (multi-artist albums list
+   *  every owner; single-artist albums list the one). Linkable when resolved. */
+  artists: { name: string; artist_id: number | null }[];
 }
 
 export interface MusicArtistDetail {
@@ -256,10 +259,18 @@ export interface MusicAlbumDetail {
   /** null = artist-less album (no artist tags anywhere in it). */
   artist_id: number | null;
   artist_title: string | null;
+  /** Multi-artist albums: full ordered credit, each linkable when the library
+   *  has that artist. Empty = single artist (use artist_title). */
+  artist_credits: { name: string; artist_id: number | null }[];
   covers: string[];
   selected_cover: string | null;
   genres: string[];
   releases: MusicRelease[];
+  /** Sound-side entry (virtual collection) — swaps music affordances for
+   *  collection ones (move tracks between collections, etc.). */
+  is_sound: boolean;
+  /** Owning library — collection dialogs are library-scoped. */
+  library_id: string;
 }
 
 // A file the scanner could not read at all (get_music_scan_issues).
@@ -439,6 +450,24 @@ export interface PersonInfo {
   id: number;
   name: string;
   image_path: string | null;
+}
+
+// Full person record for the person-detail header (biography rides in person_meta).
+export interface PersonDetail {
+  id: number;
+  name: string;
+  image_path: string | null;
+  tmdb_id: number | null;
+  biography: string | null;
+}
+
+// One hit from search_tmdb_person (match dialog / cast-editor TMDB source).
+export interface TmdbPersonSearchResult {
+  id: number;
+  name: string;
+  profile_path: string | null;
+  known_for_department: string | null;
+  known_for_summary: string | null;
 }
 
 // Returned by search_people_by_character (people-page search by character name).

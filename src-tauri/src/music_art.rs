@@ -237,7 +237,7 @@ pub async fn fetch_artist_images(
         }
         let _ = app.emit(
             "music-enrich-progress",
-            serde_json::json!({ "phase": "artist-images", "done": i, "total": total, "name": title }),
+            serde_json::json!({ "libraryId": library_id, "phase": "artist-images", "done": i, "total": total, "name": title }),
         );
         if artist_has_image(pool, library_id, artist_id, &folder_path, selected_cover.as_deref()).await? {
             stamp(pool, artist_id, "has-own").await?;
