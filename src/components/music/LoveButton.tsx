@@ -22,15 +22,24 @@ export function currentLoved(trackId: number, fallback: boolean): boolean {
 export function setTrackLoved(trackId: number, loved: boolean): void {
   overrides.set(trackId, loved);
   notify();
-  invoke("set_track_loved", { trackId, loved }).catch(() => {
-    overrides.set(trackId, !loved);
-    notify();
-  });
+  invoke("set_track_loved", { trackId, loved })
+    .then(() => {
+      // The write landed — surfaces showing loved AGGREGATES (the artists
+      // grid's "N loved" subtitles and Most-loved order) refresh off this;
+      // per-track hearts already update through the override store above.
+      window.dispatchEvent(
+        new CustomEvent("waverunner:loved-changed", { detail: { trackId } }),
+      );
+    })
+    .catch(() => {
+      overrides.set(trackId, !loved);
+      notify();
+    });
 }
 
 /** Live loved state for a track: the override when one exists, else the
  *  caller's fetched snapshot. Re-renders on any toggle anywhere. */
-function useLoved(trackId: number, fallback: boolean): boolean {
+export function useLoved(trackId: number, fallback: boolean): boolean {
   const [, bump] = useState(0);
   useEffect(() => {
     const l = () => bump((n) => n + 1);

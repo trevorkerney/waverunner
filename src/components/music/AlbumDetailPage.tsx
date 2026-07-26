@@ -191,11 +191,11 @@ export function AlbumDetailPage({
           <img
             src={getFullCoverUrl(cover)}
             alt=""
-            className="h-80 w-80 shrink-0 rounded-md object-cover shadow-md"
+            className="h-80 w-80 shrink-0 rounded-[3px] object-cover shadow-md"
             draggable={false}
           />
         ) : (
-          <div className="flex h-80 w-80 shrink-0 items-center justify-center rounded-md bg-muted text-muted-foreground">
+          <div className="flex h-80 w-80 shrink-0 items-center justify-center rounded-[3px] bg-muted text-muted-foreground">
             <Disc3 size={56} />
           </div>
         )}

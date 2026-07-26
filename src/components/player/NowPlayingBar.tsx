@@ -1,8 +1,9 @@
 import { useState, useRef, useEffect, useSyncExternalStore, type ReactNode } from "react";
-import { convertFileSrc } from "@tauri-apps/api/core";
-import { Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, X, Music2, ChevronUp, ChevronDown, Shuffle, Repeat, Repeat1, ListMusic } from "lucide-react";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, X, Music2, ChevronUp, ChevronDown, Shuffle, Repeat, Repeat1, ListMusic, Heart } from "lucide-react";
 import { Slider } from "../ui/slider";
 import { MusicPlayerState, MusicPlayerActions, currentMusicItem } from "../../hooks/useMusicPlayer";
+import { useLoved } from "../music/LoveButton";
 import { UpNextPanel } from "./UpNextPanel";
 
 const MARQUEE_PX_PER_SEC = 40;
@@ -127,6 +128,29 @@ export function NowPlayingBar({ state, actions, hidden, onOpenAlbum, onOpenArtis
   const volumeDragRef = useRef<number | null>(null);
   const [queueOpen, setQueueOpen] = useState(false);
 
+  // Loved heart beside the title — display only. Queue items don't carry
+  // loved state, so a per-track snapshot is fetched; the session override
+  // store keeps it live when the track is (un)loved anywhere in the app.
+  const currentTrackId = currentMusicItem(state)?.trackId ?? null;
+  const [lovedSnapshot, setLovedSnapshot] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    setLovedSnapshot(false);
+    if (currentTrackId != null) {
+      invoke<boolean>("get_track_loved", { trackId: currentTrackId })
+        .then((v) => {
+          if (!cancelled) setLovedSnapshot(v);
+        })
+        .catch(() => {
+          /* heart is decorative — stay hidden on failure */
+        });
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [currentTrackId]);
+  const loved = useLoved(currentTrackId ?? -1, lovedSnapshot);
+
   if (!state.isActive || hidden) return null;
 
   const current = currentMusicItem(state);
@@ -201,21 +225,32 @@ export function NowPlayingBar({ state, actions, hidden, onOpenAlbum, onOpenArtis
           )}
         </div>
         <div className="min-w-0 flex-1">
-          <MarqueeText text={current.title} className="text-sm font-medium">
-            {current.albumId != null && onOpenAlbum ? (
-              <span
-                role="link"
-                className="cursor-pointer hover:underline"
-                onClick={() =>
-                  onOpenAlbum(current.albumId!, current.albumTitle ?? current.title, current.trackId)
-                }
-              >
-                {current.title}
-              </span>
-            ) : (
-              current.title
+          {/* Heart AFTER the marquee container: short titles get it right
+              beside the text, overflowing ones keep it pinned at the end
+              while the title scrolls. Indicator only — not a button. */}
+          <div className="flex min-w-0 items-center gap-1.5">
+            <MarqueeText text={current.title} className="text-sm font-medium">
+              {current.albumId != null && onOpenAlbum ? (
+                <span
+                  role="link"
+                  className="cursor-pointer hover:underline"
+                  onClick={() =>
+                    onOpenAlbum(current.albumId!, current.albumTitle ?? current.title, current.trackId)
+                  }
+                >
+                  {current.title}
+                </span>
+              ) : (
+                current.title
+              )}
+            </MarqueeText>
+            {loved && (
+              // Nudged up 1px: flex centering aligns to the full line box
+              // (descenders included), which reads visually low — this centers
+              // the heart on the letterforms' cap/x-height band instead.
+              <Heart size={10} fill="currentColor" className="shrink-0 -translate-y-px text-rose-500" />
             )}
-          </MarqueeText>
+          </div>
           {subtitle && (
             <MarqueeText text={subtitle} className="text-xs text-muted-foreground">
               {current.artistName

@@ -234,6 +234,7 @@ pub fn run() {
             music::get_music_tag_fallbacks,
             music::set_track_loved,
             music::get_artist_loved_counts,
+            music::get_track_loved,
             music::get_track_queue_items,
             music::list_sound_collections,
             music::create_sound_collection,

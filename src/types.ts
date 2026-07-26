@@ -18,6 +18,9 @@ export interface EntriesResponse {
   format: string;
   selected_preset_id: number | null;
   presets: SortPreset[];
+  /** Albums/Sounds views only: loose-track count for the header button —
+   *  riding the grid payload keeps the button in the grid's render commit. */
+  loose_count?: number | null;
 }
 
 export interface SortPreset {
@@ -142,6 +145,7 @@ export type ViewSpec =
   | { kind: "albums";             libraryId: string }
   | { kind: "sounds";             libraryId: string }
   | { kind: "tracks";             libraryId: string }
+  | { kind: "loose-tracks";       libraryId: string; sounds: boolean }
   | { kind: "music-issues";       libraryId: string };
 
 // One node in the static complication tree shown for a library.

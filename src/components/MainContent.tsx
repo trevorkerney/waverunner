@@ -140,6 +140,7 @@ import { AlbumDetailPage } from "@/components/music/AlbumDetailPage";
 import { MusicIssuesPage } from "@/components/music/MusicIssuesPage";
 import { TracksPage } from "@/components/music/TracksPage";
 import { LooseTracksSection } from "@/components/music/LooseTracksSection";
+import { LooseTracksPage } from "@/components/music/LooseTracksPage";
 import { NewSoundCollectionDialog } from "@/components/music/MoveToCollectionDialog";
 
 function letterForTitle(title: string): string {
@@ -226,6 +227,11 @@ interface MainContentProps {
   /** Sound collections were created/deleted/re-membered — the host drops its
    *  caches and refreshes the grid in place. */
   onSoundCollectionsChanged?: (libraryId: string) => void;
+  /** Open the Loose-tracks page for a library (music or sounds side). */
+  onOpenLooseTracks?: (libraryId: string, sounds: boolean) => void;
+  /** Loose-track count for the Albums/Sounds header button — rides the grid
+   *  payload/cache so the button renders in the same commit as the grid. */
+  looseCount?: number | null;
   onBreadcrumbClick: (index: number) => void;
   selectedLibrary: Library | null;
   hasLibraries: boolean;
@@ -305,6 +311,8 @@ export function MainContent({
   onNavigateToPlaylist,
   onPlaylistChanged,
   onSoundCollectionsChanged,
+  onOpenLooseTracks,
+  looseCount,
   onBreadcrumbClick,
   selectedLibrary,
   hasLibraries,
@@ -1134,6 +1142,51 @@ export function MainContent({
     );
   }
 
+  if (activeView?.kind === "loose-tracks") {
+    return (
+      <main className="flex flex-1 flex-col overflow-hidden bg-background">
+        {breadcrumbBar}
+        {/* relative: the page's loading spinner centers absolutely over this box */}
+        {/* p-4 matches the generic detail container the album/collection
+            pages render in, so this page sits identically in the frame. */}
+        <div ref={scrollContainerRef} className="relative flex min-h-0 flex-1 flex-col overflow-y-auto p-4">
+          <LooseTracksPage
+            libraryId={activeView.libraryId}
+            sounds={activeView.sounds}
+            focusRequest={musicTracksFocusRequest ?? null}
+            onPlayQueue={(items, startIndex) => onPlayMusicQueue?.(items, startIndex)}
+            currentTrackId={musicCurrentTrackId ?? null}
+            playing={musicPlaying ?? false}
+            onPlaylistsChanged={() => onPlaylistChanged(activeView.libraryId)}
+            onEnqueue={onEnqueueMusic}
+            onCollectionsChanged={() => onSoundCollectionsChanged?.(activeView.libraryId)}
+            onNavigateToArtist={(artistId, artistTitle) => onNavigate({
+              id: artistId,
+              title: artistTitle,
+              year: null,
+              end_year: null,
+              folder_path: "",
+              parent_id: null,
+              entry_type: "artist",
+              covers: [],
+              selected_cover: null,
+              child_count: 0,
+              season_display: null,
+              collection_display: null,
+              tmdb_id: null,
+              link_id: null,
+              interactive: false,
+              watched: false,
+              watch_progress: null,
+              unwatched: false,
+              has_progress: false,
+            })}
+          />
+        </div>
+      </main>
+    );
+  }
+
   if (activeView?.kind === "playlists") {
     return (
       <PlaylistsView
@@ -1476,43 +1529,19 @@ export function MainContent({
       ) : (
       <ContextMenu>
         <ContextMenuTrigger render={<div className="flex min-h-full flex-col" />}>
-        {/* Albums page: album-less tracks get a flat list above the grid —
+        {/* Albums page: album-less tracks get a header button above the grid —
             their hidden containers never surface as cards, so this is their
-            only album-side home. The Sounds page gets the same section for its
-            loose pool (base-root + misc-folder files), with add-to-collection.
-            Renders nothing when the library has none. */}
-        {(activeView?.kind === "albums" || activeView?.kind === "sounds") && !searchResults && !loading && selectedLibrary && (
+            only album-side entrance. The Sounds page gets the same button for
+            its loose pool (base-root + misc-folder files). Hidden at zero. */}
+        {/* The count arrives IN the grid payload (and its cache), so this
+            renders in the exact same commit as the grid — no separate fetch,
+            no pop-in either direction. */}
+        {(activeView?.kind === "albums" || activeView?.kind === "sounds") && !searchResults && selectedLibrary && (
           <LooseTracksSection
-            sounds={activeView.kind === "sounds"}
-            onCollectionsChanged={() => onSoundCollectionsChanged?.(activeView.libraryId)}
-            libraryId={activeView.libraryId}
-            onPlayQueue={(items, startIndex) => onPlayMusicQueue?.(items, startIndex)}
-            currentTrackId={musicCurrentTrackId ?? null}
-            playing={musicPlaying ?? false}
-            onEnqueue={onEnqueueMusic}
-            onPlaylistsChanged={() => onPlaylistChanged(activeView.libraryId)}
-            getCoverUrl={getCoverUrl}
-            onNavigateToArtist={(artistId, artistTitle) => onNavigate({
-              id: artistId,
-              title: artistTitle,
-              year: null,
-              end_year: null,
-              folder_path: "",
-              parent_id: null,
-              entry_type: "artist",
-              covers: [],
-              selected_cover: null,
-              child_count: 0,
-              season_display: null,
-              collection_display: null,
-              tmdb_id: null,
-              link_id: null,
-              interactive: false,
-              watched: false,
-              watch_progress: null,
-              unwatched: false,
-              has_progress: false,
-            })}
+            count={looseCount ?? 0}
+            onOpen={() =>
+              onOpenLooseTracks?.(activeView.libraryId, activeView.kind === "sounds")
+            }
           />
         )}
         {!selectedLibrary ? (

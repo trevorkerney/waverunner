@@ -3851,8 +3851,9 @@ pub async fn get_music_counts(
     state: State<'_, AppState>,
     library_id: String,
 ) -> Result<MusicCounts, String> {
-    // Sound-marked content lives on its own node: the sounds count, excluded
-    // from artists/albums/tracks (an all-sounds artist hides from the grid).
+    // Sound-marked content lives on its own node: the sounds count is TOTAL
+    // sound tracks (every collection plus the loose pool — not collections),
+    // and it's excluded from artists/albums/tracks.
     let (artists, albums, tracks, sounds): (i64, i64, i64, i64) = sqlx::query_as(
         "SELECT
             COALESCE(SUM(CASE WHEN met.name = 'artist'
@@ -3867,9 +3868,8 @@ pub async fn get_music_counts(
             COALESCE(SUM(CASE WHEN met.name = 'track'
                 AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = me.parent_id)
                 THEN 1 ELSE 0 END), 0),
-            COALESCE(SUM(CASE WHEN met.name = 'album'
-                AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = me.id)
-                AND EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = me.id)
+            COALESCE(SUM(CASE WHEN met.name = 'track'
+                AND EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = me.parent_id)
                 THEN 1 ELSE 0 END), 0)
          FROM media_entry me
          JOIN media_entry_type met ON met.id = me.entry_type_id
@@ -4204,6 +4204,22 @@ pub(crate) async fn artist_loved_counts(
     .fetch_all(pool)
     .await
     .map_err(|e| e.to_string())
+}
+
+/// Loved snapshot for one track — the now-playing bar's heart indicator
+/// (queue items don't carry loved state; toggles stay live via the frontend
+/// override store on top of this).
+#[tauri::command]
+pub async fn get_track_loved(
+    state: State<'_, AppState>,
+    track_id: i64,
+) -> Result<bool, String> {
+    sqlx::query_as::<_, (i64,)>("SELECT EXISTS(SELECT 1 FROM track_loved WHERE track_id = ?)")
+        .bind(track_id)
+        .fetch_one(&state.app_db)
+        .await
+        .map(|(v,)| v != 0)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

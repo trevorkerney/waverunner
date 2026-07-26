@@ -103,6 +103,9 @@ function App() {
   const [sortMode, setSortMode] = useState("alpha");
   const [selectedPresetId, setSelectedPresetId] = useState<number | null>(null);
   const [presets, setPresets] = useState<SortPreset[]>([]);
+  // Albums/Sounds views: loose-track count for the header button — delivered
+  // in the grid payload/cache so button and grid render in one commit.
+  const [looseCount, setLooseCount] = useState<number | null>(null);
   const [coverSize, setCoverSize] = useState(200);
   const coverSizeTimerRef = useRef<number | null>(null);
   const [search, setSearch] = useState("");
@@ -210,9 +213,9 @@ function App() {
   }, [playerState.isActive]);
 
   // Cache: "libraryId:parentId" -> { entries, sortMode } (library-root view only)
-  const entryCacheRef = useRef<Map<string, { entries: MediaEntry[]; sort_mode: string; selected_preset_id: number | null; presets: SortPreset[] }>>(new Map());
+  const entryCacheRef = useRef<Map<string, { entries: MediaEntry[]; sort_mode: string; selected_preset_id: number | null; presets: SortPreset[]; loose_count?: number | null }>>(new Map());
   // Cache: viewCacheKey(view) -> entries (non-root MediaEntry views: movies-only / shows-only / person-detail)
-  const viewEntriesCacheRef = useRef<Map<string, { entries: MediaEntry[]; sort_mode: string; selected_preset_id: number | null; presets: SortPreset[] }>>(new Map());
+  const viewEntriesCacheRef = useRef<Map<string, { entries: MediaEntry[]; sort_mode: string; selected_preset_id: number | null; presets: SortPreset[]; loose_count?: number | null }>>(new Map());
   // Cache: viewCacheKey(view) -> people (people-list views)
   const peopleCacheRef = useRef<Map<string, PersonSummary[]>>(new Map());
   // Top-100/All mode per people view (keyed by viewCacheKey). Persisted to the settings
@@ -742,7 +745,7 @@ function App() {
       // (HomePage / MusicIssuesPage / TracksPage) — just clear grid state.
       // Scroll restores like any grid (the restore waits out the self-fetch);
       // Home is libraryless and keys under a fixed "home" prefix.
-      if (view.kind === "home" || view.kind === "music-issues" || view.kind === "tracks") {
+      if (view.kind === "home" || view.kind === "music-issues" || view.kind === "tracks" || view.kind === "loose-tracks") {
         setEntries([]);
         setPeople(null);
         setPlaylists(null);
@@ -873,6 +876,7 @@ function App() {
         setSortMode(cached.sort_mode);
         setSelectedPresetId(cached.selected_preset_id);
         setPresets(cached.presets);
+        setLooseCount(cached.loose_count ?? null);
         setBreadcrumbs(breadcrumb);
         if (restoreScroll) restoreScrollPosition(view.libraryId, scrollKindFor(view), breadcrumb[breadcrumb.length - 1]?.id ?? null);
         else resetScrollToTop();
@@ -886,6 +890,9 @@ function App() {
         setBreadcrumbs(breadcrumb);
         setEntries([]);
         setLoading(true);
+        // A stale count from the previous grid must not linger under the
+        // spinner — the button reappears with the new grid's data.
+        setLooseCount(null);
         // This view's persisted sort rides in the response — until it lands the
         // mode is UNKNOWN, and showing the previous view's (or the "alpha"
         // default) flashes a wrong label in the toolbar. "" renders as a
@@ -897,6 +904,7 @@ function App() {
         let sort_mode: string;
         let selected_preset_id: number | null = null;
         let view_presets: SortPreset[] = [];
+        let loose_count: number | null = null;
         switch (view.kind) {
           case "library-root": {
             const res = await invoke<EntriesResponse>("get_entries", {
@@ -926,6 +934,7 @@ function App() {
             sort_mode = res.sort_mode;
             selected_preset_id = res.selected_preset_id;
             view_presets = res.presets;
+            loose_count = res.loose_count ?? null;
             break;
           }
           case "person-detail": {
@@ -960,12 +969,13 @@ function App() {
           }
         }
         await preloadCovers(entries);
-        cache.set(cacheKey, { entries, sort_mode, selected_preset_id, presets: view_presets });
+        cache.set(cacheKey, { entries, sort_mode, selected_preset_id, presets: view_presets, loose_count });
         if (stale()) return;
         setEntries(entries);
         setSortMode(sort_mode);
         setSelectedPresetId(selected_preset_id);
         setPresets(view_presets);
+        setLooseCount(loose_count);
         // In-place refreshes never touch the scroll: the grid stayed mounted and
         // the user may be mid-page — restoring a stale saved offset would jump.
         if (!inPlace) {
@@ -1093,7 +1103,9 @@ function App() {
         viewEntriesCacheRef.current.set(viewCacheKey(view), {
           entries: fresh, sort_mode: fresh_sort,
           selected_preset_id: fresh_selected_preset_id, presets: fresh_presets,
+          loose_count: res.loose_count ?? null,
         });
+        setLooseCount(res.loose_count ?? null);
       } else if (view.kind === "person-detail") {
         fresh = await invoke<MediaEntry[]>("get_entries_for_person", {
           libraryId: view.libraryId,
@@ -1260,19 +1272,28 @@ function App() {
     [libraries, saveScrollPosition, scanningLibs]
   );
 
-  // Album-less recently-played tiles land on the Tracks page instead (there
-  // is no album page for them) — scrolled to the track and highlighted.
+  // Album-less recently-played tiles land on the LOOSE TRACKS page (their
+  // album-side home) — scrolled to the track and highlighted. Chain roots
+  // under Albums, matching the page's normal entrance.
   const openTrackFromHome = useCallback(
     (libraryId: string, trackId: number) => {
       const lib = libraries.find((l) => l.id === libraryId);
       if (!lib || lib.setup_stage || scanningLibs.has(libraryId)) return;
       saveScrollPosition(); // Home's scroll, for the return trip
-      const view: ViewSpec = { kind: "tracks", libraryId };
+      const view: ViewSpec = { kind: "loose-tracks", libraryId, sounds: false };
       setActiveView(view);
       setSelectedEntry(null);
       setSearch("");
       pushHistory();
-      setBreadcrumbs([{ id: null, title: `${lib.name} - Tracks`, view }]);
+      setBreadcrumbs([
+        {
+          id: null,
+          title: `${lib.name} - Albums`,
+          view: { kind: "albums", libraryId },
+          synthetic: true,
+        },
+        { id: null, title: "Loose tracks", view },
+      ]);
       musicFocusNonceRef.current += 1;
       setTracksFocusRequest({ trackId, nonce: musicFocusNonceRef.current });
     },
@@ -1546,6 +1567,94 @@ function App() {
     [breadcrumbs, loadView, collapseLoop, saveScrollPosition]
   );
 
+  // Loose-tracks page (Albums/Sounds header button): appended to the current
+  // chain like a genre — "Music - Albums > Loose tracks"; back returns to the
+  // grid via the history stack.
+  const openLooseTracks = useCallback(
+    (libraryId: string, sounds: boolean) => {
+      if (
+        activeView?.kind === "loose-tracks" &&
+        activeView.libraryId === libraryId &&
+        activeView.sounds === sounds
+      ) {
+        return; // already there
+      }
+      saveScrollPosition();
+      const view: ViewSpec = { kind: "loose-tracks", libraryId, sounds };
+      const newBreadcrumbs: BreadcrumbItem[] = [
+        ...breadcrumbs,
+        { id: null, title: "Loose tracks", view },
+      ];
+      setActiveView(view);
+      setSelectedEntry(null);
+      setSearch("");
+      pushHistory();
+      loadView(view, null, newBreadcrumbs, false);
+    },
+    [activeView, breadcrumbs, loadView, saveScrollPosition]
+  );
+
+  // Loving a track changes the artists grid's loved AGGREGATES ("N loved"
+  // subtitles, Most-loved order) which are baked into the cached grid.
+  // Debounced refetch straight into the cache (and the live grid when the
+  // artists page is the current view), so returning to the grid is instant
+  // AND fresh. Listener attaches once; live state comes through a ref.
+  const lovedCtxRef = useRef<{ lib: Library | null; view: ViewSpec | null }>({
+    lib: null,
+    view: null,
+  });
+  lovedCtxRef.current = { lib: selectedLibrary, view: activeView };
+  useEffect(() => {
+    let timer: number | undefined;
+    let lastTrackId: number | null = null;
+    const onLoved = (e: Event) => {
+      lastTrackId = (e as CustomEvent<{ trackId: number }>).detail?.trackId ?? null;
+      window.clearTimeout(timer);
+      timer = window.setTimeout(async () => {
+        const { lib } = lovedCtxRef.current;
+        const target = lib && lib.format === "music" ? lib : null;
+        if (!target) {
+          // Loved from outside a music library (e.g. Home's recently played):
+          // resolve the owning library and just drop its cached artists grid —
+          // the next visit refetches fresh.
+          if (lastTrackId == null) return;
+          try {
+            const libId = await invoke<string | null>("get_entry_library", {
+              entryId: lastTrackId,
+            });
+            if (libId) entryCacheRef.current.delete(`${libId}:null`);
+          } catch {
+            /* best-effort */
+          }
+          return;
+        }
+        try {
+          const res = await invoke<EntriesResponse>("get_entries", {
+            libraryId: target.id,
+            parentId: null,
+          });
+          entryCacheRef.current.set(`${target.id}:null`, {
+            entries: res.entries,
+            sort_mode: res.sort_mode,
+            selected_preset_id: res.selected_preset_id,
+            presets: res.presets,
+          });
+          const v = lovedCtxRef.current.view;
+          if (v?.kind === "library-root" && v.libraryId === target.id) {
+            setEntries(res.entries);
+          }
+        } catch {
+          /* best-effort — worst case the grid stays a refetch behind */
+        }
+      }, 500);
+    };
+    window.addEventListener("waverunner:loved-changed", onLoved);
+    return () => {
+      window.clearTimeout(timer);
+      window.removeEventListener("waverunner:loved-changed", onLoved);
+    };
+  }, []);
+
   const navigateTo = useCallback(
     (entry: MediaEntry) => {
       if (!selectedLibrary) return;
@@ -1610,7 +1719,7 @@ function App() {
         // at the library root so the detail page actually renders.
         if (
           activeView &&
-          ["people-list", "people-all", "genres", "playlists", "tracks", "music-issues"].includes(
+          ["people-list", "people-all", "genres", "playlists", "tracks", "loose-tracks", "music-issues"].includes(
             activeView.kind,
           )
         ) {
@@ -2839,6 +2948,8 @@ function App() {
             window.dispatchEvent(new Event("waverunner:library-rescanned"));
             refreshMusicCountsFor(libId);
           }}
+          onOpenLooseTracks={openLooseTracks}
+          looseCount={looseCount}
           onBreadcrumbClick={navigateBreadcrumb}
           selectedLibrary={selectedLibrary}
           hasLibraries={libraries.length > 0}

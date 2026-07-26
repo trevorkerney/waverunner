@@ -191,6 +191,7 @@ export function viewCacheKey(view: ViewSpec): string {
     case "albums":             return `${view.libraryId}:albums`;
     case "sounds":             return `${view.libraryId}:sounds`;
     case "tracks":             return `${view.libraryId}:tracks`;
+    case "loose-tracks":       return `${view.libraryId}:loose:${view.sounds ? "sounds" : "music"}`;
     case "music-issues":       return `${view.libraryId}:music-issues`;
   }
 }
@@ -223,6 +224,7 @@ export function scopeKeyFor(view: ViewSpec, parentId: number | null): string | n
     case "albums":
     case "sounds":
     case "tracks":
+    case "loose-tracks":
     case "music-issues":
       return null;
   }

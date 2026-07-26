@@ -140,6 +140,11 @@ pub struct EntriesResponse {
     pub selected_preset_id: Option<i64>,
     /// All presets saved at this scope, alpha of creation.
     pub presets: Vec<SortPresetSummary>,
+    /// Albums/Sounds views only: loose-track count for the header button —
+    /// rides the grid payload so the button renders WITH the grid (a separate
+    /// fetch pops in on its own beat). None everywhere else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loose_count: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1346,6 +1351,7 @@ pub async fn get_entries(
                 format,
                 selected_preset_id,
                 presets,
+                loose_count: None,
             }
         }
         "music" => {
@@ -1443,12 +1449,30 @@ pub async fn get_entries(
                         }
                     })
                     .collect();
+                // Loose-track count rides along so the header button renders
+                // in the same commit as the grid.
+                let loose_marker = if sounds {
+                    "AND EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = me.parent_id)"
+                } else {
+                    "AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = me.parent_id)"
+                };
+                let (loose_count,): (i64,) = sqlx::query_as(&format!(
+                    "SELECT COUNT(*) FROM track t \
+                     JOIN media_entry me ON me.id = t.id \
+                     JOIN loose_album la ON la.album_id = me.parent_id \
+                     WHERE me.library_id = ? {loose_marker}",
+                ))
+                .bind(&library_id)
+                .fetch_one(&state.app_db)
+                .await
+                .map_err(|e| e.to_string())?;
                 return Ok(EntriesResponse {
                     entries,
                     sort_mode,
                     format,
                     selected_preset_id: None,
                     presets: Vec::new(),
+                    loose_count: Some(loose_count),
                 });
             }
 
@@ -1553,6 +1577,26 @@ pub async fn get_entries(
             .map_err(|e| e.to_string())?;
             let appears_by_artist: std::collections::HashMap<i64, i64> =
                 appears_rows.into_iter().collect();
+            // Album-less tracks under the artist's hidden loose container
+            // (music side only) — a subtitle part in alpha/credits modes and
+            // 1 point each in the credited score, so loose-only artists
+            // aren't blank-and-bottom.
+            let loose_rows: Vec<(i64, i64)> = sqlx::query_as(
+                "SELECT alme.parent_id, COUNT(*) \
+                 FROM track t \
+                 JOIN media_entry me ON me.id = t.id \
+                 JOIN media_entry alme ON alme.id = me.parent_id \
+                 JOIN loose_album la ON la.album_id = alme.id \
+                 WHERE me.library_id = ? AND alme.parent_id IS NOT NULL \
+                   AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = alme.id) \
+                 GROUP BY alme.parent_id",
+            )
+            .bind(&library_id)
+            .fetch_all(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+            let loose_by_artist: std::collections::HashMap<i64, i64> =
+                loose_rows.into_iter().collect();
             let works_display = |id: i64| -> Option<String> {
                 let mut parts: Vec<String> = Vec::new();
                 if let Some(counts) = counts_by_artist.get(&id) {
@@ -1574,18 +1618,32 @@ pub async fn get_entries(
                         parts.push(format!("{n} appearance{}", if *n == 1 { "" } else { "s" }));
                     }
                 }
+                if let Some(n) = loose_by_artist.get(&id) {
+                    if *n > 0 {
+                        parts.push(format!("{n} loose track{}", if *n == 1 { "" } else { "s" }));
+                    }
+                }
                 if parts.is_empty() { None } else { Some(parts.join(" · ")) }
             };
 
-            // Total works (own + appears-on) rides on child_count so the
-            // frontend can re-sort locally on a mode switch (People-page
-            // snappiness) instead of refetching.
+            // Weighted credited score, riding on child_count so the frontend
+            // can re-sort locally on a mode switch (People-page snappiness)
+            // instead of refetching: albums/EPs/compilations 5 points each,
+            // singles/appearances/loose tracks 1 each — a discography can't
+            // be outranked by a pile of features, but feature-only and
+            // loose-only artists still rank above true zeroes.
             let total_works = |id: i64| -> i64 {
-                counts_by_artist
+                let releases: i64 = counts_by_artist
                     .get(&id)
-                    .map(|v| v.iter().map(|(_, n)| *n).sum::<i64>())
-                    .unwrap_or(0)
+                    .map(|v| {
+                        v.iter()
+                            .map(|(ty, n)| if ty == "single" { *n } else { *n * 5 })
+                            .sum::<i64>()
+                    })
+                    .unwrap_or(0);
+                releases
                     + appears_by_artist.get(&id).copied().unwrap_or(0)
+                    + loose_by_artist.get(&id).copied().unwrap_or(0)
             };
 
             // Loved-track counts feed the "loved" sort AND two subtitle variants.
@@ -1611,6 +1669,10 @@ pub async fn get_entries(
                 }
                 if appears > 0 {
                     parts.push(format!("{appears} appearance{}", if appears == 1 { "" } else { "s" }));
+                }
+                let loose = loose_by_artist.get(&id).copied().unwrap_or(0);
+                if loose > 0 {
+                    parts.push(format!("{loose} loose track{}", if loose == 1 { "" } else { "s" }));
                 }
                 if loved > 0 {
                     parts.push(format!("{loved} loved"));
@@ -1685,6 +1747,7 @@ pub async fn get_entries(
                 format,
                 selected_preset_id: None,
                 presets: Vec::new(),
+                loose_count: None,
             }
         }
         _ => {

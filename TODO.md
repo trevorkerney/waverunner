@@ -7,7 +7,7 @@
 
 ## bugs / needs fixing
 
-WHOLE MUSIC SECTION NEEDS CONTEXT MENU IMPROVEMENTS
+WHOLE MUSIC SECTION NEEDS CONTEXT MENU IMPROVEMENTS (alpha.12.5)
 
 
 ## changes / small new features

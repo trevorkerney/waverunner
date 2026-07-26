@@ -57,9 +57,13 @@ export function trackDisplayTitle(title: string, filePath: string): string {
 
 export function fmtTrackTime(secs: number | null): string {
   if (secs == null || secs <= 0) return "–:––";
-  const m = Math.floor(secs / 60);
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
   const s = Math.floor(secs % 60);
-  return `${m}:${String(s).padStart(2, "0")}`;
+  // Hour-long tracks (10-hour rain recordings) read as 10:00:30, not 600:30.
+  return h > 0
+    ? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`
+    : `${m}:${String(s).padStart(2, "0")}`;
 }
 
 export function fmtAlbumRuntime(secs: number): string {
