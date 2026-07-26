@@ -1,4 +1,4 @@
-﻿{
+{
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "waverunner",
   "version": "1.0.0-alpha.12.3",

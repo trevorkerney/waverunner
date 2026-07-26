@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "waverunner"
 version = "1.0.0-alpha.12.3"
 description = "Media library"
