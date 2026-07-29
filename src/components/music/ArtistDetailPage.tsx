@@ -15,6 +15,7 @@ import {
   ContextMenuItem,
 } from "../ui/context-menu";
 import { TrackEditDialog, ArtistEditDialog, SplitArtistDialog } from "./EditDialogs";
+import { MatchDialog, MbStatusChip } from "./MatchDialog";
 import { PlayingIndicator } from "./PlayingIndicator";
 import { LoveButton, LoveMenuItem } from "./LoveButton";
 import { MusicArtistDetail, MusicAlbumCard, MusicAlbumDetail, MusicQueueItem, MusicTrack } from "../../types";
@@ -75,6 +76,10 @@ export function ArtistDetailPage({
   const [editTrackId, setEditTrackId] = useState<number | null>(null);
   const [editArtistOpen, setEditArtistOpen] = useState(false);
   const [splitArtistOpen, setSplitArtistOpen] = useState(false);
+  // MusicBrainz matching for this artist, plus a nonce so the chip refetches.
+  const [matchOpen, setMatchOpen] = useState(false);
+  const [matchTrack, setMatchTrack] = useState<number | null>(null);
+  const [mbKey, setMbKey] = useState(0);
   const [reloadKey, setReloadKey] = useState(0);
   const [viewMode, setViewMode] = useState<"grid" | "list">(cachedArtistView ?? "grid");
   const [sortDir, setSortDir] = useState<"date" | "date-desc">(cachedArtistSort ?? "date");
@@ -508,6 +513,14 @@ export function ArtistDetailPage({
               .filter(Boolean)
               .join(" · ")}
           </p>
+          <div className="mt-1.5">
+            <MbStatusChip
+              kind="artist"
+              entityId={detail.id}
+              reloadKey={mbKey}
+              onClick={() => setMatchOpen(true)}
+            />
+          </div>
           {detail.biography && (
             <p className="mt-2 line-clamp-3 max-w-2xl whitespace-pre-line text-sm text-muted-foreground" title={detail.biography}>
               {detail.biography}
@@ -660,6 +673,10 @@ export function ArtistDetailPage({
               <Pencil size={14} />
               Edit metadata
             </ContextMenuItem>
+            <ContextMenuItem onClick={() => setMatchTrack(menuTrackRef.current?.id ?? null)}>
+              <Disc3 size={14} />
+              Match to MusicBrainz…
+            </ContextMenuItem>
             <LoveMenuItem
               resolve={() =>
                 menuTrackRef.current
@@ -765,6 +782,10 @@ export function ArtistDetailPage({
                     <ContextMenuItem onClick={() => setEditTrackId(t.id)}>
                       <Pencil size={14} />
                       Edit metadata
+                    </ContextMenuItem>
+                    <ContextMenuItem onClick={() => setMatchTrack(t.id)}>
+                      <Disc3 size={14} />
+                      Match to MusicBrainz…
                     </ContextMenuItem>
                     <LoveMenuItem resolve={() => ({ id: t.id, loved: t.loved })} />
                     {onAddToPlaylist && (
@@ -887,6 +908,10 @@ export function ArtistDetailPage({
                   <Pencil size={14} />
                   Edit metadata
                 </ContextMenuItem>
+                <ContextMenuItem onClick={() => setMatchTrack(menuTrackRef.current?.id ?? null)}>
+                  <Disc3 size={14} />
+                  Match to MusicBrainz…
+                </ContextMenuItem>
                 <LoveMenuItem
                   resolve={() =>
                     menuTrackRef.current
@@ -929,6 +954,28 @@ export function ArtistDetailPage({
         open={splitArtistOpen}
         onOpenChange={setSplitArtistOpen}
       />
+      <MatchDialog
+        kind="artist"
+        entityId={entryId}
+        open={matchOpen}
+        onOpenChange={setMatchOpen}
+        onChanged={() => {
+          setMbKey((k) => k + 1);
+          handleSaved();
+        }}
+      />
+      {matchTrack != null && (
+        <MatchDialog
+          kind="track"
+          entityId={matchTrack}
+          open={matchTrack != null}
+          onOpenChange={(o) => !o && setMatchTrack(null)}
+          onChanged={() => {
+            setMbKey((k) => k + 1);
+            handleSaved();
+          }}
+        />
+      )}
     </div>
   );
 }

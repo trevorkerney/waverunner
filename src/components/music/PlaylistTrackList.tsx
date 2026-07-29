@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useSortable } from "@dnd-kit/sortable";
 import { useDroppable } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
-import { Play, Folder, Pencil, ListPlus, ListX, Music2, ListStart, ListEnd } from "lucide-react";
+import { Play, Folder, Pencil, ListPlus, ListX, Music2, ListStart, ListEnd, Disc3 } from "lucide-react";
 import {
   ContextMenu,
   ContextMenuTrigger,
@@ -11,6 +11,7 @@ import {
   ContextMenuItem,
 } from "../ui/context-menu";
 import { TrackEditDialog } from "./EditDialogs";
+import { MatchDialog } from "./MatchDialog";
 import { PlayingIndicator } from "./PlayingIndicator";
 import { LoveButton, LoveMenuItem } from "./LoveButton";
 import { MediaEntry, MusicQueueItem, TrackQueueInfo } from "../../types";
@@ -117,6 +118,8 @@ export function PlaylistTrackList({
   // file paths for playback) — one batch fetch per view.
   const [infos, setInfos] = useState<Map<number, TrackQueueInfo> | null>(null);
   const [editTrackId, setEditTrackId] = useState<number | null>(null);
+  // Track being matched to MusicBrainz (its own dialog).
+  const [matchTrack, setMatchTrack] = useState<number | null>(null);
   // State (not a ref): the menu's items branch on the row's entry type.
   const [menuEntry, setMenuEntry] = useState<MediaEntry | null>(null);
   // Selection keyed by sortable id (a track linked twice = two selectable rows).
@@ -296,6 +299,10 @@ export function PlaylistTrackList({
               <Pencil size={14} />
               Edit metadata
             </ContextMenuItem>
+            <ContextMenuItem onClick={() => menuEntry && setMatchTrack(menuEntry.id)}>
+              <Disc3 size={14} />
+              Match to MusicBrainz…
+            </ContextMenuItem>
             <LoveMenuItem
               resolve={() =>
                 menuEntry
@@ -350,6 +357,15 @@ export function PlaylistTrackList({
         }}
         onSaved={() => onMetadataChanged?.()}
       />
+      {matchTrack != null && (
+        <MatchDialog
+          kind="track"
+          entityId={matchTrack}
+          open={matchTrack != null}
+          onOpenChange={(o) => !o && setMatchTrack(null)}
+          onChanged={() => onMetadataChanged?.()}
+        />
+      )}
     </ContextMenu>
   );
 }

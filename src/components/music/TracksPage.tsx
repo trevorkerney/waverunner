@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Play, Music, Music2, Pencil, ListPlus, ListStart, ListEnd } from "lucide-react";
+import { Play, Music, Music2, Pencil, ListPlus, ListStart, ListEnd, Disc3 } from "lucide-react";
 import { Spinner } from "../ui/spinner";
 import { Input } from "../ui/input";
 import {
@@ -10,6 +10,7 @@ import {
   ContextMenuItem,
 } from "../ui/context-menu";
 import { TrackEditDialog } from "./EditDialogs";
+import { MatchDialog } from "./MatchDialog";
 import { AddToPlaylistDialog } from "../AddToPlaylistDialog";
 import { useDeselectOnBackgroundClick } from "./useTrackSelection";
 import { PlayingIndicator } from "./PlayingIndicator";
@@ -197,6 +198,8 @@ export function TracksPage({ libraryId, onPlayQueue, currentTrackId, playing, on
   const [rows, setRows] = useState<LibraryTrackRow[] | null>(null);
   const [filter, setFilter] = useState("");
   const [editTrackId, setEditTrackId] = useState<number | null>(null);
+  // Track being matched to MusicBrainz (its own dialog).
+  const [matchTrack, setMatchTrack] = useState<number | null>(null);
   const [playlistFor, setPlaylistFor] = useState<{ id: number; title: string } | null>(null);
   const [selectedTrackId, setSelectedTrackId] = useState<number | null>(null);
   useDeselectOnBackgroundClick(useCallback(() => setSelectedTrackId(null), []));
@@ -369,6 +372,10 @@ export function TracksPage({ libraryId, onPlayQueue, currentTrackId, playing, on
               <Pencil size={14} />
               Edit metadata
             </ContextMenuItem>
+            <ContextMenuItem onClick={() => setMatchTrack(menuTrackRef.current)}>
+              <Disc3 size={14} />
+              Match to MusicBrainz…
+            </ContextMenuItem>
             <LoveMenuItem
               resolve={() => {
                 const t = rows?.find((r) => r.id === menuTrackRef.current);
@@ -405,6 +412,15 @@ export function TracksPage({ libraryId, onPlayQueue, currentTrackId, playing, on
         }}
         onSaved={() => setReloadKey((k) => k + 1)}
       />
+      {matchTrack != null && (
+        <MatchDialog
+          kind="track"
+          entityId={matchTrack}
+          open={matchTrack != null}
+          onOpenChange={(o) => !o && setMatchTrack(null)}
+          onChanged={() => setReloadKey((k) => k + 1)}
+        />
+      )}
     </div>
   );
 }

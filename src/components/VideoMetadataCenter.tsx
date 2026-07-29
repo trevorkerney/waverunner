@@ -243,7 +243,7 @@ export function VideoMetadataCenterDialog({
   }, [open]);
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="flex max-h-[85vh] flex-col overflow-hidden sm:max-w-2xl">
+      <DialogContent className="flex h-[85vh] max-h-[85vh] w-[min(72rem,calc(100vw-3rem))] max-w-none flex-col overflow-hidden">
         <DialogHeader>
           <DialogTitle>Metadata center</DialogTitle>
         </DialogHeader>

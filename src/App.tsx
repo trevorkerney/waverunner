@@ -2988,19 +2988,6 @@ function App() {
               refreshGridInPlace();
             }
           }}
-          onRescan={() => {
-            if (!selectedLibrary) return;
-            invalidateCache(selectedLibrary.id);
-            // Only reload the grid if the user is still somewhere inside this
-            // library — a rescan bounces them to Home, and reloading then
-            // would stomp Home's breadcrumbs/entries with the stale view.
-            const cur = navStateRef.current.view;
-            if (cur && "libraryId" in cur && cur.libraryId === selectedLibrary.id) {
-              const parentId = breadcrumbs[breadcrumbs.length - 1]?.id ?? null;
-              loadEntries(selectedLibrary, parentId, breadcrumbs);
-            }
-            window.dispatchEvent(new Event("waverunner:library-rescanned"));
-          }}
           getCoverUrl={getCoverUrl}
           getCoverAspect={getCoverAspect}
           getFullCoverUrl={getFullCoverUrl}

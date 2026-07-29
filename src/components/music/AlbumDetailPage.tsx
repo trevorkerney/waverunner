@@ -1,12 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Play, Disc3, Pencil, ListPlus, ListStart, ListEnd } from "lucide-react";
+import { toast } from "sonner";
+import { Play, Disc3, Pencil, ListPlus, ListStart, ListEnd, Scissors, Undo2, ListChecks } from "lucide-react";
 import { Spinner } from "../ui/spinner";
 import { MusicAlbumDetail, MusicRelease, MusicQueueItem, MusicTrack } from "../../types";
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "../ui/dropdown-menu";
 import {
@@ -16,6 +18,7 @@ import {
   ContextMenuItem,
 } from "../ui/context-menu";
 import { TrackEditDialog, AlbumEditDialog } from "./EditDialogs";
+import { MatchDialog, MbStatusChip } from "./MatchDialog";
 import { MoveToCollectionDialog } from "./MoveToCollectionDialog";
 import { PlayingIndicator } from "./PlayingIndicator";
 import { LoveButton, LoveMenuItem } from "./LoveButton";
@@ -71,6 +74,17 @@ export function AlbumDetailPage({
   // Sound collections: track being moved to another collection (or to loose).
   const [moveFor, setMoveFor] = useState<{ id: number; title: string } | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
+  // A MusicBrainz track-list check is in flight (one network round trip).
+  const [checking, setChecking] = useState(false);
+  // MusicBrainz matching: which entity the dialog is on, and a nonce that
+  // makes the status chips refetch after a match/unmatch.
+  const [matchOpen, setMatchOpen] = useState(false);
+  const [matchTrack, setMatchTrack] = useState<{ id: number; title: string } | null>(null);
+  const [mbKey, setMbKey] = useState(0);
+  // Albums the user folded into this one — each undoable.
+  const [absorbed, setAbsorbed] = useState<
+    { combine_id: number; name: string; mode: string }[]
+  >([]);
 
   // Navigations clear the page (spinner); edit-triggered refetches are silent
   // and keep the selected release when it still exists.
@@ -124,6 +138,22 @@ export function AlbumDetailPage({
     window.addEventListener("waverunner:library-rescanned", onRescanned);
     return () => window.removeEventListener("waverunner:library-rescanned", onRescanned);
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    invoke<{ combine_id: number; name: string; mode: string }[]>("get_album_absorbed", {
+      albumId: entryId,
+    })
+      .then((rows) => {
+        if (!cancelled) setAbsorbed(rows);
+      })
+      .catch(() => {
+        if (!cancelled) setAbsorbed([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [entryId, reloadKey]);
 
   // Consume the focus request once per nonce: select the row and scroll it to
   // the viewport center. Waits for detail so the rows exist to scroll to.
@@ -203,7 +233,7 @@ export function AlbumDetailPage({
           <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
             {detail.album_type || "album"}
           </p>
-          <h1 className="group/title flex min-w-0 items-center gap-2 font-heading text-3xl font-bold">
+          <h1 className="group/title flex min-w-0 items-center gap-2 font-heading text-4xl font-bold">
             <span className="truncate">{detail.title}</span>
             <button
               onClick={() => setEditAlbumOpen(true)}
@@ -212,6 +242,41 @@ export function AlbumDetailPage({
             >
               <Pencil size={16} />
             </button>
+            {/* Re-compare this album's tracks against the release it matched.
+                A track whose title disagrees with MusicBrainz never received
+                MB's credits — this is how that surfaces (and how it clears
+                once the tags are fixed and rescanned). */}
+            {detail.mb_matched && !detail.is_sound && (
+              <button
+                onClick={async () => {
+                  setChecking(true);
+                  try {
+                    const g = await invoke<{ ours: number; mb: number }>("mb_recheck_album", {
+                      albumId: detail.id,
+                    });
+                    setMbKey((k) => k + 1);
+                    const parts = [
+                      g.ours > 0 && `${g.ours} of your tracks unmatched`,
+                      g.mb > 0 && `${g.mb} on the release missing here`,
+                    ].filter(Boolean);
+                    toast[parts.length === 0 ? "success" : "warning"](
+                      parts.length === 0
+                        ? "Every track lines up with MusicBrainz."
+                        : `${parts.join(" · ")} — see the metadata center.`,
+                    );
+                  } catch (e) {
+                    toast.error(String(e));
+                  } finally {
+                    setChecking(false);
+                  }
+                }}
+                disabled={checking}
+                className="shrink-0 rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/title:opacity-100 disabled:opacity-40"
+                title="Check track list against MusicBrainz"
+              >
+                {checking ? <Spinner className="size-4" /> : <ListChecks size={16} />}
+              </button>
+            )}
           </h1>
           <p className="mt-1 truncate text-sm text-muted-foreground">
             {/* Multi-artist albums show the full credit, each name linking to
@@ -258,6 +323,16 @@ export function AlbumDetailPage({
           {detail.genres.length > 0 && (
             <p className="mt-0.5 truncate text-xs text-muted-foreground">{detail.genres.join(", ")}</p>
           )}
+          {!detail.is_sound && (
+            <div className="mt-1.5">
+              <MbStatusChip
+                kind="album"
+                entityId={detail.id}
+                reloadKey={mbKey}
+                onClick={() => setMatchOpen(true)}
+              />
+            </div>
+          )}
           <div className="mt-3 flex items-center gap-2.5">
             <button
               onClick={() => playFrom(0)}
@@ -282,10 +357,61 @@ export function AlbumDetailPage({
                       )}
                     </DropdownMenuItem>
                   ))}
+                  <DropdownMenuSeparator />
+                  {/* Pull the SHOWN edition out into an album of its own —
+                      undoes scanner grouping or a combine, whichever put it
+                      here. Applies on the rescan it kicks off. */}
+                  <DropdownMenuItem
+                    disabled={release == null}
+                    onClick={async () => {
+                      if (!release) return;
+                      try {
+                        const libId = await invoke<string>("split_album_release", {
+                          releaseId: release.id,
+                        });
+                        window.dispatchEvent(
+                          new CustomEvent("waverunner:open-rescan", { detail: { libraryId: libId } }),
+                        );
+                      } catch (e) {
+                        toast.error(String(e));
+                      }
+                    }}
+                  >
+                    <Scissors size={13} />
+                    Separate “{release ? releaseLabel(release) : ""}”
+                  </DropdownMenuItem>
                 </DropdownMenuContent>
               </DropdownMenu>
             )}
           </div>
+          {/* Albums you folded into this one. Undo returns each to being its
+              own album on the next scan — nothing on disk moves. */}
+          {absorbed.length > 0 && (
+            <p className="mt-2 flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-muted-foreground">
+              <span>Combined from</span>
+              {absorbed.map((a) => (
+                <button
+                  key={a.combine_id}
+                  onClick={async () => {
+                    try {
+                      const libId = await invoke<string>("undo_album_combine", {
+                        combineId: a.combine_id,
+                      });
+                      window.dispatchEvent(
+                        new CustomEvent("waverunner:open-rescan", { detail: { libraryId: libId } }),
+                      );
+                    } catch (e) {
+                      toast.error(String(e));
+                    }
+                  }}
+                  className="group/undo inline-flex items-center gap-1 rounded border px-1.5 py-0.5 transition-colors hover:border-foreground/30 hover:text-foreground"
+                >
+                  <span className="max-w-48 truncate">{a.name}</span>
+                  <Undo2 size={11} className="opacity-50 group-hover/undo:opacity-100" />
+                </button>
+              ))}
+            </p>
+          )}
         </div>
       </div>
 
@@ -406,6 +532,16 @@ export function AlbumDetailPage({
                       <Pencil size={14} />
                       Edit metadata
                     </ContextMenuItem>
+                    {!detail.is_sound && (
+                      <ContextMenuItem
+                        onClick={() =>
+                          setMatchTrack({ id: t.id, title: trackDisplayTitle(t.title, t.file_path) })
+                        }
+                      >
+                        <Disc3 size={14} />
+                        Match to MusicBrainz…
+                      </ContextMenuItem>
+                    )}
                     <LoveMenuItem resolve={() => ({ id: t.id, loved: t.loved })} />
                     {onAddToPlaylist && (
                       <ContextMenuItem
@@ -424,6 +560,30 @@ export function AlbumDetailPage({
           </div>
         </div>
       ))}
+      <MatchDialog
+        kind="album"
+        entityId={detail.id}
+        open={matchOpen}
+        onOpenChange={setMatchOpen}
+        onChanged={() => {
+          setMbKey((k) => k + 1);
+          setReloadKey((k) => k + 1);
+          onMetadataChanged?.();
+        }}
+      />
+      {matchTrack && (
+        <MatchDialog
+          kind="track"
+          entityId={matchTrack.id}
+          open={matchTrack !== null}
+          onOpenChange={(o) => !o && setMatchTrack(null)}
+          onChanged={() => {
+            setMbKey((k) => k + 1);
+            setReloadKey((k) => k + 1);
+            onMetadataChanged?.();
+          }}
+        />
+      )}
       <TrackEditDialog
         trackId={editTrackId}
         open={editTrackId !== null}

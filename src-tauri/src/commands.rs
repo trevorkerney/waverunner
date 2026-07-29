@@ -4043,17 +4043,16 @@ pub struct PersonDetail {
     pub biography: Option<String>,
 }
 
-/// Read a single person record (biography rides in the person_meta side table).
-/// Used by the person-detail page header and as a refresh after match actions.
+/// Read a single person record. Used by the person-detail page header and as
+/// a refresh after match actions.
 #[tauri::command]
 pub async fn get_person_detail(
     state: tauri::State<'_, AppState>,
     person_id: i64,
 ) -> Result<PersonDetail, String> {
     let row: Option<(i64, String, Option<String>, Option<i64>, Option<String>)> = sqlx::query_as(
-        "SELECT p.id, p.name, p.image_path, p.tmdb_id, pm.biography \
-         FROM person p LEFT JOIN person_meta pm ON pm.person_id = p.id \
-         WHERE p.id = ?",
+        "SELECT p.id, p.name, p.image_path, p.tmdb_id, p.biography \
+         FROM person p WHERE p.id = ?",
     )
     .bind(person_id)
     .fetch_optional(&state.app_db)
@@ -4114,7 +4113,7 @@ pub async fn search_tmdb_person(
 }
 
 /// Internal helper — fetches /person/{tmdb_id} and writes tmdb_id + canonical name to
-/// `person`, biography to `person_meta`. Kicks off a profile image download when the
+/// `person`, biography included. Kicks off a profile image download when the
 /// person has none. Used by both apply_tmdb_person_match and refresh_tmdb_person.
 async fn fetch_and_apply_tmdb_person(
     pool: &SqlitePool,
@@ -4129,22 +4128,14 @@ async fn fetch_and_apply_tmdb_person(
         let t = b.trim();
         if t.is_empty() { None } else { Some(t.to_string()) }
     });
-    sqlx::query("UPDATE person SET tmdb_id = ?, name = ? WHERE id = ?")
+    sqlx::query("UPDATE person SET tmdb_id = ?, name = ?, biography = ? WHERE id = ?")
         .bind(tmdb_id)
         .bind(&detail.name)
+        .bind(bio.as_deref())
         .bind(person_id)
         .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
-    sqlx::query(
-        "INSERT INTO person_meta (person_id, biography) VALUES (?, ?) \
-         ON CONFLICT(person_id) DO UPDATE SET biography = excluded.biography",
-    )
-    .bind(person_id)
-    .bind(bio.as_deref())
-    .execute(pool)
-    .await
-    .map_err(|e| e.to_string())?;
     // Reuse the shared image-download path — it skips the work when the person
     // already has an image, and handles missing profile_path gracefully.
     process_person_images(pool, app_data_dir, vec![(person_id, tmdb_id, detail.profile_path)]).await;
@@ -4199,12 +4190,7 @@ pub async fn clear_tmdb_person_match(
     state: tauri::State<'_, AppState>,
     person_id: i64,
 ) -> Result<(), String> {
-    sqlx::query("UPDATE person SET tmdb_id = NULL WHERE id = ?")
-        .bind(person_id)
-        .execute(&state.app_db)
-        .await
-        .map_err(|e| e.to_string())?;
-    sqlx::query("DELETE FROM person_meta WHERE person_id = ?")
+    sqlx::query("UPDATE person SET tmdb_id = NULL, biography = NULL WHERE id = ?")
         .bind(person_id)
         .execute(&state.app_db)
         .await

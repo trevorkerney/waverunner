@@ -273,6 +273,8 @@ export interface MusicAlbumDetail {
   /** Sound-side entry (virtual collection) — swaps music affordances for
    *  collection ones (move tracks between collections, etc.). */
   is_sound: boolean;
+  /** Matched to a MusicBrainz release — enables the track-list check. */
+  mb_matched: boolean;
   /** Owning library — collection dialogs are library-scoped. */
   library_id: string;
 }

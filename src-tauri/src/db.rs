@@ -1,6 +1,302 @@
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use std::path::Path;
 
+/// One schema change, applied exactly once and recorded.
+///
+/// `id` orders them and is the key — NOT the app version, because two
+/// migrations can ship in one release and because "alpha.12.10" sorts before
+/// "alpha.12.4" as a string. `app_version` is a label: it lands in the
+/// schema_version row so the table reads as a history of what shipped when.
+///
+/// Statements run in order inside one transaction per migration. Keep them
+/// additive where you can — an older build ignores an unknown column the same
+/// as an unknown table, so an additive migration leaves a downgrade possible.
+/// A DROP does not, which is what the pre-migration backup is for.
+struct Migration {
+    id: i64,
+    app_version: &'static str,
+    description: &'static str,
+    /// Skip (and record as done) when this table isn't present. A migration
+    /// that only moves data out of a table is vacuously complete on a database
+    /// that never had it — which is the normal case for a table that only ever
+    /// existed in development, and the reason this field exists.
+    requires_table: Option<&'static str>,
+    statements: &'static [&'static str],
+}
+
+/// Adding a column and emptying the old table are kept as SEPARATE migrations
+/// on purpose: the column is needed by every database, the backfill only by
+/// the ones that have something to backfill.
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        id: 1,
+        app_version: "1.0.0-alpha.12.5",
+        description: "album.mb_release_group_id column",
+        requires_table: None,
+        statements: &["ALTER TABLE album ADD COLUMN mb_release_group_id TEXT"],
+    },
+    Migration {
+        id: 2,
+        app_version: "1.0.0-alpha.12.5",
+        description: "move album_mb into album, drop it",
+        requires_table: Some("album_mb"),
+        statements: &[
+            "UPDATE album SET mb_release_group_id =
+                (SELECT mb_release_group_id FROM album_mb WHERE album_mb.album_id = album.id)
+             WHERE EXISTS (SELECT 1 FROM album_mb WHERE album_mb.album_id = album.id)",
+            "DROP TABLE album_mb",
+        ],
+    },
+    Migration {
+        id: 3,
+        app_version: "1.0.0-alpha.12.5",
+        description: "person.biography column",
+        requires_table: None,
+        statements: &["ALTER TABLE person ADD COLUMN biography TEXT"],
+    },
+    Migration {
+        id: 4,
+        app_version: "1.0.0-alpha.12.5",
+        description: "move person_meta into person, drop it",
+        requires_table: Some("person_meta"),
+        statements: &[
+            "UPDATE person SET biography =
+                (SELECT biography FROM person_meta WHERE person_meta.person_id = person.id)
+             WHERE EXISTS (SELECT 1 FROM person_meta WHERE person_meta.person_id = person.id)",
+            "DROP TABLE person_meta",
+        ],
+    },
+    Migration {
+        id: 5,
+        app_version: "1.0.0-alpha.12.5",
+        description: "album_combine target_folder/source_name/target_name columns",
+        requires_table: None,
+        statements: &[
+            "ALTER TABLE album_combine ADD COLUMN target_folder TEXT",
+            "ALTER TABLE album_combine ADD COLUMN source_name TEXT",
+            "ALTER TABLE album_combine ADD COLUMN target_name TEXT",
+        ],
+    },
+    Migration {
+        id: 6,
+        app_version: "1.0.0-alpha.12.5",
+        description: "move album_combine_meta into album_combine, drop it",
+        requires_table: Some("album_combine_meta"),
+        statements: &[
+            "UPDATE album_combine SET
+                target_folder = (SELECT target_folder FROM album_combine_meta m WHERE m.combine_id = album_combine.id),
+                source_name   = (SELECT source_name   FROM album_combine_meta m WHERE m.combine_id = album_combine.id),
+                target_name   = (SELECT target_name   FROM album_combine_meta m WHERE m.combine_id = album_combine.id)
+             WHERE EXISTS (SELECT 1 FROM album_combine_meta m WHERE m.combine_id = album_combine.id)",
+            "DROP TABLE album_combine_meta",
+        ],
+    },
+    Migration {
+        id: 7,
+        app_version: "1.0.0-alpha.12.5",
+        description: "carry existing MusicBrainz ids into field_override",
+        requires_table: None,
+        // Until now an album's matched RELEASE id lived only on its
+        // album_release row, which every rescan deletes and rebuilds from file
+        // tags — so matches quietly lost the one fact identifying what they
+        // matched. Both ids move to the app-owned store here; without this,
+        // every already-matched album would read as unmatched after the update.
+        statements: &[
+            "INSERT OR IGNORE INTO field_override (entity_id, field, tier, value)
+             SELECT id, 'mb_release_group_id', 'mb', mb_release_group_id FROM album
+             WHERE mb_release_group_id IS NOT NULL AND mb_release_group_id <> ''",
+            "INSERT OR IGNORE INTO field_override (entity_id, field, tier, value)
+             SELECT album_id, 'mb_release_id', 'mb', mb_release_id FROM album_release
+             WHERE is_default = 1 AND mb_release_id IS NOT NULL AND mb_release_id <> ''",
+            "INSERT OR IGNORE INTO field_override (entity_id, field, tier, value)
+             SELECT id, 'mb_artist_id', 'mb', musicbrainz_id FROM artist
+             WHERE musicbrainz_id IS NOT NULL AND musicbrainz_id <> ''",
+        ],
+    },
+    Migration {
+        id: 8,
+        app_version: "1.0.0-alpha.12.5",
+        description: "group mb_change_log rows into per-action batches",
+        requires_table: None,
+        // A match logs one row per KIND of change (credits, type, date), so
+        // undoing "this album's match" meant undoing several entries. Rows are
+        // grouped into the action that wrote them: a run of consecutive rows
+        // sharing a target. Contiguity matters — two separate merges into the
+        // same artist are two actions and must not collapse into one.
+        statements: &[
+            "ALTER TABLE mb_change_log ADD COLUMN batch_id INTEGER",
+            "WITH marked AS (
+                SELECT id,
+                       CASE WHEN LAG(target_id) OVER (ORDER BY id) IS target_id
+                                 AND kind <> 'artist_merge'
+                            THEN 0 ELSE 1 END AS starts
+                FROM mb_change_log
+             ),
+             grouped AS (
+                SELECT id, SUM(starts) OVER (ORDER BY id ROWS UNBOUNDED PRECEDING) AS batch
+                FROM marked
+             )
+             UPDATE mb_change_log
+             SET batch_id = (SELECT batch FROM grouped WHERE grouped.id = mb_change_log.id)",
+        ],
+    },
+    Migration {
+        id: 9,
+        app_version: "1.0.0-alpha.12.5",
+        description: "split change batches that mix reverted and live rows",
+        requires_table: None,
+        // Batches were briefly inferred from row adjacency, which merged a
+        // re-match into the batch of the match it replaced. An action is
+        // either undone or it isn't, so a batch holding both is two actions:
+        // the reverted rows move to a fresh id (max + old, so ordering is kept
+        // and no new id can collide with an existing one).
+        statements: &[
+            "UPDATE mb_change_log
+             SET batch_id = (SELECT MAX(batch_id) FROM mb_change_log) + batch_id
+             WHERE undone = 1
+               AND batch_id IN (
+                 SELECT batch_id FROM mb_change_log
+                 GROUP BY batch_id HAVING COUNT(DISTINCT undone) > 1
+               )",
+        ],
+    },
+    Migration {
+        id: 10,
+        app_version: "1.0.0-alpha.12.5",
+        description: "music_scan_issue.is_sound",
+        requires_table: None,
+        statements: &["ALTER TABLE music_scan_issue ADD COLUMN is_sound INTEGER NOT NULL DEFAULT 0"],
+    },
+    Migration {
+        id: 11,
+        app_version: "1.0.0-alpha.12.5",
+        description: "retry artist lookups that failed on punctuation",
+        requires_table: None,
+        // Artist names were compared byte-for-byte, so MusicBrainz's
+        // typographic hyphens and apostrophes turned score-100 matches into
+        // cached misses. The comparison now normalises; drop the poisoned
+        // cache entries so those names get another look.
+        statements: &["DELETE FROM mb_artist_lookup WHERE status = 'notfound'"],
+    },
+    Migration {
+        id: 12,
+        app_version: "1.0.0-alpha.12.5",
+        description: "feat_join — comma-bearing artist names kept whole",
+        requires_table: None,
+        statements: &[
+            "CREATE TABLE IF NOT EXISTS feat_join (
+                library_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                PRIMARY KEY (library_id, name),
+                FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE
+            )",
+        ],
+    },
+];
+
+/// Copy the database beside itself before the first migration of a run
+/// touches it. Cheap (a file copy) and the only real answer to a migration
+/// that turns out to be wrong about production data.
+fn backup_before_migrating(db_path: &Path, from: i64, to: i64) {
+    let backup = db_path.with_extension(format!("v{from}-to-v{to}.bak"));
+    if backup.exists() {
+        return;
+    }
+    match std::fs::copy(db_path, &backup) {
+        Ok(_) => eprintln!("[db] backed up to {}", backup.display()),
+        Err(e) => eprintln!("[db] WARNING: backup failed ({e}) — migrating anyway"),
+    }
+}
+
+/// Record every migration as applied without running any of it. For a
+/// database created moments ago by the CREATE statements, which already
+/// describe the post-migration shape.
+async fn baseline_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    ensure_schema_version(pool).await?;
+    for m in MIGRATIONS {
+        sqlx::query(
+            "INSERT OR IGNORE INTO schema_version (id, app_version, description)
+             VALUES (?, ?, ?)",
+        )
+        .bind(m.id)
+        .bind(m.app_version)
+        .bind(m.description)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn ensure_schema_version(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS schema_version (
+            id INTEGER PRIMARY KEY,
+            app_version TEXT NOT NULL,
+            description TEXT NOT NULL,
+            applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Apply every migration above the recorded schema version, in order, each in
+/// its own transaction so a failure leaves the database on the last good one.
+async fn run_migrations(pool: &SqlitePool, db_path: &Path) -> Result<(), sqlx::Error> {
+    ensure_schema_version(pool).await?;
+
+    let current: i64 = sqlx::query_as::<_, (Option<i64>,)>("SELECT MAX(id) FROM schema_version")
+        .fetch_one(pool)
+        .await?
+        .0
+        .unwrap_or(0);
+
+    // Sorted by id, not by position: a migration written into the wrong slot
+    // in the array would otherwise run out of order, and a failure part-way
+    // could strand a lower id behind a higher recorded version.
+    let mut pending: Vec<&Migration> = MIGRATIONS.iter().filter(|m| m.id > current).collect();
+    pending.sort_by_key(|m| m.id);
+    let Some(last) = pending.last() else { return Ok(()) };
+    backup_before_migrating(db_path, current, last.id);
+
+    for m in pending {
+        // Foreign keys are enforced per-connection; a migration that rebuilds
+        // or drops a table must not trip them mid-flight.
+        sqlx::query("PRAGMA foreign_keys = OFF").execute(pool).await?;
+        let mut tx = pool.begin().await?;
+        let applicable = match m.requires_table {
+            None => true,
+            Some(table) => {
+                sqlx::query_as::<_, (i64,)>(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+                )
+                .bind(table)
+                .fetch_one(&mut *tx)
+                .await?
+                .0 != 0
+            }
+        };
+        if applicable {
+            for stmt in m.statements {
+                sqlx::query(stmt).execute(&mut *tx).await?;
+            }
+        } else {
+            eprintln!("[db] migration {} vacuous (no {}) — recording", m.id, m.requires_table.unwrap_or(""));
+        }
+        sqlx::query("INSERT INTO schema_version (id, app_version, description) VALUES (?, ?, ?)")
+            .bind(m.id)
+            .bind(m.app_version)
+            .bind(m.description)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        sqlx::query("PRAGMA foreign_keys = ON").execute(pool).await?;
+        eprintln!("[db] migration {} applied — {}", m.id, m.description);
+    }
+    Ok(())
+}
+
 pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
     let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
     let pool = SqlitePoolOptions::new()
@@ -15,6 +311,17 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
         })
         .connect(&db_url)
         .await?;
+
+    // A database with no tables yet is about to be created at the CURRENT
+    // schema, so every migration is already true of it. It gets baselined
+    // below rather than migrated — running migration 1 against it would try
+    // to drop an album_mb that never existed.
+    let fresh: bool = sqlx::query_as::<_, (i64,)>(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+    )
+    .fetch_one(&pool)
+    .await?
+    .0 == 0;
 
     // ── App-level tables ──────────────────────────────────────────────
 
@@ -134,19 +441,9 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
             image_path TEXT,
-            tmdb_id INTEGER
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    // Extended person fields live in a side table — `person` predates them in
-    // shipped databases and this schema only ever creates, never alters.
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS person_meta (
-            person_id INTEGER PRIMARY KEY,
-            biography TEXT,
-            FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
+            tmdb_id INTEGER,
+            -- Was the person_meta side table until migration 2.
+            biography TEXT
         )",
     )
     .execute(&pool)
@@ -535,6 +832,9 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             release_date TEXT,
             album_type TEXT NOT NULL DEFAULT 'album',
             disc_count INTEGER,
+            -- MusicBrainz release group (the album as a work, across pressings).
+            -- Was the album_mb side table until migration 1.
+            mb_release_group_id TEXT,
             FOREIGN KEY (id) REFERENCES media_entry(id) ON DELETE CASCADE
         )",
     )
@@ -656,17 +956,6 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .execute(&pool)
     .await?;
 
-    // MusicBrainz release-group id for an album (album table is frozen).
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS album_mb (
-            album_id INTEGER PRIMARY KEY,
-            mb_release_group_id TEXT,
-            FOREIGN KEY (album_id) REFERENCES album(id) ON DELETE CASCADE
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
     // ── Track artist credits ──────────────────────────────────────────
     // Ordered credit list per track, parsed from tags at scan time: main
     // artist(s) first, then features (from the artist tag's "feat." clause,
@@ -766,6 +1055,10 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             after_json TEXT,
             undone INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            -- The action that wrote this row: one match logs several rows
+            -- (credits, type, date) and the review list undoes the action, not
+            -- its parts. Added by migration 8.
+            batch_id INTEGER,
             FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE
         )",
     )
@@ -795,6 +1088,42 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             album_id INTEGER PRIMARY KEY,
             status TEXT NOT NULL,
             fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (album_id) REFERENCES album(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // Artist names that contain a comma and must survive feature-clause
+    // splitting. "(feat. Tyler, The Creator)" is ONE guest, but the splitter
+    // can't know that — MusicBrainz confirms it and the name is recorded here,
+    // so every later scan rejoins the pair instead of inventing an artist.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS feat_join (
+            library_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            PRIMARY KEY (library_id, name),
+            FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // Where a matched album and its MusicBrainz release disagree about the
+    // track list. `side` says who has the track the other one lacks: 'ours' =
+    // in the library, 'mb' = on the release. `counterpart` is the title MB has
+    // at that same disc/track when the slot exists but the titles differ —
+    // exactly the case where MB's credits are NOT applied, which is otherwise
+    // invisible. Rewritten whole on every match/re-check; dismissing deletes.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS album_match_gap (
+            album_id INTEGER NOT NULL,
+            side TEXT NOT NULL,
+            disc INTEGER NOT NULL,
+            position INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            counterpart TEXT,
+            PRIMARY KEY (album_id, side, disc, position),
             FOREIGN KEY (album_id) REFERENCES album(id) ON DELETE CASCADE
         )",
     )
@@ -920,6 +1249,23 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .execute(&pool)
     .await?;
 
+    // ── Album splitting (the inverse of album_combine) ────────────────
+    // A folder whose tracks must NOT group with the album their tags would
+    // put them in — the user pulled this edition out of a multi-edition
+    // album. Keyed by the RELEASE's folder (editions are folder-derived), so
+    // it survives rescans; the scanner gives such a folder its own album.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS album_release_split (
+            library_id TEXT NOT NULL,
+            folder_path TEXT NOT NULL,
+            PRIMARY KEY (library_id, folder_path),
+            FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+
     // Virtual sound COLLECTIONS: the user-facing grouping for sounds. A row
     // marks an album entry as a collection — never folder-claimed by rescans,
     // never swept, lives until the user deletes it. Folder-mimicked at first
@@ -959,6 +1305,11 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             library_id TEXT NOT NULL,
             file_path TEXT NOT NULL,
             reason TEXT NOT NULL,
+            -- Came from a sounds-typed base. file_path is relative to whichever
+            -- base was scanned, so nothing in the path itself can tell you.
+            -- Sounds are excluded from the metadata center: they may carry tags
+            -- but are never expected to.
+            is_sound INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE
         )",
     )
@@ -1004,6 +1355,12 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             target_title TEXT NOT NULL,
             mode TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            -- Which edition a merge pours into, plus the names as they read at
+            -- combine time (for the undo chip). Was album_combine_meta until
+            -- migration 3.
+            target_folder TEXT,
+            source_name TEXT,
+            target_name TEXT,
             FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE
         )",
     )
@@ -1396,6 +1753,15 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     )
     .execute(&pool)
     .await?;
+
+    // ── Schema migrations ─────────────────────────────────────────────
+    // The CREATE statements above are idempotent and describe the schema as
+    // it is TODAY. Migrations carry existing databases up to that shape.
+    if fresh {
+        baseline_migrations(&pool).await?;
+    } else {
+        run_migrations(&pool, db_path).await?;
+    }
 
     Ok(pool)
 }

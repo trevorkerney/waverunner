@@ -142,6 +142,17 @@ export function CreateLibraryDialog({
   const prevFormHeightRef = useRef<number | null>(null);
   const [formHeight, setFormHeight] = useState<number | null>(null);
   const [heightAnimating, setHeightAnimating] = useState(false);
+  // The animation clip exists to stop a scrollbar FLASHING IN mid-transition —
+  // but when the wrapper is ALREADY scrolling (small window), clipping yanks a
+  // real scrollbar away and pops it back 300ms later. Capture the pre-animation
+  // overflow state and keep the scrollbar through the transition when present.
+  const wrapperRef = useRef<HTMLDivElement | null>(null);
+  const keepScrollbarRef = useRef(false);
+  const beginHeightAnim = () => {
+    const w = wrapperRef.current;
+    keepScrollbarRef.current = !!w && w.scrollHeight > w.clientHeight + 1;
+    setHeightAnimating(true);
+  };
 
   useEffect(() => {
     if (!formEl) {
@@ -162,7 +173,7 @@ export function CreateLibraryDialog({
         Number.isFinite(styled) && styled > 0 ? styled : formEl.getBoundingClientRect().height,
       );
       if (prevFormHeightRef.current !== null && Math.abs(prevFormHeightRef.current - h) > 1) {
-        setHeightAnimating(true);
+        beginHeightAnim();
       }
       prevFormHeightRef.current = h;
       setFormHeight(h);
@@ -580,7 +591,7 @@ export function CreateLibraryDialog({
       }}
     >
       <DialogContent
-        className={`overflow-hidden flex flex-col px-0 gap-0 ${step === 4 ? "sm:max-w-2xl max-h-[85vh]" : "sm:max-w-md"}`}
+        className={`overflow-hidden flex flex-col px-0 gap-0 ${step === 4 ? "w-[min(72rem,calc(100vw-3rem))] max-w-none h-[85vh]" : "sm:w-lg"}`}
       >
         <DialogHeader className="px-4 pb-2">
           <DialogTitle>{title}</DialogTitle>
@@ -656,7 +667,7 @@ export function CreateLibraryDialog({
         </DialogHeader>
 
         {step === 4 && libraryId ? (
-          <div className="flex min-h-0 flex-1 flex-col px-4 pt-2">
+          <div className="flex min-h-0 flex-1 flex-col pl-4 pr-0 pt-2">
             {effFormat === "music" ? (
               <MetadataCenter libraryId={libraryId} reloadKey={centerReloadKey} />
             ) : (
@@ -665,11 +676,16 @@ export function CreateLibraryDialog({
           </div>
         ) : (
           <div
+            ref={wrapperRef}
             // Scrolling only exists for step 1 (folder lists can outgrow a
             // small window). Steps 2/3 are fixed-size progress views — hiding
             // overflow there kills the phantom sub-pixel scrollbar for good.
+            // A height animation with a LIVE scrollbar keeps it — clipping
+            // would yank it away and pop it right back.
             className={`min-h-0 transition-[height] duration-300 ease-in-out ${
-              heightAnimating || step !== 1 ? "overflow-hidden" : "overflow-y-auto overflow-x-hidden"
+              (heightAnimating && !keepScrollbarRef.current) || step !== 1
+                ? "overflow-hidden"
+                : "overflow-y-auto overflow-x-hidden"
             }`}
             style={{ height: formHeight != null ? `${formHeight + 2}px` : undefined }}
             onTransitionEnd={(e) => {
@@ -701,10 +717,10 @@ export function CreateLibraryDialog({
                         // Only on a real change: an unchanged height never fires the
                         // transition, which would leave the clip stuck on.
                         if (v.includes("video") && format !== "video") {
-                          setHeightAnimating(true);
+                          beginHeightAnim();
                           setFormat("video");
                         } else if (v.includes("music") && format !== "music") {
-                          setHeightAnimating(true);
+                          beginHeightAnim();
                           setFormat("music");
                         }
                       }}
@@ -772,14 +788,14 @@ export function CreateLibraryDialog({
                         paths={musicPaths}
                         setPaths={setMusicPaths}
                         onAutoName={maybeAutoName}
-                        onRowsChange={() => setHeightAnimating(true)}
+                        onRowsChange={() => beginHeightAnim()}
                       />
                       <FolderSection
                         label="Sounds folders"
                         paths={soundsPaths}
                         setPaths={setSoundsPaths}
                         onAutoName={maybeAutoName}
-                        onRowsChange={() => setHeightAnimating(true)}
+                        onRowsChange={() => beginHeightAnim()}
                       />
                     </>
                   ) : (
@@ -789,14 +805,14 @@ export function CreateLibraryDialog({
                         paths={moviePaths}
                         setPaths={setMoviePaths}
                         onAutoName={maybeAutoName}
-                        onRowsChange={() => setHeightAnimating(true)}
+                        onRowsChange={() => beginHeightAnim()}
                       />
                       <FolderSection
                         label="TV Show folders"
                         paths={showPaths}
                         setPaths={setShowPaths}
                         onAutoName={maybeAutoName}
-                        onRowsChange={() => setHeightAnimating(true)}
+                        onRowsChange={() => beginHeightAnim()}
                       />
                     </>
                   )}

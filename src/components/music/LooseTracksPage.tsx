@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Play, Music2, Pencil, ListPlus, ListStart, ListEnd } from "lucide-react";
+import { Play, Music2, Pencil, ListPlus, ListStart, ListEnd, Disc3 } from "lucide-react";
 import { Spinner } from "../ui/spinner";
 import {
   ContextMenu,
@@ -9,6 +9,7 @@ import {
   ContextMenuItem,
 } from "../ui/context-menu";
 import { TrackEditDialog } from "./EditDialogs";
+import { MatchDialog } from "./MatchDialog";
 import { AddToPlaylistDialog } from "../AddToPlaylistDialog";
 import { MoveToCollectionDialog } from "./MoveToCollectionDialog";
 import { PlayingIndicator } from "./PlayingIndicator";
@@ -52,6 +53,8 @@ export function LooseTracksPage({
   const [rows, setRows] = useState<LibraryTrackRow[] | null>(null);
   const [selectedTrackId, setSelectedTrackId] = useState<number | null>(null);
   const [editTrackId, setEditTrackId] = useState<number | null>(null);
+  // Track being matched to MusicBrainz (its own dialog).
+  const [matchTrack, setMatchTrack] = useState<number | null>(null);
   const [playlistFor, setPlaylistFor] = useState<{ id: number; title: string } | null>(null);
   const [moveFor, setMoveFor] = useState<{ id: number; title: string } | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
@@ -292,6 +295,10 @@ export function LooseTracksPage({
                   <Pencil size={14} />
                   Edit metadata
                 </ContextMenuItem>
+                <ContextMenuItem onClick={() => setMatchTrack(t.id)}>
+                  <Disc3 size={14} />
+                  Match to MusicBrainz…
+                </ContextMenuItem>
                 <LoveMenuItem resolve={() => ({ id: t.id, loved: t.loved })} />
                 <ContextMenuItem
                   onClick={() =>
@@ -325,6 +332,15 @@ export function LooseTracksPage({
         }}
         onSaved={() => setReloadKey((k) => k + 1)}
       />
+      {matchTrack != null && (
+        <MatchDialog
+          kind="track"
+          entityId={matchTrack}
+          open={matchTrack != null}
+          onOpenChange={(o) => !o && setMatchTrack(null)}
+          onChanged={() => setReloadKey((k) => k + 1)}
+        />
+      )}
       {sounds && (
         <MoveToCollectionDialog
           libraryId={libraryId}

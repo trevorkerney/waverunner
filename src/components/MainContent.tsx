@@ -103,6 +103,8 @@ import {
   Disc3,
   ListStart,
   ListEnd,
+  Check,
+  ListChecks,
 } from "lucide-react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { toast } from "sonner";
@@ -132,7 +134,7 @@ import { RenameDialog } from "@/components/RenameDialog";
 import { ArtistDetailPage } from "@/components/music/ArtistDetailPage";
 import { PlaylistTrackList } from "@/components/music/PlaylistTrackList";
 import { HomePage } from "@/components/HomePage";
-import { CombineAlbumsDialog } from "@/components/music/CombineAlbumsDialog";
+import { CombineSelectedDialog, type AlbumSelection } from "@/components/music/CombineSelectedDialog";
 import { EditCharacterNameDialog, type CharacterEditTarget } from "@/components/EditCharacterNameDialog";
 import { TmdbPersonSearchDialog } from "@/components/TmdbPersonSearchDialog";
 import { ArtistsGrid } from "@/components/music/ArtistsGrid";
@@ -259,7 +261,6 @@ interface MainContentProps {
   onMoveEntry: (entryId: number, newParentId: number | null, insertBeforeId: number | null, anchor?: { id: number; viewportTop: number }) => Promise<void>;
   onCreateCollection: (name: string) => Promise<number | null>;
   onDeleteEntry: (entryId: number) => Promise<void>;
-  onRescan: () => void;
   onEntryChanged: () => void;
   getCoverUrl: (filePath: string) => string;
   getCoverAspect: (filePath: string) => number | undefined;
@@ -332,7 +333,6 @@ export function MainContent({
   onMoveEntry,
   onCreateCollection,
   onDeleteEntry,
-  onRescan,
   onEntryChanged,
   getCoverUrl,
   getCoverAspect,
@@ -350,8 +350,77 @@ export function MainContent({
   musicPlaying,
   musicFocusRequest,
 }: MainContentProps) {
-  // Music album being combined into another (the context menu's source).
-  const [combineSource, setCombineSource] = useState<{ id: number; title: string } | null>(null);
+  // Album SELECTION MODE — entered from a card's context menu, exited with
+  // Escape or Done. Cards grow checkboxes and clicking toggles instead of
+  // navigating; bulk actions live in the toolbar strip (no overlay panel).
+  // Built generic so other bulk actions can join later.
+  const [albumSelect, setAlbumSelect] = useState<AlbumSelection | null>(null);
+  const [gridMenuOpen, setGridMenuOpen] = useState(false);
+  const toggleAlbumSelect = useCallback((entry: MediaEntry) => {
+    setAlbumSelect((s) => {
+      if (!s) return s;
+      const has = s.picked.some((p) => p.id === entry.id);
+      const picked = has
+        ? s.picked.filter((p) => p.id !== entry.id)
+        : [...s.picked, { id: entry.id, title: entry.title }];
+      // Keeper defaults to the first pick and re-homes if it's unchecked.
+      let keeperId = s.keeperId;
+      if (has && keeperId === entry.id) keeperId = picked[0]?.id ?? null;
+      if (!has && keeperId == null) keeperId = entry.id;
+      return { ...s, picked, keeperId };
+    });
+  }, []);
+  // Context-menu entrance: "Select" enters the mode with THAT album picked;
+  // used again while the mode is live it just toggles, like a card click.
+  const startAlbumSelect = useCallback(
+    (entry: MediaEntry) => {
+      if (!selectedLibrary) return;
+      if (albumSelect && albumSelect.libraryId === selectedLibrary.id) {
+        toggleAlbumSelect(entry);
+        return;
+      }
+      setAlbumSelect({
+        libraryId: selectedLibrary.id,
+        picked: [{ id: entry.id, title: entry.title }],
+        keeperId: entry.id,
+        mode: "merge",
+        busy: false,
+        configuring: false,
+      });
+    },
+    [selectedLibrary, albumSelect, toggleAlbumSelect],
+  );
+  const combineSelected = useCallback(async (targetReleaseFolder: string | null) => {
+    if (!albumSelect || albumSelect.keeperId == null || albumSelect.picked.length < 2) return;
+    const { libraryId, picked, keeperId, mode } = albumSelect;
+    setAlbumSelect((s) => (s ? { ...s, busy: true } : s));
+    try {
+      await invoke("combine_albums_multi", {
+        libraryId,
+        sourceIds: picked.filter((p) => p.id !== keeperId).map((p) => p.id),
+        targetId: keeperId,
+        mode,
+        targetReleaseFolder,
+      });
+      setAlbumSelect(null);
+      // The directives apply on rescan — run one through the wizard modal.
+      window.dispatchEvent(
+        new CustomEvent("waverunner:open-rescan", { detail: { libraryId } }),
+      );
+    } catch (err) {
+      toast.error(String(err));
+      setAlbumSelect((s) => (s ? { ...s, busy: false } : s));
+    }
+  }, [albumSelect]);
+  useEffect(() => {
+    if (!albumSelect || albumSelect.busy) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !albumSelect.configuring) setAlbumSelect(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [albumSelect]);
+
   // Character-name edit (person filmography cards + detail-page cast cards).
   const [characterEdit, setCharacterEdit] = useState<{
     personId: number;
@@ -1231,9 +1300,41 @@ export function MainContent({
             />
           )}
 
+          {/* Selection mode takes over the toolbar row: the everyday controls
+              step aside for the selection's actions. Existing chrome, so the
+              grid keeps its full width and nothing hovers over it. */}
+          {!selectedEntry && albumSelect && selectedLibrary?.id === albumSelect.libraryId && (
+            <div className="flex items-center gap-3 border-b border-border px-4 py-2">
+              <p className="flex-1 text-sm">
+                <span className="font-medium">{albumSelect.picked.length} selected</span>
+                <span className="ml-2 text-muted-foreground">
+                  Click albums to add or remove them.
+                </span>
+              </p>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-8 gap-1.5"
+                disabled={albumSelect.picked.length < 2}
+                onClick={() => setAlbumSelect((s) => (s ? { ...s, configuring: true } : s))}
+              >
+                <Layers size={13} />
+                Combine…
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-8"
+                onClick={() => setAlbumSelect(null)}
+              >
+                Done
+              </Button>
+            </div>
+          )}
+
           {/* Search + Sort + Size Slider. Hidden on person pages — the filmography
               is a small curated list, always alphabetical. */}
-          {!selectedEntry && activeView?.kind !== "person-detail" && <div className="flex items-center gap-3 border-b border-border px-4 py-2">
+          {!selectedEntry && !albumSelect && activeView?.kind !== "person-detail" && <div className="flex items-center gap-3 border-b border-border px-4 py-2">
             <div className="relative flex-1">
               <Search
                 size={14}
@@ -1527,7 +1628,10 @@ export function MainContent({
           />
         )
       ) : (
-      <ContextMenu>
+      // Background menu — controlled for the same reason as the card menus
+      // (toggling open between false and undefined breaks it permanently);
+      // selection mode swaps its contents rather than silencing it.
+      <ContextMenu open={gridMenuOpen} onOpenChange={setGridMenuOpen}>
         <ContextMenuTrigger render={<div className="flex min-h-full flex-col" />}>
         {/* Albums page: album-less tracks get a header button above the grid —
             their hidden containers never surface as cards, so this is their
@@ -1636,11 +1740,25 @@ export function MainContent({
                     size={coverSize}
                     onNavigate={onNavigate}
                     onRename={onRenameEntry}
-                    onCombineAlbum={
-                      selectedLibrary?.format === "music"
-                        ? (e) => setCombineSource({ id: e.id, title: e.title })
-                        : undefined
+                    selectMode={
+                      !!albumSelect &&
+                      entry.entry_type === "album" &&
+                      entry.link_id == null &&
+                      selectedLibrary?.id === albumSelect.libraryId
                     }
+                    selected={!!albumSelect?.picked.some((p) => p.id === entry.id)}
+                    onToggleSelect={toggleAlbumSelect}
+                    onStartSelect={
+                      selectedLibrary?.format === "music" ? startAlbumSelect : undefined
+                    }
+                    selectionCount={albumSelect?.picked.length ?? 0}
+                    onSelectionCombine={() =>
+                      setAlbumSelect((s) => (s ? { ...s, configuring: true } : s))
+                    }
+                    onSelectionClear={() =>
+                      setAlbumSelect((s) => (s ? { ...s, picked: [], keeperId: null } : s))
+                    }
+                    onSelectionDone={() => setAlbumSelect(null)}
                     onEnqueueAlbum={
                       selectedLibrary?.format === "music" && onEnqueueMusic
                         ? (e, mode) => void enqueueAlbum(e, mode)
@@ -1719,6 +1837,32 @@ export function MainContent({
         )}
         </ContextMenuTrigger>
           <ContextMenuContent>
+            {albumSelect && selectedLibrary?.id === albumSelect.libraryId ? (
+              // Selection mode: background right-click acts on the selection.
+              <>
+                <ContextMenuItem
+                  disabled={albumSelect.picked.length < 2}
+                  onClick={() => setAlbumSelect((s) => (s ? { ...s, configuring: true } : s))}
+                >
+                  <Layers size={14} />
+                  Combine {albumSelect.picked.length} albums…
+                </ContextMenuItem>
+                <ContextMenuSeparator />
+                <ContextMenuItem
+                  onClick={() =>
+                    setAlbumSelect((s) => (s ? { ...s, picked: [], keeperId: null } : s))
+                  }
+                >
+                  <RotateCcw size={14} />
+                  Clear selection
+                </ContextMenuItem>
+                <ContextMenuItem onClick={() => setAlbumSelect(null)}>
+                  <Check size={14} />
+                  Done selecting
+                </ContextMenuItem>
+              </>
+            ) : (
+              <>
             {activeView?.kind === "playlist-detail" && (
               <ContextMenuItem onClick={() => setCreateCollectionOpen(true)}>
                 <FolderPlus size={14} />
@@ -1745,6 +1889,8 @@ export function MainContent({
                 <RefreshCw size={14} />
                 Rescan
               </ContextMenuItem>
+            )}
+              </>
             )}
           </ContextMenuContent>
       </ContextMenu>
@@ -1838,15 +1984,13 @@ export function MainContent({
         onSave={onSavePreset}
       />
 
-      {selectedLibrary?.format === "music" && (
-        <CombineAlbumsDialog
-          libraryId={selectedLibrary.id}
-          source={combineSource}
-          open={combineSource !== null}
-          onOpenChange={(o) => {
-            if (!o) setCombineSource(null);
-          }}
-          onDone={onRescan}
+      {albumSelect && (
+        <CombineSelectedDialog
+          selection={albumSelect}
+          onKeeper={(id) => setAlbumSelect((s) => (s ? { ...s, keeperId: id } : s))}
+          onMode={(mode) => setAlbumSelect((s) => (s ? { ...s, mode } : s))}
+          onOpenChange={(o) => setAlbumSelect((s) => (s ? { ...s, configuring: o } : s))}
+          onConfirm={(targetReleaseFolder) => void combineSelected(targetReleaseFolder)}
         />
       )}
 
@@ -1976,10 +2120,17 @@ function SortableCoverCard({
   onRemoveLink,
   onRenamePlaylistCollection,
   onDeletePlaylistCollection,
-  onCombineAlbum,
   onEnqueueAlbum,
   onEditCharacterName,
   onDeleteSoundCollection,
+  selectMode,
+  selected,
+  onToggleSelect,
+  onStartSelect,
+  selectionCount = 0,
+  onSelectionCombine,
+  onSelectionClear,
+  onSelectionDone,
   sortableId,
   getCoverUrl,
   getCoverAspect,
@@ -2001,10 +2152,20 @@ function SortableCoverCard({
   onRemoveLink?: (linkId: number) => void;
   onRenamePlaylistCollection?: (entry: MediaEntry) => void;
   onDeletePlaylistCollection?: (entry: MediaEntry) => void;
-  /** Music albums: open the combine-albums dialog with this entry as source. */
-  onCombineAlbum?: (entry: MediaEntry) => void;
   /** Music albums: queue the whole album ("Play next" / "Add to queue"). */
   onEnqueueAlbum?: (entry: MediaEntry, mode: "next" | "last") => void;
+  /** Selection mode (bulk actions): the card grows a checkbox, and clicking
+   *  toggles selection instead of navigating. */
+  selectMode?: boolean;
+  selected?: boolean;
+  onToggleSelect?: (entry: MediaEntry) => void;
+  /** Context-menu "Select": enters selection mode with this entry picked. */
+  onStartSelect?: (entry: MediaEntry) => void;
+  /** Selection-mode context menu (the accelerator beside the toolbar strip). */
+  selectionCount?: number;
+  onSelectionCombine?: () => void;
+  onSelectionClear?: () => void;
+  onSelectionDone?: () => void;
   /** Person filmography (actor pages): edit the character this person plays here. */
   onEditCharacterName?: (entry: MediaEntry) => void;
   /** Sounds grid: delete this virtual collection (its tracks demote to loose). */
@@ -2106,6 +2267,11 @@ function SortableCoverCard({
     }
   };
 
+  // Card context menu, held controlled: swapping `open` between a boolean and
+  // undefined leaves the menu stuck in controlled mode and it never opens
+  // again. Selection mode keeps the menu but swaps its CONTENTS.
+  const [menuOpen, setMenuOpen] = useState(false);
+
   const coverPath = getDisplayCover(entry);
   const coverSrc = coverPath ? getCoverUrl(coverPath) : null;
   // If the cover's real aspect was captured during preload, reserve the exact box height
@@ -2113,7 +2279,7 @@ function SortableCoverCard({
   const coverAspect = coverPath ? getCoverAspect(coverPath) : undefined;
 
   return (
-    <ContextMenu>
+    <ContextMenu open={menuOpen} onOpenChange={setMenuOpen}>
       <ContextMenuTrigger
         render={
           <div
@@ -2121,7 +2287,17 @@ function SortableCoverCard({
             {...attributes}
             {...listeners}
             data-flip-id={String(sortableId ?? entry.id)}
-            onClick={() => !isRenaming && !isDragging && onNavigate(entry)}
+            onClick={() =>
+              !isRenaming &&
+              !isDragging &&
+              (selectMode && onToggleSelect ? onToggleSelect(entry) : onNavigate(entry))
+            }
+            // File-manager behavior: right-clicking an UNSELECTED card while
+            // selecting adds it first, so the menu can't act on a set that
+            // excludes what the pointer is on.
+            onContextMenu={() => {
+              if (selectMode && !selected && onToggleSelect) onToggleSelect(entry);
+            }}
           />
         }
         className={`group grid justify-items-center rounded-md p-2 text-left ${
@@ -2134,8 +2310,12 @@ function SortableCoverCard({
             cover translates above the card's padding). Here the clip box is the
             already-overflow-hidden cover and transforms along with the hover. */}
         <div
-          className={`relative self-end overflow-hidden bg-muted shadow-md ring-1 ring-foreground/10 transition-[translate,scale] duration-200 group-hover:-translate-y-1 group-hover:scale-[1.04] group-hover:shadow-xl group-hover:ring-foreground/25 ${
+          className={`relative self-end overflow-hidden bg-muted shadow-md transition-[translate,scale] duration-200 group-hover:-translate-y-1 group-hover:scale-[1.04] group-hover:shadow-xl ${
             entry.entry_type === "artist" ? "rounded-full" : "rounded-[3px]"
+          } ${
+            selected
+              ? "ring-2 ring-primary"
+              : "ring-1 ring-foreground/10 group-hover:ring-foreground/25"
           }`}
           style={
             // Artists render as circles: square box, image center-cropped.
@@ -2208,6 +2388,19 @@ function SortableCoverCard({
               ) : (
                 <Folder size={size * 0.3} className="text-muted-foreground" />
               )}
+            </div>
+          )}
+          {/* Selection-mode checkbox — top-left, always visible while the
+              mode is active so the affordance is unmissable. */}
+          {selectMode && (
+            <div
+              className={`absolute left-1.5 top-1.5 flex size-5 items-center justify-center rounded-full border shadow ${
+                selected
+                  ? "border-primary bg-primary text-primary-foreground"
+                  : "border-white/80 bg-black/45 text-transparent backdrop-blur-sm"
+              }`}
+            >
+              <Check size={13} strokeWidth={3} />
             </div>
           )}
           {/* Top-right badge stack. Watched is the library default and goes
@@ -2289,7 +2482,27 @@ function SortableCoverCard({
         </div>
       </ContextMenuTrigger>
       <ContextMenuContent>
-        {entry.entry_type === "playlist_collection" ? (
+        {selectMode ? (
+          // Selection mode: the menu acts on the SELECTION, not this card.
+          <>
+            <ContextMenuItem
+              disabled={selectionCount < 2}
+              onClick={() => onSelectionCombine?.()}
+            >
+              <Layers size={14} />
+              Combine {selectionCount} albums…
+            </ContextMenuItem>
+            <ContextMenuSeparator />
+            <ContextMenuItem onClick={() => onSelectionClear?.()}>
+              <RotateCcw size={14} />
+              Clear selection
+            </ContextMenuItem>
+            <ContextMenuItem onClick={() => onSelectionDone?.()}>
+              <Check size={14} />
+              Done selecting
+            </ContextMenuItem>
+          </>
+        ) : entry.entry_type === "playlist_collection" ? (
           <>
             {onRenamePlaylistCollection && (
               <ContextMenuItem onClick={() => onRenamePlaylistCollection(entry)}>
@@ -2370,10 +2583,10 @@ function SortableCoverCard({
                 </ContextMenuItem>
               </>
             )}
-            {onCombineAlbum && entry.link_id == null && entry.entry_type === "album" && (
-              <ContextMenuItem onClick={() => onCombineAlbum(entry)}>
-                <Layers size={14} />
-                Combine with…
+            {onStartSelect && entry.link_id == null && entry.entry_type === "album" && (
+              <ContextMenuItem onClick={() => onStartSelect(entry)}>
+                <ListChecks size={14} />
+                Select
               </ContextMenuItem>
             )}
             {onEditCharacterName && (entry.entry_type === "movie" || entry.entry_type === "show") && (
