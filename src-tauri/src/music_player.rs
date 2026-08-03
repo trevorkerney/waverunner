@@ -464,6 +464,7 @@ fn update_play_log(
                 let (row_id, listened, duration, scrobbled) =
                     (log.row_id, log.listened_secs, log.duration, log.scrobbled);
                 let pool = app.state::<AppState>().app_db.clone();
+                let emit_app = scrobble_now.then(|| app.clone());
                 tauri::async_runtime::spawn(async move {
                     let _ = sqlx::query(
                         "UPDATE music_play SET played_secs = ?, duration_secs = ?, scrobbled = ? WHERE id = ?",
@@ -474,6 +475,23 @@ fn update_play_log(
                     .bind(row_id)
                     .execute(&pool)
                     .await;
+                    // The play count just ticked — tell any open page showing
+                    // counts, so they refresh without a manual reload.
+                    if let Some(app) = emit_app {
+                        let track_id: Option<(i64,)> =
+                            sqlx::query_as("SELECT track_id FROM music_play WHERE id = ?")
+                                .bind(row_id)
+                                .fetch_optional(&pool)
+                                .await
+                                .ok()
+                                .flatten();
+                        if let Some((track_id,)) = track_id {
+                            let _ = app.emit(
+                                "music-scrobbled",
+                                serde_json::json!({ "trackId": track_id }),
+                            );
+                        }
+                    }
                 });
             }
         }
@@ -485,6 +503,7 @@ fn update_play_log(
 fn flush_play_log(app: &AppHandle, inner: &Arc<MusicInner>) {
     if let Ok(mut guard) = inner.log.lock() {
         if let Some(log) = guard.as_mut() {
+            let was_scrobbled = log.scrobbled;
             if log.duration > 0.0 {
                 // On natural EOF, credit the played tail between the last tick
                 // and the actual end — but only that tail, never a seek gap.
@@ -505,6 +524,9 @@ fn flush_play_log(app: &AppHandle, inner: &Arc<MusicInner>) {
             let (row_id, listened, duration, scrobbled) =
                 (log.row_id, log.listened_secs, log.duration, log.scrobbled);
             let pool = app.state::<AppState>().app_db.clone();
+            // EOF can be the moment the scrobble rule trips (the credited
+            // tail pushes it over) — announce that one too.
+            let emit_app = (!was_scrobbled && scrobbled).then(|| app.clone());
             tauri::async_runtime::spawn(async move {
                 let _ = sqlx::query(
                     "UPDATE music_play SET played_secs = ?, duration_secs = ?, scrobbled = ? WHERE id = ?",
@@ -515,6 +537,19 @@ fn flush_play_log(app: &AppHandle, inner: &Arc<MusicInner>) {
                 .bind(row_id)
                 .execute(&pool)
                 .await;
+                if let Some(app) = emit_app {
+                    let track_id: Option<(i64,)> =
+                        sqlx::query_as("SELECT track_id FROM music_play WHERE id = ?")
+                            .bind(row_id)
+                            .fetch_optional(&pool)
+                            .await
+                            .ok()
+                            .flatten();
+                    if let Some((track_id,)) = track_id {
+                        let _ = app
+                            .emit("music-scrobbled", serde_json::json!({ "trackId": track_id }));
+                    }
+                }
             });
         }
     }

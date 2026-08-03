@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
 import {
   Dialog,
@@ -49,6 +50,20 @@ interface MbCandidateRow {
   score: number;
 }
 
+/** One release inside a matched group — what the release picker lists. */
+interface GroupRelease {
+  release_id: string;
+  title: string;
+  artist: string;
+  date: string | null;
+  track_count: number | null;
+  country: string | null;
+  format: string | null;
+  label: string | null;
+  status: string | null;
+  disambiguation: string | null;
+}
+
 const ENTITY_URL: Record<MbEntityKind, string> = {
   album: "release",
   artist: "artist",
@@ -86,7 +101,7 @@ export function mbStateOf(s: MbStatus | null): {
   }
   if (s.mbid) return { state: "matched", label: s.tier === "user" ? "Matched by you" : "Matched" };
   // Pre-12.5 matches knew the album but never recorded which pressing.
-  if (s.release_group_id) return { state: "partial", label: "Matched, pressing unknown" };
+  if (s.release_group_id) return { state: "partial", label: "Matched, release unknown" };
   if (s.searched_not_found) return { state: "notfound", label: "Searched, not found" };
   return { state: "none", label: "Not matched" };
 }
@@ -111,6 +126,10 @@ export function MatchDialog({
   const [results, setResults] = useState<MbCandidateRow[] | null>(null);
   const [searching, setSearching] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
+  // Group-matched albums don't search — the group already names the album,
+  // so the dialog lists the group's releases to pick from instead.
+  const [groupReleases, setGroupReleases] = useState<GroupRelease[] | null>(null);
+  const [loadingReleases, setLoadingReleases] = useState(false);
 
   const load = useCallback(async () => {
     const s = await invoke<MbStatus>("mb_status", { kind, entityId });
@@ -123,8 +142,34 @@ export function MatchDialog({
   useEffect(() => {
     if (!open) return;
     setResults(null);
+    setGroupReleases(null);
     load().catch((e) => toast.error(String(e)));
   }, [open, load]);
+
+  // The release picker's list — fetched whenever the dialog is open on a
+  // group-matched album (and refetched if an apply/unmatch changes the group).
+  const groupId = kind === "album" ? (status?.release_group_id ?? null) : null;
+  useEffect(() => {
+    if (!open || !groupId) {
+      setGroupReleases(null);
+      return;
+    }
+    let stale = false;
+    setLoadingReleases(true);
+    invoke<GroupRelease[]>("mb_group_releases", { groupId })
+      .then((rows) => {
+        if (!stale) setGroupReleases(rows);
+      })
+      .catch((e) => {
+        if (!stale) toast.error(String(e));
+      })
+      .finally(() => {
+        if (!stale) setLoadingReleases(false);
+      });
+    return () => {
+      stale = true;
+    };
+  }, [open, groupId]);
 
   const search = async () => {
     setSearching(true);
@@ -175,12 +220,14 @@ export function MatchDialog({
   const st = mbStateOf(status);
   const StateIcon =
     st.state === "matched" ? CircleCheck : st.state === "mismatch" ? TriangleAlert : CircleSlash;
+  // Same vocabulary as the library map: green matched, amber partial
+  // (mismatch / release unknown), red unmatched.
   const stateColor =
     st.state === "matched"
       ? "text-emerald-400"
-      : st.state === "mismatch"
+      : st.state === "mismatch" || st.state === "partial"
         ? "text-amber-400"
-        : "text-muted-foreground";
+        : "text-red-400";
 
   return (
     <Dialog open={open} onOpenChange={(o) => !busy && onOpenChange(o)}>
@@ -205,19 +252,41 @@ export function MatchDialog({
                 {st.label}
               </p>
               {status?.mbid && (
-                <a
-                  href={`https://musicbrainz.org/${kind === "album" ? "release" : ENTITY_URL[kind]}/${status.mbid}`}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="mt-0.5 block truncate font-mono text-[11px] text-muted-foreground hover:text-foreground hover:underline"
+                // Opener plugin, not an anchor: the webview ignores _blank.
+                <button
+                  type="button"
+                  onClick={() =>
+                    void openUrl(
+                      `https://musicbrainz.org/${kind === "album" ? "release" : ENTITY_URL[kind]}/${status.mbid}`,
+                    )
+                  }
+                  className="mt-0.5 block w-full truncate text-left font-mono text-[11px] text-muted-foreground hover:text-foreground hover:underline"
                 >
+                  {kind === "album" && (
+                    <span className="mr-1.5 font-sans text-muted-foreground/70">release</span>
+                  )}
                   {status.mbid}
-                </a>
+                </button>
+              )}
+              {/* Albums carry TWO ids — the release group (the album as a
+                  work) alongside the release. Both shown, both links; group
+                  alone means the release is still unmatched. */}
+              {kind === "album" && status?.release_group_id && (
+                <button
+                  type="button"
+                  onClick={() =>
+                    void openUrl(`https://musicbrainz.org/release-group/${status.release_group_id}`)
+                  }
+                  className="mt-0.5 block w-full truncate text-left font-mono text-[11px] text-muted-foreground hover:text-foreground hover:underline"
+                >
+                  <span className="mr-1.5 font-sans text-muted-foreground/70">release group</span>
+                  {status.release_group_id}
+                </button>
               )}
               {!status?.mbid && status?.release_group_id && (
                 <p className="mt-0.5 text-[11px] text-muted-foreground">
                   Matched to the album, but not to a specific release — so its track list can’t be
-                  checked. Match it again to fix that.
+                  checked. Pick your release below.
                 </p>
               )}
             </div>
@@ -240,9 +309,10 @@ export function MatchDialog({
 
           {/* An identified artist has nothing left to search for — there is
               one right answer and it's already stored. Unmatch first if it's
-              wrong. Albums and tracks keep the box, since a matched album can
-              still want a different pressing. */}
-          {!artistSettled && (
+              wrong. A GROUP-matched album doesn't search either: the group
+              already names the album, so its releases are listed below to
+              pick from — Unmatch is the way to a different album entirely. */}
+          {!artistSettled && !groupId && (
             <>
           <div className="flex gap-2">
             <Input
@@ -261,7 +331,7 @@ export function MatchDialog({
                 placeholder={`${CONTEXT_LABEL[kind]} (optional)`}
               />
             )}
-            <Button size="sm" variant="outline" disabled={searching} onClick={search}>
+            <Button size="sm" variant="outline" className="h-8" disabled={searching} onClick={search}>
               {searching ? <Spinner className="size-3" /> : <Search size={13} />}
               Go
             </Button>
@@ -271,6 +341,82 @@ export function MatchDialog({
               ? `Clear the ${CONTEXT_LABEL[kind].toLowerCase()} to widen the search — a wrong tag there hides every real result.`
               : "Paste a MusicBrainz link for an exact match."}
           </p>
+            </>
+          )}
+
+          {/* Release picker: every release of the matched group, pick the one
+              your files are. Applying brings its track list and credits. */}
+          {groupId && (
+            <>
+              <p className="px-1 text-[11px] text-muted-foreground">
+                Releases of this album on MusicBrainz — pick the one your files are. Applying it
+                brings its track list and credits.
+              </p>
+              {loadingReleases ? (
+                <div className="flex justify-center py-4">
+                  <Spinner className="size-4" />
+                </div>
+              ) : (
+                groupReleases && (
+                  <div className="max-h-72 overflow-y-auto overflow-x-hidden rounded-md border">
+                    {groupReleases.length === 0 && (
+                      <p className="px-3 py-2 text-xs text-muted-foreground">
+                        MusicBrainz lists no releases in this group.
+                      </p>
+                    )}
+                    {groupReleases.map((r, i) => (
+                      <div
+                        key={r.release_id}
+                        className={`flex items-center justify-between gap-2 px-3 py-1.5 hover:bg-accent/50 ${
+                          i > 0 ? "border-t" : ""
+                        }`}
+                      >
+                        <span className="min-w-0">
+                          <span className="block break-words text-sm">
+                            {r.title}
+                            {r.release_id === status?.mbid && (
+                              <span className="ml-1.5 text-[11px] text-emerald-400">current</span>
+                            )}
+                          </span>
+                          <span className="block break-words text-xs text-muted-foreground">
+                            {[
+                              r.date,
+                              r.country,
+                              r.format,
+                              r.track_count != null ? `${r.track_count} tracks` : null,
+                              r.label,
+                              r.status && r.status !== "Official" ? r.status : null,
+                              r.disambiguation,
+                            ]
+                              .filter(Boolean)
+                              .join(" · ")}
+                          </span>
+                        </span>
+                        <span className="flex shrink-0 items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              void openUrl(`https://musicbrainz.org/release/${r.release_id}`)
+                            }
+                            className="text-[11px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+                          >
+                            view
+                          </button>
+                          <Button
+                            size="sm"
+                            className="gap-1.5"
+                            disabled={busy !== null || r.release_id === status?.mbid}
+                            onClick={() => apply(r.release_id, "release")}
+                          >
+                            {busy === `apply:${r.release_id}` && <Spinner className="size-3" />}
+                            Apply
+                          </Button>
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )
+              )}
             </>
           )}
 
@@ -296,7 +442,7 @@ export function MatchDialog({
                       <span className="block break-words text-sm">
                         {c.title}
                         {c.kind === "release" && (
-                          <span className="ml-1.5 text-[11px] text-amber-300">one pressing</span>
+                          <span className="ml-1.5 text-[11px] text-amber-300">one release</span>
                         )}
                         {c.mbid === status?.mbid && (
                           <span className="ml-1.5 text-[11px] text-emerald-400">current</span>

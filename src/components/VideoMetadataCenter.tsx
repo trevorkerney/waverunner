@@ -238,16 +238,56 @@ export function VideoMetadataCenterDialog({
   onChanged?: () => void;
 }) {
   const [reloadKey, setReloadKey] = useState(0);
+  // Per-library opt-out: the whole video center is TMDB/OMDB-backed, so an
+  // opted-out library gets the notice (with the way back on) instead.
+  const [online, setOnline] = useState<boolean | null>(null);
   useEffect(() => {
     if (open) setReloadKey((k) => k + 1);
   }, [open]);
+  useEffect(() => {
+    if (!open || !libraryId) return;
+    setOnline(null);
+    void invoke<Record<string, string>>("get_library_settings", { libraryId })
+      .then((ls) => setOnline(ls["online_metadata"] !== "off"))
+      .catch(() => setOnline(true));
+  }, [open, libraryId, reloadKey]);
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="flex h-[85vh] max-h-[85vh] w-[min(72rem,calc(100vw-3rem))] max-w-none flex-col overflow-hidden">
         <DialogHeader>
           <DialogTitle>Metadata center</DialogTitle>
         </DialogHeader>
-        {open && libraryId && (
+        {open && libraryId && online === null && (
+          <div className="flex flex-1 items-center justify-center">
+            <Spinner className="size-6" />
+          </div>
+        )}
+        {open && libraryId && online === false && (
+          <div className="flex flex-1 flex-col items-center justify-center gap-3 text-center">
+            <p className="max-w-md text-sm text-muted-foreground">
+              Online metadata is off for this library — nothing here talks to TMDB or OMDB, and
+              movies and shows aren’t matched.
+            </p>
+            <Button
+              variant="outline"
+              onClick={async () => {
+                try {
+                  await invoke("set_library_setting", {
+                    libraryId,
+                    key: "online_metadata",
+                    value: "on",
+                  });
+                  setOnline(true);
+                } catch (e) {
+                  toast.error(String(e));
+                }
+              }}
+            >
+              Turn on
+            </Button>
+          </div>
+        )}
+        {open && libraryId && online === true && (
           <VideoMetadataCenter libraryId={libraryId} reloadKey={reloadKey} onChanged={onChanged} />
         )}
         <DialogFooter>

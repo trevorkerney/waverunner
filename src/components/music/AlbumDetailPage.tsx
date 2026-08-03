@@ -133,10 +133,15 @@ export function AlbumDetailPage({
 
   // A metadata-center apply/undo (or rescan) landed while this page is open —
   // silently refetch so the credit line, title, and covers update in place.
+  // Scrobbles too: a play count ticking over shouldn't need a manual reload.
   useEffect(() => {
     const onRescanned = () => setReloadKey((k) => k + 1);
     window.addEventListener("waverunner:library-rescanned", onRescanned);
-    return () => window.removeEventListener("waverunner:library-rescanned", onRescanned);
+    window.addEventListener("waverunner:track-scrobbled", onRescanned);
+    return () => {
+      window.removeEventListener("waverunner:library-rescanned", onRescanned);
+      window.removeEventListener("waverunner:track-scrobbled", onRescanned);
+    };
   }, []);
 
   useEffect(() => {
@@ -366,12 +371,12 @@ export function AlbumDetailPage({
                     onClick={async () => {
                       if (!release) return;
                       try {
-                        const libId = await invoke<string>("split_album_release", {
+                        await invoke<string>("split_album_release", {
                           releaseId: release.id,
                         });
-                        window.dispatchEvent(
-                          new CustomEvent("waverunner:open-rescan", { detail: { libraryId: libId } }),
-                        );
+                        // Staged — batched behind the next rescan with any
+                        // other pending directives.
+                        toast("Separation staged — it applies on the next rescan");
                       } catch (e) {
                         toast.error(String(e));
                       }
@@ -394,12 +399,12 @@ export function AlbumDetailPage({
                   key={a.combine_id}
                   onClick={async () => {
                     try {
-                      const libId = await invoke<string>("undo_album_combine", {
+                      await invoke<string>("undo_album_combine", {
                         combineId: a.combine_id,
                       });
-                      window.dispatchEvent(
-                        new CustomEvent("waverunner:open-rescan", { detail: { libraryId: libId } }),
-                      );
+                      // Staged — the album returns as its own on the next
+                      // rescan, batched with any other pending directives.
+                      toast("Un-combine staged — it applies on the next rescan");
                     } catch (e) {
                       toast.error(String(e));
                     }

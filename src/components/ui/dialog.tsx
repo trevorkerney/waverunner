@@ -45,7 +45,11 @@ function DialogContent({
       <DialogPrimitive.Popup
         data-slot="dialog-content"
         className={cn(
-          "fixed top-1/2 left-1/2 z-50 grid w-sm max-h-[calc(100vh-12rem)] -translate-x-1/2 -translate-y-1/2 gap-4 rounded-xl bg-popover p-4 text-sm text-popover-foreground ring-1 ring-foreground/10 duration-100 outline-none data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95 dark:bg-[oklch(0.145_0_0)]",
+          // Width is a MAX, not a fixed size. This was `w-sm`, which pinned
+          // every dialog to 384px and made each one's own `max-w-*` class
+          // silently do nothing — several dialogs had been asking to be wider
+          // for a long time and were being ignored.
+          "fixed top-1/2 left-1/2 z-50 grid w-[calc(100vw-3rem)] max-w-md max-h-[calc(100vh-12rem)] -translate-x-1/2 -translate-y-1/2 gap-4 rounded-xl bg-popover p-4 text-sm text-popover-foreground ring-1 ring-foreground/10 duration-100 outline-none data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95 dark:bg-[oklch(0.145_0_0)]",
           className
         )}
         {...props}

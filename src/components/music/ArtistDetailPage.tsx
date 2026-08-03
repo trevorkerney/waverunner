@@ -167,10 +167,15 @@ export function ArtistDetailPage({
 
   // A metadata-center apply/undo (or rescan) landed while this page is open —
   // silently refetch so per-album credit lines and subtitles update in place.
+  // Scrobbles too: list view shows play counts.
   useEffect(() => {
     const onRescanned = () => setReloadKey((k) => k + 1);
     window.addEventListener("waverunner:library-rescanned", onRescanned);
-    return () => window.removeEventListener("waverunner:library-rescanned", onRescanned);
+    window.addEventListener("waverunner:track-scrobbled", onRescanned);
+    return () => {
+      window.removeEventListener("waverunner:library-rescanned", onRescanned);
+      window.removeEventListener("waverunner:track-scrobbled", onRescanned);
+    };
   }, []);
 
   // Any detail refresh (navigation or silent post-edit refetch) invalidates the
@@ -574,9 +579,13 @@ export function ArtistDetailPage({
       {viewMode === "grid" ? (
       <div
         className="grid gap-4"
-        style={{ gridTemplateColumns: "repeat(auto-fill, minmax(160px, 1fr))" }}
+        // 224px floor = the detail view's h-56 cover, so switching views
+        // doesn't resize the artwork.
+        style={{ gridTemplateColumns: "repeat(auto-fill, minmax(224px, 1fr))" }}
       >
-        {detail.albums.map((album) => {
+        {/* albumsSorted, NOT detail.albums — the date sort toggle was being
+            computed and then ignored by this view. */}
+        {albumsSorted.map((album) => {
           const albumCoverPath = displayCover(album.covers, album.selected_cover);
           return (
             <div key={album.id} className="group min-w-0">
@@ -816,7 +825,7 @@ export function ArtistDetailPage({
           {viewMode === "grid" ? (
           <div
             className="grid gap-4"
-            style={{ gridTemplateColumns: "repeat(auto-fill, minmax(160px, 1fr))" }}
+            style={{ gridTemplateColumns: "repeat(auto-fill, minmax(224px, 1fr))" }}
           >
             {appearsSorted.map((album) => {
               const albumCoverPath = displayCover(album.covers, album.selected_cover);

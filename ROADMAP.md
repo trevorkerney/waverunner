@@ -4,8 +4,7 @@
 |-|-|
 | beta | movie/tv library |
 | beta | video player |
-| alpha | rich movie/tv detail view and sidebar complications |
-| X | music library |
-| X | audio player |
+| alpha | music library |
+| alpha | audio player |
 | X | plex/jellyfin/emby streaming |
 | X | IPTV streaming |

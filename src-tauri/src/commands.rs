@@ -493,6 +493,53 @@ pub async fn set_setting(
 }
 
 #[tauri::command]
+pub async fn get_library_settings(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+) -> Result<HashMap<String, String>, String> {
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT key, value FROM library_setting WHERE library_id = ?")
+            .bind(&library_id)
+            .fetch_all(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+    Ok(rows.into_iter().collect())
+}
+
+#[tauri::command]
+pub async fn set_library_setting(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    key: String,
+    value: String,
+) -> Result<(), String> {
+    sqlx::query("INSERT OR REPLACE INTO library_setting (library_id, key, value) VALUES (?, ?, ?)")
+        .bind(&library_id)
+        .bind(&key)
+        .bind(&value)
+        .execute(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Whether this library talks to online metadata providers at all. Absent
+/// row = yes — opting OUT is the recorded choice.
+pub(crate) async fn library_online_metadata(
+    pool: &sqlx::SqlitePool,
+    library_id: &str,
+) -> Result<bool, String> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT value FROM library_setting WHERE library_id = ? AND key = 'online_metadata'",
+    )
+    .bind(library_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(row.map(|(v,)| v != "off").unwrap_or(true))
+}
+
+#[tauri::command]
 pub async fn get_app_version() -> Result<String, String> {
     Ok(env!("CARGO_PKG_VERSION").to_string())
 }
@@ -811,6 +858,27 @@ pub(crate) fn emit_scan_progress(app: &tauri::AppHandle, library_id: &str, folde
     let _ = app.emit(
         "scan-progress",
         serde_json::json!({ "libraryId": library_id, "folder": folder }),
+    );
+}
+
+/// Same event, with a phase and counts — music scans have two honest halves
+/// (reading tags, building rows + thumbnails) and known totals for both.
+/// Video scans keep the bare variant; the frontend treats a missing phase as
+/// the old single-stream display.
+pub(crate) fn emit_scan_progress_phased(
+    app: &tauri::AppHandle,
+    library_id: &str,
+    folder: &str,
+    phase: &str,
+    done: usize,
+    total: usize,
+) {
+    let _ = app.emit(
+        "scan-progress",
+        serde_json::json!({
+            "libraryId": library_id, "folder": folder,
+            "phase": phase, "done": done, "total": total,
+        }),
     );
 }
 
@@ -7384,6 +7452,16 @@ pub async fn rescan_library(
         }
     }
     .await;
+
+    // Staged directives (splits, combines, separates) are applied by any
+    // successful rescan — the pending list they fed is now history.
+    if rescan_result.is_ok() {
+        sqlx::query("DELETE FROM pending_change WHERE library_id = ?")
+            .bind(&library_id)
+            .execute(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
 
     emit_scan_state(&app, &library_id, &lib_name, if rescan_result.is_ok() { "finished" } else { "failed" });
     rescan_result

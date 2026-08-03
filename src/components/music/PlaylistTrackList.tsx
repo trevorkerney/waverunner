@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useFlipList } from "../../hooks/useFlipList";
 import { invoke } from "@tauri-apps/api/core";
 import { useSortable } from "@dnd-kit/sortable";
 import { useDroppable } from "@dnd-kit/core";
@@ -42,6 +43,11 @@ interface PlaylistTrackListProps {
   onMetadataChanged?: () => void;
   onRenameCollection?: (entry: MediaEntry) => void;
   onDeleteCollection?: (entry: MediaEntry) => void;
+  /** Row text becomes links: artist chips per credit, the album cell, and
+   *  the track title (album focused at that track) — the now-playing bar's
+   *  exact navigation recipe. */
+  onOpenArtist?: (artistId: number, artistName: string) => void;
+  onOpenAlbum?: (albumId: number, albumTitle: string, trackId?: number) => void;
 }
 
 function displayCover(covers: string[], selected: string | null): string | null {
@@ -83,6 +89,7 @@ function Row({
       {...attributes}
       {...listeners}
       data-track-row
+      data-flip-id={String(sortableIdFor(entry))}
       style={{ transform: CSS.Transform.toString(transform), transition }}
       className={`group/track flex cursor-default items-center gap-3 rounded-md px-2 py-1.5 text-sm ${
         selected ? "bg-accent" : "hover:bg-accent/50"
@@ -113,6 +120,8 @@ export function PlaylistTrackList({
   onMetadataChanged,
   onRenameCollection,
   onDeleteCollection,
+  onOpenArtist,
+  onOpenAlbum,
 }: PlaylistTrackListProps) {
   // Row facts the hydrated entries lack (artists, album, duration, loved,
   // file paths for playback) — one batch fetch per view.
@@ -127,6 +136,14 @@ export function PlaylistTrackList({
   useDeselectOnBackgroundClick(useCallback(() => setSelectedRowId(null), []));
 
   const trackEntries = useMemo(() => entries.filter((e) => e.entry_type === "track"), [entries]);
+
+  // Sort-mode switches slide rows to their new order (shared FLIP recipe).
+  // Skipped whenever any row carries an inline transform — that's dnd-kit
+  // mid-drag/settle, which animates itself.
+  const listRef = useRef<HTMLDivElement>(null);
+  useFlipList(listRef, {
+    skip: () => !!listRef.current?.querySelector('[data-track-row][style*="transform"]'),
+  });
 
   useEffect(() => {
     let cancelled = false;
@@ -182,7 +199,7 @@ export function PlaylistTrackList({
 
   return (
     <ContextMenu>
-      <ContextMenuTrigger render={<div />}>
+      <ContextMenuTrigger render={<div ref={listRef} />}>
         {entries.map((e) => {
           if (e.entry_type === "playlist_collection") {
             const cover = displayCover(e.covers, e.selected_cover);
@@ -213,10 +230,16 @@ export function PlaylistTrackList({
           const info = infos?.get(e.id);
           const isCurrent = currentTrackId === e.id;
           const cover = displayCover(e.covers, e.selected_cover);
-          const artists =
+          // Credits render as individual chips so each resolvable artist is
+          // its own link; unresolved names stay plain text between them.
+          const creditChips =
             info && info.artists.length > 0
-              ? info.artists.map((c) => c.name).join(", ")
-              : info?.artist_name ?? e.collection_display ?? "";
+              ? info.artists
+              : info?.artist_name
+                ? [{ name: info.artist_name, artist_id: info.artist_id ?? null }]
+                : e.collection_display
+                  ? [{ name: e.collection_display, artist_id: null }]
+                  : [];
           return (
             <Row
               key={sortableIdFor(e)}
@@ -250,18 +273,63 @@ export function PlaylistTrackList({
               </span>
               <span className="min-w-0 flex-1">
                 <span className="flex min-w-0 items-baseline gap-1.5">
-                  <span className={`truncate ${isCurrent ? "font-medium text-primary" : e.title.trim() === "" ? "text-muted-foreground" : ""}`}>
-                    {trackDisplayTitle(e.title, info?.file_path ?? "")}
-                  </span>
+                  {/* Title links to its album, focused at this track — the
+                      bar-title recipe. Loose tracks have no album; plain. */}
+                  {onOpenAlbum && info?.album_id != null ? (
+                    <button
+                      onClick={(ev) => {
+                        ev.stopPropagation();
+                        onOpenAlbum(info.album_id!, info.album_title ?? "", e.id);
+                      }}
+                      className={`truncate text-left hover:underline ${isCurrent ? "font-medium text-primary" : e.title.trim() === "" ? "text-muted-foreground" : ""}`}
+                    >
+                      {trackDisplayTitle(e.title, info?.file_path ?? "")}
+                    </button>
+                  ) : (
+                    <span className={`truncate ${isCurrent ? "font-medium text-primary" : e.title.trim() === "" ? "text-muted-foreground" : ""}`}>
+                      {trackDisplayTitle(e.title, info?.file_path ?? "")}
+                    </span>
+                  )}
                   {isCurrent && <PlayingIndicator paused={!playing} className="shrink-0" />}
                 </span>
-                {artists && (
-                  <span className="block truncate text-xs text-muted-foreground">{artists}</span>
+                {creditChips.length > 0 && (
+                  <span className="block truncate text-xs text-muted-foreground">
+                    {creditChips.map((c, i) => (
+                      <span key={i}>
+                        {i > 0 && ", "}
+                        {onOpenArtist && c.artist_id != null ? (
+                          <button
+                            onClick={(ev) => {
+                              ev.stopPropagation();
+                              onOpenArtist(c.artist_id!, c.name);
+                            }}
+                            className="hover:text-foreground hover:underline"
+                          >
+                            {c.name}
+                          </button>
+                        ) : (
+                          c.name
+                        )}
+                      </span>
+                    ))}
+                  </span>
                 )}
               </span>
-              <span className="hidden min-w-0 max-w-[35%] shrink-0 truncate text-xs text-muted-foreground sm:block">
-                {info?.album_title ?? ""}
-              </span>
+              {onOpenAlbum && info?.album_id != null ? (
+                <button
+                  onClick={(ev) => {
+                    ev.stopPropagation();
+                    onOpenAlbum(info.album_id!, info.album_title ?? "");
+                  }}
+                  className="hidden min-w-0 max-w-[35%] shrink-0 truncate text-left text-xs text-muted-foreground hover:text-foreground hover:underline sm:block"
+                >
+                  {info.album_title ?? ""}
+                </button>
+              ) : (
+                <span className="hidden min-w-0 max-w-[35%] shrink-0 truncate text-xs text-muted-foreground sm:block">
+                  {info?.album_title ?? ""}
+                </span>
+              )}
               <LoveButton trackId={e.id} loved={info?.loved ?? false} reveal="group-hover/track:opacity-100" />
               <span className="w-10 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
                 {fmtTrackTime(info?.duration_secs ?? null)}

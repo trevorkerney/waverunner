@@ -25,6 +25,7 @@ import {
 } from "@/components/ui/tooltip";
 import { Spinner } from "@/components/ui/spinner";
 import { Checkbox } from "@/components/ui/checkbox";
+import { Switch } from "@/components/ui/switch";
 import { MetadataCenter } from "@/components/music/MetadataCenter";
 import { VideoMetadataCenter } from "@/components/VideoMetadataCenter";
 import { runBulkMatch } from "@/components/tmdbMatchEngine";
@@ -96,8 +97,20 @@ export function CreateLibraryDialog({
   // Only 'local' is implemented; 'server' (Jellyfin/Plex/Emby client mode) is
   // shown disabled so the direction is visible in the UI.
   const [source, setSource] = useState("local");
+  // Per-library opt-out of online metadata (MusicBrainz / TMDB+OMDB),
+  // recorded at creation. Default ON; "off" is the stored choice.
+  const [onlineMetadata, setOnlineMetadata] = useState(true);
   const [creating, setCreating] = useState(creatingGlobal);
-  const [scanProgress, setScanProgress] = useState("");
+  const [scanProgress, setScanProgress] = useState<{
+    folder: string;
+    phase?: string;
+    done?: number;
+    total?: number;
+  } | null>(null);
+  // Last-known done/total per scan sub-phase (read tags → build), feeding the
+  // Scan step's sub-stepper. Music scans only — video scans emit no phase, so
+  // this stays empty and the stepper never shows.
+  const [scanSub, setScanSub] = useState<Record<string, { done: number; total: number }>>({});
 
   const [step, setStep] = useState<Step>(1);
   const [matchPhase, setMatchPhase] = useState<MatchPhase>("elect");
@@ -116,7 +129,17 @@ export function CreateLibraryDialog({
   // (albums → artists) since their per-step costs differ.
   const etaSamplesRef = useRef<{ phase: string; times: number[] }>({ phase: "", times: [] });
   const [uncheckedCount, setUncheckedCount] = useState<number | null>(null);
+  // Music only: artists without an MBID — the pass's second phase. Counted
+  // separately because a post-split rescan can have 0 new albums but several
+  // new member artists worth looking up.
+  const [uncheckedArtists, setUncheckedArtists] = useState<number>(0);
+  // Music review gate: pending "Needs a decision" count reported by the
+  // embedded metadata center. null = not yet loaded — Finish stays held, so a
+  // slow load can't be finished past. Decisions are required work.
+  const [decisionsLeft, setDecisionsLeft] = useState<number | null>(null);
   const [confirmExit, setConfirmExit] = useState(false);
+  // Two-step "Skip remaining" during the match run — see the footer.
+  const [confirmSkip, setConfirmSkip] = useState(false);
   const [centerReloadKey, setCenterReloadKey] = useState(0);
   // The library the wizard is driving (created here, or resumed/rescanned).
   const [libraryId, setLibraryId] = useState<string | null>(null);
@@ -194,8 +217,18 @@ export function CreateLibraryDialog({
 
   useEffect(() => {
     if (!creating) return;
-    const unlisten = listen<{ libraryId: string; folder: string }>("scan-progress", (event) => {
-      setScanProgress(event.payload.folder);
+    const unlisten = listen<{
+      libraryId: string;
+      folder: string;
+      phase?: string;
+      done?: number;
+      total?: number;
+    }>("scan-progress", (event) => {
+      setScanProgress(event.payload);
+      const { phase, done, total } = event.payload;
+      if (phase && total != null) {
+        setScanSub((prev) => ({ ...prev, [phase]: { done: done ?? 0, total } }));
+      }
     });
     return () => { unlisten.then((fn) => fn()); };
   }, [creating]);
@@ -257,8 +290,10 @@ export function CreateLibraryDialog({
     if (initializedRef.current) return;
     initializedRef.current = true;
     setConfirmExit(false);
+    setConfirmSkip(false);
     setMatchProgress(null);
     setSubProgress({});
+    setDecisionsLeft(null);
     if (mode.kind === "create") {
       setStep(1);
       setLibraryId(null);
@@ -311,6 +346,7 @@ export function CreateLibraryDialog({
     setSoundsPaths([""]);
     setFormat("video");
     setSource("local");
+    setOnlineMetadata(true);
     setStep(1);
     setMatchPhase("elect");
     setMatchProgress(null);
@@ -318,6 +354,7 @@ export function CreateLibraryDialog({
     setConfirmExit(false);
     setLibraryId(null);
     setLibraryName("");
+    setDecisionsLeft(null);
   }
 
   function closeWizard() {
@@ -327,6 +364,18 @@ export function CreateLibraryDialog({
   }
 
   async function enterMatch(libId: string) {
+    // Per-library opt-out: with online metadata off there IS no match step —
+    // the wizard is done once the scan is. Checked here (not at the callers)
+    // so every route in — create, rescan, resume-at-match — honors it.
+    try {
+      const ls = await invoke<Record<string, string>>("get_library_settings", { libraryId: libId });
+      if (ls["online_metadata"] === "off") {
+        await finishWizard(libId);
+        return;
+      }
+    } catch (e) {
+      console.error(e);
+    }
     setStep(3);
     setMatchPhase("elect");
     setHeightAnimating(true);
@@ -337,18 +386,24 @@ export function CreateLibraryDialog({
       return;
     }
     try {
-      const ms = await invoke<{ unchecked: number; running: boolean }>("music_match_state", { libraryId: libId });
+      const ms = await invoke<{ unchecked: number; unchecked_artists: number; running: boolean }>(
+        "music_match_state",
+        { libraryId: libId },
+      );
       setUncheckedCount(ms.unchecked);
+      setUncheckedArtists(ms.unchecked_artists);
       // A pass already running (resumed mid-match after an app restart with
       // the flag still set is impossible — RUNNING dies with the app — but a
       // center-triggered pass may be live): show its progress instead.
       if (ms.running) setMatchPhase("running");
     } catch {
       setUncheckedCount(null);
+      setUncheckedArtists(0);
     }
   }
 
   async function enterReview() {
+    setConfirmSkip(false);
     const libId = libraryId;
     if (managesSetupRow && libId) {
       try {
@@ -401,8 +456,10 @@ export function CreateLibraryDialog({
     if (matchPhase === "elect") await enterReview();
   }
 
-  async function finishWizard() {
-    const libId = libraryId;
+  // libIdOverride: callers holding a fresher id than state (create hands the
+  // id to enterMatch before setLibraryId commits) pass it explicitly.
+  async function finishWizard(libIdOverride?: string) {
+    const libId = libIdOverride ?? libraryId;
     if (managesSetupRow && libId) {
       try {
         await invoke("complete_library_setup", { libraryId: libId });
@@ -423,7 +480,8 @@ export function CreateLibraryDialog({
   async function runRescan(libId: string) {
     setCreating(true);
     creatingGlobal = true;
-    setScanProgress("");
+    setScanProgress(null);
+    setScanSub({});
     try {
       await invoke("rescan_library", { libraryId: libId });
       if (managesSetupRow) {
@@ -444,7 +502,8 @@ export function CreateLibraryDialog({
     if (!name || totalValidPaths === 0 || creatingGlobal) return;
     setCreating(true);
     creatingGlobal = true;
-    setScanProgress("");
+    setScanProgress(null);
+    setScanSub({});
     setStep(2);
     setHeightAnimating(true);
     try {
@@ -459,6 +518,14 @@ export function CreateLibraryDialog({
               ...validShowPaths.map((path) => ({ path, kind: "show" })),
             ];
       const library = await invoke<Library>("create_library", { name, paths, format, source });
+      if (!onlineMetadata) {
+        // Recorded before enterMatch so its opt-out check sees the choice.
+        await invoke("set_library_setting", {
+          libraryId: library.id,
+          key: "online_metadata",
+          value: "off",
+        });
+      }
       onCreated();
       setLibraryId(library.id);
       setLibraryName(library.name);
@@ -565,10 +632,19 @@ export function CreateLibraryDialog({
     { n: 3, label: "Match" },
     { n: 4, label: "Review" },
   ];
-  const visibleSteps = mode.kind === "create" ? steps : steps.filter((s) => s.n !== 1);
+  // Opted out of online metadata at creation: Match and Review never happen,
+  // so the timeline honestly ends at Scan.
+  const visibleSteps =
+    mode.kind === "create"
+      ? onlineMetadata
+        ? steps
+        : steps.filter((s) => s.n <= 2)
+      : steps.filter((s) => s.n !== 1);
 
   const estMinutes =
-    uncheckedCount != null ? Math.max(1, Math.round((uncheckedCount * 3) / 60)) : null;
+    uncheckedCount != null
+      ? Math.max(1, Math.round((uncheckedCount * 3 + uncheckedArtists * 1.5) / 60))
+      : null;
 
   const title =
     mode.kind === "create"
@@ -621,14 +697,17 @@ export function CreateLibraryDialog({
               </div>
             ))}
           </div>
-          {/* Match sub-stages (music): albums → artists → images, each with its
-              own done/total so the counter doesn't look like it resets. */}
+          {/* Match sub-stages (music): albums → identify (credit-derived
+              artist ids) → artists (suggestion search) → images, each with
+              its own done/total so the counter doesn't look like it resets. */}
           {step === 3 && matchPhase === "running" && effFormat === "music" && (
             <div className="mt-1 flex items-center justify-center gap-2 text-[11px]">
               {(
                 [
                   ["albums", "Albums"],
-                  ["artists", "Artists"],
+                  ["artist-ids", "Identify"],
+                  ["artist-credits", "Credits"],
+                  ["artist-search", "Artists"],
                   ["artist-images", "Images"],
                 ] as const
               ).map(([key, label], i, arr) => {
@@ -653,11 +732,49 @@ export function CreateLibraryDialog({
                       }
                     >
                       {label}
-                      {state === "done" && p
-                        ? ` ${p.total}/${p.total}`
-                        : state === "current" && p
-                          ? ` ${Math.min(p.done + 1, p.total)}/${p.total}`
-                          : ""}
+                      {/* Count only once a stage FINISHES — "(237)" as a
+                          record of what it covered. Live progress belongs to
+                          the spinner line below; five stages of counters
+                          overflow the dialog's fixed width. */}
+                      {state === "done" && p ? ` (${p.total})` : ""}
+                    </span>
+                  </span>
+                );
+              })}
+            </div>
+          )}
+          {/* Scan sub-stages (music): read tags (per file) → build (album
+              rows + cover thumbnails). Video scans emit no phase, so scanSub
+              stays empty and this never renders for them. */}
+          {step === 2 && Object.keys(scanSub).length > 0 && (
+            <div className="mt-1 flex items-center justify-center gap-2 text-[11px]">
+              {(
+                [
+                  ["read-tags", "Read tags"],
+                  ["build", "Build"],
+                ] as const
+              ).map(([key, label], i, arr) => {
+                const p = scanSub[key];
+                const currentIdx = arr.findIndex(([k]) => k === scanProgress?.phase);
+                const state =
+                  currentIdx === -1 ? "pending"
+                  : i < currentIdx ? "done"
+                  : i === currentIdx ? "current"
+                  : "pending";
+                return (
+                  <span key={key} className="flex items-center gap-2">
+                    {i > 0 && <span className="h-px w-3 bg-border" />}
+                    <span
+                      className={
+                        state === "current"
+                          ? "text-foreground"
+                          : state === "done"
+                            ? "text-primary"
+                            : "text-muted-foreground"
+                      }
+                    >
+                      {label}
+                      {state === "done" && p ? ` (${p.total})` : ""}
                     </span>
                   </span>
                 );
@@ -669,7 +786,21 @@ export function CreateLibraryDialog({
         {step === 4 && libraryId ? (
           <div className="flex min-h-0 flex-1 flex-col pl-4 pr-0 pt-2">
             {effFormat === "music" ? (
-              <MetadataCenter libraryId={libraryId} reloadKey={centerReloadKey} />
+              <MetadataCenter
+                libraryId={libraryId}
+                reloadKey={centerReloadKey}
+                // A split written here needs its migration rescan, and this
+                // wizard already owns the scan flow — loop back through the
+                // Scan step (then Match, then land on Review again) instead of
+                // asking the sidebar to open a second wizard, which it
+                // rightly refuses while this one is up.
+                onRescanNeeded={(libId) => {
+                  setStep(2);
+                  setHeightAnimating(true);
+                  void runRescan(libId);
+                }}
+                onDecisionsChange={setDecisionsLeft}
+              />
             ) : (
               <VideoMetadataCenter libraryId={libraryId} reloadKey={centerReloadKey} />
             )}
@@ -816,15 +947,37 @@ export function CreateLibraryDialog({
                       />
                     </>
                   )}
+                  <div className="flex items-center gap-3 rounded-md border px-3 py-2.5">
+                    <div className="min-w-0 flex-1">
+                      <p className="text-sm font-medium">Online metadata</p>
+                      <p className="text-xs text-muted-foreground">
+                        {format === "music"
+                          ? "Identify albums and artists on MusicBrainz."
+                          : "Identify movies and shows on TMDB and OMDB."}{" "}
+                        Off keeps this library fully offline — changeable later in Library
+                        settings.
+                      </p>
+                    </div>
+                    <Switch checked={onlineMetadata} onCheckedChange={setOnlineMetadata} />
+                  </div>
                 </>
               )}
 
               {step === 2 && (
                 <div className="flex w-full min-w-0 flex-col items-center gap-3 overflow-hidden py-6 text-center">
                   <Spinner className="size-6" />
-                  <p className="text-sm font-medium">Scanning your library…</p>
+                  <p className="w-full min-w-0 truncate px-2 text-sm font-medium">
+                    {scanProgress?.phase === "read-tags"
+                      ? "Reading file tags"
+                      : scanProgress?.phase === "build"
+                        ? "Building your library"
+                        : "Scanning your library…"}
+                    {scanProgress?.phase && scanProgress.total != null
+                      ? ` — ${Math.min((scanProgress.done ?? 0) + 1, scanProgress.total)}/${scanProgress.total}`
+                      : ""}
+                  </p>
                   <p className="min-h-4 w-full min-w-0 truncate px-2 text-xs text-muted-foreground">
-                    {scanProgress || "Reading folders…"}
+                    {scanProgress?.folder || "Reading folders…"}
                   </p>
                 </div>
               )}
@@ -851,9 +1004,20 @@ export function CreateLibraryDialog({
                     </p>
                     {uncheckedCount != null && (
                       <p className="mt-2 text-xs text-muted-foreground">
-                        {uncheckedCount} {uncheckedCount === 1 ? "album" : "albums"} to check
-                        {estMinutes != null && uncheckedCount > 0
-                          ? ` · about ${estMinutes} ${estMinutes === 1 ? "minute" : "minutes"} — each album takes a couple of requests, and MusicBrainz allows ~1 per second`
+                        {/* Albums and artists are separate phases of the pass,
+                            and either can be the only one with work — a
+                            post-split rescan has 0 new albums but new member
+                            artists to look up. */}
+                        {[
+                          `${uncheckedCount} ${uncheckedCount === 1 ? "album" : "albums"}`,
+                          uncheckedArtists > 0 &&
+                            `${uncheckedArtists} ${uncheckedArtists === 1 ? "artist" : "artists"}`,
+                        ]
+                          .filter(Boolean)
+                          .join(" · ")}{" "}
+                        to check
+                        {estMinutes != null && (uncheckedCount > 0 || uncheckedArtists > 0)
+                          ? ` · about ${estMinutes} ${estMinutes === 1 ? "minute" : "minutes"} — MusicBrainz allows ~1 request per second`
                           : ""}
                       </p>
                     )}
@@ -862,14 +1026,21 @@ export function CreateLibraryDialog({
               )}
 
               {step === 3 && effFormat === "music" && matchPhase === "running" && (
-                <div className="flex w-full min-w-0 flex-col items-center gap-3 overflow-hidden py-6 text-center">
+                // pt < pb on purpose: the header's sub-stepper line adds its
+                // own breathing room above, so equal padding read as
+                // top-heavy — this evens the VISUAL gap to the footer's.
+                <div className="flex w-full min-w-0 flex-col items-center gap-3 overflow-hidden pt-3 pb-6 text-center">
                   <Spinner className="size-6" />
                   <p className="w-full min-w-0 truncate px-2 text-sm font-medium">
-                    {matchProgress?.phase === "artists"
-                      ? "Looking up artists on MusicBrainz"
-                      : matchProgress?.phase === "artist-images"
-                        ? "Fetching artist images"
-                        : "Matching against MusicBrainz"}
+                    {matchProgress?.phase === "artist-ids"
+                      ? "Identifying artists from matched albums"
+                      : matchProgress?.phase === "artist-credits"
+                        ? "Reading album credits on MusicBrainz"
+                        : matchProgress?.phase === "artist-search"
+                          ? "Searching artists on MusicBrainz"
+                          : matchProgress?.phase === "artist-images"
+                            ? "Fetching artist images"
+                            : "Matching against MusicBrainz"}
                     {matchProgress ? ` — ${matchProgress.done + 1}/${matchProgress.total}` : "…"}
                   </p>
                   <p className="min-h-4 w-full min-w-0 truncate px-2 text-xs text-muted-foreground">
@@ -923,18 +1094,54 @@ export function CreateLibraryDialog({
               <Button variant="outline" onClick={() => void skipMatching()}>
                 Skip for now
               </Button>
-              <Button onClick={() => void startMatching()} disabled={uncheckedCount === 0}>
+              <Button
+                onClick={() => void startMatching()}
+                disabled={uncheckedCount === 0 && uncheckedArtists === 0}
+              >
                 Start matching
               </Button>
             </>
           ) : step === 3 ? (
-            <div className="flex w-full items-center justify-end gap-2">
-              <Button variant="outline" size="sm" onClick={() => void skipMatching()}>
-                Skip remaining
-              </Button>
-            </div>
+            // Two-step skip: the button is one click away from abandoning a
+            // long pass, and it sits right where an idle cursor rests.
+            confirmSkip ? (
+              <div className="flex w-full items-center gap-2">
+                <span className="flex-1 text-xs text-muted-foreground">
+                  Skip the remaining matching? Unmatched items stay available in the metadata
+                  center.
+                </span>
+                <Button variant="outline" size="sm" onClick={() => setConfirmSkip(false)}>
+                  Keep going
+                </Button>
+                <Button
+                  size="sm"
+                  onClick={() => {
+                    setConfirmSkip(false);
+                    void skipMatching();
+                  }}
+                >
+                  Skip remaining
+                </Button>
+              </div>
+            ) : (
+              <div className="flex w-full items-center justify-end gap-2">
+                <Button variant="outline" size="sm" onClick={() => setConfirmSkip(true)}>
+                  Skip remaining
+                </Button>
+              </div>
+            )
           ) : (
-            <Button onClick={() => void finishWizard()}>Finish</Button>
+            <div className="flex w-full items-center justify-end gap-3">
+              {/* Informational, not a gate — decisions wait in the metadata
+                  center; the library is never held hostage to them. */}
+              {effFormat === "music" && (decisionsLeft ?? 0) > 0 && (
+                <span className="text-xs text-muted-foreground">
+                  {decisionsLeft} {decisionsLeft === 1 ? "suggestion" : "suggestions"} waiting in
+                  the metadata center
+                </span>
+              )}
+              <Button onClick={() => void finishWizard()}>Finish</Button>
+            </div>
           )}
         </DialogFooter>
       </DialogContent>

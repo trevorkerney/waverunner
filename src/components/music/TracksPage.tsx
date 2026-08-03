@@ -2,7 +2,7 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Play, Music, Music2, Pencil, ListPlus, ListStart, ListEnd, Disc3 } from "lucide-react";
 import { Spinner } from "../ui/spinner";
-import { Input } from "../ui/input";
+import { ClearableInput } from "../ui/clearable-input";
 import {
   ContextMenu,
   ContextMenuTrigger,
@@ -224,11 +224,16 @@ export function TracksPage({ libraryId, onPlayQueue, currentTrackId, playing, on
   }, [libraryId, reloadKey]);
 
   // Rescans change the track list out from under this page — refetch silently
-  // (rows stay visible; only reloadKey 0 shows the loading state).
+  // (rows stay visible; only reloadKey 0 shows the loading state). Scrobbles
+  // tick the play-count column, same silent treatment.
   useEffect(() => {
     const onRescanned = () => setReloadKey((k) => k + 1);
     window.addEventListener("waverunner:library-rescanned", onRescanned);
-    return () => window.removeEventListener("waverunner:library-rescanned", onRescanned);
+    window.addEventListener("waverunner:track-scrobbled", onRescanned);
+    return () => {
+      window.removeEventListener("waverunner:library-rescanned", onRescanned);
+      window.removeEventListener("waverunner:track-scrobbled", onRescanned);
+    };
   }, []);
 
   const filtered = useMemo(() => {
@@ -309,12 +314,14 @@ export function TracksPage({ libraryId, onPlayQueue, currentTrackId, playing, on
           Tracks
           <span className="text-base font-normal text-muted-foreground">({rows.length})</span>
         </h1>
-        <Input
-          value={filter}
-          onChange={(e) => setFilter(e.target.value)}
-          placeholder="Filter tracks…"
-          className="h-8 max-w-xs text-sm"
-        />
+        <div className="w-full max-w-xs">
+          <ClearableInput
+            value={filter}
+            onValueChange={setFilter}
+            placeholder="Filter tracks…"
+            className="h-8 text-sm"
+          />
+        </div>
       </div>
 
       {filtered.length === 0 ? (

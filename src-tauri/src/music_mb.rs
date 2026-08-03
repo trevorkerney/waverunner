@@ -170,6 +170,12 @@ pub fn spawn_enrich(app: AppHandle, library_id: String) {
 /// Start the matching pass (wizard match step / metadata-center re-run).
 #[tauri::command]
 pub async fn music_match_begin(app: AppHandle, library_id: String) -> Result<(), String> {
+    // Backstop for the per-library opt-out — the UI hides every entry point,
+    // but no pass should ever reach MusicBrainz against a recorded "off".
+    let pool = app.state::<AppState>().app_db.clone();
+    if !crate::commands::library_online_metadata(&pool, &library_id).await? {
+        return Err("Online metadata is turned off for this library".to_string());
+    }
     spawn_enrich(app, library_id);
     Ok(())
 }
@@ -187,6 +193,12 @@ pub struct MusicMatchState {
     pub running: bool,
     /// Albums never checked against MusicBrainz (no stamp).
     pub unchecked: i64,
+    /// Artists whose identity the pass can DERIVE: no MBID yet, but credited
+    /// on a matched album (whose MB credit names them by id). Artists with no
+    /// matched evidence aren't counted — the pass won't touch them. Albums
+    /// and artists are separate counts because either can be zero while the
+    /// other has work.
+    pub unchecked_artists: i64,
     pub pending_suggestions: i64,
     pub unmatched: i64,
     pub matched: i64,
@@ -212,6 +224,27 @@ pub async fn music_match_state(
     .fetch_one(pool)
     .await
     .map_err(|e| e.to_string())?;
+    let (unchecked_artists,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM artist a
+         JOIN media_entry me ON me.id = a.id
+         WHERE me.library_id = ?1 AND (a.musicbrainz_id IS NULL OR a.musicbrainz_id = '')
+           AND (EXISTS (SELECT 1 FROM album_artist_credit ac
+                        JOIN field_override f ON f.entity_id = ac.album_id
+                           AND f.field = 'mb_release_group_id'
+                        WHERE ac.artist_id = a.id)
+             OR EXISTS (SELECT 1 FROM track_credit tc
+                        JOIN media_entry tme ON tme.id = tc.track_id
+                        JOIN field_override f ON f.entity_id = tme.parent_id
+                           AND f.field = 'mb_release_id'
+                        WHERE tc.artist_id = a.id)
+             OR NOT EXISTS (SELECT 1 FROM mb_suggestion s
+                            WHERE s.library_id = ?1 AND s.kind = 'artist_match'
+                              AND s.target_key = CAST(a.id AS TEXT)))",
+    )
+    .bind(&library_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| e.to_string())?;
     let (pending_suggestions,): (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM mb_suggestion WHERE library_id = ? AND status = 'pending'",
     )
@@ -232,6 +265,7 @@ pub async fn music_match_state(
     Ok(MusicMatchState {
         running: RUNNING.load(Ordering::SeqCst),
         unchecked,
+        unchecked_artists,
         pending_suggestions,
         unmatched: by("notfound"),
         matched: by("matched"),
@@ -257,9 +291,17 @@ async fn enrich(app: &AppHandle, library_id: &str) -> Result<EnrichOutcome, Stri
 
     let (albums_matched, albums_processed) = enrich_albums(app, &pool, &client, library_id).await?;
     crate::music::ensure_credit_artists(&pool, library_id).await?;
-    let artists_updated = enrich_artist_mbids(app, &pool, &client, library_id).await?;
+    let (artists_updated, fetch_failed) =
+        enrich_artist_mbids(app, &pool, &client, library_id).await?;
+    // Features on group-matched albums: dig one level deeper (the group's
+    // pressings) for track-credit MBIDs before falling back to asking.
+    let (harvested, harvest_failed) =
+        harvest_group_credits(app, &pool, &client, library_id).await?;
+    let artists_updated = artists_updated + harvested;
+    let fetch_failed: std::collections::HashSet<i64> =
+        fetch_failed.union(&harvest_failed).copied().collect();
     merge_mbid_duplicates(&pool, library_id).await?;
-    resolve_merge_suggestions_via_mbid(&pool, &client, library_id).await?;
+    suggest_artist_matches(app, &pool, &client, library_id, &fetch_failed).await?;
     // Credit replacement above can orphan artists that only backed a
     // since-replaced parsed credit string — sweep them so no works-less
     // artist lingers in the grid.
@@ -269,6 +311,10 @@ async fn enrich(app: &AppHandle, library_id: &str) -> Result<EnrichOutcome, Stri
         .join("cache")
         .join(library_id);
     crate::music::sweep_orphan_artists(&pool, library_id, &cache_base).await?;
+    // The sweep deletes artists whose ids may still be stamped on surviving
+    // credit rows (artist_id is a soft reference) — re-stamp so nothing
+    // dangles.
+    crate::music::resolve_credit_ids(&pool, library_id).await?;
 
     // Artist images: Wikidata (by the MBIDs just filled) + Deezer fallback —
     // gap-fill only, no MusicBrainz requests involved.
@@ -309,14 +355,29 @@ async fn enrich_albums(
     client: &reqwest::Client,
     library_id: &str,
 ) -> Result<(usize, usize), String> {
-    let albums: Vec<(i64, String, Option<String>)> = sqlx::query_as(
-        "SELECT al.id, al.title, ar.title FROM album al
+    // Unchecked albums, plus NOT-FOUND albums whose artist has since been
+    // identified: an arid-scoped search is strictly stronger evidence than
+    // the name search that failed, so those earn a re-try each pass.
+    let albums: Vec<(i64, String, Option<String>, Option<String>, String)> = sqlx::query_as(
+        "SELECT al.id, al.title, ar.title, ar.musicbrainz_id,
+                COALESCE((SELECT f.status FROM mb_credit_fetch f WHERE f.album_id = al.id), '')
+         FROM album al
          JOIN media_entry me ON me.id = al.id
          LEFT JOIN artist ar ON ar.id = me.parent_id
          WHERE me.library_id = ?
-           AND NOT EXISTS (SELECT 1 FROM mb_credit_fetch f WHERE f.album_id = al.id)
+           AND (NOT EXISTS (SELECT 1 FROM mb_credit_fetch f WHERE f.album_id = al.id)
+                OR (EXISTS (SELECT 1 FROM mb_credit_fetch f
+                            WHERE f.album_id = al.id AND f.status = 'notfound')
+                    AND ar.musicbrainz_id IS NOT NULL AND ar.musicbrainz_id <> ''))
            AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = al.id)
            AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = al.id)
+           -- An undone match is a standing 'not this' — the pass must not
+           -- re-conclude it. Unmatch clears the suppression for a start-over.
+           AND NOT EXISTS (SELECT 1 FROM mb_suppression s
+                           WHERE s.kind = 'album_match' AND s.target_id = al.id)
+           -- Ignored albums have left the matching machinery entirely.
+           AND NOT EXISTS (SELECT 1 FROM field_override ig
+                           WHERE ig.entity_id = al.id AND ig.field = 'mb_ignored')
          ORDER BY al.sort_title COLLATE NOCASE",
     )
     .bind(library_id)
@@ -330,7 +391,7 @@ async fn enrich_albums(
     let total = albums.len();
     let mut matched = 0usize;
     let mut processed = 0usize;
-    for (i, (album_id, title, artist)) in albums.into_iter().enumerate() {
+    for (i, (album_id, title, artist, artist_mbid, prior_stamp)) in albums.into_iter().enumerate() {
         if CANCEL.load(Ordering::SeqCst) {
             break; // skip-remaining: the rest stay unstamped for later
         }
@@ -366,26 +427,55 @@ async fn enrich_albums(
             }
         }
 
-        // Otherwise identify the ALBUM only. Searched as tagged first, then
-        // with store/ripper decorations stripped — `[88.2/24 Tidal]` and
-        // `(Explicit Version)` are the most common reason a search finds
-        // nothing at all.
-        let mut groups = match search_release_groups(client, &title, artist.as_deref()).await {
-            Ok(g) => g,
-            Err(e) => {
-                eprintln!("musicbrainz release-group search '{title}': {e}");
-                continue;
-            }
-        };
+        // Otherwise identify the ALBUM only. Attempts run strongest-evidence
+        // first: an identified artist scopes the search to their discography
+        // (arid:), which is near-deterministic; the name-text scope is the
+        // fallback so a differently-credited group (compilations, joint
+        // credits filed under one member) is still findable. Each tier tries
+        // the title as tagged, then with store/ripper decorations stripped —
+        // `[88.2/24 Tidal]` is the most common reason a search finds nothing.
+        // Re-tried not-founds run ONLY the arid tier: the name tier is
+        // exactly what already failed, and repeating it would bill two
+        // pointless requests per album every pass.
+        let arid = artist_mbid.as_deref().filter(|s| !s.is_empty());
+        let retry = prior_stamp == "notfound";
         let stripped = strip_title_decorations(&title);
-        if groups.is_empty() && stripped != title && !stripped.is_empty() {
-            groups = match search_release_groups(client, &stripped, artist.as_deref()).await {
-                Ok(g) => g,
-                Err(e) => {
-                    eprintln!("musicbrainz release-group search '{stripped}': {e}");
-                    continue;
-                }
+        let mut attempts: Vec<(&str, bool)> = Vec::new();
+        if arid.is_some() {
+            attempts.push((title.as_str(), true));
+            if stripped != title && !stripped.is_empty() {
+                attempts.push((stripped.as_str(), true));
+            }
+        }
+        if !retry {
+            attempts.push((title.as_str(), false));
+            if stripped != title && !stripped.is_empty() {
+                attempts.push((stripped.as_str(), false));
+            }
+        }
+        let mut groups = Vec::new();
+        let mut search_failed = false;
+        for (t, use_arid) in attempts {
+            let found = if use_arid {
+                search_release_groups(client, t, None, arid).await
+            } else {
+                search_release_groups(client, t, artist.as_deref(), None).await
             };
+            match found {
+                Ok(g) if !g.is_empty() => {
+                    groups = g;
+                    break;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("musicbrainz release-group search '{t}': {e}");
+                    search_failed = true;
+                    break;
+                }
+            }
+        }
+        if search_failed {
+            continue; // transient — unstamped (or still notfound), retried next pass
         }
 
         // Confident means UNAMBIGUOUS: exactly one credible group. Two albums
@@ -494,6 +584,10 @@ pub const MB_RELEASE: &str = "mb_release_id";
 pub const MB_RELEASE_GROUP: &str = "mb_release_group_id";
 pub const MB_RECORDING: &str = "mb_recording_id";
 pub const MB_ARTIST: &str = "mb_artist_id";
+/// Not an id: a user directive. "Don't match this and stop counting it" —
+/// the entity leaves every pass, every warning count, and the guide; the
+/// library map paints it gray instead of red. Cleared by un-ignoring.
+pub const MB_IGNORED: &str = "mb_ignored";
 
 pub const TIER_USER: &str = "user";
 pub const TIER_MB: &str = "mb";
@@ -538,6 +632,23 @@ pub async fn mb_id(
     .await
     .map_err(|e| e.to_string())?;
     Ok(row.and_then(|(v, t)| v.map(|v| (v, t))))
+}
+
+/// Mark an album or artist as ignored (or clear it): excluded from the
+/// passes and the unmatched counts, gray on the library map. Stored in
+/// field_override like the ids — per entity, rescan-proof.
+#[tauri::command]
+pub async fn mb_set_ignored(
+    state: State<'_, AppState>,
+    entity_id: i64,
+    ignored: bool,
+) -> Result<(), String> {
+    let pool = &state.app_db;
+    if ignored {
+        set_mb_id(pool, entity_id, MB_IGNORED, "1", TIER_USER).await
+    } else {
+        clear_mb_id(pool, entity_id, MB_IGNORED).await
+    }
 }
 
 /// Forget an id at every tier — what Unmatch means.
@@ -774,9 +885,10 @@ struct MbReleaseFull {
     album_type: Option<String>,
     /// Release-group first release date (falls back to the release date).
     date: Option<String>,
-    /// RELEASE-level artist credit ("Drake & Future" → [Drake, Future]).
-    /// Two or more names = a joint album; the pass writes album_artist_credit.
-    album_artists: Vec<String>,
+    /// RELEASE-level artist credit ("Drake & Future" → [Drake, Future]),
+    /// each name with its MB artist id. Two or more names = a joint album;
+    /// the pass writes album_artist_credit.
+    album_artists: Vec<(String, Option<String>)>,
     tracks: Vec<MbTrack>,
 }
 
@@ -832,7 +944,7 @@ async fn fetch_release(
     }
     // RELEASE-level artist credit — joint albums ("Drake & Future") carry
     // every owner here, separate from the per-track credits.
-    let album_artists: Vec<String> = body["artist-credit"]
+    let album_artists: Vec<(String, Option<String>)> = body["artist-credit"]
         .as_array()
         .into_iter()
         .flatten()
@@ -842,7 +954,10 @@ async fn fetch_release(
                 .or_else(|| c["artist"]["name"].as_str())?
                 .trim()
                 .to_string();
-            (!name.is_empty()).then_some(name)
+            if name.is_empty() {
+                return None;
+            }
+            Some((name, c["artist"]["id"].as_str().map(|s| s.to_string())))
         })
         .collect();
 
@@ -908,20 +1023,27 @@ pub struct GroupCandidate {
     pub score: i64,
     /// Release-level artist credit; two or more names means a joint album.
     pub artists: Vec<String>,
+    /// Each credited name's MB artist id, parallel to `artists`. This is what
+    /// makes ARTIST identity derivable with certainty: matching the album
+    /// tells us exactly which "God" its credit means.
+    pub artist_ids: Vec<Option<String>>,
 }
 
 fn group_of(g: &serde_json::Value, default_score: i64) -> Option<GroupCandidate> {
-    let artists: Vec<String> = g["artist-credit"]
+    let credit: Vec<(String, Option<String>)> = g["artist-credit"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(|c| {
-            c["name"]
+            let name = c["name"]
                 .as_str()
-                .or_else(|| c["artist"]["name"].as_str())
-                .map(|s| s.to_string())
+                .or_else(|| c["artist"]["name"].as_str())?
+                .to_string();
+            Some((name, c["artist"]["id"].as_str().map(|s| s.to_string())))
         })
         .collect();
+    let artists: Vec<String> = credit.iter().map(|(n, _)| n.clone()).collect();
+    let artist_ids: Vec<Option<String>> = credit.into_iter().map(|(_, id)| id).collect();
     Some(GroupCandidate {
         group_id: g["id"].as_str()?.to_string(),
         title: g["title"].as_str().unwrap_or_default().to_string(),
@@ -937,6 +1059,7 @@ fn group_of(g: &serde_json::Value, default_score: i64) -> Option<GroupCandidate>
             .map(|s| s.to_string()),
         score: g["score"].as_i64().unwrap_or(default_score),
         artists,
+        artist_ids,
     })
 }
 
@@ -995,9 +1118,15 @@ async fn search_release_groups(
     client: &reqwest::Client,
     title: &str,
     artist: Option<&str>,
+    // The artist's MBID, when identity is already certain — collapses the
+    // search space to that artist's discography (strictly stronger than the
+    // name text, which matches any same-named stranger's albums).
+    arid: Option<&str>,
 ) -> Result<Vec<GroupCandidate>, String> {
     let mut query = format!("releasegroup:\"{}\"", title.replace('"', " "));
-    if let Some(artist) = artist {
+    if let Some(arid) = arid {
+        query.push_str(&format!(" AND arid:{arid}"));
+    } else if let Some(artist) = artist {
         query.push_str(&format!(" AND artist:\"{}\"", artist.replace('"', " ")));
     }
     let url = url::Url::parse_with_params(
@@ -1041,6 +1170,74 @@ async fn fetch_release_group(
     Ok(group_of(&body, 100))
 }
 
+/// The ONLY automatic artist matching waverunner does: identity derived from
+/// the credit of an album that is already matched. The credit names each
+/// artist by MBID, so "your artist credited on this album IS this MB artist"
+/// holds with certainty — where a bare name search can hit any same-named
+/// stranger ("God" is several artists on MusicBrainz; the one credited on
+/// Yeezus is Kanye West's collaborator entry or nobody).
+///
+/// Fills gaps only: an artist that already has an id (user-tier or an earlier
+/// stamp) is left alone — conflicting evidence is a decision, not an update.
+async fn stamp_artist_ids_from_credit(
+    pool: &SqlitePool,
+    library_id: &str,
+    credit: &[(String, Option<String>)],
+) -> Result<usize, String> {
+    let mut stamped = 0usize;
+    for (name, mbid) in credit {
+        let Some(mbid) = mbid else { continue };
+        // As-credited name → our artist row (title or redirect), same
+        // resolution surface the credit stamps use.
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT an.artist_id FROM artist_names an
+             JOIN media_entry me ON me.id = an.artist_id
+             JOIN artist a ON a.id = an.artist_id
+             WHERE me.library_id = ?1 AND LOWER(an.name) = LOWER(?2)
+               AND (a.musicbrainz_id IS NULL OR a.musicbrainz_id = '')
+             LIMIT 1",
+        )
+        .bind(library_id)
+        .bind(name)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        if let Some((artist_id,)) = row {
+            sqlx::query("UPDATE artist SET musicbrainz_id = ? WHERE id = ?")
+                .bind(mbid)
+                .bind(artist_id)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            set_mb_id(pool, artist_id, MB_ARTIST, mbid, TIER_MB).await?;
+            settle_artist_card_derived(pool, library_id, artist_id).await?;
+            stamped += 1;
+        }
+    }
+    Ok(stamped)
+}
+
+/// A pending "Which artist is this?" card whose artist just got identified by
+/// EVIDENCE is a question that answered itself — settle it (status 'derived':
+/// hidden from review, never re-asked) so cards vanish the moment any other
+/// page's action makes them moot.
+async fn settle_artist_card_derived(
+    pool: &SqlitePool,
+    library_id: &str,
+    artist_id: i64,
+) -> Result<(), String> {
+    sqlx::query(
+        "UPDATE mb_suggestion SET status = 'derived'
+         WHERE library_id = ? AND kind = 'artist_match' AND target_key = ? AND status = 'pending'",
+    )
+    .bind(library_id)
+    .bind(artist_id.to_string())
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Apply what a release group knows: album type, first release date, and the
 /// album-level artist credit. Never touches tracks — a group has no track
 /// list, and that is exactly why it is safe to conclude automatically.
@@ -1053,6 +1250,9 @@ async fn apply_group(
     tier: &str,
 ) -> Result<(), String> {
     let batch = next_batch(pool).await?;
+    // Pre-match id, captured before it's overwritten — the "before" of the
+    // match log written at the end of this function.
+    let prev_group_id = mb_id(pool, album_id, MB_RELEASE_GROUP).await?.map(|(v, _)| v);
     set_mb_id(pool, album_id, MB_RELEASE_GROUP, &group.group_id, tier).await?;
     sqlx::query("UPDATE album SET mb_release_group_id = ? WHERE id = ?")
         .bind(&group.group_id)
@@ -1060,6 +1260,17 @@ async fn apply_group(
         .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
+
+    // Credited artists that already have pages get their identity from this
+    // match; names whose pages don't exist yet are caught by the pass's
+    // artist phase after ensure_credit_artists creates them.
+    let credit_pairs: Vec<(String, Option<String>)> = group
+        .artists
+        .iter()
+        .cloned()
+        .zip(group.artist_ids.iter().cloned())
+        .collect();
+    stamp_artist_ids_from_credit(pool, library_id, &credit_pairs).await?;
 
     if group.artists.len() >= 2
         && !suppressed(pool, "album_artists", album_id).await?
@@ -1170,6 +1381,25 @@ async fn apply_group(
             }
         }
     }
+
+    // A person's match is a decision even when every gap-fill above turned
+    // out to be a no-op (type, date and credits already agreeing with MB) —
+    // log the match itself so history records the answer. Logged LAST so it
+    // titles the batch's history row. The automatic pass stays silent here:
+    // machine actions log only when they change data.
+    if tier == TIER_USER {
+        log_change(
+            pool,
+            library_id,
+            "album_match",
+            album_id,
+            &format!("{album_title} — matched to MusicBrainz"),
+            &serde_json::json!({ "release_group_id": prev_group_id }),
+            &serde_json::json!({ "release_group_id": group.group_id }),
+            batch,
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -1194,6 +1424,11 @@ async fn apply_release(
     // Everything below is ONE action — applying this release — so it shares a
     // batch and undoes as a unit.
     let batch = next_batch(pool).await?;
+
+    // Pre-match ids, captured before they're overwritten — the "before" of
+    // the match log written at the end of this function.
+    let prev_group_id = mb_id(pool, album_id, MB_RELEASE_GROUP).await?.map(|(v, _)| v);
+    let prev_release_id = mb_id(pool, album_id, MB_RELEASE).await?.map(|(v, _)| v);
 
     // Credits: replace our parsed guesses on the default release's tracks.
     if !suppressed(pool, "track_credits", album_id).await? {
@@ -1225,7 +1460,9 @@ async fn apply_release(
     // written as album_artist_credit rows so the album lands in each of their
     // discographies. User-set credits outrank; logged and undoable like every
     // other application.
-    if full.album_artists.len() >= 2
+    let album_artist_names: Vec<String> =
+        full.album_artists.iter().map(|(n, _)| n.clone()).collect();
+    if album_artist_names.len() >= 2
         && !suppressed(pool, "album_artists", album_id).await?
         && !crate::music_edit::has_override(pool, album_id, "artist_credits").await?
     {
@@ -1239,10 +1476,10 @@ async fn apply_release(
         .into_iter()
         .map(|(n,)| n)
         .collect();
-        let differs = current.len() != full.album_artists.len()
+        let differs = current.len() != album_artist_names.len()
             || current
                 .iter()
-                .zip(&full.album_artists)
+                .zip(&album_artist_names)
                 .any(|(a, b)| !a.eq_ignore_ascii_case(b));
         if differs {
             sqlx::query("DELETE FROM album_artist_credit WHERE album_id = ?")
@@ -1250,7 +1487,7 @@ async fn apply_release(
                 .execute(pool)
                 .await
                 .map_err(|e| e.to_string())?;
-            for (i, name) in full.album_artists.iter().enumerate() {
+            for (i, name) in album_artist_names.iter().enumerate() {
                 sqlx::query(
                     "INSERT INTO album_artist_credit (album_id, position, name) VALUES (?, ?, ?)",
                 )
@@ -1266,13 +1503,32 @@ async fn apply_release(
                 library_id,
                 "album_artists",
                 album_id,
-                &format!("{album_title} — credited to {}", full.album_artists.join(" · ")),
+                &format!("{album_title} — credited to {}", album_artist_names.join(" · ")),
                 &serde_json::json!({ "names": current }),
-                &serde_json::json!({ "names": full.album_artists }),
+                &serde_json::json!({ "names": album_artist_names }),
                 batch,
             )
             .await?;
         }
+    }
+
+    // Artist identity from this release's credits — album-level owners AND
+    // per-track features (this is where a guest like Xzibit, credited on one
+    // matched song, gets his exact MB identity). De-duplicated so a name
+    // credited on twelve tracks resolves once.
+    {
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut credit_pairs: Vec<(String, Option<String>)> = Vec::new();
+        for (name, id) in full
+            .album_artists
+            .iter()
+            .chain(full.tracks.iter().flat_map(|(_, _, _, credits)| credits.iter()))
+        {
+            if id.is_some() && seen.insert(name.as_str()) {
+                credit_pairs.push((name.clone(), id.clone()));
+            }
+        }
+        stamp_artist_ids_from_credit(pool, library_id, &credit_pairs).await?;
     }
 
     // Album type: MB's release-group type replaces the track-count guess —
@@ -1362,6 +1618,31 @@ async fn apply_release(
             .execute(pool)
             .await
             .map_err(|e| e.to_string())?;
+    }
+
+    // Same rule as apply_group: a person's match logs even when every
+    // application above turned out to be a no-op, so the decision itself is
+    // visible (and undoable) in history — not only its side effects. Logged
+    // LAST so it titles the batch's history row. The automatic pass stays
+    // silent: machine actions log only when they change data.
+    if tier == TIER_USER {
+        log_change(
+            pool,
+            library_id,
+            "album_match",
+            album_id,
+            &format!("{album_title} — matched to MusicBrainz"),
+            &serde_json::json!({
+                "release_group_id": prev_group_id,
+                "release_id": prev_release_id,
+            }),
+            &serde_json::json!({
+                "release_group_id": full.release_group_id,
+                "release_id": full.release_id,
+            }),
+            batch,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -1574,16 +1855,427 @@ fn titles_match(a: &str, b: &str) -> bool {
 // Artist MBIDs
 // ---------------------------------------------------------------------------
 
+/// Returns (stamped count, artists whose evidence fetch FAILED this pass) —
+/// the failures must not fall through to the suggestion sweep, or a transient
+/// 503 would permanently convert a derivable artist into a burned question.
 async fn enrich_artist_mbids(
     app: &AppHandle,
     pool: &SqlitePool,
     client: &reqwest::Client,
     library_id: &str,
+) -> Result<(usize, std::collections::HashSet<i64>), String> {
+    // Evidence-based only. An artist qualifies when they're credited on a
+    // MATCHED album — album-level credit on a group-matched album, or a track
+    // credit on a release-matched one. The matched entity's credit names each
+    // artist by MBID, which is the certainty a bare name search can never
+    // give ("God" is several artists on MusicBrainz; the one credited on the
+    // album you matched is exactly one of them). Artists with no matched
+    // evidence stay unidentified on purpose — a person decides those.
+    let candidates: Vec<(i64, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT a.id, a.title,
+                (SELECT f.value FROM album_artist_credit ac
+                 JOIN field_override f ON f.entity_id = ac.album_id
+                    AND f.field = 'mb_release_group_id'
+                 WHERE ac.artist_id = a.id LIMIT 1),
+                (SELECT f.value FROM track_credit tc
+                 JOIN media_entry tme ON tme.id = tc.track_id
+                 JOIN field_override f ON f.entity_id = tme.parent_id
+                    AND f.field = 'mb_release_id'
+                 WHERE tc.artist_id = a.id LIMIT 1)
+         FROM artist a
+         JOIN media_entry me ON me.id = a.id
+         WHERE me.library_id = ? AND (a.musicbrainz_id IS NULL OR a.musicbrainz_id = '')
+           AND NOT EXISTS (SELECT 1 FROM field_override ig
+                           WHERE ig.entity_id = a.id AND ig.field = 'mb_ignored')
+         ORDER BY a.sort_title COLLATE NOCASE",
+    )
+    .bind(library_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let candidates: Vec<_> = candidates
+        .into_iter()
+        .filter(|(_, _, gid, rid)| gid.is_some() || rid.is_some())
+        .collect();
+    if candidates.is_empty() {
+        return Ok((0, std::collections::HashSet::new()));
+    }
+
+    // Every name each candidate answers to, for matching against fetched
+    // credits with the module's normalize (dash/diacritic folding — MB's
+    // typography must not cost a match).
+    let mut names_by_artist: HashMap<i64, Vec<String>> = HashMap::new();
+    for (artist_id, _, _, _) in &candidates {
+        let names: Vec<(String,)> =
+            sqlx::query_as("SELECT name FROM artist_names WHERE artist_id = ?")
+                .bind(artist_id)
+                .fetch_all(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        names_by_artist.insert(*artist_id, names.into_iter().map(|(n,)| n).collect());
+    }
+
+    // One fetch can identify several members (joint albums), so fetches are
+    // cached per pass and already-stamped artists are skipped.
+    let total = candidates.len();
+    let mut group_cache: HashMap<String, Vec<(String, Option<String>)>> = HashMap::new();
+    let mut release_cache: HashMap<String, Vec<(String, Option<String>)>> = HashMap::new();
+    let mut stamped: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    // Evidence fetches that errored, keyed by the group/release id — every
+    // artist leaning on one of these gets shielded from the suggestion sweep
+    // this pass and derived next pass instead.
+    let mut failed_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut fetch_failed: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut updated = 0usize;
+
+    for (i, (artist_id, title, gid, rid)) in candidates.iter().enumerate() {
+        if CANCEL.load(Ordering::SeqCst) {
+            break; // skip-remaining: identities fill in on a later pass
+        }
+        let _ = app.emit(
+            "music-enrich-progress",
+            serde_json::json!({ "libraryId": library_id, "phase": "artist-ids", "done": i, "total": total, "name": title }),
+        );
+        if stamped.contains(artist_id) {
+            continue;
+        }
+
+        // The credit of this artist's matched evidence, fetched or cached.
+        // Transient fetch errors skip the artist (a later pass retries) —
+        // never fail the whole phase over one request.
+        let pairs: &[(String, Option<String>)] = if let Some(gid) = gid {
+            match group_cache.entry(gid.clone()) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    let fetched = match fetch_release_group(client, gid).await {
+                        Ok(Some(g)) => g
+                            .artists
+                            .iter()
+                            .cloned()
+                            .zip(g.artist_ids.iter().cloned())
+                            .collect(),
+                        Ok(None) => Vec::new(),
+                        Err(e) => {
+                            eprintln!("artist identity: group {gid} fetch failed: {e}");
+                            failed_keys.insert(gid.clone());
+                            Vec::new()
+                        }
+                    };
+                    slot.insert(fetched)
+                }
+            }
+        } else if let Some(rid) = rid {
+            match release_cache.entry(rid.clone()) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    let fetched = match fetch_release(client, rid).await {
+                        Ok(Some(full)) => {
+                            let mut seen: std::collections::HashSet<String> =
+                                std::collections::HashSet::new();
+                            let mut pairs = Vec::new();
+                            for (name, id) in full.album_artists.iter().chain(
+                                full.tracks.iter().flat_map(|(_, _, _, c)| c.iter()),
+                            ) {
+                                if id.is_some() && seen.insert(name.clone()) {
+                                    pairs.push((name.clone(), id.clone()));
+                                }
+                            }
+                            pairs
+                        }
+                        Ok(None) => Vec::new(),
+                        Err(e) => {
+                            eprintln!("artist identity: release {rid} fetch failed: {e}");
+                            failed_keys.insert(rid.clone());
+                            Vec::new()
+                        }
+                    };
+                    slot.insert(fetched)
+                }
+            }
+        } else {
+            continue;
+        };
+        if pairs.is_empty() {
+            // Nothing to match against. If that's because the fetch FAILED
+            // (not because MB returned an empty credit), shield this artist
+            // from the sweep — a retry next pass may still derive them.
+            let key_failed = gid.as_ref().is_some_and(|g| failed_keys.contains(g))
+                || rid.as_ref().is_some_and(|r| failed_keys.contains(r));
+            if key_failed {
+                fetch_failed.insert(*artist_id);
+            }
+            continue;
+        }
+
+        // Stamp EVERY still-unidentified candidate this credit names, not
+        // just the artist that prompted the fetch.
+        for (cname, cid) in pairs {
+            let Some(cid) = cid else { continue };
+            let want = normalize(cname);
+            let hit = names_by_artist.iter().find(|(aid, names)| {
+                !stamped.contains(aid) && names.iter().any(|n| normalize(n) == want)
+            });
+            if let Some((&aid, _)) = hit {
+                sqlx::query("UPDATE artist SET musicbrainz_id = ? WHERE id = ?")
+                    .bind(cid)
+                    .bind(aid)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                // Durable copy, same as albums: the column is convenience,
+                // the override is the record.
+                set_mb_id(pool, aid, MB_ARTIST, cid, TIER_MB).await?;
+                settle_artist_card_derived(pool, library_id, aid).await?;
+                stamped.insert(aid);
+                updated += 1;
+            }
+        }
+    }
+    Ok((updated, fetch_failed))
+}
+
+/// The manual verification loop, mechanized: group → pressing → track credit
+/// → artist MBID. A GROUP-matched album proves its album-level credit, but
+/// the features live one fetch deeper — on the group's releases, whose track
+/// credits carry artist MBIDs. Walk a few pressings per group and stamp every
+/// still-unidentified credited artist whose name (or alias) those credits
+/// answer to. Same certainty tier as release-match derivation — MusicBrainz
+/// itself saying who the "Castro" on THIS album is — so no card is shown;
+/// resolved artists settle 'derived'. Names the pressings never mention fall
+/// through to the suggestion sweep unchanged.
+async fn harvest_group_credits(
+    app: &AppHandle,
+    pool: &SqlitePool,
+    client: &reqwest::Client,
+    library_id: &str,
+) -> Result<(usize, std::collections::HashSet<i64>), String> {
+    // Every fetched pressing costs a rate-limited request; three is enough to
+    // cover standard + deluxe + one regional variant, and whatever they miss
+    // still gets its suggestion card.
+    const MAX_RELEASES_PER_GROUP: usize = 3;
+
+    // Group-matched albums still crediting an MBID-less artist. Albums with a
+    // RELEASE match are excluded — their track credits were already harvested
+    // by enrich_artist_mbids from the release itself.
+    let albums: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT al.id, al.title FROM album al
+         JOIN media_entry me ON me.id = al.id
+         WHERE me.library_id = ?
+           AND EXISTS (SELECT 1 FROM field_override f
+                       WHERE f.entity_id = al.id AND f.field = 'mb_release_group_id'
+                         AND f.value IS NOT NULL AND f.value <> '')
+           AND NOT EXISTS (SELECT 1 FROM field_override r
+                           WHERE r.entity_id = al.id AND r.field = 'mb_release_id'
+                             AND r.value IS NOT NULL AND r.value <> '')
+           AND (EXISTS (SELECT 1 FROM album_artist_credit ac
+                        JOIN artist a ON a.id = ac.artist_id
+                        WHERE ac.album_id = al.id
+                          AND (a.musicbrainz_id IS NULL OR a.musicbrainz_id = ''))
+                OR EXISTS (SELECT 1 FROM media_entry t
+                           JOIN track_credit tc ON tc.track_id = t.id
+                           JOIN artist a ON a.id = tc.artist_id
+                           WHERE t.parent_id = al.id
+                             AND (a.musicbrainz_id IS NULL OR a.musicbrainz_id = '')))
+           AND NOT EXISTS (SELECT 1 FROM field_override ig
+                           WHERE ig.entity_id = al.id AND ig.field = 'mb_ignored')
+         ORDER BY al.sort_title COLLATE NOCASE",
+    )
+    .bind(library_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    if albums.is_empty() {
+        return Ok((0, std::collections::HashSet::new()));
+    }
+
+    // One group can back several local albums (and vice versa several artists)
+    // — work per GROUP, keyed by the winning override, first album's title as
+    // the progress label.
+    struct GroupWork {
+        title: String,
+        wanted: std::collections::HashSet<i64>,
+    }
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, GroupWork> = HashMap::new();
+    for (album_id, title) in &albums {
+        let Some((gid, _)) = mb_id(pool, *album_id, MB_RELEASE_GROUP).await? else {
+            continue;
+        };
+        let wanted: Vec<(i64,)> = sqlx::query_as(
+            "SELECT DISTINCT a.id FROM artist a
+             WHERE (a.musicbrainz_id IS NULL OR a.musicbrainz_id = '')
+               AND NOT EXISTS (SELECT 1 FROM field_override ig
+                               WHERE ig.entity_id = a.id AND ig.field = 'mb_ignored')
+               AND a.id IN (SELECT ac.artist_id FROM album_artist_credit ac
+                            WHERE ac.album_id = ?1
+                            UNION
+                            SELECT tc.artist_id FROM track_credit tc
+                            JOIN media_entry t ON t.id = tc.track_id
+                            WHERE t.parent_id = ?1)",
+        )
+        .bind(album_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        if wanted.is_empty() {
+            continue;
+        }
+        let entry = groups.entry(gid.clone()).or_insert_with(|| {
+            order.push(gid.clone());
+            GroupWork { title: title.clone(), wanted: std::collections::HashSet::new() }
+        });
+        entry.wanted.extend(wanted.into_iter().map(|(id,)| id));
+    }
+    if order.is_empty() {
+        return Ok((0, std::collections::HashSet::new()));
+    }
+
+    // Every name each pool artist answers to, for matching fetched credits
+    // with the module's normalize (dash/diacritic folding).
+    let pool_ids: std::collections::HashSet<i64> =
+        groups.values().flat_map(|g| g.wanted.iter().copied()).collect();
+    let mut names_by_artist: HashMap<i64, Vec<String>> = HashMap::new();
+    for artist_id in &pool_ids {
+        let names: Vec<(String,)> =
+            sqlx::query_as("SELECT name FROM artist_names WHERE artist_id = ?")
+                .bind(artist_id)
+                .fetch_all(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        names_by_artist.insert(*artist_id, names.into_iter().map(|(n,)| n).collect());
+    }
+
+    let total = order.len();
+    let mut stamped: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut fetch_failed: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut updated = 0usize;
+
+    for (i, gid) in order.iter().enumerate() {
+        if CANCEL.load(Ordering::SeqCst) {
+            break; // skip-remaining: unresolved artists get their turn next pass
+        }
+        let work = &groups[gid];
+        let _ = app.emit(
+            "music-enrich-progress",
+            serde_json::json!({ "libraryId": library_id, "phase": "artist-credits", "done": i, "total": total, "name": work.title }),
+        );
+        // An earlier group's pressing may have already named everyone here.
+        if work.wanted.iter().all(|id| stamped.contains(id)) {
+            continue;
+        }
+
+        // Transient fetch errors shield the group's unresolved artists from
+        // the suggestion sweep (same as enrich_artist_mbids) — a retry next
+        // pass may still derive them; never fail the phase over one request.
+        let mut failed = false;
+        let mut releases = match releases_in_group(client, gid).await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("credit harvest: group {gid} release list failed: {e}");
+                fetch_failed
+                    .extend(work.wanted.iter().filter(|id| !stamped.contains(id)));
+                continue;
+            }
+        };
+        // Official pressings first, bigger track lists first — a deluxe
+        // edition's credits are a superset of the standard's.
+        releases.sort_by_key(|r| {
+            (r.status.as_deref() != Some("Official"), -(r.track_count.unwrap_or(0)))
+        });
+
+        for release in releases.iter().take(MAX_RELEASES_PER_GROUP) {
+            if CANCEL.load(Ordering::SeqCst) {
+                break;
+            }
+            let full = match fetch_release(client, &release.release_id).await {
+                Ok(Some(f)) => f,
+                Ok(None) => continue,
+                Err(e) => {
+                    eprintln!(
+                        "credit harvest: release {} fetch failed: {e}",
+                        release.release_id
+                    );
+                    failed = true;
+                    continue;
+                }
+            };
+            // Album-level + every track credit, deduped by credited name.
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for (cname, cid) in full
+                .album_artists
+                .iter()
+                .chain(full.tracks.iter().flat_map(|(_, _, _, c)| c.iter()))
+            {
+                let Some(cid) = cid else { continue };
+                if !seen.insert(cname.clone()) {
+                    continue;
+                }
+                // Stamp EVERY still-unidentified pool artist this credit
+                // names, not just this group's own — a feature heard on two
+                // albums is proven by whichever pressing names them first.
+                let want = normalize(cname);
+                let hit = names_by_artist.iter().find(|(aid, names)| {
+                    !stamped.contains(aid) && names.iter().any(|n| normalize(n) == want)
+                });
+                if let Some((&aid, _)) = hit {
+                    sqlx::query("UPDATE artist SET musicbrainz_id = ? WHERE id = ?")
+                        .bind(cid)
+                        .bind(aid)
+                        .execute(pool)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    set_mb_id(pool, aid, MB_ARTIST, cid, TIER_MB).await?;
+                    settle_artist_card_derived(pool, library_id, aid).await?;
+                    stamped.insert(aid);
+                    updated += 1;
+                }
+            }
+            if work.wanted.iter().all(|id| stamped.contains(id)) {
+                break; // this group's own artists are all proven — stop paying
+            }
+        }
+        if failed {
+            fetch_failed.extend(work.wanted.iter().filter(|id| !stamped.contains(id)));
+        }
+    }
+    Ok((updated, fetch_failed))
+}
+
+// Name-based artist AUTO-matching is GONE on purpose (with its
+// mb_artist_lookup cache): an exact name match against all of MusicBrainz can
+// hit any same-named stranger — "God" auto-matched a random artist because
+// somebody out there is called that. Artist identity now derives only from
+// matched albums' credits (enrich_artist_mbids / stamp_artist_ids_from_credit)
+// or from the user's own match. Name search survives ONLY as a question:
+// suggest_artist_matches below turns a small candidate set into a
+// needs-a-decision entry, never a conclusion.
+
+/// For artists no matched album vouches for: search MusicBrainz by name once,
+/// and when the plausible candidates are FEW (1–4 at the score bar), park
+/// them as an 'artist_match' suggestion for the person to decide — with
+/// disambiguation, type, and years, which is what a machine can't weigh.
+/// Zero or many candidates settle silently (status 'notfound'): nothing worth
+/// asking, and the artist stays honestly unidentified. Each artist is asked
+/// about at most once — any existing suggestion row, whatever its status,
+/// stands as the record.
+async fn suggest_artist_matches(
+    app: &AppHandle,
+    pool: &SqlitePool,
+    client: &reqwest::Client,
+    library_id: &str,
+    // Artists whose evidence fetch failed THIS pass — asking them now would
+    // burn their one-time question on a network hiccup.
+    skip: &std::collections::HashSet<i64>,
 ) -> Result<usize, String> {
     let artists: Vec<(i64, String)> = sqlx::query_as(
         "SELECT a.id, a.title FROM artist a
          JOIN media_entry me ON me.id = a.id
-         WHERE me.library_id = ? AND (a.musicbrainz_id IS NULL OR a.musicbrainz_id = '')
+         WHERE me.library_id = ?1 AND (a.musicbrainz_id IS NULL OR a.musicbrainz_id = '')
+           AND NOT EXISTS (SELECT 1 FROM mb_suggestion s
+                           WHERE s.library_id = ?1 AND s.kind = 'artist_match'
+                             AND s.target_key = CAST(a.id AS TEXT))
+           AND NOT EXISTS (SELECT 1 FROM field_override ig
+                           WHERE ig.entity_id = a.id AND ig.field = 'mb_ignored')
          ORDER BY a.sort_title COLLATE NOCASE",
     )
     .bind(library_id)
@@ -1595,190 +2287,63 @@ async fn enrich_artist_mbids(
     }
 
     let total = artists.len();
-    let mut updated = 0usize;
+    let mut suggested = 0usize;
     for (i, (artist_id, title)) in artists.into_iter().enumerate() {
         if CANCEL.load(Ordering::SeqCst) {
-            break; // skip-remaining: MBIDs fill in on a later pass
+            break; // skip-remaining: unasked artists get their turn next pass
+        }
+        if skip.contains(&artist_id) {
+            continue; // evidence fetch failed this pass — derivable next pass
         }
         let _ = app.emit(
             "music-enrich-progress",
-            serde_json::json!({ "libraryId": library_id, "phase": "artists", "done": i, "total": total, "name": title }),
+            serde_json::json!({ "libraryId": library_id, "phase": "artist-search", "done": i, "total": total, "name": title }),
         );
-        if let Some(mbid) = cached_or_lookup_artist(pool, client, &title).await? {
-            sqlx::query(
-                "UPDATE artist SET musicbrainz_id = ? WHERE id = ? AND (musicbrainz_id IS NULL OR musicbrainz_id = '')",
+        // Transient search failure: skip WITHOUT recording, so the artist is
+        // asked about again next pass instead of being settled by an outage.
+        let candidates = match search_artists(client, &title, 50).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                eprintln!("artist suggestion search '{title}': {e}");
+                continue;
+            }
+        };
+        // Candidates are artists actually ANSWERING to this name (title or
+        // alias), not high scorers: MB's relevance ranking puts famous
+        // partial matches above obscure exact ones — a score bar on "Castro"
+        // kept Cristian, Fidel, and Tommy Castro while cutting every artist
+        // literally named Castro. And aliases matter as much as titles: a
+        // renamed artist ("Hodgy Beats" → "Hodgy") answers through their
+        // alias, and the canonical entity must not lose to a bare duplicate
+        // that kept the old spelling as its title.
+        let credible: Vec<&MbCandidateRow> =
+            candidates.iter().filter(|c| c.name_match).collect();
+        let (status, payload) = if (1..=4).contains(&credible.len()) {
+            suggested += 1;
+            (
+                "pending",
+                serde_json::json!({
+                    "artist_id": artist_id,
+                    "artist_name": title,
+                    "candidates": credible,
+                }),
             )
-            .bind(&mbid)
-            .bind(artist_id)
-            .execute(pool)
-            .await
-            .map_err(|e| e.to_string())?;
-            // Durable copy, same as albums: the column is convenience, the
-            // override is the record. Without this the artist list and the
-            // match dialog disagree about whether an artist is identified.
-            set_mb_id(pool, artist_id, MB_ARTIST, &mbid, TIER_MB).await?;
-            updated += 1;
         } else {
-            // Unknown to MusicBrainz. It may be several artists in one tag —
-            // but deciding that automatically needs MusicBrainz to recognise
-            // the whole name, and it often doesn't (it has never heard of
-            // "Rob Bailey & The Hustle Standard", a real band). Guessing there
-            // risks writing a rescan-durable split of someone's actual name,
-            // so the unidentified list surfaces these and the person decides.
-            detect_feat_join(pool, client, library_id, &title).await?;
-        }
-    }
-    Ok(updated)
-}
-
-/// The other half of the split problem: a name that is unknown to MusicBrainz
-/// because it is only PART of one. "(feat. Tyler, The Creator)" is split on
-/// the comma at scan time, leaving an artist called "The Creator" that always
-/// sits immediately after "Tyler". If gluing it back to its predecessor gives
-/// a name MusicBrainz knows, the split was wrong — record the whole name so
-/// every scan rejoins it, and repair what the last scan already wrote.
-///
-/// Returns true when a join was recorded, so the caller doesn't then go on to
-/// propose splitting the fragment further.
-async fn detect_feat_join(
-    pool: &SqlitePool,
-    client: &reqwest::Client,
-    library_id: &str,
-    name: &str,
-) -> Result<bool, String> {
-    // The name that precedes this one, and whether it does so EVERY time.
-    // Once is a coincidence; always is a name that was cut in half.
-    let rows: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT prev.name, COUNT(*)
-         FROM track_credit tc
-         JOIN track_credit prev
-           ON prev.track_id = tc.track_id AND prev.position = tc.position - 1
-         JOIN media_entry me ON me.id = tc.track_id
-         WHERE me.library_id = ? AND tc.name = ?
-         GROUP BY prev.name
-         ORDER BY COUNT(*) DESC",
-    )
-    .bind(library_id)
-    .bind(name)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| e.to_string())?;
-    let [(prev, together)] = rows.as_slice() else {
-        return Ok(false); // no predecessor, or more than one — not a cut name
-    };
-    let (total,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM track_credit tc
-         JOIN media_entry me ON me.id = tc.track_id
-         WHERE me.library_id = ? AND tc.name = ?",
-    )
-    .bind(library_id)
-    .bind(name)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| e.to_string())?;
-    if *together != total {
-        return Ok(false);
-    }
-
-    let joined = format!("{prev}, {name}");
-    if cached_or_lookup_artist(pool, client, &joined).await?.is_none() {
-        return Ok(false);
-    }
-
-    sqlx::query("INSERT OR IGNORE INTO feat_join (library_id, name) VALUES (?, ?)")
+            ("notfound", serde_json::json!({ "artist_id": artist_id, "artist_name": title }))
+        };
+        sqlx::query(
+            "INSERT OR IGNORE INTO mb_suggestion (library_id, kind, target_key, payload, status)
+             VALUES (?, 'artist_match', ?, ?, ?)",
+        )
         .bind(library_id)
-        .bind(&joined)
+        .bind(artist_id.to_string())
+        .bind(payload.to_string())
+        .bind(status)
         .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
-    let fixed = crate::music::apply_feat_joins(pool, library_id).await?;
-    eprintln!("[mb] rejoined '{joined}' across {fixed} tracks");
-    Ok(true)
-}
-
-/// Settled lookups (matched or notfound) come from the cache; anything new
-/// hits the API (rate-limited) and settles the cache. Transient failures
-/// return None without caching, so they retry next pass.
-async fn cached_or_lookup_artist(
-    pool: &SqlitePool,
-    client: &reqwest::Client,
-    name: &str,
-) -> Result<Option<String>, String> {
-    let key = name.to_lowercase();
-    let cached: Option<(Option<String>, String)> =
-        sqlx::query_as("SELECT mbid, status FROM mb_artist_lookup WHERE name = ?")
-            .bind(&key)
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| e.to_string())?;
-    if let Some((mbid, _)) = cached {
-        return Ok(mbid);
     }
-    let looked_up = lookup_artist(client, name).await;
-    tokio::time::sleep(REQUEST_GAP).await;
-    match looked_up {
-        Ok(mbid) => {
-            sqlx::query("INSERT OR REPLACE INTO mb_artist_lookup (name, mbid, status) VALUES (?, ?, ?)")
-                .bind(&key)
-                .bind(&mbid)
-                .bind(if mbid.is_some() { "matched" } else { "notfound" })
-                .execute(pool)
-                .await
-                .map_err(|e| e.to_string())?;
-            Ok(mbid)
-        }
-        Err(e) => {
-            eprintln!("musicbrainz artist lookup '{name}': {e}");
-            Ok(None)
-        }
-    }
-}
-
-/// Search MusicBrainz for one artist name. Ok(Some(mbid)) on a confident
-/// match, Ok(None) for a settled miss, Err for transient failures.
-async fn lookup_artist(client: &reqwest::Client, name: &str) -> Result<Option<String>, String> {
-    let query = format!("artist:\"{}\"", name.replace('"', " "));
-    let url = url::Url::parse_with_params(
-        "https://musicbrainz.org/ws/2/artist",
-        &[("query", query.as_str()), ("fmt", "json"), ("limit", "5")],
-    )
-    .map_err(|e| e.to_string())?;
-    let resp = mb_get(client, url).await?;
-    if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
-        return Err("rate limited (503)".to_string());
-    }
-    if !resp.status().is_success() {
-        return Err(format!("HTTP {}", resp.status()));
-    }
-    let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-
-    let candidates = body["artists"].as_array().cloned().unwrap_or_default();
-    for artist in candidates {
-        let score = artist["score"].as_i64().unwrap_or(0);
-        if score < MB_MIN_SCORE {
-            break; // results are score-ordered; nothing below the bar matches
-        }
-        // Compare normalised, NOT byte-for-byte: MusicBrainz writes
-        // "Wu‐Tang Clan" with U+2010 and "Martin O’Donnell" with a curly
-        // apostrophe, and exact comparison rejected those at score 100.
-        let want = normalize(name);
-        let mb_name = artist["name"].as_str().unwrap_or_default();
-        let name_matches = normalize(mb_name) == want
-            || artist["aliases"]
-                .as_array()
-                .map(|aliases| {
-                    aliases
-                        .iter()
-                        .any(|a| a["name"].as_str().is_some_and(|n| normalize(n) == want))
-                })
-                .unwrap_or(false);
-        if name_matches {
-            if let Some(id) = artist["id"].as_str() {
-                return Ok(Some(id.to_string()));
-            }
-        }
-    }
-    Ok(None)
+    Ok(suggested)
 }
 
 // ---------------------------------------------------------------------------
@@ -1930,6 +2495,35 @@ pub async fn merge_artists(
             .map_err(|e| e.to_string())?;
     }
 
+    // Credit rows stamped with the absorbed artist re-point to the survivor —
+    // by id for what was stamped, then a full re-resolve for bare spellings
+    // that only now redirect somewhere (name-only merges stamp NULL → keep).
+    // Undo reverses this the same way: it moves the redirects back and
+    // re-resolves, so the stamps follow.
+    if let Some(other_id) = other_id {
+        for table in ["track_credit", "album_artist_credit"] {
+            sqlx::query(&format!("UPDATE {table} SET artist_id = ? WHERE artist_id = ?"))
+                .bind(keep_id)
+                .bind(other_id)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        // The absorbed page's own "Which artist is this?" card now asks about
+        // an entity that no longer exists — settle it as obsolete so it
+        // vanishes from review instead of erroring on apply.
+        sqlx::query(
+            "UPDATE mb_suggestion SET status = 'obsolete'
+             WHERE library_id = ? AND kind = 'artist_match' AND target_key = ? AND status = 'pending'",
+        )
+        .bind(library_id)
+        .bind(other_id.to_string())
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    crate::music::resolve_credit_ids(pool, library_id).await?;
+
     let batch = next_batch(pool).await?;
     log_change(
         pool,
@@ -1962,51 +2556,12 @@ pub async fn merge_artists(
     Ok(())
 }
 
-/// Pending heuristic merge suggestions get auto-accepted when MusicBrainz
-/// proves the identity: the lookalike name resolves to the same MBID as the
-/// keep-target artist.
-async fn resolve_merge_suggestions_via_mbid(
-    pool: &SqlitePool,
-    client: &reqwest::Client,
-    library_id: &str,
-) -> Result<(), String> {
-    let pending: Vec<(i64, String)> = sqlx::query_as(
-        "SELECT id, payload FROM mb_suggestion
-         WHERE library_id = ? AND kind = 'artist_merge' AND status = 'pending'",
-    )
-    .bind(library_id)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| e.to_string())?;
-
-    for (suggestion_id, payload) in pending {
-        let Ok(payload) = serde_json::from_str::<serde_json::Value>(&payload) else { continue };
-        let (Some(keep_id), Some(keep_title), Some(other_name)) = (
-            payload["keep_id"].as_i64(),
-            payload["keep_title"].as_str(),
-            payload["other_name"].as_str(),
-        ) else {
-            continue;
-        };
-        let keeper_mbid: Option<(Option<String>,)> =
-            sqlx::query_as("SELECT musicbrainz_id FROM artist WHERE id = ?")
-                .bind(keep_id)
-                .fetch_optional(pool)
-                .await
-                .map_err(|e| e.to_string())?;
-        let Some((Some(keeper_mbid),)) = keeper_mbid else { continue };
-        if keeper_mbid.is_empty() {
-            continue;
-        }
-        if let Some(other_mbid) = cached_or_lookup_artist(pool, client, other_name).await? {
-            if other_mbid == keeper_mbid {
-                merge_artists(pool, library_id, keep_id, keep_title, None, other_name).await?;
-                let _ = suggestion_id; // status flipped inside merge_artists
-            }
-        }
-    }
-    Ok(())
-}
+// resolve_merge_suggestions_via_mbid is gone with the name lookup it relied
+// on: "the lookalike name resolves to the same MBID" was a name search taking
+// MusicBrainz's first exact match — the very uncertainty being retired.
+// Lookalike suggestions now wait for the person; merge_mbid_duplicates still
+// auto-merges pages whose STORED (credit-derived, certain) ids prove they're
+// one artist.
 
 // ---------------------------------------------------------------------------
 // Review commands (the metadata center)
@@ -2034,11 +2589,18 @@ pub struct MbAlbumRow {
     pub state: String,
     pub gap_ours: i64,
     pub gap_mb: i64,
+    /// The owning artist (media_entry.parent_id) — how the library map groups
+    /// albums under their artist rows. None for root/orphan albums.
+    pub artist_id: Option<i64>,
+    /// User said "stop counting this": excluded from passes and warn counts,
+    /// gray on the map.
+    pub ignored: bool,
 }
 
-/// Artists and where they stand. An artist's MusicBrainz id is resolved by
-/// NAME, which is the least reliable thing the pass does — so which ones are
-/// identified, and the ability to correct one, both have to be visible.
+/// Artists and where they stand. An artist's MusicBrainz id only ever comes
+/// from the credit of a matched album (certain) or the user's own decision —
+/// never from a name search — so "unidentified" here means "no matched album
+/// vouches for them yet".
 #[derive(Debug, Serialize)]
 pub struct MbArtistRow {
     pub artist_id: i64,
@@ -2046,6 +2608,9 @@ pub struct MbArtistRow {
     /// "matched" | "notfound" | "unchecked"
     pub state: String,
     pub album_count: i64,
+    /// User said "stop counting this": excluded from passes and warn counts,
+    /// gray on the map.
+    pub ignored: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -2101,7 +2666,7 @@ pub async fn mb_get_review(state: State<'_, AppState>, library_id: String) -> Re
     .fetch_all(pool)
     .await
     .map_err(|e| e.to_string())?;
-    let suggestions = suggestion_rows
+    let mut suggestions: Vec<MbSuggestionView> = suggestion_rows
         .into_iter()
         .map(|(id, kind, payload)| MbSuggestionView {
             id,
@@ -2109,12 +2674,73 @@ pub async fn mb_get_review(state: State<'_, AppState>, library_id: String) -> Re
             payload: serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null),
         })
         .collect();
+    // "Which artist is this?" cards get an "In your library:" line — WHERE the
+    // artist is credited, which is what jogs the memory for a feature-only
+    // name nobody recognizes cold. Computed at read time, not stored: the
+    // stored payload froze at suggestion time, but the library moves.
+    for s in suggestions.iter_mut() {
+        if s.kind != "artist_match" {
+            continue;
+        }
+        let Some(artist_id) = s.payload["artist_id"].as_i64() else { continue };
+        // Their own / jointly-credited albums (loose containers have empty
+        // titles and aren't albums to a reader). Each carries the album's
+        // matched release-group id when there is one, so the card can link
+        // straight to the MB page — drill to a release there, find the track,
+        // compare its credited artist against the candidate.
+        let albums: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT al.title,
+                    (SELECT f.value FROM field_override f
+                     WHERE f.entity_id = al.id AND f.field = 'mb_release_group_id'
+                     ORDER BY CASE f.tier WHEN 'user' THEN 0 ELSE 1 END LIMIT 1)
+             FROM album_artist_credit ac
+             JOIN album al ON al.id = ac.album_id
+             WHERE ac.artist_id = ? AND al.title <> ''
+             ORDER BY al.id",
+        )
+        .bind(artist_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        // Tracks crediting them, with the album for context (empty = loose).
+        let tracks: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT t.title, COALESCE(al.title, ''),
+                    (SELECT f.value FROM field_override f
+                     WHERE f.entity_id = me.parent_id AND f.field = 'mb_release_group_id'
+                     ORDER BY CASE f.tier WHEN 'user' THEN 0 ELSE 1 END LIMIT 1)
+             FROM track_credit tc
+             JOIN track t ON t.id = tc.track_id
+             JOIN media_entry me ON me.id = tc.track_id
+             LEFT JOIN album al ON al.id = me.parent_id
+             WHERE tc.artist_id = ?
+             ORDER BY t.id",
+        )
+        .bind(artist_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        let total = albums.len() + tracks.len();
+        let appearances: Vec<serde_json::Value> = albums
+            .into_iter()
+            .map(|(al, gid)| serde_json::json!({ "album": al, "group_id": gid }))
+            .chain(tracks.into_iter().map(|(t, al, gid)| {
+                serde_json::json!({
+                    "track": t,
+                    "album": if al.is_empty() { serde_json::Value::Null } else { al.into() },
+                    "group_id": gid,
+                })
+            }))
+            .take(3)
+            .collect();
+        s.payload["appearances"] = serde_json::json!(appearances);
+        s.payload["appearance_count"] = serde_json::json!(total);
+    }
 
     // Eligibility matches the pass exactly — loose tracks and sounds are not
     // albums it will ever look at, so they must not appear in a total either.
     // State comes from what is KNOWN (which id is stored), not from the
     // stamp: a stamp says a pass finished, an id says what it found.
-    let album_rows: Vec<(i64, String, Option<String>, String, i64, i64)> = sqlx::query_as(
+    let album_rows: Vec<(i64, String, Option<String>, String, i64, i64, Option<i64>, i64)> = sqlx::query_as(
         "SELECT al.id, al.title, ar.title,
                 CASE
                   WHEN EXISTS (SELECT 1 FROM field_override o
@@ -2128,7 +2754,10 @@ pub async fn mb_get_review(state: State<'_, AppState>, library_id: String) -> Re
                   ELSE 'unchecked'
                 END,
                 COALESCE((SELECT SUM(side = 'ours') FROM album_match_gap g WHERE g.album_id = al.id), 0),
-                COALESCE((SELECT SUM(side = 'mb') FROM album_match_gap g WHERE g.album_id = al.id), 0)
+                COALESCE((SELECT SUM(side = 'mb') FROM album_match_gap g WHERE g.album_id = al.id), 0),
+                me.parent_id,
+                EXISTS (SELECT 1 FROM field_override ig
+                        WHERE ig.entity_id = al.id AND ig.field = 'mb_ignored')
          FROM album al
          JOIN media_entry me ON me.id = al.id
          LEFT JOIN artist ar ON ar.id = me.parent_id
@@ -2143,19 +2772,21 @@ pub async fn mb_get_review(state: State<'_, AppState>, library_id: String) -> Re
     .map_err(|e| e.to_string())?;
     let albums = album_rows
         .into_iter()
-        .map(|(album_id, title, artist_title, state, gap_ours, gap_mb)| MbAlbumRow {
+        .map(|(album_id, title, artist_title, state, gap_ours, gap_mb, artist_id, ignored)| MbAlbumRow {
             album_id,
             title,
             artist_title,
             state,
             gap_ours,
             gap_mb,
+            artist_id,
+            ignored: ignored != 0,
         })
         .collect();
 
     // An artist identified before ids were stored durably still carries one on
     // its own row, so the fallback keeps this list agreeing with the dialog.
-    let artist_rows: Vec<(i64, String, String, i64)> = sqlx::query_as(
+    let artist_rows: Vec<(i64, String, String, i64, i64)> = sqlx::query_as(
         "SELECT a.id, a.title,
                 CASE
                   WHEN EXISTS (SELECT 1 FROM field_override o
@@ -2166,7 +2797,9 @@ pub async fn mb_get_review(state: State<'_, AppState>, library_id: String) -> Re
                                WHERE l.name = LOWER(a.title) AND l.status = 'notfound') THEN 'notfound'
                   ELSE 'unchecked'
                 END,
-                (SELECT COUNT(*) FROM media_entry ame WHERE ame.parent_id = a.id)
+                (SELECT COUNT(*) FROM media_entry ame WHERE ame.parent_id = a.id),
+                EXISTS (SELECT 1 FROM field_override ig
+                        WHERE ig.entity_id = a.id AND ig.field = 'mb_ignored')
          FROM artist a
          JOIN media_entry me ON me.id = a.id
          WHERE me.library_id = ?
@@ -2178,11 +2811,12 @@ pub async fn mb_get_review(state: State<'_, AppState>, library_id: String) -> Re
     .map_err(|e| e.to_string())?;
     let artists = artist_rows
         .into_iter()
-        .map(|(artist_id, title, state, album_count)| MbArtistRow {
+        .map(|(artist_id, title, state, album_count, ignored)| MbArtistRow {
             artist_id,
             title,
             state,
             album_count,
+            ignored: ignored != 0,
         })
         .collect();
 
@@ -2466,6 +3100,15 @@ pub struct MbCandidateRow {
     pub subtitle: String,
     pub detail: Option<String>,
     pub score: i64,
+    /// Artists only: the searched name equals this artist's name OR one of
+    /// their aliases (normalized). This is what the suggestion sweep filters
+    /// on — MB's own scoring ranks famous partial matches above obscure
+    /// exact ones, and title-only comparison misses the canonical entity
+    /// when the searched name lives on it as an alias (an artist who
+    /// RENAMED, e.g. "Hodgy Beats" → "Hodgy", answers via alias while a bare
+    /// duplicate answers by title).
+    #[serde(skip_serializing)]
+    pub name_match: bool,
 }
 
 fn group_row(g: GroupCandidate) -> MbCandidateRow {
@@ -2483,6 +3126,7 @@ fn group_row(g: GroupCandidate) -> MbCandidateRow {
         )
         .filter(|s| !s.is_empty()),
         score: g.score,
+        name_match: false,
     }
 }
 
@@ -2507,6 +3151,7 @@ fn release_row(c: ReleaseCandidate) -> MbCandidateRow {
         )
         .filter(|s| !s.is_empty()),
         score: c.score,
+        name_match: false,
     }
 }
 
@@ -2549,14 +3194,14 @@ pub async fn mb_search_entity(
                     return Ok(vec![group_row(g)]);
                 }
             }
-            let mut groups = search_release_groups(&client, &query, context.as_deref()).await?;
+            let mut groups = search_release_groups(&client, &query, context.as_deref(), None).await?;
             let stripped = strip_title_decorations(&query);
             if groups.is_empty() && stripped != query && !stripped.is_empty() {
-                groups = search_release_groups(&client, &stripped, context.as_deref()).await?;
+                groups = search_release_groups(&client, &stripped, context.as_deref(), None).await?;
             }
             if groups.is_empty() && context.is_some() {
                 // A junk artist tag hides every result, same as before.
-                groups = search_release_groups(&client, &stripped, None).await?;
+                groups = search_release_groups(&client, &stripped, None, None).await?;
             }
             Ok(groups.into_iter().map(group_row).collect())
         }
@@ -2564,7 +3209,7 @@ pub async fn mb_search_entity(
             let found = mb_search_releases(query, context).await?;
             Ok(found.results.into_iter().map(release_row).collect())
         }
-        "artist" => search_artists(&client, &query).await,
+        "artist" => search_artists(&client, &query, 10).await,
         "track" => search_recordings(&client, &query, context.as_deref()).await,
         other => Err(format!("unknown entity kind {other}")),
     }
@@ -2573,6 +3218,11 @@ pub async fn mb_search_entity(
 async fn search_artists(
     client: &reqwest::Client,
     query: &str,
+    // MB orders results by fame, and exact-name obscure artists sink below
+    // famous partial matches — the suggestion sweep searches DEEP (a page of
+    // 50) so the exact-name filter sees them; the dialog stays at 10, since
+    // a human is scanning that list.
+    limit: u32,
 ) -> Result<Vec<MbCandidateRow>, String> {
     let body = if let Some(id) = parse_bare_mbid(query, "artist") {
         let url = url::Url::parse_with_params(
@@ -2588,12 +3238,21 @@ async fn search_artists(
         let one: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
         serde_json::json!({ "artists": [one] })
     } else {
+        // artist: matches NAMES only — an entity answering via alias is never
+        // returned by it at all ("Hodgy", alias "Hodgy Beats", was invisible
+        // to artist:"Hodgy Beats"). The alias: clause brings those in; the
+        // exact-match filter then checks names AND aliases, which the search
+        // rows carry.
+        let escaped = query.replace('"', " ");
         let url = url::Url::parse_with_params(
             "https://musicbrainz.org/ws/2/artist",
             &[
-                ("query", format!("artist:\"{}\"", query.replace('"', " ")).as_str()),
+                (
+                    "query",
+                    format!("artist:\"{escaped}\" OR alias:\"{escaped}\"").as_str(),
+                ),
                 ("fmt", "json"),
-                ("limit", "10"),
+                ("limit", limit.to_string().as_str()),
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -2605,6 +3264,7 @@ async fn search_artists(
         resp.json().await.map_err(|e| e.to_string())?
     };
 
+    let want = normalize(query);
     Ok(body["artists"]
         .as_array()
         .into_iter()
@@ -2622,6 +3282,18 @@ async fn search_artists(
                 (false, true) => format!("{begin} –"),
                 _ => String::new(),
             };
+            // Name OR alias: an artist who renamed answers to the old name
+            // through their alias — that's the canonical entity, and it must
+            // not lose to a bare same-named duplicate on title alone.
+            let name_match = normalize(a["name"].as_str().unwrap_or_default()) == want
+                || a["aliases"]
+                    .as_array()
+                    .map(|aliases| {
+                        aliases
+                            .iter()
+                            .any(|al| al["name"].as_str().is_some_and(|n| normalize(n) == want))
+                    })
+                    .unwrap_or(false);
             Some(MbCandidateRow {
                 kind: "artist".to_string(),
                 mbid: a["id"].as_str()?.to_string(),
@@ -2640,9 +3312,15 @@ async fn search_artists(
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string()),
                 score: a["score"].as_i64().unwrap_or(100),
+                name_match,
             })
         })
-        .filter(|c| c.score >= 50)
+        // NO score floor. Scores are lucene relevance, and the OR alias:
+        // clause dilutes them — obscure exact-name artists can land under
+        // any fixed cutoff (Castro's namesakes dropped below 50) while the
+        // famous stay comfortably above it. The sweep's exact name/alias
+        // filter is the real gatekeeper; the dialog is a ranked list a human
+        // reads, where a weak tail is harmless.
         .collect())
 }
 
@@ -2703,6 +3381,7 @@ async fn search_recordings(
                             .join(", ")
                     })
                     .unwrap_or_default(),
+                name_match: false,
                 detail: Some(
                     [
                         secs.map(|s| format!("{}:{:02}", s / 60, s % 60)),
@@ -2761,6 +3440,19 @@ pub async fn mb_apply_entity_match(
                 .ok_or_else(|| "no MusicBrainz release group with that id".to_string())?;
             apply_group(pool, &library_id, entity_id, &title, &group, TIER_USER).await?;
             stamp(pool, entity_id, "matched").await?;
+            // The pending "which album is this?" suggestion is now answered —
+            // without this the card lingers after Apply and the decision
+            // count never moves (the release path settles it in
+            // mb_apply_album_match; this group path forgot to).
+            sqlx::query(
+                "UPDATE mb_suggestion SET status = 'accepted'
+                 WHERE library_id = ? AND kind = 'album_match' AND target_key = ? AND status = 'pending'",
+            )
+            .bind(&library_id)
+            .bind(entity_id.to_string())
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
         }
         "artist" => {
             let (title,): (String,) = sqlx::query_as("SELECT title FROM artist WHERE id = ?")
@@ -2781,15 +3473,65 @@ pub async fn mb_apply_entity_match(
                 .execute(pool)
                 .await
                 .map_err(|e| e.to_string())?;
-            // Seed the name cache so the automatic pass stops re-resolving it.
+            // A pending "which artist is this?" suggestion is now answered.
             sqlx::query(
-                "INSERT OR REPLACE INTO mb_artist_lookup (name, mbid, status) VALUES (?, ?, 'matched')",
+                "UPDATE mb_suggestion SET status = 'accepted'
+                 WHERE library_id = ? AND kind = 'artist_match' AND target_key = ? AND status = 'pending'",
             )
-            .bind(title.to_lowercase())
-            .bind(&mbid)
+            .bind(&library_id)
+            .bind(entity_id.to_string())
             .execute(pool)
             .await
             .map_err(|e| e.to_string())?;
+            // Pending MERGE suggestions whose two sides now hold DIFFERENT
+            // ids are answered by the ids themselves: provably two artists.
+            // Reject them — the same standing "no" a human click leaves.
+            // (Sides proven EQUAL are left for merge_mbid_duplicates, which
+            // merges them properly on the next pass.)
+            let pending_merges: Vec<(i64, String)> = sqlx::query_as(
+                "SELECT id, payload FROM mb_suggestion
+                 WHERE library_id = ? AND kind = 'artist_merge' AND status = 'pending'",
+            )
+            .bind(&library_id)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            for (sid, payload) in pending_merges {
+                let Ok(p) = serde_json::from_str::<serde_json::Value>(&payload) else { continue };
+                let (Some(keep_id), Some(other_name)) =
+                    (p["keep_id"].as_i64(), p["other_name"].as_str())
+                else {
+                    continue;
+                };
+                let keep: Option<(Option<String>,)> =
+                    sqlx::query_as("SELECT musicbrainz_id FROM artist WHERE id = ?")
+                        .bind(keep_id)
+                        .fetch_optional(pool)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                let Some((Some(keep_mbid),)) = keep else { continue };
+                let other: Option<(Option<String>,)> = sqlx::query_as(
+                    "SELECT a.musicbrainz_id FROM artist_names an
+                     JOIN artist a ON a.id = an.artist_id
+                     JOIN media_entry me ON me.id = a.id
+                     WHERE me.library_id = ?1 AND LOWER(an.name) = LOWER(?2) AND a.id != ?3
+                     LIMIT 1",
+                )
+                .bind(&library_id)
+                .bind(other_name)
+                .bind(keep_id)
+                .fetch_optional(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+                let Some((Some(other_mbid),)) = other else { continue };
+                if !keep_mbid.is_empty() && !other_mbid.is_empty() && keep_mbid != other_mbid {
+                    sqlx::query("UPDATE mb_suggestion SET status = 'rejected' WHERE id = ?")
+                        .bind(sid)
+                        .execute(pool)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+            }
             log_change(
                 pool,
                 &library_id,
@@ -2820,6 +3562,7 @@ pub async fn mb_apply_entity_match(
             .into_iter()
             .map(|(n,)| n)
             .collect();
+            let prev_recording_id = mb_id(pool, entity_id, MB_RECORDING).await?.map(|(v, _)| v);
             set_mb_id(pool, entity_id, MB_RECORDING, &mbid, TIER_USER).await?;
             if !credits.is_empty() && before != credits {
                 sqlx::query("DELETE FROM track_credit WHERE track_id = ?")
@@ -2850,9 +3593,26 @@ pub async fn mb_apply_entity_match(
                 )
                 .await?;
             }
+            // The match itself logs unconditionally (same rule as albums and
+            // artists) — the credits row above is only its side effect.
+            // Logged last so it titles the batch's history row.
+            log_change(
+                pool,
+                &library_id,
+                "track_match",
+                entity_id,
+                &format!("{title} — matched to MusicBrainz"),
+                &serde_json::json!({ "recording_id": prev_recording_id }),
+                &serde_json::json!({ "recording_id": mbid }),
+                batch,
+            )
+            .await?;
         }
         other => return Err(format!("unknown entity kind {other}")),
     }
+    // Applied credits can carry names new to the library: pages for them, and
+    // fresh stamps for every touched row (ensure ends with resolve_credit_ids).
+    crate::music::ensure_credit_artists(pool, &library_id).await?;
     let _ = app.emit(
         "music-enrich-done",
         serde_json::json!({ "libraryId": library_id, "updated": 0, "albumsMatched": 0, "processed": 0, "pendingReview": 0 }),
@@ -3028,6 +3788,28 @@ pub async fn mb_search_releases(
     Ok(ReleaseSearch { results, widened_from, from_id: false })
 }
 
+/// The releases of one release group, for the match dialog's release picker:
+/// a group-matched album lists what's IN its group instead of making the
+/// user search for what is already known. Official releases first, oldest
+/// first — the top of the list is usually the standard edition.
+#[tauri::command]
+pub async fn mb_group_releases(group_id: String) -> Result<Vec<ReleaseCandidate>, String> {
+    let client = mb_client()?;
+    let mut releases = releases_in_group(&client, &group_id).await?;
+    releases.sort_by(|a, b| {
+        let official = |r: &ReleaseCandidate| r.status.as_deref() != Some("Official");
+        official(a)
+            .cmp(&official(b))
+            .then_with(|| match (&a.date, &b.date) {
+                (Some(x), Some(y)) => x.cmp(y),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            })
+    });
+    Ok(releases)
+}
+
 /// Apply a chosen release to an album (modal candidate pick or manual search
 /// result). Same application path as a confident auto-match.
 #[tauri::command]
@@ -3059,6 +3841,9 @@ pub async fn mb_apply_album_match(
     .execute(pool)
     .await
     .map_err(|e| e.to_string())?;
+    // Applied credits can carry names new to the library: pages for them, and
+    // fresh stamps for every touched row (ensure ends with resolve_credit_ids).
+    crate::music::ensure_credit_artists(pool, &library_id).await?;
     // Silent refresh (no toast: zero counts).
     let _ = app.emit(
         "music-enrich-done",
@@ -3078,14 +3863,15 @@ pub async fn mb_resolve_suggestion(
     accept: bool,
 ) -> Result<(), String> {
     let pool = &state.app_db;
-    let row: Option<(String, String)> =
-        sqlx::query_as("SELECT kind, payload FROM mb_suggestion WHERE id = ? AND library_id = ?")
-            .bind(suggestion_id)
-            .bind(&library_id)
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| e.to_string())?;
-    let Some((kind, payload)) = row else {
+    let row: Option<(String, String, String)> = sqlx::query_as(
+        "SELECT kind, payload, target_key FROM mb_suggestion WHERE id = ? AND library_id = ?",
+    )
+    .bind(suggestion_id)
+    .bind(&library_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let Some((kind, payload, target_key)) = row else {
         return Err("suggestion not found".to_string());
     };
 
@@ -3095,6 +3881,45 @@ pub async fn mb_resolve_suggestion(
             .execute(pool)
             .await
             .map_err(|e| e.to_string())?;
+        // A "no" is as much a decision as a "yes" — log it so history holds
+        // every answer, and so a misclicked rejection has an undo (which
+        // returns the card to pending).
+        let p: serde_json::Value = serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null);
+        let label = match kind.as_str() {
+            "artist_match" => format!(
+                "{} — suggested match declined",
+                p["artist_name"].as_str().unwrap_or("artist")
+            ),
+            "album_match" => format!(
+                "{} — suggested match declined",
+                p["album_title"].as_str().unwrap_or("album")
+            ),
+            "artist_merge" => format!(
+                "{} and {} kept separate",
+                p["keep_title"].as_str().unwrap_or("?"),
+                p["other_name"].as_str().unwrap_or("?")
+            ),
+            _ => "suggestion declined".to_string(),
+        };
+        // Merge suggestions key on a name, not an entity id — fall back to
+        // the payload's artist hint so the row still points somewhere real.
+        let target_id = target_key
+            .parse::<i64>()
+            .ok()
+            .or_else(|| p["keep_id"].as_i64())
+            .unwrap_or(0);
+        let batch = next_batch(pool).await?;
+        log_change(
+            pool,
+            &library_id,
+            "suggestion_rejected",
+            target_id,
+            &label,
+            &serde_json::json!({ "suggestion_id": suggestion_id }),
+            &serde_json::json!({ "status": "rejected" }),
+            batch,
+        )
+        .await?;
         return Ok(());
     }
 
@@ -3220,7 +4045,10 @@ pub async fn mb_undo_change(
                     .flatten()
                     .filter_map(|n| n.as_str())
                     .collect();
-                if names.len() >= 2 {
+                // Solo credit sets are real now too — restore any non-empty
+                // set (an empty one means pre-13 data; resolve_credit_ids
+                // refills the solo row from the parent).
+                if !names.is_empty() {
                     for (i, name) in names.iter().enumerate() {
                         sqlx::query(
                             "INSERT INTO album_artist_credit (album_id, position, name) VALUES (?, ?, ?)",
@@ -3321,12 +4149,101 @@ pub async fn mb_undo_change(
                 .map_err(|e| e.to_string())?;
             }
         }
+        "artist_mbid" => {
+            // Restore the pre-match id — null for a suggestion-accepted
+            // match, returning the artist to unidentified. The settled
+            // suggestion deliberately stays settled (never re-ask); the
+            // artist remains matchable via Match or the evidence pass.
+            let prev = before["musicbrainz_id"].as_str().filter(|s| !s.is_empty());
+            sqlx::query("UPDATE artist SET musicbrainz_id = ? WHERE id = ?")
+                .bind(prev)
+                .bind(target_id)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            clear_mb_id(pool, target_id, MB_ARTIST).await?;
+            if let Some(prev) = prev {
+                // An earlier id existed (evidence stamp mirrored in the
+                // column) — keep it on record at mb tier.
+                set_mb_id(pool, target_id, MB_ARTIST, prev, TIER_MB).await?;
+            }
+        }
+        "album_match" => {
+            // Forget the ids the match wrote (every tier), un-stamp the fetch
+            // so the album reads unchecked, and restore whatever id stood
+            // before. The suppression written below keeps the automatic pass
+            // from re-concluding the same match next pass; Unmatch clears it
+            // for a true start-over.
+            clear_mb_id(pool, target_id, MB_RELEASE).await?;
+            clear_mb_id(pool, target_id, MB_RELEASE_GROUP).await?;
+            sqlx::query("UPDATE album SET mb_release_group_id = NULL WHERE id = ?")
+                .bind(target_id)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            sqlx::query("UPDATE album_release SET mb_release_id = NULL WHERE album_id = ?")
+                .bind(target_id)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            sqlx::query("DELETE FROM album_match_gap WHERE album_id = ?")
+                .bind(target_id)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            sqlx::query("DELETE FROM mb_credit_fetch WHERE album_id = ?")
+                .bind(target_id)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            let prev_group = before["release_group_id"].as_str().filter(|s| !s.is_empty());
+            if let Some(g) = prev_group {
+                set_mb_id(pool, target_id, MB_RELEASE_GROUP, g, TIER_MB).await?;
+                sqlx::query("UPDATE album SET mb_release_group_id = ? WHERE id = ?")
+                    .bind(g)
+                    .bind(target_id)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            let prev_release = before["release_id"].as_str().filter(|s| !s.is_empty());
+            if let Some(r) = prev_release {
+                set_mb_id(pool, target_id, MB_RELEASE, r, TIER_MB).await?;
+            }
+            if prev_group.is_some() || prev_release.is_some() {
+                stamp(pool, target_id, "matched").await?;
+            }
+        }
+        "track_match" => {
+            // Same shape as artist_mbid: drop the id, restore any earlier one
+            // at mb tier. Credits the match rewrote are their own row.
+            clear_mb_id(pool, target_id, MB_RECORDING).await?;
+            if let Some(prev) = before["recording_id"].as_str().filter(|s| !s.is_empty()) {
+                set_mb_id(pool, target_id, MB_RECORDING, prev, TIER_MB).await?;
+            }
+        }
+        "suggestion_rejected" => {
+            // The card returns to pending — the one place a settled answer
+            // deliberately unsettles, because the settled state IS the change
+            // being undone. Row gone (merged away, swept)? Nothing to
+            // restore; the undo still marks itself done below.
+            if let Some(sid) = before["suggestion_id"].as_i64() {
+                sqlx::query(
+                    "UPDATE mb_suggestion SET status = 'pending' WHERE id = ? AND status = 'rejected'",
+                )
+                .bind(sid)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            }
+        }
         other => return Err(format!("change kind '{other}' cannot be undone")),
     }
 
-    // Merge suppression is handled by the rejected suggestion row above; the
-    // rest suppress by (kind, target).
-    if kind != "artist_merge" {
+    // Merge suppression is handled by the rejected suggestion row above;
+    // un-rejecting has nothing to suppress (the pending card is the whole
+    // point); the rest suppress by (kind, target).
+    if kind != "artist_merge" && kind != "suggestion_rejected" {
         sqlx::query("INSERT OR IGNORE INTO mb_suppression (kind, target_id) VALUES (?, ?)")
             .bind(&kind)
             .bind(target_id)
@@ -3339,6 +4256,11 @@ pub async fn mb_undo_change(
         .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
+
+    // Restored credits may name artists the sweep since removed (pages come
+    // back), and every row the undo rewrote needs a fresh stamp — including
+    // re-resolving names away from a keep-artist after an unmerge.
+    crate::music::ensure_credit_artists(pool, &library_id).await?;
 
     let _ = app.emit(
         "music-enrich-done",

@@ -192,6 +192,143 @@ const MIGRATIONS: &[Migration] = &[
             )",
         ],
     },
+    Migration {
+        id: 13,
+        app_version: "1.0.0-alpha.12.5",
+        description: "credit rows carry artist_id; every album gets credit rows",
+        requires_table: None,
+        // Credits stop being resolved by name at read time: each row gets the
+        // id of the artist it refers to, stamped once. Solo albums — which
+        // carried no credit rows and were attributed through their folder
+        // parent — get their one row here, so album↔artist membership has a
+        // single source. The LOWER() backfill is ASCII-folding; the Rust
+        // resolution pass re-stamps with proper Unicode casing on next scan.
+        // No FOREIGN KEY on artist_id (soft reference — see CREATE TABLE).
+        statements: &[
+            "ALTER TABLE track_credit ADD COLUMN artist_id INTEGER",
+            "ALTER TABLE album_artist_credit ADD COLUMN artist_id INTEGER",
+            "UPDATE track_credit SET artist_id = (
+                SELECT MIN(an.artist_id) FROM artist_names an
+                JOIN media_entry ame ON ame.id = an.artist_id
+                JOIN media_entry tme ON tme.id = track_credit.track_id
+                WHERE ame.library_id = tme.library_id
+                  AND LOWER(an.name) = LOWER(track_credit.name))",
+            "UPDATE album_artist_credit SET artist_id = (
+                SELECT MIN(an.artist_id) FROM artist_names an
+                JOIN media_entry ame ON ame.id = an.artist_id
+                JOIN media_entry alme ON alme.id = album_artist_credit.album_id
+                WHERE ame.library_id = alme.library_id
+                  AND LOWER(an.name) = LOWER(album_artist_credit.name))",
+            "INSERT INTO album_artist_credit (album_id, position, name, artist_id)
+             SELECT al.id, 0, a.title, a.id FROM album al
+             JOIN media_entry me ON me.id = al.id
+             JOIN artist a ON a.id = me.parent_id
+             WHERE NOT EXISTS (SELECT 1 FROM album_artist_credit ac WHERE ac.album_id = al.id)
+               AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = al.id)
+               AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = al.id)",
+        ],
+    },
+    Migration {
+        id: 14,
+        app_version: "1.0.0-alpha.12.5",
+        description: "retract name-derived artist matches",
+        requires_table: None,
+        // Every mb-tier artist id to date came from a name search that took
+        // MusicBrainz's first exact-name hit — which is how "God" on Yeezus
+        // matched a random artist named God. Identity now derives only from
+        // matched albums' credits (which carry per-artist MBIDs) or from the
+        // user. Retract the name-derived ids and the lookup cache; the next
+        // matching pass re-stamps every artist a matched album vouches for.
+        // User-tier matches (their decision) keep both the override and the
+        // mirrored column value.
+        statements: &[
+            "DELETE FROM field_override WHERE field = 'mb_artist_id' AND tier = 'mb'",
+            "UPDATE artist SET musicbrainz_id = NULL
+             WHERE musicbrainz_id IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM field_override f
+                               WHERE f.entity_id = artist.id AND f.field = 'mb_artist_id')",
+            "DELETE FROM mb_artist_lookup",
+        ],
+    },
+    Migration {
+        id: 15,
+        app_version: "1.0.0-alpha.12.5",
+        description: "regenerate artist-match suggestions with exact-name candidates",
+        requires_table: None,
+        // The first cut of "Which artist is this?" picked candidates by MB
+        // search score, which ranks famous partial-name matches above obscure
+        // exact ones — "Castro" offered Cristian, Fidel, and Tommy Castro and
+        // cut every artist literally named Castro. Unanswered (pending) and
+        // silently-settled (notfound) rows regenerate under the exact-name
+        // rule on the next pass; the user's accepted/rejected decisions are
+        // answers and stand.
+        statements: &[
+            "DELETE FROM mb_suggestion
+             WHERE kind = 'artist_match' AND status IN ('pending', 'notfound')",
+        ],
+    },
+    Migration {
+        id: 16,
+        app_version: "1.0.0-alpha.12.5",
+        description: "regenerate artist-match suggestions with alias-aware candidates",
+        requires_table: None,
+        // Candidate selection now counts an ALIAS hit as answering to the
+        // name, not just the title — a renamed artist ("Hodgy Beats" →
+        // "Hodgy") answers through their alias, and title-only matching
+        // offered the bare duplicate while hiding the canonical entity.
+        // Unanswered/silently-settled rows regenerate on the next pass;
+        // answered ones stand.
+        statements: &[
+            "DELETE FROM mb_suggestion
+             WHERE kind = 'artist_match' AND status IN ('pending', 'notfound')",
+        ],
+    },
+    Migration {
+        id: 17,
+        app_version: "1.0.0-alpha.12.5",
+        description: "regenerate artist-match suggestions from a deep search",
+        requires_table: None,
+        // The sweep searched MB with limit 10, and MB orders by FAME — an
+        // exact-name obscure artist can sit at #12 behind famous partial
+        // matches and never reach the filter ("Castro" showed two of its
+        // three namesakes). The sweep now searches a page of 50. Same
+        // regeneration rule as 15/16: answers stand.
+        statements: &[
+            "DELETE FROM mb_suggestion
+             WHERE kind = 'artist_match' AND status IN ('pending', 'notfound')",
+        ],
+    },
+    Migration {
+        id: 18,
+        app_version: "1.0.0-alpha.12.5",
+        description: "regenerate artist-match suggestions with alias-field search",
+        requires_table: None,
+        // MB's artist: search field matches names only — entities answering
+        // through an ALIAS were never returned at all, so a renamed artist's
+        // canonical entity ("Hodgy", alias "Hodgy Beats") lost to its bare
+        // duplicate by absence. The query now includes alias:. Same
+        // regeneration rule as 15–17: answers stand; unanswered and
+        // silently-settled rows re-ask on the next pass.
+        statements: &[
+            "DELETE FROM mb_suggestion
+             WHERE kind = 'artist_match' AND status IN ('pending', 'notfound')",
+        ],
+    },
+    Migration {
+        id: 19,
+        app_version: "1.0.0-alpha.12.5",
+        description: "regenerate artist-match suggestions without the score floor",
+        requires_table: None,
+        // The OR alias: query dilutes lucene scores, and search_artists'
+        // score>=50 floor silently cut obscure exact-name artists from the
+        // lineups (Castro's namesakes vanished). The floor is gone — the
+        // exact name/alias filter is the gatekeeper. Same regeneration rule
+        // as 15–18: answers stand.
+        statements: &[
+            "DELETE FROM mb_suggestion
+             WHERE kind = 'artist_match' AND status IN ('pending', 'notfound')",
+        ],
+    },
 ];
 
 /// Copy the database beside itself before the first migration of a run
@@ -960,13 +1097,17 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     // Ordered credit list per track, parsed from tags at scan time: main
     // artist(s) first, then features (from the artist tag's "feat." clause,
     // multi-value ARTISTS frames, and "(feat. …)" title parentheticals).
-    // Names are display strings; a future MusicBrainz pass can canonicalize
-    // them and create artist entries for feature-only names.
+    // name is the as-credited text (what the tag said); artist_id is WHO that
+    // is — stamped by resolve_credit_ids after every pass that changes
+    // credits or artists. NULL = unresolved. Deliberately not a FOREIGN KEY:
+    // artist deletes (sweeps, merges) must not be blocked by stale stamps,
+    // which the next resolution pass heals.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS track_credit (
             track_id INTEGER NOT NULL,
             position INTEGER NOT NULL,
             name TEXT NOT NULL,
+            artist_id INTEGER,
             PRIMARY KEY (track_id, position),
             FOREIGN KEY (track_id) REFERENCES track(id) ON DELETE CASCADE
         )",
@@ -989,10 +1130,13 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .execute(&pool)
     .await?;
 
-    // ── Artist aliases ────────────────────────────────────────────────
-    // Alternate spellings that resolve to an artist ("J Cole" → "J. Cole").
-    // Written by accepted/auto merges; credit rows keep their RAW scanned
-    // names and resolve through this layer, so merges are reversible.
+    // ── Artist name redirects ─────────────────────────────────────────
+    // Former spellings that must keep resolving to an artist: names absorbed
+    // by merges and pre-rename titles ("J Cole" → "J. Cole"). Despite the
+    // table name these are NOT "also known as" credits — nothing records an
+    // artist being credited under another name here. Consulted by
+    // resolve_credit_ids when stamping credit artist_ids (the scanner's
+    // dictionary), not by display queries.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS artist_alias (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1008,8 +1152,10 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
         .execute(&pool)
         .await?;
 
-    // Every name an artist answers to (title + aliases) — the join surface
-    // for credit → artist resolution.
+    // Every name an artist answers to (title + redirects) — the lookup
+    // surface for stamping credit artist_ids at resolution time. Display
+    // paths read the stamped ids; only the raw track_meta.artist_name string
+    // still prettifies through here.
     sqlx::query(
         "CREATE VIEW IF NOT EXISTS artist_names AS
          SELECT id AS artist_id, title AS name FROM artist
@@ -1164,17 +1310,53 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     // Presence of a row = the track is loved. Keyed on the track id, which
     // rescans preserve by file path — a loved track keeps its heart unless
     // its file moves out from under it (same durability as play history).
-    // Ordered album-level artist credits ("Drake · Future"). Only written for
-    // albums with MORE than one credited artist — single-artist albums read
-    // their parent artist as before. Fed by artist splits and multi-value
-    // album-artist tags; display joins names via artist_names for links.
+    // Ordered album-level artist credits ("Drake · Future") — THE record of
+    // whose album this is. Every album carries rows, solo included; the
+    // media_entry parent is only where the album lives (folder position,
+    // cascade), never attribution. Fed by artist splits, multi-value
+    // album-artist tags, and MusicBrainz credits. artist_id as on
+    // track_credit: stamped by resolve_credit_ids, soft reference on purpose.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS album_artist_credit (
             album_id INTEGER NOT NULL,
             position INTEGER NOT NULL,
             name TEXT NOT NULL,
+            artist_id INTEGER,
             PRIMARY KEY (album_id, position),
             FOREIGN KEY (album_id) REFERENCES album(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // Per-library settings — key/value like the app-wide `settings` table,
+    // scoped to one library. First key: 'online_metadata' ("on"/"off",
+    // absent = on) — whether this library talks to online providers at all
+    // (MusicBrainz for music, TMDB/OMDB for video).
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS library_setting (
+            library_id TEXT NOT NULL,
+            key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            PRIMARY KEY (library_id, key),
+            FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // Directives staged since the last rescan, one row per user action
+    // (split, combine, separate). The directives themselves are permanent and
+    // rescan-idempotent; these rows only record "written but not yet applied"
+    // so the UI can show what a rescan will do instead of forcing a rescan
+    // per action. Cleared when a rescan completes.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS pending_change (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            library_id TEXT NOT NULL,
+            label TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE
         )",
     )
     .execute(&pool)

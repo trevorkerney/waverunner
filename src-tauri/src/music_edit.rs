@@ -415,7 +415,7 @@ pub(crate) async fn split_artist_inner(
     .map(|(n,)| n)
     .collect();
     if !source_names.iter().any(|n| n.eq_ignore_ascii_case(&source_name)) {
-        source_names.push(source_name);
+        source_names.push(source_name.clone());
     }
     let members_json = serde_json::to_string(&members).map_err(|e| e.to_string())?;
     for name in &source_names {
@@ -453,6 +453,12 @@ pub(crate) async fn split_artist_inner(
             .map_err(|e| e.to_string())?;
         }
     }
+    stage_pending_change(
+        pool,
+        &library_id,
+        &format!("Split \u{201c}{source_name}\u{201d} into {}", members.join(" · ")),
+    )
+    .await?;
     Ok(library_id)
 }
 
@@ -495,6 +501,256 @@ pub async fn search_artist_options(
     .await
     .map_err(|e| e.to_string())?;
     Ok(rows.into_iter().map(|(t,)| t).collect())
+}
+
+/// One pickable artist, with enough to draw a profile row.
+#[derive(Debug, Serialize)]
+pub struct ArtistChoice {
+    pub id: i64,
+    pub name: String,
+    /// Cached image path, resolved the same way the artist page picks one:
+    /// the chosen cover if it's still there, else the first available.
+    pub image: Option<String>,
+    pub release_count: i64,
+}
+
+/// Artist picker options for the split dialog — richer than the plain-name
+/// suggestion lists, because the picker draws each option as a profile.
+#[tauri::command]
+pub async fn search_artist_choices(
+    state: State<'_, AppState>,
+    artist_id: i64,
+    query: String,
+    limit: Option<i64>,
+) -> Result<Vec<ArtistChoice>, String> {
+    let pool = &state.app_db;
+    let (library_id,): (String,) =
+        sqlx::query_as("SELECT library_id FROM media_entry WHERE id = ?")
+            .bind(artist_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or("Artist not found")?;
+    let q = query.trim();
+    if q.is_empty() {
+        return Ok(Vec::new());
+    }
+    let escaped = q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+    let substr = format!("%{escaped}%");
+    let prefix = format!("{escaped}%");
+    let rows: Vec<(i64, String, Option<String>, String, i64)> = sqlx::query_as(
+        "SELECT a.id, a.title, a.selected_cover, a.folder_path,
+                (SELECT COUNT(*) FROM media_entry c WHERE c.parent_id = a.id)
+         FROM artist a
+         JOIN media_entry me ON me.id = a.id
+         WHERE me.library_id = ?1 AND a.id != ?2 AND a.title LIKE ?3 ESCAPE '\\'
+         ORDER BY CASE WHEN a.title LIKE ?4 ESCAPE '\\' THEN 0 ELSE 1 END,
+                  a.title COLLATE NOCASE
+         LIMIT ?5",
+    )
+    .bind(&library_id)
+    .bind(artist_id)
+    .bind(&substr)
+    .bind(&prefix)
+    .bind(limit.unwrap_or(8).clamp(1, 25))
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for (id, name, selected, folder, release_count) in rows {
+        let mut covers = covers_for_folder(pool, &library_id, &folder).await?;
+        covers.extend(
+            covers_for_folder(pool, &library_id, &crate::music_art::artist_fetch_rel(id)).await?,
+        );
+        let image = selected
+            .filter(|s| covers.iter().any(|c| c == s))
+            .or_else(|| covers.into_iter().next());
+        out.push(ArtistChoice { id, name, image, release_count });
+    }
+    Ok(out)
+}
+
+/// Resolve exact names to existing artists, in the order given.
+///
+/// The split dialog guesses member names by cutting the joint name apart, and
+/// those guesses are usually real artists already in the library — offering to
+/// "create" a 2 Chainz that already exists would spawn a duplicate. `None` for
+/// a name means nothing in this library answers to it.
+#[tauri::command]
+pub async fn resolve_artist_choices(
+    state: State<'_, AppState>,
+    artist_id: i64,
+    names: Vec<String>,
+) -> Result<Vec<Option<ArtistChoice>>, String> {
+    let pool = &state.app_db;
+    let (library_id,): (String,) =
+        sqlx::query_as("SELECT library_id FROM media_entry WHERE id = ?")
+            .bind(artist_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or("Artist not found")?;
+
+    let mut out = Vec::with_capacity(names.len());
+    for name in names {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            out.push(None);
+            continue;
+        }
+        // Exact match only — a split member is a specific artist, and a fuzzy
+        // hit here would silently attach albums to the wrong page.
+        let row: Option<(i64, String, Option<String>, String, i64)> = sqlx::query_as(
+            "SELECT a.id, a.title, a.selected_cover, a.folder_path,
+                    (SELECT COUNT(*) FROM media_entry c WHERE c.parent_id = a.id)
+             FROM artist a
+             JOIN media_entry me ON me.id = a.id
+             WHERE me.library_id = ?1 AND a.id != ?2 AND a.title = ?3 COLLATE NOCASE
+             LIMIT 1",
+        )
+        .bind(&library_id)
+        .bind(artist_id)
+        .bind(trimmed)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        match row {
+            Some((id, title, selected, folder, release_count)) => {
+                let mut covers = covers_for_folder(pool, &library_id, &folder).await?;
+                covers.extend(
+                    covers_for_folder(pool, &library_id, &crate::music_art::artist_fetch_rel(id))
+                        .await?,
+                );
+                let image = selected
+                    .filter(|s| covers.iter().any(|c| c == s))
+                    .or_else(|| covers.into_iter().next());
+                out.push(Some(ArtistChoice { id, name: title, image, release_count }));
+            }
+            None => out.push(None),
+        }
+    }
+    Ok(out)
+}
+
+/// Artist picker options scoped by LIBRARY — for surfaces acting on a bare
+/// credit name, where there's no artist entity to anchor the search on (the
+/// unlinked-credits list). Same rows as search_artist_choices.
+#[tauri::command]
+pub async fn search_credit_link_choices(
+    state: State<'_, AppState>,
+    library_id: String,
+    query: String,
+    limit: Option<i64>,
+    exclude_artist_id: Option<i64>,
+) -> Result<Vec<ArtistChoice>, String> {
+    let pool = &state.app_db;
+    let q = query.trim();
+    if q.is_empty() {
+        return Ok(Vec::new());
+    }
+    let escaped = q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+    let substr = format!("%{escaped}%");
+    let prefix = format!("{escaped}%");
+    let rows: Vec<(i64, String, Option<String>, String, i64)> = sqlx::query_as(
+        "SELECT a.id, a.title, a.selected_cover, a.folder_path,
+                (SELECT COUNT(*) FROM media_entry c WHERE c.parent_id = a.id)
+         FROM artist a
+         JOIN media_entry me ON me.id = a.id
+         WHERE me.library_id = ?1 AND a.id != ?2 AND a.title LIKE ?3 ESCAPE '\\'
+         ORDER BY CASE WHEN a.title LIKE ?4 ESCAPE '\\' THEN 0 ELSE 1 END,
+                  a.title COLLATE NOCASE
+         LIMIT ?5",
+    )
+    .bind(&library_id)
+    .bind(exclude_artist_id.unwrap_or(-1))
+    .bind(&substr)
+    .bind(&prefix)
+    .bind(limit.unwrap_or(8).clamp(1, 25))
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for (id, name, selected, folder, release_count) in rows {
+        let mut covers = covers_for_folder(pool, &library_id, &folder).await?;
+        covers.extend(
+            covers_for_folder(pool, &library_id, &crate::music_art::artist_fetch_rel(id)).await?,
+        );
+        let image = selected
+            .filter(|s| covers.iter().any(|c| c == s))
+            .or_else(|| covers.into_iter().next());
+        out.push(ArtistChoice { id, name, image, release_count });
+    }
+    Ok(out)
+}
+
+/// "This credit name is really that artist" — the manual identity decision
+/// (\u{201c}God\u{201d} on Yeezus → Kanye West). Implemented as a merge, because that IS
+/// the shipped machinery for exactly this: the name (and its auto-created
+/// page, when the scan spawned one — albums included) folds into the chosen
+/// artist, the name becomes a redirect, every credit row stamped with it
+/// re-points, the action lands in the change log undoable, and rescans keep
+/// honouring it because artist grouping resolves through redirects.
+#[tauri::command]
+pub async fn link_credit_name(
+    state: State<'_, AppState>,
+    library_id: String,
+    name: String,
+    target_artist_id: i64,
+) -> Result<(), String> {
+    let pool = &state.app_db;
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("No credit name given".to_string());
+    }
+    let target: Option<(String,)> = sqlx::query_as(
+        "SELECT a.title FROM artist a JOIN media_entry me ON me.id = a.id
+         WHERE a.id = ? AND me.library_id = ?",
+    )
+    .bind(target_artist_id)
+    .bind(&library_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let (target_title,) = target.ok_or("Target artist not found")?;
+
+    // The name's own page, if the scan created one — merged in full.
+    let source: Option<(i64,)> = sqlx::query_as(
+        "SELECT an.artist_id FROM artist_names an
+         JOIN media_entry me ON me.id = an.artist_id
+         WHERE me.library_id = ?1 AND LOWER(an.name) = LOWER(?2) LIMIT 1",
+    )
+    .bind(&library_id)
+    .bind(&name)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let source_id = source.map(|(id,)| id);
+    if source_id == Some(target_artist_id) {
+        return Err(format!("\u{201c}{name}\u{201d} already resolves to {target_title}"));
+    }
+    crate::music_mb::merge_artists(pool, &library_id, target_artist_id, &target_title, source_id, &name)
+        .await
+}
+
+async fn covers_for_folder(
+    pool: &SqlitePool,
+    library_id: &str,
+    folder_path: &str,
+) -> Result<Vec<String>, String> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT cached_path FROM cached_images
+         WHERE library_id = ? AND entry_folder_path = ? AND image_type = 'cover'
+         ORDER BY source_filename",
+    )
+    .bind(library_id)
+    .bind(folder_path)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(rows.into_iter().map(|(p,)| p).collect())
 }
 
 /// Existing-artist suggestions for the track editor's artist rows — canonical
@@ -1310,7 +1566,56 @@ pub async fn combine_albums_multi(
         .map_err(|e| e.to_string())?;
     }
     tx.commit().await.map_err(|e| e.to_string())?;
+    let combined: Vec<String> =
+        directives.iter().map(|(_, _, n)| format!("\u{201c}{n}\u{201d}")).collect();
+    stage_pending_change(
+        pool,
+        &library_id,
+        &format!("Combine {} into \u{201c}{tgt_name}\u{201d}", combined.join(", ")),
+    )
+    .await?;
     Ok(())
+}
+
+/// Record one staged, rescan-applied user action in the library's pending
+/// list. The directive itself is already durable and rescan-idempotent; this
+/// row only says "written but not applied yet", so decisions batch behind ONE
+/// rescan instead of forcing one per action. Any successful rescan clears the
+/// list.
+pub(crate) async fn stage_pending_change(
+    pool: &SqlitePool,
+    library_id: &str,
+    label: &str,
+) -> Result<(), String> {
+    sqlx::query("INSERT INTO pending_change (library_id, label) VALUES (?, ?)")
+        .bind(library_id)
+        .bind(label)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+pub struct PendingChange {
+    pub id: i64,
+    pub label: String,
+}
+
+/// The staged actions a rescan will apply, oldest first.
+#[tauri::command]
+pub async fn get_pending_changes(
+    state: State<'_, AppState>,
+    library_id: String,
+) -> Result<Vec<PendingChange>, String> {
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT id, label FROM pending_change WHERE library_id = ? ORDER BY id",
+    )
+    .bind(&library_id)
+    .fetch_all(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(rows.into_iter().map(|(id, label)| PendingChange { id, label }).collect())
 }
 
 /// An album folded into this one by a user combine — the undo list.
@@ -1374,8 +1679,8 @@ pub async fn undo_album_combine(
     combine_id: i64,
 ) -> Result<String, String> {
     let pool = &state.app_db;
-    let (library_id,): (String,) =
-        sqlx::query_as("SELECT library_id FROM album_combine WHERE id = ?")
+    let (library_id, source_name, source_title): (String, Option<String>, String) =
+        sqlx::query_as("SELECT library_id, source_name, source_title FROM album_combine WHERE id = ?")
             .bind(combine_id)
             .fetch_optional(pool)
             .await
@@ -1386,6 +1691,13 @@ pub async fn undo_album_combine(
         .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
+    let name = source_name.unwrap_or(source_title);
+    stage_pending_change(
+        pool,
+        &library_id,
+        &format!("Un-combine \u{201c}{name}\u{201d} back into its own album"),
+    )
+    .await?;
     Ok(library_id)
 }
 
@@ -1448,6 +1760,12 @@ pub async fn split_album_release(
                         .execute(pool)
                         .await
                         .map_err(|e| e.to_string())?;
+                    stage_pending_change(
+                        pool,
+                        &library_id,
+                        &format!("Separate an edition of \u{201c}{}\u{201d}", album_title_for(pool, album_id).await?),
+                    )
+                    .await?;
                     return Ok(library_id);
                 }
             }
@@ -1463,5 +1781,21 @@ pub async fn split_album_release(
     .execute(pool)
     .await
     .map_err(|e| e.to_string())?;
+    stage_pending_change(
+        pool,
+        &library_id,
+        &format!("Separate an edition of \u{201c}{}\u{201d}", album_title_for(pool, album_id).await?),
+    )
+    .await?;
     Ok(library_id)
+}
+
+/// Album display title for pending-change labels.
+async fn album_title_for(pool: &SqlitePool, album_id: i64) -> Result<String, String> {
+    sqlx::query_as::<_, (String,)>("SELECT title FROM album WHERE id = ?")
+        .bind(album_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())
+        .map(|r| r.map(|(t,)| t).unwrap_or_default())
 }

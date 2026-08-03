@@ -1236,6 +1236,25 @@ function App() {
     };
   }, [openHome]);
 
+  // The metadata centers read (and write) the library they're showing —
+  // mid-scan that data is the same inconsistent state the grids get bounced
+  // off of, so they close too. Catches both directions: a rescan starting
+  // under an open center (split from the standalone center, backed-out
+  // wizard) and opening a center onto an already-scanning library.
+  useEffect(() => {
+    if (mbReviewLibraryId && scanningLibs.has(mbReviewLibraryId)) {
+      setMbReviewLibraryId(null);
+    }
+    if (videoCenterLibraryId && scanningLibs.has(videoCenterLibraryId)) {
+      setVideoCenterLibraryId(null);
+    }
+  }, [scanningLibs, mbReviewLibraryId, videoCenterLibraryId]);
+
+  // Pending "Needs a decision" entries do NOT lock the library — the user
+  // decided metadata questions are the metadata center's business, not a
+  // toll booth on playback. The gate lives inside the center itself: while
+  // decisions pend, its other panes (bar History) stay locked.
+
   // "Go to page" from a Home card — detail navigation that may cross into a
   // different library than whatever was last selected. Sets up the target
   // library's root as the crumb base; Back re-loads its grid via the crumb.
@@ -1244,7 +1263,12 @@ function App() {
   const openEntryFromHome = useCallback(
     (libraryId: string, entry: MediaEntry, focusTrackId?: number) => {
       const lib = libraries.find((l) => l.id === libraryId);
-      if (!lib || lib.setup_stage || scanningLibs.has(libraryId)) return;
+      if (!lib || lib.setup_stage) return;
+      if (scanningLibs.has(libraryId)) {
+        // Say WHY the click did nothing — a silent no-op reads as broken.
+        toast.info(`“${lib.name}” is rescanning — available again when it finishes.`);
+        return;
+      }
       saveScrollPosition(); // Home's scroll, for the return trip
       // Albums root under the Albums grid (that's what the tile was);
       // movies/shows root at the library's All.
@@ -1278,7 +1302,12 @@ function App() {
   const openTrackFromHome = useCallback(
     (libraryId: string, trackId: number) => {
       const lib = libraries.find((l) => l.id === libraryId);
-      if (!lib || lib.setup_stage || scanningLibs.has(libraryId)) return;
+      if (!lib || lib.setup_stage) return;
+      if (scanningLibs.has(libraryId)) {
+        // Say WHY the click did nothing — a silent no-op reads as broken.
+        toast.info(`“${lib.name}” is rescanning — available again when it finishes.`);
+        return;
+      }
       saveScrollPosition(); // Home's scroll, for the return trip
       const view: ViewSpec = { kind: "loose-tracks", libraryId, sounds: false };
       setActiveView(view);
@@ -1937,6 +1966,18 @@ function App() {
       unlisten.then((fn) => fn());
     };
   }, [invalidateCache, refreshMusicCountsFor]);
+
+  // A play just crossed the scrobble threshold — relay to the window event
+  // the self-fetching pages listen on, so visible play counts tick without a
+  // manual refresh.
+  useEffect(() => {
+    const unlisten = listen("music-scrobbled", () => {
+      window.dispatchEvent(new Event("waverunner:track-scrobbled"));
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
 
 
   const updateCache = useCallback((libraryId: string, parentId: number | null, entries: MediaEntry[], sort_mode: string) => {
@@ -2997,6 +3038,8 @@ function App() {
           onPlayEpisode={handlePlayEpisode}
           onPlayMusicQueue={handlePlayMusicQueue}
           onEnqueueMusic={handleEnqueueMusic}
+          onOpenMusicAlbum={openMusicAlbumFromBar}
+          onOpenMusicArtist={openMusicArtistFromBar}
           onOpenLibraryEntry={openEntryFromHome}
           onOpenLibraryTrack={openTrackFromHome}
           musicTracksFocusRequest={tracksFocusRequest}

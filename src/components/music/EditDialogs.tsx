@@ -8,6 +8,7 @@ import {
   DialogTitle,
   DialogFooter,
 } from "@/components/ui/dialog";
+import { ArtistPicker, ArtistChoice, PickedArtist } from "./ArtistPicker";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -745,6 +746,11 @@ function guessSplitMembers(name: string): string[] {
   return ["", ""];
 }
 
+/** Ceiling on split members. A tag naming more than a dozen artists is a
+ *  compilation credit or a mistake, not a group, and an unbounded list lets
+ *  the field stack run off the bottom of the dialog. */
+const MAX_SPLIT_MEMBERS = 12;
+
 /** Record a split directive for a joint-named artist entry, then kick a
  *  rescan to migrate: albums re-home under the first member (full list as
  *  the album's artist credit), matching track credits split, and the joint
@@ -760,67 +766,62 @@ export function SplitArtistDialog({
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
-  const [members, setMembers] = useState<string[]>(["", ""]);
+  // Each row is a decision — an existing artist, a name to create, or nothing
+  // yet — rather than free text, so the dialog can show who was chosen.
+  const [members, setMembers] = useState<(PickedArtist | null)[]>([null, null]);
   const [busy, setBusy] = useState(false);
-
-  // Existing-artist suggestions per member row.
-  const [suggest, setSuggest] = useState<{ row: number; options: string[] } | null>(null);
-  const suggestSeq = useRef(0);
-  const suggestTimer = useRef<number | undefined>(undefined);
-  const queryArtists = (row: number, q: string) => {
-    window.clearTimeout(suggestTimer.current);
-    const trimmed = q.trim();
-    if (trimmed.length < 2 || artistId == null) {
-      setSuggest(null);
-      return;
-    }
-    const seq = ++suggestSeq.current;
-    suggestTimer.current = window.setTimeout(async () => {
-      try {
-        const options = await invoke<string[]>("search_artist_options", {
-          artistId,
-          query: trimmed,
-        });
-        if (suggestSeq.current === seq) {
-          setSuggest(options.length > 0 ? { row, options } : null);
-        }
-      } catch {
-        /* best-effort */
-      }
-    }, 150);
-  };
-  const visibleOptions = (row: number): string[] => {
-    if (!suggest || suggest.row !== row) return [];
-    // Other rows only — the typed row keeps its own exact match visible.
-    const taken = new Set(
-      members.filter((_, i) => i !== row).map((m) => m.trim().toLowerCase()).filter(Boolean),
-    );
-    return suggest.options.filter((name) => !taken.has(name.toLowerCase()));
-  };
 
   useEffect(() => {
     if (!open) return;
-    setMembers(guessSplitMembers(artistName));
-    setSuggest(null);
-  }, [open, artistName]);
+    const guessed = guessSplitMembers(artistName);
+    // Fill with the guess immediately, then upgrade any name that turns out
+    // to be an artist the library already has — "2 Chainz, Lil Wayne" splits
+    // into two names that both exist, and offering to create them would spawn
+    // duplicates of the real pages.
+    setMembers(guessed.map((n) => (n ? { name: n, isNew: true } : null)));
+    if (artistId == null) return;
+    let cancelled = false;
+    invoke<(ArtistChoice | null)[]>("resolve_artist_choices", { artistId, names: guessed })
+      .then((found) => {
+        if (cancelled) return;
+        setMembers(
+          guessed.map((n, i) => {
+            const hit = found[i];
+            if (hit)
+              return {
+                name: hit.name,
+                id: hit.id,
+                image: hit.image,
+                releaseCount: hit.release_count,
+              };
+            return n ? { name: n, isNew: true } : null;
+          }),
+        );
+      })
+      .catch(() => {
+        /* keep the plain guess */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, artistName, artistId]);
 
   const apply = async () => {
     if (artistId == null) return;
-    const list = members.map((m) => m.trim()).filter(Boolean);
+    const list = members.map((m) => m?.name.trim() ?? "").filter(Boolean);
     if (list.length < 2) {
       toast.error("A split needs at least two artists");
       return;
     }
     setBusy(true);
     try {
-      const libraryId = await invoke<string>("split_artist", { artistId, members: list });
+      await invoke<string>("split_artist", { artistId, members: list });
       onOpenChange(false);
-      // The migration is a rescan — run through the wizard modal (the user
-      // can minimize it to the sidebar's progress row); the wizard's
-      // completion callback handles the post-rescan refresh.
-      window.dispatchEvent(
-        new CustomEvent("waverunner:open-rescan", { detail: { libraryId } }),
-      );
+      // STAGED, not applied: the migration is a rescan, and splits batch up
+      // behind one rescan with every other staged directive instead of each
+      // forcing its own. The metadata center's pending banner shows the batch
+      // and offers the rescan.
+      toast("Split staged — it applies on the next rescan");
     } catch (e) {
       toast.error(String(e));
     } finally {
@@ -836,77 +837,86 @@ export function SplitArtistDialog({
         </DialogHeader>
         <div className="grid gap-3">
           <p className="text-sm text-muted-foreground">
-            <span className="font-medium text-foreground">{artistName}</span> is really these
-            artists. Their joint albums move under the first artist and credit every member;
-            matching track credits split the same way. This survives rescans.
+            <span className="font-medium text-foreground">{artistName}</span> is really these{" "}
+            <span className="font-medium text-foreground">{members.length}</span> artists. Their
+            joint albums credit every member — in this order — and appear on each one's page;
+            matching track credits split the same way. Staged now, applied by the next rescan,
+            and it survives every rescan after.
           </p>
-          <div className="flex flex-col gap-1">
-            {members.map((name, i) => {
-              const options = visibleOptions(i);
+          {/* Long member lists scroll rather than pushing the footer off screen.
+              scrollbar-gutter keeps that space reserved whether or not the bar
+              is showing — otherwise adding the row that first overflows steals
+              the width from every field and the whole stack jumps left. */}
+          <div className="flex max-h-72 flex-col gap-1 overflow-y-auto overflow-x-hidden pr-1 [scrollbar-gutter:stable]">
+            {members.map((picked, i) => {
               return (
-                <div key={i} className="flex gap-1">
-                  <div className="relative flex-1">
-                    <input
-                      value={name}
-                      onChange={(e) => {
+                <div key={i} className="flex items-center gap-1">
+                  <ArtistPicker
+                    value={picked}
+                    onChange={(v) => {
+                      const next = members.slice();
+                      next[i] = v;
+                      setMembers(next);
+                    }}
+                    contextArtistId={artistId}
+                    exclude={members
+                      .filter((_, idx) => idx !== i)
+                      .map((m) => m?.name ?? "")
+                      .filter(Boolean)}
+                    // Uniform on purpose: since credits became the record of
+                    // whose album it is, no member "owns" anything — the only
+                    // thing slot order controls is credit display order.
+                    placeholder="Select an artist…"
+                  />
+                  {/* Always present, disabled at the two-member floor — a
+                      button that appears and disappears shifts the field
+                      widths as you add and remove rows. */}
+                  {/* One control, two jobs: cancel the chosen artist, or —
+                      when the row is already empty — drop the row. Disabled
+                      only when there's neither a choice to cancel nor a
+                      spare row to remove. */}
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    disabled={picked == null && members.length <= 2}
+                    onClick={() => {
+                      if (picked != null) {
                         const next = members.slice();
-                        next[i] = e.target.value;
+                        next[i] = null;
                         setMembers(next);
-                        queryArtists(i, e.target.value);
-                      }}
-                      onBlur={() => setTimeout(() => setSuggest((s) => (s?.row === i ? null : s)), 100)}
-                      placeholder={i === 0 ? "First artist (owns the albums)" : "Artist"}
-                      className="w-full rounded border border-input bg-transparent px-2 py-1 text-sm outline-none"
-                    />
-                    {options.length > 0 && (
-                      <div className="absolute left-0 right-0 top-full z-20 mt-1 max-h-56 overflow-y-auto rounded-md border border-border bg-popover p-1 shadow-md">
-                        {options.map((option) => (
-                          <button
-                            key={option}
-                            type="button"
-                            onMouseDown={(e) => {
-                              e.preventDefault();
-                              const next = members.slice();
-                              next[i] = option;
-                              setMembers(next);
-                              setSuggest(null);
-                            }}
-                            className="flex w-full items-center rounded px-2 py-1 text-left text-sm hover:bg-accent"
-                          >
-                            <span className="truncate">{option}</span>
-                          </button>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                  {members.length > 2 && (
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      onClick={() => setMembers(members.filter((_, idx) => idx !== i))}
-                    >
-                      <X size={14} />
-                    </Button>
-                  )}
+                      } else {
+                        setMembers(members.filter((_, idx) => idx !== i));
+                      }
+                    }}
+                  >
+                    <X size={14} />
+                  </Button>
                 </div>
               );
             })}
+          </div>
+          {/* Outside the scroll box on purpose: inside it, clicking Add moved
+              the button down and the browser scrolled the freshly-focused
+              button back into view, which made the scrollbar flash every time
+              the list was near its height limit. Out here it also stays put
+              instead of scrolling away. */}
+          {members.length < MAX_SPLIT_MEMBERS && (
             <Button
               size="sm"
               variant="outline"
               className="w-fit"
-              onClick={() => setMembers([...members, ""])}
+              onClick={() => setMembers([...members, null])}
             >
               + Add artist
             </Button>
-          </div>
+          )}
         </div>
         <DialogFooter>
           <Button variant="outline" disabled={busy} onClick={() => onOpenChange(false)}>
             Cancel
           </Button>
           <Button disabled={busy} onClick={apply}>
-            {busy ? "Splitting…" : "Split & rescan"}
+            {busy ? "Staging…" : "Stage split"}
           </Button>
         </DialogFooter>
       </DialogContent>

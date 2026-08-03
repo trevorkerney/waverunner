@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { ListFilter, Search, Star, User } from "lucide-react";
-import { Input } from "@/components/ui/input";
+import { ClearableInput } from "@/components/ui/clearable-input";
 import {
   ContextMenu,
   ContextMenuTrigger,
@@ -396,12 +396,12 @@ export function PeoplePage({ people, libraryId, role, initialMode, onModeChange,
     <>
       {/* Toolbar: search (always searches ALL people) + Top/All selector */}
       <div className="flex items-center gap-3 border-b border-border px-4 py-2">
-        <div className="relative flex-1">
-          <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground" />
-          <Input
+        <div className="relative flex flex-1">
+          <Search size={14} className="absolute left-2.5 top-1/2 z-10 -translate-y-1/2 text-muted-foreground" />
+          <ClearableInput
             value={search}
-            onChange={(e) => {
-              setSearch(e.target.value);
+            onValueChange={(v) => {
+              setSearch(v);
               resetScroll();
             }}
             placeholder="Search people..."

@@ -25,6 +25,8 @@ import { CSS } from "@dnd-kit/utilities";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Input } from "@/components/ui/input";
+import { ClearableInput } from "@/components/ui/clearable-input";
+import { useFlipList } from "@/hooks/useFlipList";
 import { Slider } from "@/components/ui/slider";
 import {
   Breadcrumb,
@@ -272,6 +274,9 @@ interface MainContentProps {
   onPlayMusicQueue?: (items: MusicQueueItem[], startIndex: number) => void;
   /** "Play next" / "Add to queue" from music context menus. */
   onEnqueueMusic?: (items: MusicQueueItem[], mode: "next" | "last") => void;
+  /** Playlist-row links — the now-playing bar's navigation handlers. */
+  onOpenMusicAlbum?: (albumId: number, albumTitle: string, trackId?: number) => void;
+  onOpenMusicArtist?: (artistId: number, artistName: string) => void;
   /** Home-card "Go to page" — cross-library detail navigation (App-owned).
    *  focusTrackId (albums): scroll to and highlight that track on arrival. */
   onOpenLibraryEntry?: (libraryId: string, entry: MediaEntry, focusTrackId?: number) => void;
@@ -343,6 +348,8 @@ export function MainContent({
   onPlayEpisode,
   onPlayMusicQueue,
   onEnqueueMusic,
+  onOpenMusicAlbum,
+  onOpenMusicArtist,
   onOpenLibraryEntry,
   onOpenLibraryTrack,
   musicTracksFocusRequest,
@@ -403,10 +410,9 @@ export function MainContent({
         targetReleaseFolder,
       });
       setAlbumSelect(null);
-      // The directives apply on rescan — run one through the wizard modal.
-      window.dispatchEvent(
-        new CustomEvent("waverunner:open-rescan", { detail: { libraryId } }),
-      );
+      // STAGED: the directive applies on the next rescan, batched with any
+      // other staged changes (the metadata center's pending banner offers it).
+      toast("Combine staged — it applies on the next rescan");
     } catch (err) {
       toast.error(String(err));
       setAlbumSelect((s) => (s ? { ...s, busy: false } : s));
@@ -1335,14 +1341,14 @@ export function MainContent({
           {/* Search + Sort + Size Slider. Hidden on person pages — the filmography
               is a small curated list, always alphabetical. */}
           {!selectedEntry && !albumSelect && activeView?.kind !== "person-detail" && <div className="flex items-center gap-3 border-b border-border px-4 py-2">
-            <div className="relative flex-1">
+            <div className="relative flex flex-1">
               <Search
                 size={14}
-                className="absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground"
+                className="absolute left-2.5 top-1/2 z-10 -translate-y-1/2 text-muted-foreground"
               />
-              <Input
+              <ClearableInput
                 value={search}
-                onChange={(e) => onSearchChange(e.target.value)}
+                onValueChange={onSearchChange}
                 placeholder="Search..."
                 className="h-8 pl-8 text-sm"
               />
@@ -1708,6 +1714,8 @@ export function MainContent({
                     onAddToPlaylist={(t) => setAddToPlaylistFor(t)}
                     onEnqueue={onEnqueueMusic}
                     onMetadataChanged={onEntryChanged}
+                    onOpenArtist={onOpenMusicArtist}
+                    onOpenAlbum={onOpenMusicAlbum}
                     onRenameCollection={(e) => setRenameCollectionFor(e)}
                     onDeleteCollection={(e) => {
                       if (e.child_count === 0) {
@@ -5379,6 +5387,12 @@ function PlaylistsView({
   useEffect(() => { setLocalOrder(null); }, [playlists]);
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 8 } }));
 
+  // Sort-mode/preset switches slide the cards to their new spots instead of
+  // snapping (the "like other pages" animation). Drags sit it out — dnd runs
+  // its own settle, and a FLIP on top would double-move the card.
+  const flipSkipRef = useRef(false);
+  useFlipList(gridRef, { skip: () => flipSkipRef.current });
+
   const ordered = localOrder ?? playlists;
   const q = search.trim().toLowerCase();
   const visible = ordered ? (q ? ordered.filter((p) => p.title.toLowerCase().includes(q)) : ordered) : null;
@@ -5386,6 +5400,10 @@ function PlaylistsView({
   const dragEnabled = sortMode === "custom" && !q;
 
   const handleDragEnd = (event: DragEndEvent) => {
+    // Hold the FLIP through the post-drop render + dnd's settle animation.
+    window.setTimeout(() => {
+      flipSkipRef.current = false;
+    }, 400);
     const { active, over } = event;
     if (!over || active.id === over.id || !ordered) return;
     const oldIndex = ordered.findIndex((p) => p.id === active.id);
@@ -5406,9 +5424,9 @@ function PlaylistsView({
       {/* Search + Sort + Size — parity with the library grid's toolbar. */}
       {!loading && (
         <div className="flex items-center gap-3 border-b border-border px-4 py-2">
-          <div className="relative flex-1">
-            <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground" />
-            <Input value={search} onChange={(e) => onSearchChange(e.target.value)} placeholder="Search..." className="h-8 pl-8 text-sm" />
+          <div className="relative flex flex-1">
+            <Search size={14} className="absolute left-2.5 top-1/2 z-10 -translate-y-1/2 text-muted-foreground" />
+            <ClearableInput value={search} onValueChange={onSearchChange} placeholder="Search..." className="h-8 pl-8 text-sm" />
           </div>
           <div className="flex items-center gap-1.5">
             <DropdownMenu>
@@ -5478,7 +5496,14 @@ function PlaylistsView({
             <p className="p-4 text-sm text-muted-foreground">No results</p>
           )}
           {!loading && visible && visible.length > 0 && (
-            <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
+            <DndContext
+              sensors={sensors}
+              collisionDetection={closestCenter}
+              onDragStart={() => {
+                flipSkipRef.current = true;
+              }}
+              onDragEnd={handleDragEnd}
+            >
               <SortableContext items={visible.map((p) => p.id)} strategy={rectSortingStrategy}>
                 <div
                   ref={gridRef}
@@ -5624,6 +5649,7 @@ function PlaylistCard({
             ref={setNodeRef}
             {...attributes}
             {...listeners}
+            data-flip-id={String(playlist.id)}
             style={{ width: coverSize, maxWidth: "100%", ...(sortable ? { transform: CSS.Transform.toString(transform), transition } : {}) }}
             onClick={() => { if (!isDragging) onClick(); }}
             onContextMenu={(e) => e.stopPropagation()}

@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { useFlipList } from "@/hooks/useFlipList";
+import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
 import {
   Dialog,
@@ -10,8 +12,21 @@ import {
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { ClearableInput } from "@/components/ui/clearable-input";
 import { Spinner } from "@/components/ui/spinner";
-import { Search, Undo2, GitMerge, CircleCheck, RefreshCw, FileWarning, TriangleAlert, ChevronRight, Scissors } from "lucide-react";
+import { Search, Undo2, GitMerge, CircleCheck, RefreshCw, FileWarning, TriangleAlert, ChevronRight, Scissors, Music2 } from "lucide-react";
+import {
+  ContextMenu,
+  ContextMenuTrigger,
+  ContextMenuContent,
+  ContextMenuItem,
+} from "@/components/ui/context-menu";
+import {
+  Tooltip,
+  TooltipTrigger,
+  TooltipContent,
+  TooltipProvider,
+} from "@/components/ui/tooltip";
 import { MatchDialog } from "./MatchDialog";
 import { SplitArtistDialog } from "./EditDialogs";
 
@@ -47,10 +62,27 @@ interface MbSuggestion {
     keep_id?: number;
     keep_title?: string;
     other_name?: string;
-    // artist_split
+    // artist_split / artist_match
     artist_id?: number;
     artist_name?: string;
     parts?: string[];
+    /** artist_match: the few MusicBrainz artists answering to this name —
+     *  the pass never picks between same-named strangers, the user does. */
+    candidates?: {
+      mbid: string;
+      title: string;
+      subtitle: string;
+      detail: string | null;
+      score: number;
+    }[];
+    /** artist_match: where the artist is credited in YOUR library — the
+     *  memory jog for a feature-only name. album alone = credited on that
+     *  album; track + album = a feature; track alone = a loose track.
+     *  group_id links to the album's matched MB release group, so the user
+     *  can drill to a release, find the track, and compare its credited
+     *  artist against the candidate. */
+    appearances?: { track?: string; album?: string | null; group_id?: string | null }[];
+    appearance_count?: number;
   };
 }
 
@@ -63,6 +95,10 @@ interface MbAlbumRow {
   state: MbAlbumState;
   gap_ours: number;
   gap_mb: number;
+  /** Owning artist id — how the map groups album chips under artist rows. */
+  artist_id: number | null;
+  /** User said "stop counting this" — gray on the map, out of every count. */
+  ignored: boolean;
 }
 
 interface MbChange {
@@ -101,6 +137,8 @@ interface MbArtistRow {
   title: string;
   state: MbArtistState;
   album_count: number;
+  /** User said "stop counting this" — gray on the map, out of every count. */
+  ignored: boolean;
 }
 
 interface MbReview {
@@ -114,6 +152,8 @@ interface MbReview {
 export interface MusicMatchState {
   running: boolean;
   unchecked: number;
+  /** Artists without an MBID — the pass's artist phase workload. */
+  unchecked_artists: number;
   pending_suggestions: number;
   unmatched: number;
   matched: number;
@@ -138,17 +178,38 @@ interface MetadataCenterProps {
    *  suggestion resolved, or a re-run pass landing) so the host can refresh
    *  the pages behind this panel. */
   onChanged?: () => void;
+  /** A directive needing a rescan was written (artist split). Hosts that ARE
+   *  a wizard run the rescan themselves; without this the request goes out as
+   *  the sidebar window event, which is refused while a wizard is open. */
+  onRescanNeeded?: (libraryId: string) => void;
+  /** Reports the pending-decision count after every load — the wizard shows
+   *  it beside Finish as a pointer (never a gate). */
+  onDecisionsChange?: (pending: number) => void;
 }
 
-type PaneId = "albums" | "artists" | "review" | "gaps" | "files" | "history";
+type PaneId = "map" | "albums" | "artists" | "credits" | "gaps" | "files" | "history";
 
+/** A credit name resolving to no artist — the residue the scan refused to
+ *  guess about (usually a lookalike routed to a merge suggestion instead of
+ *  spawning a duplicate page). */
+interface UnlinkedCredit {
+  name: string;
+  track_count: number;
+  album_count: number;
+  near_miss_id: number | null;
+  near_miss_title: string | null;
+}
+
+interface ArtistChoice {
+  id: number;
+  name: string;
+  image: string | null;
+  release_count: number;
+}
+
+/** Album states, in the order the rail's warning count reads them. The lists
+ *  group these into identified (release, album) and not (notfound, unchecked). */
 const STATE_ORDER: MbAlbumState[] = ["release", "album", "notfound", "unchecked"];
-const STATE_LABEL: Record<MbAlbumState, string> = {
-  release: "matched to a release",
-  album: "matched to an album only",
-  notfound: "not matched",
-  unchecked: "never checked",
-};
 
 /** A titled block that stays shut until asked. For lists that are long by
  *  nature and not actionable here — file paths the user fixes elsewhere. */
@@ -184,11 +245,146 @@ function Collapsible({
   );
 }
 
+/** "This name is really that artist" — search-and-pick over the library's
+ *  existing artists, applied as a merge (name becomes a redirect, credits
+ *  re-stamp, undoable from History). For wrong-name credits like "God" on
+ *  Yeezus → Kanye West. */
+function LinkArtistDialog({
+  libraryId,
+  sourceName,
+  sourceArtistId,
+  onOpenChange,
+  onDone,
+}: {
+  libraryId: string;
+  sourceName: string;
+  /** The name's auto-created page, when acting on an artist row — excluded
+   *  from the search so it can't be merged into itself. */
+  sourceArtistId: number | null;
+  onOpenChange: (open: boolean) => void;
+  onDone: () => void;
+}) {
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState<ArtistChoice[] | null>(null);
+  const [applying, setApplying] = useState<number | null>(null);
+  const seq = useRef(0);
+  const timer = useRef<number | undefined>(undefined);
+
+  const search = (q: string) => {
+    window.clearTimeout(timer.current);
+    const trimmed = q.trim();
+    if (trimmed.length < 1) {
+      setResults(null);
+      return;
+    }
+    const mine = ++seq.current;
+    timer.current = window.setTimeout(async () => {
+      try {
+        const rows = await invoke<ArtistChoice[]>("search_credit_link_choices", {
+          libraryId,
+          query: trimmed,
+          limit: 8,
+          excludeArtistId: sourceArtistId,
+        });
+        if (seq.current === mine) setResults(rows);
+      } catch {
+        if (seq.current === mine) setResults([]);
+      }
+    }, 150);
+  };
+
+  const apply = async (target: ArtistChoice) => {
+    setApplying(target.id);
+    try {
+      await invoke("link_credit_name", {
+        libraryId,
+        name: sourceName,
+        targetArtistId: target.id,
+      });
+      toast.success(`“${sourceName}” is now ${target.name}.`);
+      onOpenChange(false);
+      onDone();
+    } catch (e) {
+      toast.error(String(e));
+      setApplying(null);
+    }
+  };
+
+  return (
+    <Dialog open onOpenChange={onOpenChange}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>“{sourceName}” is really…</DialogTitle>
+        </DialogHeader>
+        <p className="text-xs text-muted-foreground">
+          Everything credited to “{sourceName}” moves to the artist you pick, and the name keeps
+          resolving there through future rescans. Undoable from History.
+        </p>
+        <Input
+          autoFocus
+          value={query}
+          onChange={(e) => {
+            setQuery(e.target.value);
+            search(e.target.value);
+          }}
+          placeholder="Search artists…"
+          className="h-8 text-sm"
+        />
+        <div className="overflow-hidden rounded-md border">
+          {(results ?? []).map((o, i) => (
+            <button
+              key={o.id}
+              type="button"
+              disabled={applying !== null}
+              onClick={() => apply(o)}
+              className={`flex w-full items-center gap-2 px-2 py-1.5 text-left hover:bg-accent disabled:opacity-60 ${
+                i === 0 ? "" : "border-t"
+              }`}
+            >
+              {o.image ? (
+                <img
+                  src={convertFileSrc(o.image)}
+                  alt=""
+                  draggable={false}
+                  className="size-7 shrink-0 rounded-full object-cover"
+                />
+              ) : (
+                <span className="flex size-7 shrink-0 items-center justify-center rounded-full bg-muted text-muted-foreground">
+                  <Music2 size={14} />
+                </span>
+              )}
+              <span className="min-w-0 flex-1">
+                <span className="block truncate text-sm">{o.name}</span>
+                <span className="block text-[11px] text-muted-foreground">
+                  {o.release_count} {o.release_count === 1 ? "release" : "releases"}
+                </span>
+              </span>
+              {applying === o.id && <Spinner className="size-3.5 shrink-0" />}
+            </button>
+          ))}
+          {(results ?? []).length === 0 && (
+            <p className="flex items-center gap-1.5 px-2 py-1.5 text-[11px] text-muted-foreground">
+              <Search size={12} />
+              {query.trim().length < 1
+                ? "Type to search existing artists"
+                : results === null
+                  ? "Searching…"
+                  : "No matching artists"}
+            </p>
+          )}
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 function ArtistRow({
   a,
   first,
   onMatch,
   onSplit,
+  onLink,
+  disabled,
 }: {
   a: MbArtistRow;
   first: boolean;
@@ -196,38 +392,132 @@ function ArtistRow({
   /** Unidentified rows only — a name MusicBrainz can't place is very often
    *  several artists in one tag, and that is the fix. */
   onSplit?: (a: MbArtistRow) => void;
+  /** Unidentified rows only — the OTHER wrong-name fix: the tag is one
+   *  artist under the wrong name ("God" → Kanye West), so fold it in. */
+  onLink?: (a: MbArtistRow) => void;
+  /** A pending suggestion owns the row — answer or dismiss it first; the
+   *  manual actions unlock once it's gone (hover explains). */
+  disabled?: boolean;
 }) {
+  // Disabled buttons swallow pointer events, so the hover hint rides a
+  // wrapper span around each one.
+  const withHint = (btn: React.ReactNode, key: string) =>
+    disabled ? (
+      <TooltipProvider key={key}>
+        <Tooltip>
+          <TooltipTrigger render={<span className="shrink-0" />}>{btn}</TooltipTrigger>
+          <TooltipContent>dismiss suggestion to unlock</TooltipContent>
+        </Tooltip>
+      </TooltipProvider>
+    ) : (
+      btn
+    );
   return (
-    <div className={`flex items-center gap-3 px-3 py-1.5 text-sm ${first ? "" : "border-t"}`}>
+    <div className={`flex items-center gap-1.5 px-3 py-1.5 text-sm ${first ? "" : "border-t"}`}>
       <span className="min-w-0 flex-1 truncate">
         {a.title}
         <span className="ml-1.5 text-[11px] text-muted-foreground">
           {a.album_count} {a.album_count === 1 ? "release" : "releases"}
         </span>
       </span>
-      {onSplit && a.state !== "matched" && (
-        <Button
-          size="sm"
-          variant="ghost"
-          className="h-6 shrink-0 gap-1 px-2 text-xs"
-          onClick={() => onSplit(a)}
-        >
-          <Scissors size={12} />
-          Split
-        </Button>
-      )}
+      {onLink &&
+        a.state !== "matched" &&
+        withHint(
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-6 shrink-0 gap-1 px-2 text-xs"
+            disabled={disabled}
+            onClick={() => onLink(a)}
+          >
+            <GitMerge size={12} />
+            Join
+          </Button>,
+          "join",
+        )}
+      {onSplit &&
+        a.state !== "matched" &&
+        withHint(
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-6 shrink-0 gap-1 px-2 text-xs"
+            disabled={disabled}
+            onClick={() => onSplit(a)}
+          >
+            <Scissors size={12} />
+            Split
+          </Button>,
+          "split",
+        )}
       {/* An identified artist's button states the fact rather than repeating
           the invitation — it still opens the dialog, where you can look at
           the id or unmatch. */}
+      {withHint(
+        <Button
+          size="sm"
+          variant="ghost"
+          className={`h-6 shrink-0 gap-1 px-2 text-xs ${
+            a.state === "matched" ? "text-emerald-400 hover:text-emerald-300" : ""
+          }`}
+          disabled={disabled}
+          onClick={() => onMatch(a.artist_id)}
+        >
+          {a.state === "matched" ? (
+            <>
+              <CircleCheck size={12} className="-translate-y-px" />
+              Matched
+            </>
+          ) : (
+            <>
+              <Search size={12} />
+              Match
+            </>
+          )}
+        </Button>,
+        "match",
+      )}
+    </div>
+  );
+}
+
+function AlbumRow({
+  a,
+  first,
+  onMatch,
+}: {
+  a: MbAlbumRow;
+  first: boolean;
+  onMatch: (id: number) => void;
+}) {
+  const identified = a.state === "release" || a.state === "album";
+  return (
+    <div className={`flex items-center gap-3 px-3 py-1.5 text-sm ${first ? "" : "border-t"}`}>
+      <span className="min-w-0 flex-1 truncate">
+        {a.title}
+        {a.artist_title && <span className="text-muted-foreground"> — {a.artist_title}</span>}
+        {(a.gap_ours > 0 || a.gap_mb > 0) && (
+          <span className="ml-1.5 text-[11px] text-amber-300">
+            {[a.gap_ours > 0 && `${a.gap_ours} unmatched`, a.gap_mb > 0 && `${a.gap_mb} missing`]
+              .filter(Boolean)
+              .join(" · ")}
+          </span>
+        )}
+      </span>
+      {/* Knowing the album but not the pressing is its own state — worth
+          saying on the row, since it's what blocks track-list checking. */}
+      {a.state === "album" && (
+        <span className="shrink-0 text-[11px] text-muted-foreground">release unknown</span>
+      )}
       <Button
         size="sm"
         variant="ghost"
         className={`h-6 shrink-0 gap-1 px-2 text-xs ${
-          a.state === "matched" ? "text-emerald-400 hover:text-emerald-300" : ""
+          a.state === "release" ? "text-emerald-400 hover:text-emerald-300" : ""
         }`}
-        onClick={() => onMatch(a.artist_id)}
+        onClick={() => onMatch(a.album_id)}
       >
-        {a.state === "matched" ? (
+        {identified ? (
           <>
             <CircleCheck size={12} className="-translate-y-px" />
             Matched
@@ -251,15 +541,27 @@ const KIND_WORD: Record<string, string> = {
   album_year: "date",
   artist_merge: "artist merge",
   artist_mbid: "artist match",
+  album_match: "album match",
+  track_match: "track match",
+  suggestion_rejected: "declined",
 };
 const KIND_LABELS = (kinds: string[]) =>
   kinds.map((k) => KIND_WORD[k] ?? k).join(", ");
 
-export function MetadataCenter({ libraryId, reloadKey = 0, onChanged }: MetadataCenterProps) {
+export function MetadataCenter({
+  libraryId,
+  reloadKey = 0,
+  onChanged,
+  onRescanNeeded,
+  onDecisionsChange,
+}: MetadataCenterProps) {
   const [review, setReview] = useState<MbReview | null>(null);
   const [matchState, setMatchState] = useState<MusicMatchState | null>(null);
   const [fallbacks, setFallbacks] = useState<TagFallbackRow[]>([]);
   const [issues, setIssues] = useState<ScanIssueRow[]>([]);
+  const [unlinked, setUnlinked] = useState<UnlinkedCredit[]>([]);
+  // Staged directives (splits, combines, separates) a rescan will apply.
+  const [pending, setPending] = useState<{ id: number; label: string }[]>([]);
   const [loading, setLoading] = useState(false);
   // Which mutation is in flight ("apply:…", "resolve:…", "undo:…") — the
   // matching button shows a spinner; everything else just disables.
@@ -272,34 +574,46 @@ export function MetadataCenter({ libraryId, reloadKey = 0, onChanged }: Metadata
   const etaSamplesRef = useRef<{ phase: string; times: number[] }>({ phase: "", times: [] });
   // Per-suggestion chosen candidate; per-album manual search state.
   const [picked, setPicked] = useState<Record<number, string>>({});
-  // Which state the album list is showing, plus its text filter and paging.
-  const [filter, setFilter] = useState<MbAlbumState | null>(null);
+  // Text filter and paging for the album list.
   const [albumFilter, setAlbumFilter] = useState("");
-  const [albumLimit, setAlbumLimit] = useState(50);
+  const [albumLimit, setAlbumLimit] = useState(30);
   // Album / artist opened in the shared match dialog.
   const [matchAlbum, setMatchAlbum] = useState<number | null>(null);
   const [matchArtist, setMatchArtist] = useState<number | null>(null);
   const [splitArtist, setSplitArtist] = useState<MbArtistRow | null>(null);
+  // "Is really…" target: a credit name (and its auto-created page, if any).
+  const [linkSource, setLinkSource] = useState<{ name: string; artistId: number | null } | null>(null);
+  // Two-step "Skip remaining" for the nav's pass-progress block.
+  const [confirmSkip, setConfirmSkip] = useState(false);
   const [artistFilter, setArtistFilter] = useState("");
   const [artistLimit, setArtistLimit] = useState(30);
   // Which pane the right-hand side is showing.
   const [pane, setPane] = useState<PaneId>("artists");
   const [hideUndone, setHideUndone] = useState(false);
   const [changeLimit, setChangeLimit] = useState(25);
+  // Per-library opt-out: false hides every MusicBrainz-backed pane, leaving
+  // the local ones (unlinked credits, file problems, history).
+  const [onlineEnabled, setOnlineEnabled] = useState(true);
 
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
-      const [rev, ms, fb, iss] = await Promise.all([
+      const [rev, ms, fb, iss, unl, pend, ls] = await Promise.all([
         invoke<MbReview>("mb_get_review", { libraryId }),
         invoke<MusicMatchState>("music_match_state", { libraryId }),
         invoke<TagFallbackRow[]>("get_music_tag_fallbacks", { libraryId }),
         invoke<ScanIssueRow[]>("get_music_scan_issues", { libraryId }),
+        invoke<UnlinkedCredit[]>("get_unlinked_credits", { libraryId }),
+        invoke<{ id: number; label: string }[]>("get_pending_changes", { libraryId }),
+        invoke<Record<string, string>>("get_library_settings", { libraryId }),
       ]);
       setReview(rev);
       setMatchState(ms);
       setFallbacks(fb);
       setIssues(iss);
+      setUnlinked(unl);
+      setPending(pend);
+      setOnlineEnabled(ls["online_metadata"] !== "off");
     } catch (e) {
       toast.error(String(e));
     } finally {
@@ -313,8 +627,8 @@ export function MetadataCenter({ libraryId, reloadKey = 0, onChanged }: Metadata
   }, [refresh, reloadKey]);
 
   useEffect(() => {
-    setAlbumLimit(50);
-  }, [filter, albumFilter]);
+    setAlbumLimit(30);
+  }, [albumFilter]);
 
   // A pass runs behind this panel (re-run here, or still going from the
   // wizard): stream its progress and refresh when it lands.
@@ -339,6 +653,7 @@ export function MetadataCenter({ libraryId, reloadKey = 0, onChanged }: Metadata
     );
     const unDone = listen<{ libraryId: string }>("music-enrich-done", (e) => {
       setProgress(null);
+      setConfirmSkip(false);
       if (e.payload.libraryId === libraryId) {
         refresh();
         onChanged?.();
@@ -391,6 +706,8 @@ export function MetadataCenter({ libraryId, reloadKey = 0, onChanged }: Metadata
     });
   const dismissGaps = (albumId: number) =>
     run(`gaps:${albumId}`, () => invoke("mb_dismiss_gaps", { albumId }));
+  const setIgnored = (entityId: number, ignored: boolean) =>
+    run(`ignore:${entityId}`, () => invoke("mb_set_ignored", { entityId, ignored }));
 
   const rerunMatching = async () => {
     try {
@@ -402,28 +719,360 @@ export function MetadataCenter({ libraryId, reloadKey = 0, onChanged }: Metadata
   };
 
   const albums = review?.albums ?? [];
+  // Ignored entities have left the counting: the tallies (and the unmatched
+  // work lists) only see what still wants matching. The map is where gray
+  // lives and gets un-ignored.
   const counts = STATE_ORDER.reduce(
-    (acc, st) => ({ ...acc, [st]: albums.filter((a) => a.state === st).length }),
+    (acc, st) => ({ ...acc, [st]: albums.filter((a) => a.state === st && !a.ignored).length }),
     {} as Record<MbAlbumState, number>,
   );
-  const shown = albums.filter(
-    (a) =>
-      (filter === null || a.state === filter) &&
-      (albumFilter.trim() === "" ||
-        `${a.title} ${a.artist_title ?? ""}`.toLowerCase().includes(albumFilter.trim().toLowerCase())),
+  const albumMatches = (a: MbAlbumRow) =>
+    albumFilter.trim() === "" ||
+    `${a.title} ${a.artist_title ?? ""}`.toLowerCase().includes(albumFilter.trim().toLowerCase());
+  const albumsUnmatched = albums.filter(
+    (a) => (a.state === "notfound" || a.state === "unchecked") && !a.ignored && albumMatches(a),
+  );
+  const albumsIdentified = albums.filter(
+    (a) => (a.state === "release" || a.state === "album") && albumMatches(a),
   );
   const visibleChanges = (review?.changes ?? []).filter((c) => !hideUndone || !c.undone);
   const artists = review?.artists ?? [];
   const artistMatches = (a: MbArtistRow) =>
     artistFilter.trim() === "" || a.title.toLowerCase().includes(artistFilter.trim().toLowerCase());
-  const artistsUnmatched = artists.filter((a) => a.state !== "matched" && artistMatches(a));
+  const artistsUnmatched = artists.filter(
+    (a) => a.state !== "matched" && !a.ignored && artistMatches(a),
+  );
+  // The guide's stage-1/stage-3 boundary, made visible in the page structure:
+  // owners unlock albums, features get unlocked BY albums. Split on the same
+  // predicate the guide counts with, so its "N left" agrees with the header
+  // its Go button lands on.
+  const artistsUnmatchedOwners = artistsUnmatched.filter((a) => a.album_count > 0);
+  const artistsUnmatchedFeatures = artistsUnmatched.filter((a) => a.album_count === 0);
   const artistsIdentified = artists.filter((a) => a.state === "matched" && artistMatches(a));
   const artistsMatched = artists.filter((a) => a.state === "matched").length;
 
   const albumSuggestions = review?.suggestions.filter((s) => s.kind === "album_match") ?? [];
   const mergeSuggestions = review?.suggestions.filter((s) => s.kind === "artist_merge") ?? [];
+  const artistSuggestions = review?.suggestions.filter((s) => s.kind === "artist_match") ?? [];
+
+  // No gate: decisions lead the nav and their count nags, but every pane
+  // stays open — the user decided required-answering wasn't worth the wall.
+  const decisionsPending =
+    albumSuggestions.length + mergeSuggestions.length + artistSuggestions.length;
+  useEffect(() => {
+    // Only report once real data is in, not the initial empty state.
+    if (review) onDecisionsChange?.(decisionsPending);
+  }, [review, decisionsPending, onDecisionsChange]);
+  // The pane exists only while there's something to decide — resolving the
+  // last item lands you on Artists rather than an empty page whose nav entry
+  // just vanished.
+  // Bounce for the appear-only-when-nonempty panes: clearing the last item
+  // must not strand the user on a pane whose nav entry vanished.
+  useEffect(() => {
+    if (!review) return;
+    if (
+      (pane === "credits" && unlinked.length === 0) ||
+      (pane === "gaps" && review.gaps.length === 0)
+    )
+      setPane(onlineEnabled ? "map" : "files");
+  }, [pane, review, unlinked, onlineEnabled]);
+  // Opted out: every MusicBrainz-backed pane is hidden — a stale selection
+  // (or a just-flipped setting) redirects to the local ground.
+  useEffect(() => {
+    if (!review || onlineEnabled) return;
+    if (pane === "artists" || pane === "albums" || pane === "gaps" || pane === "map")
+      setPane("files");
+  }, [review, onlineEnabled, pane]);
+  // Each OPEN lands on the Library map — the guided process is the home, and
+  // Suggestions is one of the stops it routes to, not the front door. Once
+  // per open — after that the user's pane choice stands.
+  const landedRef = useRef(false);
+  useEffect(() => {
+    landedRef.current = false;
+  }, [reloadKey, libraryId]);
+  useEffect(() => {
+    if (!review || landedRef.current) return;
+    landedRef.current = true;
+    setPane(!onlineEnabled ? "files" : "map");
+  }, [review, onlineEnabled]);
 
   const running = matchState?.running ?? false;
+
+  // The matching-guide stages, derived from data every render — never stored.
+  // 1: artists who own albums here (each Yes arid-unlocks their discography
+  // on the next pass), 2: the albums themselves (matched albums prove their
+  // credited artists), 3: feature-only leftovers. Rescans and passes advance
+  // the stages on their own; the guide is a lens, not a gate.
+  const guideOwnerLeft = artists.filter(
+    (a) => a.state !== "matched" && !a.ignored && a.album_count > 0,
+  ).length;
+  const guideAlbumsLeft = albums.filter(
+    (a) => a.state !== "release" && a.state !== "album" && !a.ignored,
+  ).length;
+  const guideFeatureLeft = artistSuggestions.filter((s) => {
+    const row = artists.find((a) => a.artist_id === s.payload.artist_id);
+    return !row ? true : !row.ignored && row.album_count === 0;
+  }).length;
+  const guideStage =
+    guideOwnerLeft > 0 ? 1 : guideAlbumsLeft > 0 ? 2 : guideFeatureLeft > 0 ? 3 : 0;
+
+  // Suggestions ordered by the map's doctrine: owner-artist questions are
+  // stage-1 work (each answer arid-unlocks a discography), feature-artist
+  // questions are stage-3 residue that album matches usually answer for free.
+  const suggestionIsOwner = (s: MbSuggestion) => {
+    const row = artists.find((a) => a.artist_id === s.payload.artist_id);
+    return !!row && row.album_count > 0;
+  };
+  const artistSuggestionsOwners = artistSuggestions.filter(suggestionIsOwner);
+  const artistSuggestionsFeatures = artistSuggestions.filter((s) => !suggestionIsOwner(s));
+  // Suggestion per artist row, for embedding the question in the row itself.
+  const suggestionByArtist = new Map<number | undefined, MbSuggestion>(
+    artistSuggestions.map((s) => [s.payload.artist_id, s]),
+  );
+  // Rows with a ready answer float to the top of their list — they're the
+  // cheapest clicks in the stage.
+  const readyFirst = (a: MbArtistRow, b: MbArtistRow) =>
+    Number(suggestionByArtist.has(b.artist_id)) - Number(suggestionByArtist.has(a.artist_id));
+
+  // One uncertain-album-match card — rendered at the top of the Albums pane,
+  // where the stage-2 work lives (there is no Suggestions pane; every card
+  // sits with the list it belongs to).
+  const renderAlbumCard = (s: MbSuggestion) => (
+    <div key={s.id} data-flip-id={`sug-${s.id}`} className="rounded-md border p-3">
+      <p className="text-sm font-medium">
+        {s.payload.album_title}
+        {s.payload.artist_title && (
+          <span className="text-muted-foreground"> — {s.payload.artist_title}</span>
+        )}
+      </p>
+      {/* More than one album on MusicBrainz answers to this name, which is
+          exactly when a machine should not choose. */}
+      <p className="text-xs text-muted-foreground">
+        {(s.payload.groups ?? []).length} albums share this name
+      </p>
+      <div className="mt-2 space-y-1">
+        {(s.payload.groups ?? []).map((g) => (
+          <label
+            key={g.group_id}
+            className="flex cursor-pointer items-start gap-2 rounded px-1.5 py-1 text-sm hover:bg-accent/50"
+          >
+            <input
+              type="radio"
+              name={`cand-${s.id}`}
+              className="mt-1"
+              checked={picked[s.id] === g.group_id}
+              onChange={() => setPicked((p) => ({ ...p, [s.id]: g.group_id }))}
+            />
+            <span className="min-w-0 flex-1">
+              <span className="block">{g.title}</span>
+              <span className="block text-xs text-muted-foreground">
+                {[g.artist, g.album_type, g.first_release_date, g.disambiguation]
+                  .filter(Boolean)
+                  .join(" · ")}
+              </span>
+            </span>
+            {/* Two candidates can render identically — MusicBrainz has
+                genuine near-duplicate groups — so every row carries a way to
+                go look at the real thing. Through the opener plugin: the
+                webview ignores _blank anchors, so a bare <a> silently does
+                nothing. */}
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                e.preventDefault();
+                void openUrl(`https://musicbrainz.org/release-group/${g.group_id}`);
+              }}
+              className="shrink-0 self-center text-[11px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+            >
+              view
+            </button>
+          </label>
+        ))}
+      </div>
+      <div className="mt-2 flex gap-2">
+        <Button
+          size="sm"
+          className="gap-1.5"
+          disabled={busy || !picked[s.id]}
+          onClick={() => s.payload.album_id != null && applyMatch(s.payload.album_id, picked[s.id])}
+        >
+          {busyKey === `apply:${s.payload.album_id}:${picked[s.id]}` && <Spinner className="size-3" />}
+          Apply
+        </Button>
+        <Button
+          size="sm"
+          variant="outline"
+          className="gap-1.5"
+          disabled={busy}
+          onClick={() => resolve(s.id, false)}
+        >
+          {busyKey === `resolve:${s.id}:false` && <Spinner className="size-3" />}
+          Dismiss suggestion
+        </Button>
+      </div>
+    </div>
+  );
+
+  // The "Which artist is this?" suggestion, rendered INSIDE the artist's own
+  // row in the unidentified lists — the question lives on the artist it's
+  // about, not in a pile of cards somewhere else.
+  const renderArtistSuggestionBody = (s: MbSuggestion) => {
+    const candidates = s.payload.candidates ?? [];
+    // ONE candidate is a yes/no question, not a pick — no radio to parse,
+    // and the buttons say what they mean. Uniqueness on MusicBrainz still
+    // isn't identity (your artist may not be on MB at all while a same-named
+    // stranger is), hence the ask.
+    const single = candidates.length === 1;
+    const chosen = picked[s.id] ?? (single ? candidates[0].mbid : undefined);
+    return (
+      <div className="px-3 pb-2.5">
+        <p className="text-xs text-muted-foreground">
+          <span className="mr-1.5 text-[11px] font-semibold uppercase tracking-wide text-amber-300">
+            Suggestion:
+          </span>
+          {single
+            ? "Is this them? One MusicBrainz artist answers to this name"
+            : `${candidates.length} MusicBrainz artists answer to this name`}
+        </p>
+        {(s.payload.appearances?.length ?? 0) > 0 && (
+          <p className="mt-0.5 text-xs text-muted-foreground">
+            In your library:{" "}
+            {s.payload.appearances!.map((a, i) => (
+              <span key={i}>
+                {i > 0 && " · "}
+                <span className="text-foreground/80">
+                  {a.track
+                    ? a.album
+                      ? `“${a.track}” on ${a.album}`
+                      : `“${a.track}”`
+                    : a.album}
+                </span>
+                {/* The album's matched MB group: drill to a release there,
+                    find this track, and compare its credited artist against
+                    the candidate below. */}
+                {a.group_id && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void openUrl(`https://musicbrainz.org/release-group/${a.group_id}`)
+                    }
+                    className="ml-1 text-[11px] underline-offset-2 hover:text-foreground hover:underline"
+                  >
+                    view
+                  </button>
+                )}
+              </span>
+            ))}
+            {(s.payload.appearance_count ?? 0) > s.payload.appearances!.length &&
+              ` · +${s.payload.appearance_count! - s.payload.appearances!.length} more`}
+          </p>
+        )}
+        <div className="mt-2 space-y-1">
+          {candidates.map((c) => (
+            <label
+              key={c.mbid}
+              className={`flex items-start gap-2 rounded px-1.5 py-1 text-sm ${
+                single ? "" : "cursor-pointer hover:bg-accent/50"
+              }`}
+            >
+              {!single && (
+                <input
+                  type="radio"
+                  name={`artist-cand-${s.id}`}
+                  className="mt-1"
+                  checked={chosen === c.mbid}
+                  onChange={() => setPicked((p) => ({ ...p, [s.id]: c.mbid }))}
+                />
+              )}
+              <span className="min-w-0 flex-1">
+                <span className="block">{c.title}</span>
+                <span className="block text-xs text-muted-foreground">
+                  {[c.subtitle, c.detail].filter(Boolean).join(" · ")}
+                </span>
+              </span>
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  e.preventDefault();
+                  void openUrl(`https://musicbrainz.org/artist/${c.mbid}`);
+                }}
+                className="shrink-0 self-center text-[11px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+              >
+                view
+              </button>
+            </label>
+          ))}
+        </div>
+        <div className="mt-2 flex gap-2">
+          <Button
+            size="sm"
+            className="gap-1.5"
+            disabled={busy || chosen == null || s.payload.artist_id == null}
+            onClick={() =>
+              run(`artistmatch:${s.id}`, () =>
+                invoke("mb_apply_entity_match", {
+                  kind: "artist",
+                  entityId: s.payload.artist_id,
+                  mbid: chosen,
+                  mbidKind: null,
+                }),
+              )
+            }
+          >
+            {busyKey === `artistmatch:${s.id}` && <Spinner className="size-3" />}
+            {single ? "Yes, it’s them" : "This one"}
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            className="gap-1.5"
+            disabled={busy}
+            onClick={() => resolve(s.id, false)}
+          >
+            {/* One label for single and multi: what the click DOES (artist
+                stays unidentified) rather than a certainty claim ("not
+                them") the user may not be able to make. */}
+            {busyKey === `resolve:${s.id}:false` && <Spinner className="size-3" />}
+            Dismiss suggestion
+          </Button>
+        </div>
+      </div>
+    );
+  };
+
+  // The library map's tree, flattened one level: albums grouped under their
+  // owning artist (containment instead of edges), feature-only artists as a
+  // dot grid below. "Done" is NOTHING RED — every node matched, group-matched
+  // (albums), or deliberately gray.
+  const albumsByArtist = new Map<number, MbAlbumRow[]>();
+  const orphanAlbums: MbAlbumRow[] = [];
+  for (const al of albums) {
+    if (al.artist_id == null) {
+      orphanAlbums.push(al);
+      continue;
+    }
+    const list = albumsByArtist.get(al.artist_id);
+    if (list) list.push(al);
+    else albumsByArtist.set(al.artist_id, [al]);
+  }
+  const albumRed = (a: MbAlbumRow) => !a.ignored && a.state !== "release" && a.state !== "album";
+  const artistRed = (a: MbArtistRow) => !a.ignored && a.state !== "matched";
+  const ownerRows = artists
+    .filter((a) => albumsByArtist.has(a.artist_id))
+    .sort((a, b) => {
+      const ra = artistRed(a) || (albumsByArtist.get(a.artist_id) ?? []).some(albumRed) ? 0 : 1;
+      const rb = artistRed(b) || (albumsByArtist.get(b.artist_id) ?? []).some(albumRed) ? 0 : 1;
+      return ra - rb;
+    });
+  const featureArtists = artists.filter((a) => !albumsByArtist.has(a.artist_id));
+  const mapReds = artists.filter(artistRed).length + albums.filter(albumRed).length;
+
+  // FLIP for the decision cards: resolving one slides the rest up into the
+  // gap instead of snapping (shared recipe — see useFlipList).
+  const flipContainerRef = useRef<HTMLDivElement>(null);
+  useFlipList(flipContainerRef);
 
   if (loading && !review) {
     return (
@@ -435,45 +1084,154 @@ export function MetadataCenter({ libraryId, reloadKey = 0, onChanged }: Metadata
 
   // `count` is the size of the pane; `warn` is how much of it still wants
   // attention. They differ for Albums and Artists, where most rows are fine.
+  // "Needs a decision" leads — it's required work, not reference — and it
+  // only exists while there IS something to decide.
+  // Opted out of online metadata: only the LOCAL panes remain — unlinked
+  // credits, file problems (and History below). Everything MusicBrainz-backed
+  // disappears rather than sitting permanently "unfinished".
+  // The map leads: it hosts the guided process, so it gets the top slot and
+  // Suggestions sits below the working panes it feeds.
   const NAV: { id: PaneId; label: string; count: number; warn?: number }[] = [
-    {
-      id: "artists",
-      label: "Artists",
-      count: artists.length,
-      warn: artists.filter((a) => a.state !== "matched").length,
-    },
-    {
-      id: "albums",
-      label: "Albums",
-      count: albums.length,
-      warn: counts.notfound + counts.unchecked,
-    },
-    {
-      id: "review",
-      label: "Needs a decision",
-      count: albumSuggestions.length + mergeSuggestions.length,
-      warn: albumSuggestions.length + mergeSuggestions.length,
-    },
-    {
-      id: "gaps",
-      label: "Track lists differ",
-      count: review?.gaps.length ?? 0,
-      warn: review?.gaps.length ?? 0,
-    },
+    ...(onlineEnabled
+      ? [
+          {
+            id: "map" as const,
+            label: "Library map",
+            // Rendered as a status word, not numbers — "complete" is the
+            // map's whole promise (nothing red), a count is just noise.
+            count: 0,
+          },
+          {
+            id: "artists" as const,
+            label: "Artists",
+            count: artists.length,
+            warn: artists.filter((a) => a.state !== "matched" && !a.ignored).length,
+          },
+          {
+            id: "albums" as const,
+            label: "Albums",
+            count: albums.length,
+            warn: counts.notfound + counts.unchecked,
+          },
+        ]
+      : []),
+    ...(unlinked.length > 0
+      ? [
+          {
+            id: "credits" as const,
+            label: "Unlinked credits",
+            count: unlinked.length,
+            warn: unlinked.length,
+          },
+        ]
+      : []),
+    ...(onlineEnabled && (review?.gaps.length ?? 0) > 0
+      ? [
+          {
+            id: "gaps" as const,
+            label: "Track lists differ",
+            count: review?.gaps.length ?? 0,
+          },
+        ]
+      : []),
     {
       id: "files",
       label: "File problems",
       count: fallbacks.length + issues.length,
       warn: issues.length,
     },
-    { id: "history", label: "History", count: review?.changes.length ?? 0 },
   ];
+  // History is pinned to the nav's bottom, apart from the work sections — a
+  // ledger, not a queue.
+  const historyCount = review?.changes.length ?? 0;
 
   return (
-    <div className="flex min-h-0 flex-1 gap-4">
+    <div className="flex min-h-0 flex-1 flex-col">
+      {/* The recorded opt-out, visible and reversible where it bites. */}
+      {review && !onlineEnabled && (
+        <div className="mb-3 mr-4 flex items-center gap-3 rounded-md border px-3 py-2">
+          <p className="min-w-0 flex-1 text-sm text-muted-foreground">
+            Online metadata is off for this library — nothing here talks to MusicBrainz, and
+            albums and artists aren’t matched.
+          </p>
+          <Button
+            size="sm"
+            variant="outline"
+            className="shrink-0"
+            disabled={busy}
+            onClick={async () => {
+              try {
+                await invoke("set_library_setting", {
+                  libraryId,
+                  key: "online_metadata",
+                  value: "on",
+                });
+                await refresh();
+                toast.success("Online metadata is on — run a matching pass to start identifying.");
+              } catch (e) {
+                toast.error(String(e));
+              }
+            }}
+          >
+            Turn on
+          </Button>
+        </div>
+      )}
+      {/* Staged directives waiting for one rescan — splits, combines,
+          separates accumulate here instead of each forcing its own rescan.
+          Any rescan applies (and clears) the whole batch. */}
+      {pending.length > 0 && (
+        // mr-4: the host containers end at the modal edge (pr-0, so the pane
+        // scrollbar can sit flush) — right spacing is each block's own job.
+        <div className="mb-3 mr-4 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2">
+          <div className="flex items-center gap-3">
+            <TriangleAlert size={14} className="shrink-0 text-amber-300" />
+            <p className="min-w-0 flex-1 text-sm text-amber-200/90">
+              {pending.length} staged {pending.length === 1 ? "change" : "changes"} — applied by the
+              next rescan
+            </p>
+            <Button
+              size="sm"
+              variant="outline"
+              className="shrink-0 gap-1.5"
+              disabled={busy || running}
+              onClick={() => {
+                if (onRescanNeeded) onRescanNeeded(libraryId);
+                else
+                  window.dispatchEvent(
+                    new CustomEvent("waverunner:open-rescan", { detail: { libraryId } }),
+                  );
+              }}
+            >
+              <RefreshCw size={13} />
+              Rescan now
+            </Button>
+          </div>
+          {/* One line per staged action; each truncates on its own instead of
+              the whole batch collapsing into one clipped run-on. */}
+          <ul className="mt-1 space-y-0.5 pl-[26px]">
+            {pending.map((p) => (
+              <li key={p.id} className="flex min-w-0 items-baseline gap-1.5 text-xs text-muted-foreground">
+                <span className="shrink-0">•</span>
+                <span className="min-w-0 truncate">{p.label}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    {/* Same border the nav/pane divider uses, closing the header (and the
+        staged-changes banner, when present) off from the columns. The spacing
+        under the line lives INSIDE the nav (padding, not row padding) so the
+        nav's border-r runs all the way up to touch it — and the pane's pt is
+        scroll-container padding, so scrolled content passes flush beneath
+        the line. -ml-4/pl-4: both hosts pad 16px left; the row backs out of
+        it to run the border to the modal's edge, and the nav puts it back. */}
+    <div className="-ml-4 flex min-h-0 flex-1 gap-4 border-t">
       {/* Nav rail: every section at a glance with its size, so nothing hides
           below a fold and the panel stops being one long scroll. */}
-      <nav className="flex w-64 shrink-0 flex-col gap-0.5 border-r pr-2">
+      {/* px-3 matches the pt-3 rhythm: buttons sit 12px off the modal edge,
+          12px off the border-r, and 12px under the top rule. */}
+      <nav className="flex w-64 shrink-0 flex-col gap-0.5 border-r px-3 pt-3">
         {NAV.map((n) => (
           <button
             key={n.id}
@@ -483,17 +1241,31 @@ export function MetadataCenter({ libraryId, reloadKey = 0, onChanged }: Metadata
             }`}
           >
             <span className="min-w-0 flex-1 truncate">{n.label}</span>
-            {(n.warn ?? 0) > 0 && (
-              <span className="flex shrink-0 items-center gap-0.5 text-xs tabular-nums text-amber-300">
-                <TriangleAlert size={12} />
-                {n.warn}
-              </span>
-            )}
-            {n.count > 0 && (
-              <span className="w-10 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
-                {n.count}
-              </span>
-            )}
+            {/* The two numbers sit together as one cluster — they're both
+                "how much is in here", so the label is what they're apart from. */}
+            <span className="flex shrink-0 items-center gap-1">
+              {n.id === "map" ? (
+                <span
+                  className={`text-xs ${mapReds > 0 ? "text-amber-300" : "text-emerald-400"}`}
+                >
+                  {mapReds > 0 ? "incomplete" : "complete"}
+                </span>
+              ) : (
+                <>
+                  {(n.warn ?? 0) > 0 && (
+                    <span className="flex items-center gap-0.5 text-xs tabular-nums text-amber-300">
+                      <TriangleAlert size={12} />
+                      {n.warn}
+                    </span>
+                  )}
+                  {n.count > 0 && (
+                    <span className="w-8 text-right text-xs tabular-nums text-muted-foreground">
+                      {n.count}
+                    </span>
+                  )}
+                </>
+              )}
+            </span>
           </button>
         ))}
         {running && (
@@ -507,43 +1279,383 @@ export function MetadataCenter({ libraryId, reloadKey = 0, onChanged }: Metadata
             {progress && (
               <p className="mt-1 truncate text-[11px] text-muted-foreground">{progress.name}</p>
             )}
-            <Button
-              size="sm"
-              variant="ghost"
-              className="mt-1 h-6 w-full px-2 text-xs"
-              onClick={() => invoke("music_match_skip").catch(() => {})}
-            >
-              Skip remaining
-            </Button>
+            {/* Two-step, same as the wizard footer: skipping a long pass
+                should never be a single stray click. */}
+            {confirmSkip ? (
+              <div className="mt-1 flex gap-1">
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-6 flex-1 px-2 text-xs"
+                  onClick={() => setConfirmSkip(false)}
+                >
+                  Keep going
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-6 flex-1 px-2 text-xs"
+                  onClick={() => {
+                    setConfirmSkip(false);
+                    invoke("music_match_skip").catch(() => {});
+                  }}
+                >
+                  Skip
+                </Button>
+              </div>
+            ) : (
+              <Button
+                size="sm"
+                variant="ghost"
+                className="mt-1 h-6 w-full px-2 text-xs"
+                onClick={() => setConfirmSkip(true)}
+              >
+                Skip remaining
+              </Button>
+            )}
           </div>
         )}
+        {/* Pinned to the bottom, apart from the work sections: History is the
+            ledger of what happened, not a queue of things to do. */}
+        {/* The separator runs edge to edge: -ml-4 back out through the nav's
+            left padding to the modal edge, -mr-2 through its right padding to
+            meet the border-r; the paddings then restore button alignment.
+            pt-3/pb-3 mirror the nav's own pt-3 under the top rule, so the
+            three gaps (top rule→first button, this rule→History, History→
+            footer) all read as one rhythm. */}
+        <div className="-mx-3 mt-auto border-t px-3 pb-3 pt-3">
+          <button
+            onClick={() => setPane("history")}
+            className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm transition-colors ${
+              pane === "history"
+                ? "bg-accent text-foreground"
+                : "text-muted-foreground hover:text-foreground"
+            }`}
+          >
+            <span className="min-w-0 flex-1 truncate">History</span>
+            {historyCount > 0 && (
+              <span className="w-8 text-right text-xs tabular-nums text-muted-foreground">
+                {historyCount}
+              </span>
+            )}
+          </button>
+        </div>
       </nav>
 
-      {/* pt-1 so a focused input's ring isn't clipped by the scroll box —
-          the filter field sits flush against the top of this container. */}
-      <div className="min-h-0 flex-1 space-y-4 overflow-y-auto pr-4 pt-1">
+      {/* Padding on the SCROLL CONTAINER: at rest it holds the header clear
+          of the line above, and scrolled content still passes through it
+          (overflow clips at the padding edge), so rows slide flush beneath
+          the border instead of stopping short. The base pt-1 keeps a focused
+          input's ring from clipping. */}
+      <div ref={flipContainerRef} className="min-h-0 flex-1 space-y-4 overflow-y-auto pr-4 pt-3">
+      {/* The library map: guide checklist up top (the grind order that
+          actually converges — between stages the PASS does the multiplying),
+          then the whole library as state-colored nodes. Fill carries state
+          alongside color (solid / light / hollow / muted) so red-green
+          colorblindness never hides the difference. */}
+      {pane === "map" && (
+        <section className="space-y-4">
+          {mapReds === 0 ? (
+            <div className="flex items-center gap-3 rounded-md border border-emerald-500/40 bg-emerald-500/5 px-3 py-2">
+              <CircleCheck size={16} className="shrink-0 text-emerald-400" />
+              <p className="text-sm text-emerald-200/90">
+                Nothing left to match — every artist and album is matched or ignored.
+              </p>
+            </div>
+          ) : guideStage !== 0 ? (
+            <div className="overflow-hidden rounded-md border">
+              {(
+                [
+                  [
+                    1,
+                    "Match your artists",
+                    guideOwnerLeft,
+                    mergeSuggestions.length + artistSuggestionsOwners.length,
+                    "artists",
+                    "Artists with albums in your library first — each one identified unlocks their whole discography for automatic matching on the next pass.",
+                  ],
+                  [
+                    2,
+                    "Match your albums",
+                    guideAlbumsLeft,
+                    albumSuggestions.length,
+                    "albums",
+                    "Matched albums prove the artists credited on them — pick exact releases where you can.",
+                  ],
+                  [
+                    3,
+                    "Feature artists",
+                    guideFeatureLeft,
+                    artistSuggestionsFeatures.length,
+                    "artists",
+                    "Mostly resolved automatically by the passes — what's left are the genuine questions.",
+                  ],
+                ] as const
+              ).map(([n, title, left, ready, target, desc]) => (
+                <div
+                  key={n}
+                  className={`flex items-center gap-3 px-3 py-2 ${n > 1 ? "border-t" : ""} ${
+                    guideStage === n ? "bg-accent/40" : ""
+                  }`}
+                >
+                  <span
+                    className={`flex size-5 shrink-0 items-center justify-center rounded-full border text-[11px] ${
+                      left === 0
+                        ? "border-primary bg-primary text-primary-foreground"
+                        : guideStage === n
+                          ? "border-primary text-primary"
+                          : "border-border text-muted-foreground"
+                    }`}
+                  >
+                    {left === 0 ? "✓" : n}
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm font-medium">
+                      {title}
+                      {left > 0 && (
+                        <span className="font-normal text-muted-foreground"> — {left} left</span>
+                      )}
+                      {/* Cards waiting with pre-fetched candidates — the
+                          cheapest clicks in the stage, so they're advertised
+                          from here. */}
+                      {ready > 0 && (
+                        <span className="font-normal text-amber-300"> · {ready} with suggestions</span>
+                      )}
+                    </p>
+                    <p className="text-xs text-muted-foreground">{desc}</p>
+                  </div>
+                  {left > 0 && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="shrink-0"
+                      onClick={() => setPane(target)}
+                    >
+                      Go
+                    </Button>
+                  )}
+                </div>
+              ))}
+              <div className="flex items-center gap-3 border-t bg-muted/30 px-3 py-2">
+                <p className="min-w-0 flex-1 text-xs text-muted-foreground">
+                  After answering a batch, run a matching pass — it cashes your answers in:
+                  identified artists unlock their albums, matched albums prove their artists.
+                </p>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="shrink-0 gap-1.5"
+                  disabled={running || busy}
+                  onClick={rerunMatching}
+                >
+                  <RefreshCw size={13} />
+                  {running ? "Pass running…" : "Run matching pass"}
+                </Button>
+              </div>
+            </div>
+          ) : (
+            <p className="text-sm text-muted-foreground">
+              {mapReds} unmatched — match them from their nodes below, or right-click to ignore
+              what should stop counting.
+            </p>
+          )}
+
+          {/* Legend. */}
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
+            <span className="flex items-center gap-1.5">
+              <span className="inline-block h-3 w-4 rounded-sm border border-emerald-500/60 bg-emerald-500/20" />
+              matched
+            </span>
+            <span className="flex items-center gap-1.5">
+              <span className="inline-block h-3 w-4 rounded-sm border border-amber-500/60 bg-amber-500/10" />
+              album matched, release unmatched
+            </span>
+            <span className="flex items-center gap-1.5">
+              <span className="inline-block h-3 w-4 rounded-sm border border-red-500/60" />
+              unmatched
+            </span>
+            <span className="flex items-center gap-1.5">
+              <span className="inline-block h-3 w-4 rounded-sm border border-transparent bg-muted" />
+              ignored
+            </span>
+            <span className="ml-auto">click a node to match · right-click to ignore</span>
+          </div>
+
+          {/* Artist rows: the tree with containment instead of edges. Rows
+              with red float to the top — the top of the wall IS the worklist. */}
+          <div className="space-y-1.5">
+            {ownerRows.map((a) => (
+              <div key={a.artist_id} className="flex items-start gap-2">
+                <ContextMenu>
+                  <ContextMenuTrigger
+                    render={
+                      <button
+                        onClick={() => setMatchArtist(a.artist_id)}
+                        title={a.title}
+                        className={`flex w-44 shrink-0 items-center gap-1.5 rounded px-1.5 py-0.5 text-left text-xs transition-colors hover:bg-accent/50 ${
+                          a.ignored ? "text-muted-foreground" : ""
+                        }`}
+                      />
+                    }
+                  >
+                    <span
+                      className={`inline-block size-2 shrink-0 rounded-full border ${
+                        a.ignored
+                          ? "border-transparent bg-muted-foreground/40"
+                          : a.state === "matched"
+                            ? "border-emerald-500 bg-emerald-500"
+                            : "border-red-500 bg-transparent"
+                      }`}
+                    />
+                    <span className="min-w-0 truncate">{a.title}</span>
+                  </ContextMenuTrigger>
+                  <ContextMenuContent>
+                    <ContextMenuItem onClick={() => setMatchArtist(a.artist_id)}>
+                      Match…
+                    </ContextMenuItem>
+                    <ContextMenuItem onClick={() => setIgnored(a.artist_id, !a.ignored)}>
+                      {a.ignored ? "Un-ignore" : "Ignore"}
+                    </ContextMenuItem>
+                  </ContextMenuContent>
+                </ContextMenu>
+                <div className="flex min-w-0 flex-1 flex-wrap gap-1">
+                  {(albumsByArtist.get(a.artist_id) ?? []).map((al) => (
+                    <ContextMenu key={al.album_id}>
+                      <ContextMenuTrigger
+                        render={
+                          <button
+                            onClick={() => setMatchAlbum(al.album_id)}
+                            title={al.title}
+                            className={`max-w-48 truncate rounded border px-1.5 py-0.5 text-[11px] transition-colors hover:brightness-125 ${
+                              al.ignored
+                                ? "border-transparent bg-muted text-muted-foreground"
+                                : al.state === "release"
+                                  ? "border-emerald-500/60 bg-emerald-500/20 text-emerald-200"
+                                  : al.state === "album"
+                                    ? "border-amber-500/60 bg-amber-500/10 text-amber-200"
+                                    : "border-red-500/60 bg-transparent text-red-300"
+                            }`}
+                          />
+                        }
+                      >
+                        {al.title}
+                      </ContextMenuTrigger>
+                      <ContextMenuContent>
+                        <ContextMenuItem onClick={() => setMatchAlbum(al.album_id)}>
+                          Match…
+                        </ContextMenuItem>
+                        <ContextMenuItem onClick={() => setIgnored(al.album_id, !al.ignored)}>
+                          {al.ignored ? "Un-ignore" : "Ignore"}
+                        </ContextMenuItem>
+                      </ContextMenuContent>
+                    </ContextMenu>
+                  ))}
+                </div>
+              </div>
+            ))}
+            {orphanAlbums.length > 0 && (
+              <div className="flex items-start gap-2">
+                <span className="w-44 shrink-0 px-1.5 py-0.5 text-xs italic text-muted-foreground">
+                  No artist
+                </span>
+                <div className="flex min-w-0 flex-1 flex-wrap gap-1">
+                  {orphanAlbums.map((al) => (
+                    <ContextMenu key={al.album_id}>
+                      <ContextMenuTrigger
+                        render={
+                          <button
+                            onClick={() => setMatchAlbum(al.album_id)}
+                            title={al.title}
+                            className={`max-w-48 truncate rounded border px-1.5 py-0.5 text-[11px] transition-colors hover:brightness-125 ${
+                              al.ignored
+                                ? "border-transparent bg-muted text-muted-foreground"
+                                : al.state === "release"
+                                  ? "border-emerald-500/60 bg-emerald-500/20 text-emerald-200"
+                                  : al.state === "album"
+                                    ? "border-amber-500/60 bg-amber-500/10 text-amber-200"
+                                    : "border-red-500/60 bg-transparent text-red-300"
+                            }`}
+                          />
+                        }
+                      >
+                        {al.title}
+                      </ContextMenuTrigger>
+                      <ContextMenuContent>
+                        <ContextMenuItem onClick={() => setMatchAlbum(al.album_id)}>
+                          Match…
+                        </ContextMenuItem>
+                        <ContextMenuItem onClick={() => setIgnored(al.album_id, !al.ignored)}>
+                          {al.ignored ? "Un-ignore" : "Ignore"}
+                        </ContextMenuItem>
+                      </ContextMenuContent>
+                    </ContextMenu>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Artists with no albums here — features and loose-track credits.
+              No children to branch, so they cluster as their own strip. */}
+          {featureArtists.length > 0 && (
+            <div>
+              <h4 className="mb-1.5 mt-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                Feature artists
+              </h4>
+              <div className="flex flex-wrap gap-1">
+                {featureArtists.map((a) => (
+                  <ContextMenu key={a.artist_id}>
+                    <ContextMenuTrigger
+                      render={
+                        <button
+                          onClick={() => setMatchArtist(a.artist_id)}
+                          title={a.title}
+                          className={`flex max-w-48 items-center gap-1.5 rounded border px-1.5 py-0.5 text-[11px] transition-colors hover:brightness-125 ${
+                            a.ignored
+                              ? "border-transparent bg-muted text-muted-foreground"
+                              : a.state === "matched"
+                                ? "border-emerald-500/60 bg-emerald-500/20 text-emerald-200"
+                                : "border-red-500/60 bg-transparent text-red-300"
+                          }`}
+                        />
+                      }
+                    >
+                      <span className="min-w-0 truncate">{a.title}</span>
+                    </ContextMenuTrigger>
+                    <ContextMenuContent>
+                      <ContextMenuItem onClick={() => setMatchArtist(a.artist_id)}>
+                        Match…
+                      </ContextMenuItem>
+                      <ContextMenuItem onClick={() => setIgnored(a.artist_id, !a.ignored)}>
+                        {a.ignored ? "Un-ignore" : "Ignore"}
+                      </ContextMenuItem>
+                    </ContextMenuContent>
+                  </ContextMenu>
+                ))}
+              </div>
+            </div>
+          )}
+        </section>
+      )}
+
       {/* Where the library stands. Every number is a tally of `albums` below,
           so the summary and the list can never disagree — and each is a
           filter, because a count you can't open is just trivia. */}
       {pane === "albums" && (
-      <section className="rounded-md border p-3">
-        <div className="flex flex-wrap items-center gap-1.5">
-          {STATE_ORDER.filter((s) => s === filter || counts[s] > 0 || s === "release").map((s) => (
-            <button
-              key={s}
-              onClick={() => setFilter(filter === s ? null : s)}
-              className={`rounded-full border px-2.5 py-1 text-xs transition-colors ${
-                filter === s
-                  ? "border-primary bg-primary/10 text-foreground"
-                  : "text-muted-foreground hover:text-foreground"
-              }`}
-            >
-              <span className="font-medium tabular-nums">{counts[s]}</span> {STATE_LABEL[s]}
-            </button>
-          ))}
-          <span className="ml-auto shrink-0 text-xs text-muted-foreground">
-            {albums.length} albums
-          </span>
+      <section>
+        <div className="mb-4 flex items-center gap-2">
+          <h3 className="text-base font-semibold uppercase tracking-wide text-muted-foreground">
+            <span className="text-xl text-foreground">{albumsIdentified.length}</span> of{" "}
+            <span className="text-xl text-foreground">{albums.length}</span> albums identified
+          </h3>
+          <div className="ml-auto w-44">
+            <ClearableInput
+              value={albumFilter}
+              onValueChange={setAlbumFilter}
+              placeholder="Filter…"
+              className="h-7 text-xs"
+            />
+          </div>
           {counts.unchecked > 0 && !running && (
             <Button size="sm" variant="outline" className="shrink-0 gap-1.5" onClick={rerunMatching}>
               <RefreshCw size={13} />
@@ -551,6 +1663,54 @@ export function MetadataCenter({ libraryId, reloadKey = 0, onChanged }: Metadata
             </Button>
           )}
         </div>
+
+        {/* Ready-to-answer cards first: the search already found candidates,
+            so these clear faster than anything in the list below. */}
+        {albumSuggestions.length > 0 && (
+          <div className="mb-8">
+            <h4 className="mb-1.5 flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-amber-300">
+              <TriangleAlert size={14} />
+              Uncertain matches ({albumSuggestions.length})
+            </h4>
+            <div className="space-y-3">{albumSuggestions.map(renderAlbumCard)}</div>
+          </div>
+        )}
+
+        {albumsUnmatched.length > 0 && (
+          <div className="mb-8">
+            <h4 className="mb-1.5 flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-amber-300">
+              <TriangleAlert size={14} />
+              Unidentified ({albumsUnmatched.length})
+            </h4>
+            <div className="overflow-hidden rounded-md border border-amber-500/30">
+              {albumsUnmatched.map((a, i) => (
+                <AlbumRow key={a.album_id} a={a} first={i === 0} onMatch={setMatchAlbum} />
+              ))}
+            </div>
+          </div>
+        )}
+
+        {albumsIdentified.length > 0 && (
+          <>
+            <h4 className="mb-1.5 flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-emerald-400">
+              <CircleCheck size={14} className="-translate-y-px" />
+              Identified ({albumsIdentified.length})
+            </h4>
+            <div className="overflow-hidden rounded-md border border-emerald-500/30">
+              {albumsIdentified.slice(0, albumLimit).map((a, i) => (
+                <AlbumRow key={a.album_id} a={a} first={i === 0} onMatch={setMatchAlbum} />
+              ))}
+              {albumsIdentified.length > albumLimit && (
+                <button
+                  onClick={() => setAlbumLimit((n) => n + 100)}
+                  className="w-full border-t px-3 py-1.5 text-xs text-muted-foreground hover:text-foreground"
+                >
+                  Show more of {albumsIdentified.length}
+                </button>
+              )}
+            </div>
+          </>
+        )}
         {running && (
           <div className="mt-2 flex items-center gap-2 text-xs text-muted-foreground">
             <Spinner className="size-3.5" />
@@ -576,215 +1736,132 @@ export function MetadataCenter({ libraryId, reloadKey = 0, onChanged }: Metadata
       </section>
       )}
 
-      {/* Uncertain album matches */}
-      {pane === "review" && albumSuggestions.length > 0 && (
-        <section>
-          <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-            Uncertain matches ({albumSuggestions.length})
-          </h3>
-          <div className="space-y-3">
-            {albumSuggestions.map((s) => (
-              <div key={s.id} className="rounded-md border p-3">
-                <p className="text-sm font-medium">
-                  {s.payload.album_title}
-                  {s.payload.artist_title && (
-                    <span className="text-muted-foreground"> — {s.payload.artist_title}</span>
-                  )}
-                </p>
-                {/* More than one album on MusicBrainz answers to this name,
-                    which is exactly when a machine should not choose. */}
-                <p className="text-xs text-muted-foreground">
-                  {(s.payload.groups ?? []).length} albums share this name
-                </p>
-                <div className="mt-2 space-y-1">
-                  {(s.payload.groups ?? []).map((g) => (
-                    <label
-                      key={g.group_id}
-                      className="flex cursor-pointer items-start gap-2 rounded px-1.5 py-1 text-sm hover:bg-accent/50"
-                    >
-                      <input
-                        type="radio"
-                        name={`cand-${s.id}`}
-                        className="mt-1"
-                        checked={picked[s.id] === g.group_id}
-                        onChange={() => setPicked((p) => ({ ...p, [s.id]: g.group_id }))}
-                      />
-                      <span className="min-w-0 flex-1">
-                        <span className="block">{g.title}</span>
-                        <span className="block text-xs text-muted-foreground">
-                          {[g.artist, g.album_type, g.first_release_date, g.disambiguation]
-                            .filter(Boolean)
-                            .join(" · ")}
-                        </span>
-                      </span>
-                      {/* Two candidates can render identically — MusicBrainz
-                          has genuine near-duplicate groups — so every row
-                          carries a way to go look at the real thing. */}
-                      <a
-                        href={`https://musicbrainz.org/release-group/${g.group_id}`}
-                        target="_blank"
-                        rel="noreferrer"
-                        onClick={(e) => e.stopPropagation()}
-                        className="shrink-0 self-center text-[11px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
-                      >
-                        view
-                      </a>
-                    </label>
-                  ))}
-                </div>
-                <div className="mt-2 flex gap-2">
-                  <Button
-                    size="sm"
-                    className="gap-1.5"
-                    disabled={busy || !picked[s.id]}
-                    onClick={() => s.payload.album_id != null && applyMatch(s.payload.album_id, picked[s.id])}
-                  >
-                    {busyKey === `apply:${s.payload.album_id}:${picked[s.id]}` && <Spinner className="size-3" />}
-                    Apply
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    className="gap-1.5"
-                    disabled={busy}
-                    onClick={() => resolve(s.id, false)}
-                  >
-                    {busyKey === `resolve:${s.id}:false` && <Spinner className="size-3" />}
-                    None of these
-                  </Button>
-                </div>
-              </div>
-            ))}
-          </div>
-        </section>
-      )}
-
-      {/* Artist merges */}
-      {pane === "review" && mergeSuggestions.length > 0 && (
-        <section>
-          <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-            Artist merges ({mergeSuggestions.length})
-          </h3>
-          <div className="space-y-2">
-            {mergeSuggestions.map((s) => (
-              <div key={s.id} className="flex items-center justify-between gap-3 rounded-md border p-3">
-                <p className="min-w-0 text-sm">
-                  <GitMerge size={14} className="mr-1.5 inline text-muted-foreground" />
-                  Merge <span className="font-medium">“{s.payload.other_name}”</span> into{" "}
-                  <span className="font-medium">“{s.payload.keep_title}”</span>
-                </p>
-                <div className="flex shrink-0 gap-2">
-                  <Button size="sm" className="gap-1.5" disabled={busy} onClick={() => resolve(s.id, true)}>
-                    {busyKey === `resolve:${s.id}:true` && <Spinner className="size-3" />}
-                    Merge
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    className="gap-1.5"
-                    disabled={busy}
-                    onClick={() => resolve(s.id, false)}
-                  >
-                    {busyKey === `resolve:${s.id}:false` && <Spinner className="size-3" />}
-                    Keep separate
-                  </Button>
-                </div>
-              </div>
-            ))}
-          </div>
-        </section>
-      )}
-
-      {/* One album list, filtered by the header. Compact rows: 42 fat cards
-          was already a wall, and "album only" has 187 of them. */}
-      {pane === "albums" && (
-        <section>
-          <div className="mb-2 flex items-center gap-2">
-            <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-              {filter ? STATE_LABEL[filter] : "All albums"} ({shown.length})
-            </h3>
-            <Input
-              value={albumFilter}
-              onChange={(e) => setAlbumFilter(e.target.value)}
-              placeholder="Filter…"
-              className="ml-auto h-7 w-44 text-xs"
-            />
-          </div>
-          <div className="overflow-hidden rounded-md border">
-            {shown.length === 0 && (
-              <p className="px-3 py-2 text-xs text-muted-foreground">Nothing here.</p>
-            )}
-            {shown.slice(0, albumLimit).map((a, i) => (
-              <div
-                key={a.album_id}
-                className={`flex items-center gap-3 px-3 py-1.5 text-sm ${i > 0 ? "border-t" : ""}`}
-              >
-                <span className="min-w-0 flex-1 truncate">
-                  {a.title}
-                  {a.artist_title && (
-                    <span className="text-muted-foreground"> — {a.artist_title}</span>
-                  )}
-                  {(a.gap_ours > 0 || a.gap_mb > 0) && (
-                    <span className="ml-1.5 text-[11px] text-amber-300">
-                      {[a.gap_ours > 0 && `${a.gap_ours} unmatched`, a.gap_mb > 0 && `${a.gap_mb} missing`]
-                        .filter(Boolean)
-                        .join(" · ")}
-                    </span>
-                  )}
-                </span>
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  className="h-6 shrink-0 gap-1 px-2 text-xs"
-                  onClick={() => setMatchAlbum(a.album_id)}
-                >
-                  <Search size={12} />
-                  Match
-                </Button>
-              </div>
-            ))}
-            {shown.length > albumLimit && (
-              <button
-                onClick={() => setAlbumLimit((n) => n + 100)}
-                className="w-full border-t px-3 py-1.5 text-xs text-muted-foreground hover:text-foreground"
-              >
-                Show {Math.min(100, shown.length - albumLimit)} more of {shown.length}
-              </button>
-            )}
-          </div>
-        </section>
-      )}
-
-
       {pane === "artists" && (
         <section>
-          <div className="mb-8 flex items-center gap-2">
+          <div className="mb-4 flex items-center gap-2">
             {/* Numbers hold the larger size; the words step down and go to
                 caps, so the counts read as the headline. */}
-            <h3 className="text-lg font-semibold uppercase tracking-wide text-foreground">
-              <span className="text-xl">{artistsMatched}</span> of{" "}
-              <span className="text-xl">{artists.length}</span> artists identified
+            {/* Words recede, numbers carry the message. */}
+            <h3 className="text-base font-semibold uppercase tracking-wide text-muted-foreground">
+              <span className="text-xl text-foreground">{artistsMatched}</span> of{" "}
+              <span className="text-xl text-foreground">{artists.length}</span> artists identified
             </h3>
-            <Input
-              value={artistFilter}
-              onChange={(e) => setArtistFilter(e.target.value)}
-              placeholder="Filter…"
-              className="ml-auto h-7 w-44 text-xs"
-            />
+            <div className="ml-auto w-44">
+              <ClearableInput
+                value={artistFilter}
+                onValueChange={setArtistFilter}
+                placeholder="Filter…"
+                className="h-7 text-xs"
+              />
+            </div>
           </div>
-          {/* Unidentified first and in full — an artist's id is resolved from
-              its NAME, so these are the ones that need a person. The matched
-              ones are reference rather than work, so they sit below, cut short. */}
-          {artistsUnmatched.length > 0 && (
+          {/* Ready-to-answer cards first — merges are one-click structural
+              fixes, and the artist cards carry pre-fetched candidates. Then
+              the lists, split along the guide's boundary: owners are the
+              high-leverage answers, features usually resolve themselves once
+              albums are matched. Matched ones are reference — below, cut
+              short. */}
+          {mergeSuggestions.length > 0 && (
             <div className="mb-8">
               <h4 className="mb-1.5 flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-amber-300">
-                <TriangleAlert size={14} />
-                Unidentified ({artistsUnmatched.length})
+                <GitMerge size={14} />
+                Suggested merges ({mergeSuggestions.length})
               </h4>
-              <div className="overflow-hidden rounded-md border border-amber-500/30">
-                {artistsUnmatched.map((a, i) => (
-                  <ArtistRow key={a.artist_id} a={a} first={i === 0} onMatch={setMatchArtist} />
+              <div className="space-y-2">
+                {mergeSuggestions.map((s) => (
+                  <div
+                    key={s.id}
+                    data-flip-id={`sug-${s.id}`}
+                    className="flex items-center justify-between gap-3 rounded-md border p-3"
+                  >
+                    <p className="min-w-0 text-sm">
+                      <GitMerge size={14} className="mr-1.5 inline text-muted-foreground" />
+                      Merge <span className="font-medium">“{s.payload.other_name}”</span> into{" "}
+                      <span className="font-medium">“{s.payload.keep_title}”</span>
+                    </p>
+                    <div className="flex shrink-0 gap-2">
+                      <Button
+                        size="sm"
+                        className="gap-1.5"
+                        disabled={busy}
+                        onClick={() => resolve(s.id, true)}
+                      >
+                        {busyKey === `resolve:${s.id}:true` && <Spinner className="size-3" />}
+                        Merge
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="gap-1.5"
+                        disabled={busy}
+                        onClick={() => resolve(s.id, false)}
+                      >
+                        {busyKey === `resolve:${s.id}:false` && <Spinner className="size-3" />}
+                        Keep separate
+                      </Button>
+                    </div>
+                  </div>
                 ))}
+              </div>
+            </div>
+          )}
+          {artistsUnmatchedOwners.length > 0 && (
+            <div className="mb-8">
+              <h4 className="mb-0.5 flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-amber-300">
+                <TriangleAlert size={14} />
+                Unidentified — have albums or loose tracks ({artistsUnmatchedOwners.length})
+              </h4>
+              <p className="mb-1.5 text-xs text-muted-foreground">
+                Each one identified unlocks their whole discography for automatic matching on the
+                next pass.
+              </p>
+              <div className="overflow-hidden rounded-md border border-amber-500/30">
+                {[...artistsUnmatchedOwners].sort(readyFirst).map((a, i) => {
+                  const sug = suggestionByArtist.get(a.artist_id);
+                  return (
+                    <div key={a.artist_id} className={i === 0 ? "" : "border-t"}>
+                      <ArtistRow
+                        a={a}
+                        first
+                        disabled={!!sug}
+                        onMatch={setMatchArtist}
+                        onSplit={setSplitArtist}
+                        onLink={(row) => setLinkSource({ name: row.title, artistId: row.artist_id })}
+                      />
+                      {sug && renderArtistSuggestionBody(sug)}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+          {artistsUnmatchedFeatures.length > 0 && (
+            <div className="mb-8">
+              <h4 className="mb-0.5 flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-amber-300">
+                <TriangleAlert size={14} />
+                Unidentified — feature-only ({artistsUnmatchedFeatures.length})
+              </h4>
+              <p className="mb-1.5 text-xs text-muted-foreground">
+                Credited on tracks or albums but own nothing here — usually resolved automatically
+                once their albums are matched. Match albums first.
+              </p>
+              <div className="overflow-hidden rounded-md border border-amber-500/30">
+                {[...artistsUnmatchedFeatures].sort(readyFirst).map((a, i) => {
+                  const sug = suggestionByArtist.get(a.artist_id);
+                  return (
+                    <div key={a.artist_id} className={i === 0 ? "" : "border-t"}>
+                      <ArtistRow
+                        a={a}
+                        first
+                        disabled={!!sug}
+                        onMatch={setMatchArtist}
+                        onSplit={setSplitArtist}
+                        onLink={(row) => setLinkSource({ name: row.title, artistId: row.artist_id })}
+                      />
+                      {sug && renderArtistSuggestionBody(sug)}
+                    </div>
+                  );
+                })}
               </div>
             </div>
           )}
@@ -814,6 +1891,78 @@ export function MetadataCenter({ libraryId, reloadKey = 0, onChanged }: Metadata
             <p className="px-1 py-2 text-xs text-muted-foreground">Nothing here.</p>
           )}
         </section>
+      )}
+
+      {/* Credit names that resolve to no artist. */}
+      {pane === "credits" && unlinked.length > 0 && (
+        <section>
+          <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+            Credits without an artist ({unlinked.length})
+          </h3>
+          <p className="mb-2 text-xs text-muted-foreground">
+            These credit names don’t resolve to any artist page — usually because they look like an
+            existing artist and creating a duplicate would have been a guess. Linking a name is a
+            merge: everything credited to it moves to the artist you pick, durably. Undoable from
+            History.
+          </p>
+          <div className="overflow-hidden rounded-md border border-amber-500/30">
+            {unlinked.map((u, i) => (
+              <div
+                key={u.name}
+                className={`flex items-center gap-3 px-3 py-1.5 text-sm ${i === 0 ? "" : "border-t"}`}
+              >
+                <span className="min-w-0 flex-1 truncate">
+                  {u.name}
+                  <span className="ml-1.5 text-[11px] text-muted-foreground">
+                    {[
+                      u.track_count > 0 && `${u.track_count} track${u.track_count === 1 ? "" : "s"}`,
+                      u.album_count > 0 && `${u.album_count} album${u.album_count === 1 ? "" : "s"}`,
+                    ]
+                      .filter(Boolean)
+                      .join(" · ")}
+                  </span>
+                </span>
+                {u.near_miss_id != null && (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-6 shrink-0 gap-1 px-2 text-xs text-amber-300 hover:text-amber-200"
+                    disabled={busy}
+                    onClick={() =>
+                      run(`link:${u.name}`, async () => {
+                        await invoke("link_credit_name", {
+                          libraryId,
+                          name: u.name,
+                          targetArtistId: u.near_miss_id,
+                        });
+                        toast.success(`“${u.name}” is now ${u.near_miss_title}.`);
+                      })
+                    }
+                  >
+                    {busyKey === `link:${u.name}` && <Spinner className="size-3" />}
+                    <GitMerge size={12} />
+                    Is “{u.near_miss_title}”
+                  </Button>
+                )}
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-6 shrink-0 gap-1 px-2 text-xs"
+                  disabled={busy}
+                  onClick={() => setLinkSource({ name: u.name, artistId: null })}
+                >
+                  <GitMerge size={12} />
+                  Join
+                </Button>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+      {pane === "credits" && unlinked.length === 0 && (
+        <p className="py-8 text-center text-sm text-muted-foreground">
+          Every credit resolves to an artist.
+        </p>
       )}
 
       {/* Matched, but the track lists disagree */}
@@ -917,20 +2066,6 @@ export function MetadataCenter({ libraryId, reloadKey = 0, onChanged }: Metadata
         </section>
       )}
 
-      {/* Nothing pending */}
-      {pane === "review" &&
-        review &&
-        !running &&
-        albumSuggestions.length === 0 &&
-        mergeSuggestions.length === 0 &&
-        counts.notfound === 0 &&
-        review.gaps.length === 0 && (
-          <div className="flex flex-col items-center gap-2 py-8 text-muted-foreground">
-            <CircleCheck size={32} />
-            <p className="text-sm">Nothing needs matching.</p>
-          </div>
-        )}
-
       {/* File-level notes. Both are long by nature and neither is actionable
           inside waverunner, so they collapse to a line you open on purpose. */}
       {pane === "files" && fallbacks.length > 0 && (
@@ -979,7 +2114,7 @@ export function MetadataCenter({ libraryId, reloadKey = 0, onChanged }: Metadata
         <section>
           <div className="mb-2 flex items-center gap-2">
             <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-              Applied changes ({review!.changes.length})
+              History ({review!.changes.length})
             </h3>
             {review!.changes.some((c) => c.undone) && (
               <button
@@ -1057,7 +2192,25 @@ export function MetadataCenter({ libraryId, reloadKey = 0, onChanged }: Metadata
             artistId={splitArtist.artist_id}
             artistName={splitArtist.title}
             open={splitArtist !== null}
-            onOpenChange={(o) => !o && setSplitArtist(null)}
+            onOpenChange={(o) => {
+              if (!o) {
+                setSplitArtist(null);
+                // A staged split changes the pending banner — refetch.
+                refresh();
+              }
+            }}
+          />
+        )}
+      {linkSource && (
+          <LinkArtistDialog
+            libraryId={libraryId}
+            sourceName={linkSource.name}
+            sourceArtistId={linkSource.artistId}
+            onOpenChange={(o) => !o && setLinkSource(null)}
+            onDone={() => {
+              refresh();
+              onChanged?.();
+            }}
           />
         )}
       {matchArtist != null && (
@@ -1086,6 +2239,7 @@ export function MetadataCenter({ libraryId, reloadKey = 0, onChanged }: Metadata
         )}
       </div>
     </div>
+    </div>
   );
 }
 
@@ -1097,14 +2251,21 @@ interface MetadataCenterDialogProps {
 }
 
 /** Standalone host — the sidebar's always-available entrance to the center. */
-export function MetadataCenterDialog({ libraryId, open, onOpenChange, onChanged }: MetadataCenterDialogProps) {
+export function MetadataCenterDialog({
+  libraryId,
+  open,
+  onOpenChange,
+  onChanged,
+}: MetadataCenterDialogProps) {
   const [reloadKey, setReloadKey] = useState(0);
   useEffect(() => {
     if (open) setReloadKey((k) => k + 1);
   }, [open]);
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="flex h-[85vh] max-h-[85vh] w-[min(72rem,calc(100vw-3rem))] max-w-none flex-col overflow-hidden pr-0">
+      {/* pb-0: the nav/pane columns (and the nav's border-r) run to the modal's
+          bottom edge; the nav's own pb-3 keeps History on the 12px rhythm. */}
+      <DialogContent className="flex h-[85vh] max-h-[85vh] w-[min(72rem,calc(100vw-3rem))] max-w-none flex-col overflow-hidden pr-0 pb-0">
         <DialogHeader>
           <DialogTitle>Metadata center</DialogTitle>
         </DialogHeader>

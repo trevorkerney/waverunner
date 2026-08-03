@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
-import { Trash2, RefreshCw, FolderPlus, FolderCog, ChevronRight, Sparkles, Pencil, Home, CircleAlert, Music2 } from "lucide-react";
+import { Trash2, RefreshCw, FolderPlus, FolderCog, ChevronRight, Sparkles, Pencil, Home, CircleAlert, Music2, Settings2 } from "lucide-react";
 import { open as openFolderPicker } from "@tauri-apps/plugin-dialog";
 import { Spinner } from "@/components/ui/spinner";
 import {
@@ -20,9 +20,11 @@ import {
   DialogFooter,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { CreateLibraryDialog, type WizardMode } from "@/components/CreateLibraryDialog";
 import { CreatePlaylistDialog } from "@/components/CreatePlaylistDialog";
 import { RenameDialog } from "@/components/RenameDialog";
+import { LibrarySettingsDialog } from "@/components/LibrarySettingsDialog";
 import { PlayerDock } from "@/components/player/PlayerDock";
 import { PlayerState, PlayerActions } from "@/hooks/usePlayer";
 import { SidebarTree } from "@/components/SidebarTree";
@@ -109,9 +111,13 @@ export function Sidebar({
   const [wizard, setWizard] = useState<WizardMode | null>(null);
   const [wizardMinimized, setWizardMinimized] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Library | null>(null);
+  // Typed-name gate for the delete dialog — must equal the library's name.
+  const [deleteConfirmText, setDeleteConfirmText] = useState("");
   const [renameTarget, setRenameTarget] = useState<Library | null>(null);
   // Library whose source folders are being managed (add/remove/repoint).
   const [manageFoldersTarget, setManageFoldersTarget] = useState<Library | null>(null);
+  // Library whose per-library settings dialog is open.
+  const [settingsTarget, setSettingsTarget] = useState<Library | null>(null);
   // Which library to create a playlist inside, or null when the dialog is closed.
   const [createPlaylistFor, setCreatePlaylistFor] = useState<string | null>(null);
   // Track libraries the user has explicitly collapsed; default is expanded.
@@ -162,11 +168,15 @@ export function Sidebar({
         const { libraryId, phase, done, total, name } = e.payload;
         if (!libraryId) return;
         const line =
-          phase === "artists"
-            ? `matching artists ${Math.min(done + 1, total)}/${total}`
-            : phase === "artist-images"
-              ? `fetching artist images ${Math.min(done + 1, total)}/${total}`
-              : `matching ${Math.min(done + 1, total)}/${total} — ${name}`;
+          phase === "artist-ids"
+            ? `identifying artists ${Math.min(done + 1, total)}/${total}`
+            : phase === "artist-credits"
+              ? `reading album credits ${Math.min(done + 1, total)}/${total}`
+              : phase === "artist-search"
+                ? `searching artists ${Math.min(done + 1, total)}/${total}`
+                : phase === "artist-images"
+                  ? `fetching artist images ${Math.min(done + 1, total)}/${total}`
+                  : `matching ${Math.min(done + 1, total)}/${total} — ${name}`;
         setLine(libraryId, line);
       },
     );
@@ -187,8 +197,23 @@ export function Sidebar({
   const [scanFolders, setScanFolders] = useState<Map<string, string>>(new Map());
   const [scanNames, setScanNames] = useState<Map<string, string>>(new Map());
   useEffect(() => {
-    const unProgress = listen<{ libraryId: string; folder: string }>("scan-progress", (e) => {
-      setScanFolders((prev) => new Map(prev).set(e.payload.libraryId, e.payload.folder));
+    const unProgress = listen<{
+      libraryId: string;
+      folder: string;
+      phase?: string;
+      done?: number;
+      total?: number;
+    }>("scan-progress", (e) => {
+      // The stored string is the full display line — phased music scans show
+      // stage + counts, video scans keep the bare folder form.
+      const { libraryId, folder, phase, done, total } = e.payload;
+      const line =
+        phase === "read-tags" && total
+          ? `reading tags ${Math.min((done ?? 0) + 1, total)}/${total} — ${folder}`
+          : phase === "build" && total
+            ? `building ${Math.min((done ?? 0) + 1, total)}/${total} — ${folder}`
+            : `scanning — ${folder}`;
+      setScanFolders((prev) => new Map(prev).set(libraryId, line));
     });
     const unState = listen<{ libraryId: string; name?: string; state: string }>("scan-state", (e) => {
       if (e.payload.state === "started") {
@@ -336,7 +361,7 @@ export function Sidebar({
                     </span>
                     {/* The complication tree's spot while scanning. */}
                     <span className="break-words pb-1 pl-6 pr-2 text-xs italic text-muted-foreground">
-                      {folder ? `scanning — ${folder}` : "scanning…"}
+                      {folder ?? "scanning…"}
                     </span>
                   </button>
                 );
@@ -493,6 +518,10 @@ export function Sidebar({
                         <FolderCog size={14} />
                         Manage folders…
                       </ContextMenuItem>
+                      <ContextMenuItem onClick={() => setSettingsTarget(lib)}>
+                        <Settings2 size={14} />
+                        Library settings…
+                      </ContextMenuItem>
                       <ContextMenuItem
                         onClick={() => {
                           const makingDefault = defaultLibraryId !== lib.id;
@@ -561,7 +590,7 @@ export function Sidebar({
                   <span className="min-w-0 flex-1 break-words">{scanNames.get(id) ?? "New library"}</span>
                 </span>
                 <span className="break-words pb-1 pl-6 pr-2 text-xs italic text-muted-foreground">
-                  {scanFolders.get(id) ? `scanning — ${scanFolders.get(id)}` : "scanning…"}
+                  {scanFolders.get(id) ?? "scanning…"}
                 </span>
               </button>
             ))}
@@ -631,6 +660,12 @@ export function Sidebar({
         onCreated={onLibraryCreated}
         onFinished={(libId) => onLibraryRescanned(libId)}
       />
+      <LibrarySettingsDialog
+        library={settingsTarget}
+        onOpenChange={(o) => {
+          if (!o) setSettingsTarget(null);
+        }}
+      />
       <ManageFoldersDialog
         library={manageFoldersTarget}
         onOpenChange={(o) => {
@@ -665,25 +700,45 @@ export function Sidebar({
           if (createPlaylistFor) onPlaylistChanged(createPlaylistFor);
         }}
       />
-      <Dialog open={deleteTarget !== null} onOpenChange={(open) => { if (!open) setDeleteTarget(null); }}>
+      <Dialog
+        open={deleteTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) {
+            setDeleteTarget(null);
+            setDeleteConfirmText("");
+          }
+        }}
+      >
         <DialogContent className="sm:max-w-sm">
           <DialogHeader>
             <DialogTitle>Delete library?</DialogTitle>
             <DialogDescription>
-              Are you sure you want to delete "{deleteTarget?.name}"? This cannot be undone.
+              This deletes "{deleteTarget?.name}" — its matches, edits, playlists, play history,
+              and every decision made in it. It cannot be undone. Type the library's name to
+              confirm.
             </DialogDescription>
           </DialogHeader>
+          <Input
+            value={deleteConfirmText}
+            onChange={(e) => setDeleteConfirmText(e.target.value)}
+            placeholder={deleteTarget?.name ?? ""}
+            autoFocus
+          />
           <DialogFooter>
-            <Button variant="outline" onClick={() => setDeleteTarget(null)}>
+            <Button variant="outline" onClick={() => { setDeleteTarget(null); setDeleteConfirmText(""); }}>
               Cancel
             </Button>
             <Button
               variant="destructive"
+              // Exact name, case included — deliberate friction for a
+              // destructive, unrecoverable action.
+              disabled={deleteConfirmText !== (deleteTarget?.name ?? "")}
               onClick={async () => {
                 if (!deleteTarget) return;
                 try {
                   await invoke("delete_library", { libraryId: deleteTarget.id });
                   setDeleteTarget(null);
+                  setDeleteConfirmText("");
                   onLibraryDeleted(deleteTarget.id);
                 } catch (err) {
                   toast.error(String(err));
