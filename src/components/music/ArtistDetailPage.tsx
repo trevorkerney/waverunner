@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Play, Music2, Pencil, Scissors, LayoutGrid, List, ArrowUpDown, Disc3, ListPlus, ListStart, ListEnd } from "lucide-react";
+import { Play, Music2, Pencil, Scissors, LayoutGrid, List, ArrowUpDown, Disc3, ListPlus, ListStart, ListEnd, VenetianMask } from "lucide-react";
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -16,6 +16,7 @@ import {
 } from "../ui/context-menu";
 import { TrackEditDialog, ArtistEditDialog, SplitArtistDialog } from "./EditDialogs";
 import { MatchDialog, MbStatusChip } from "./MatchDialog";
+import { PersonaDialog } from "./PersonaDialog";
 import { PlayingIndicator } from "./PlayingIndicator";
 import { LoveButton, LoveMenuItem } from "./LoveButton";
 import { MusicArtistDetail, MusicAlbumCard, MusicAlbumDetail, MusicQueueItem, MusicTrack } from "../../types";
@@ -31,6 +32,8 @@ let cachedArtistSort: "date" | "date-desc" | null = null;
 
 interface ArtistDetailPageProps {
   entryId: number;
+  /** Scopes the persona picker's artist search to this library. */
+  libraryId: string;
   /** Grid thumbnail resolver (covers → covers_thumb), from App. */
   getCoverUrl: (filePath: string) => string;
   getFullCoverUrl: (filePath: string) => string;
@@ -59,6 +62,7 @@ function displayCover(covers: string[], selected: string | null): string | null 
 
 export function ArtistDetailPage({
   entryId,
+  libraryId,
   getCoverUrl,
   getFullCoverUrl,
   onOpenAlbum,
@@ -76,11 +80,31 @@ export function ArtistDetailPage({
   const [editTrackId, setEditTrackId] = useState<number | null>(null);
   const [editArtistOpen, setEditArtistOpen] = useState(false);
   const [splitArtistOpen, setSplitArtistOpen] = useState(false);
+  const [personaOpen, setPersonaOpen] = useState(false);
   // MusicBrainz matching for this artist, plus a nonce so the chip refetches.
   const [matchOpen, setMatchOpen] = useState(false);
   const [matchTrack, setMatchTrack] = useState<number | null>(null);
   const [mbKey, setMbKey] = useState(0);
   const [reloadKey, setReloadKey] = useState(0);
+  // Persona links, both directions: "Persona of J. Cole" on the mask's page,
+  // "Also performs as kiLL edward" on the human's.
+  const [personaLinks, setPersonaLinks] = useState<{
+    parent: { artist_id: number; title: string } | null;
+    personas: { artist_id: number; title: string }[];
+  } | null>(null);
+  useEffect(() => {
+    if (!detail?.id) return;
+    let alive = true;
+    invoke<{
+      parent: { artist_id: number; title: string } | null;
+      personas: { artist_id: number; title: string }[];
+    }>("get_artist_personas", { artistId: detail.id })
+      .then((r) => alive && setPersonaLinks(r))
+      .catch(() => alive && setPersonaLinks(null));
+    return () => {
+      alive = false;
+    };
+  }, [detail?.id, mbKey]);
   const [viewMode, setViewMode] = useState<"grid" | "list">(cachedArtistView ?? "grid");
   const [sortDir, setSortDir] = useState<"date" | "date-desc">(cachedArtistSort ?? "date");
   // List view: per-release full details (tracks, type, genres), fetched when
@@ -169,7 +193,13 @@ export function ArtistDetailPage({
   // silently refetch so per-album credit lines and subtitles update in place.
   // Scrobbles too: list view shows play counts.
   useEffect(() => {
-    const onRescanned = () => setReloadKey((k) => k + 1);
+    const onRescanned = () => {
+      setReloadKey((k) => k + 1);
+      // The MB chip fetches its own status and keys off mbKey — without this
+      // it keeps showing the state from before a metadata-center match/undo
+      // until you navigate away and back.
+      setMbKey((k) => k + 1);
+    };
     window.addEventListener("waverunner:library-rescanned", onRescanned);
     window.addEventListener("waverunner:track-scrobbled", onRescanned);
     return () => {
@@ -502,6 +532,13 @@ export function ArtistDetailPage({
             >
               <Scissors size={16} />
             </button>
+            <button
+              onClick={() => setPersonaOpen(true)}
+              className="shrink-0 rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/title:opacity-100"
+              title="Link as a persona of another artist"
+            >
+              <VenetianMask size={16} />
+            </button>
           </h1>
           <p className="mt-1 text-sm text-muted-foreground">
             {[
@@ -526,6 +563,52 @@ export function ArtistDetailPage({
               onClick={() => setMatchOpen(true)}
             />
           </div>
+          {/* Persona links, whichever direction this page sits on. The names
+              are the links — one human, several masks, all reachable. */}
+          {personaLinks && (personaLinks.parent || personaLinks.personas.length > 0) && (
+            <p className="mt-1.5 flex flex-wrap items-center gap-x-1.5 text-sm text-muted-foreground">
+              <VenetianMask size={14} className="shrink-0" />
+              {personaLinks.parent ? (
+                <>
+                  <span>Persona of</span>
+                  {onNavigateToArtist ? (
+                    <button
+                      onClick={() =>
+                        onNavigateToArtist(
+                          personaLinks.parent!.artist_id,
+                          personaLinks.parent!.title,
+                        )
+                      }
+                      className="text-foreground underline-offset-2 hover:underline"
+                    >
+                      {personaLinks.parent.title}
+                    </button>
+                  ) : (
+                    <span className="text-foreground">{personaLinks.parent.title}</span>
+                  )}
+                </>
+              ) : (
+                <>
+                  <span>Also performs as</span>
+                  {personaLinks.personas.map((p, i) => (
+                    <span key={p.artist_id} className="flex items-center gap-x-1.5">
+                      {i > 0 && <span>·</span>}
+                      {onNavigateToArtist ? (
+                        <button
+                          onClick={() => onNavigateToArtist(p.artist_id, p.title)}
+                          className="text-foreground underline-offset-2 hover:underline"
+                        >
+                          {p.title}
+                        </button>
+                      ) : (
+                        <span className="text-foreground">{p.title}</span>
+                      )}
+                    </span>
+                  ))}
+                </>
+              )}
+            </p>
+          )}
           {detail.biography && (
             <p className="mt-2 line-clamp-3 max-w-2xl whitespace-pre-line text-sm text-muted-foreground" title={detail.biography}>
               {detail.biography}
@@ -963,6 +1046,19 @@ export function ArtistDetailPage({
         open={splitArtistOpen}
         onOpenChange={setSplitArtistOpen}
       />
+      {personaOpen && (
+        <PersonaDialog
+          libraryId={libraryId}
+          personaId={entryId}
+          personaName={detail?.title ?? ""}
+          onOpenChange={setPersonaOpen}
+          onDone={() => {
+            // mbKey drives the persona-links effect above.
+            setMbKey((k) => k + 1);
+            handleSaved();
+          }}
+        />
+      )}
       <MatchDialog
         kind="artist"
         entityId={entryId}

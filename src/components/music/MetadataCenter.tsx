@@ -9,12 +9,13 @@ import {
   DialogContent,
   DialogHeader,
   DialogTitle,
+  DialogFooter,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ClearableInput } from "@/components/ui/clearable-input";
 import { Spinner } from "@/components/ui/spinner";
-import { Search, Undo2, GitMerge, CircleCheck, RefreshCw, FileWarning, TriangleAlert, ChevronRight, Scissors, Music2 } from "lucide-react";
+import { Search, Undo2, GitMerge, Equal, CircleAlert, CircleCheck, CircleSlash, Combine, RefreshCw, FileWarning, TriangleAlert, ChevronRight, Scissors, Music2, VenetianMask } from "lucide-react";
 import {
   ContextMenu,
   ContextMenuTrigger,
@@ -29,6 +30,9 @@ import {
 } from "@/components/ui/tooltip";
 import { MatchDialog } from "./MatchDialog";
 import { SplitArtistDialog } from "./EditDialogs";
+import { CombineSelectedDialog, type AlbumSelection } from "./CombineSelectedDialog";
+import { notifyPendingWorkChanged } from "./PendingWork";
+import { PersonaDialog } from "./PersonaDialog";
 
 /** The metadata matching/cleaning center — the permanent home for a music
  *  library's external-source state. Two entrances: the import wizard's final
@@ -95,8 +99,9 @@ interface MbAlbumRow {
   state: MbAlbumState;
   gap_ours: number;
   gap_mb: number;
-  /** Owning artist id — how the map groups album chips under artist rows. */
-  artist_id: number | null;
+  /** Every credited artist's id — the map hangs the album's chip under each
+   *  of their rows (albums have no single owning parent). */
+  artist_ids: number[];
   /** User said "stop counting this" — gray on the map, out of every count. */
   ignored: boolean;
 }
@@ -185,6 +190,10 @@ interface MetadataCenterProps {
   /** Reports the pending-decision count after every load — the wizard shows
    *  it beside Finish as a pointer (never a gate). */
   onDecisionsChange?: (pending: number) => void;
+  /** "Run a matching pass" was requested. Wizard hosts jump their stepper
+   *  back to the match step; without this the request opens the match-only
+   *  wizard through the sidebar window event. */
+  onRunPass?: () => void;
 }
 
 type PaneId = "map" | "albums" | "artists" | "credits" | "gaps" | "files" | "history";
@@ -314,11 +323,12 @@ function LinkArtistDialog({
     <Dialog open onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>“{sourceName}” is really…</DialogTitle>
+          <DialogTitle>“{sourceName}” is an alias for…</DialogTitle>
         </DialogHeader>
         <p className="text-xs text-muted-foreground">
           Everything credited to “{sourceName}” moves to the artist you pick, and the name keeps
-          resolving there through future rescans. Undoable from History.
+          resolving there through future rescans. Undoable from History. (For an independent
+          identity of the same person — an alter ego with its own work — use Persona instead.)
         </p>
         <Input
           autoFocus
@@ -384,6 +394,8 @@ function ArtistRow({
   onMatch,
   onSplit,
   onLink,
+  onIgnore,
+  onPersona,
   disabled,
 }: {
   a: MbArtistRow;
@@ -395,6 +407,12 @@ function ArtistRow({
   /** Unidentified rows only — the OTHER wrong-name fix: the tag is one
    *  artist under the wrong name ("God" → Kanye West), so fold it in. */
   onLink?: (a: MbArtistRow) => void;
+  /** Unidentified rows only — "not on MusicBrainz, stop counting this":
+   *  the artist goes gray on the map and leaves every pass and count. */
+  onIgnore?: (a: MbArtistRow) => void;
+  /** Any row — link this artist as a persona of another (independent
+   *  identity, same human). Matched or not: personas carry their own ids. */
+  onPersona?: (a: MbArtistRow) => void;
   /** A pending suggestion owns the row — answer or dismiss it first; the
    *  manual actions unlock once it's gone (hover explains). */
   disabled?: boolean;
@@ -419,7 +437,29 @@ function ArtistRow({
         <span className="ml-1.5 text-[11px] text-muted-foreground">
           {a.album_count} {a.album_count === 1 ? "release" : "releases"}
         </span>
+        {/* The pass searched this name and MusicBrainz had nothing — the
+            artist route is a dead end, so point at the other one. */}
+        {a.state === "notfound" && a.album_count > 0 && (
+          <span className="ml-1.5 text-[11px] text-amber-300/90">
+            not on MusicBrainz — match their albums
+          </span>
+        )}
       </span>
+      {onIgnore &&
+        a.state !== "matched" &&
+        withHint(
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-6 shrink-0 gap-1 px-2 text-xs"
+            disabled={disabled}
+            onClick={() => onIgnore(a)}
+          >
+            <CircleSlash size={12} />
+            Ignore
+          </Button>,
+          "ignore",
+        )}
       {onLink &&
         a.state !== "matched" &&
         withHint(
@@ -430,10 +470,26 @@ function ArtistRow({
             disabled={disabled}
             onClick={() => onLink(a)}
           >
-            <GitMerge size={12} />
-            Join
+            <Equal size={12} />
+            Alias
           </Button>,
-          "join",
+          "alias",
+        )}
+      {/* Personas apply to matched artists too (they carry their own ids),
+          so this one isn't gated on state. */}
+      {onPersona &&
+        withHint(
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-6 shrink-0 gap-1 px-2 text-xs"
+            disabled={disabled}
+            onClick={() => onPersona(a)}
+          >
+            <VenetianMask size={12} />
+            Persona
+          </Button>,
+          "persona",
         )}
       {onSplit &&
         a.state !== "matched" &&
@@ -485,14 +541,20 @@ function AlbumRow({
   a,
   first,
   onMatch,
+  onIgnore,
+  onCombine,
 }: {
   a: MbAlbumRow;
   first: boolean;
   onMatch: (id: number) => void;
+  /** Unidentified rows only — "not on MusicBrainz, stop counting this". */
+  onIgnore?: (a: MbAlbumRow) => void;
+  /** Fold this album together with another (duplicates spotted in the list). */
+  onCombine?: (a: MbAlbumRow) => void;
 }) {
   const identified = a.state === "release" || a.state === "album";
   return (
-    <div className={`flex items-center gap-3 px-3 py-1.5 text-sm ${first ? "" : "border-t"}`}>
+    <div className={`flex items-center gap-1.5 px-3 py-1.5 text-sm ${first ? "" : "border-t"}`}>
       <span className="min-w-0 flex-1 truncate">
         {a.title}
         {a.artist_title && <span className="text-muted-foreground"> — {a.artist_title}</span>}
@@ -504,23 +566,52 @@ function AlbumRow({
           </span>
         )}
       </span>
-      {/* Knowing the album but not the pressing is its own state — worth
-          saying on the row, since it's what blocks track-list checking. */}
-      {a.state === "album" && (
-        <span className="shrink-0 text-[11px] text-muted-foreground">release unknown</span>
+      {onCombine && (
+        <Button
+          size="sm"
+          variant="ghost"
+          className="h-6 shrink-0 gap-1 px-2 text-xs"
+          onClick={() => onCombine(a)}
+        >
+          <Combine size={12} />
+          Combine
+        </Button>
       )}
+      {onIgnore && !identified && (
+        <Button
+          size="sm"
+          variant="ghost"
+          className="h-6 shrink-0 gap-1 px-2 text-xs"
+          onClick={() => onIgnore(a)}
+        >
+          <CircleSlash size={12} />
+          Ignore
+        </Button>
+      )}
+      {/* The button states the row's one remaining job: a group-matched
+          album needs its release picked (the dialog opens straight onto the
+          picker), a full match just states the fact. */}
       <Button
         size="sm"
         variant="ghost"
         className={`h-6 shrink-0 gap-1 px-2 text-xs ${
-          a.state === "release" ? "text-emerald-400 hover:text-emerald-300" : ""
+          a.state === "release"
+            ? "text-emerald-400 hover:text-emerald-300"
+            : a.state === "album"
+              ? "text-amber-300 hover:text-amber-200"
+              : ""
         }`}
         onClick={() => onMatch(a.album_id)}
       >
-        {identified ? (
+        {a.state === "release" ? (
           <>
             <CircleCheck size={12} className="-translate-y-px" />
             Matched
+          </>
+        ) : a.state === "album" ? (
+          <>
+            <TriangleAlert size={12} className="-translate-y-px" />
+            Pick release
           </>
         ) : (
           <>
@@ -538,12 +629,16 @@ const KIND_WORD: Record<string, string> = {
   track_credits: "credits",
   album_artists: "album artist",
   album_type: "type",
+  album_title: "title",
+  artist_rename: "renamed",
+  artist_persona: "persona",
   album_year: "date",
   artist_merge: "artist merge",
   artist_mbid: "artist match",
   album_match: "album match",
   track_match: "track match",
   suggestion_rejected: "declined",
+  mb_ignored: "ignored",
 };
 const KIND_LABELS = (kinds: string[]) =>
   kinds.map((k) => KIND_WORD[k] ?? k).join(", ");
@@ -554,6 +649,7 @@ export function MetadataCenter({
   onChanged,
   onRescanNeeded,
   onDecisionsChange,
+  onRunPass,
 }: MetadataCenterProps) {
   const [review, setReview] = useState<MbReview | null>(null);
   const [matchState, setMatchState] = useState<MusicMatchState | null>(null);
@@ -561,17 +657,22 @@ export function MetadataCenter({
   const [issues, setIssues] = useState<ScanIssueRow[]>([]);
   const [unlinked, setUnlinked] = useState<UnlinkedCredit[]>([]);
   // Staged directives (splits, combines, separates) a rescan will apply.
-  const [pending, setPending] = useState<{ id: number; label: string }[]>([]);
+  const [pending, setPending] = useState<
+    { id: number; label: string; kind: string; target: string; locked_ids: number[] }[]
+  >([]);
+  // Applied matches a matching pass has yet to cash in (stamp the artists
+  // their credits prove). Cleared wholesale by a completed pass.
+  const [pendingPass, setPendingPass] = useState<
+    { id: number; target: string; label: string }[]
+  >([]);
   const [loading, setLoading] = useState(false);
   // Which mutation is in flight ("apply:…", "resolve:…", "undo:…") — the
   // matching button shows a spinner; everything else just disables.
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const busy = busyKey !== null;
-  // Live progress of a running matching pass (re-run started here, or a
-  // wizard pass still finishing in the background of this view).
-  const [progress, setProgress] = useState<{ done: number; total: number; name: string; etaSecs: number | null } | null>(null);
-  // Rolling per-step timestamps → avg gap × steps left = time remaining.
-  const etaSamplesRef = useRef<{ phase: string; times: number[] }>({ phase: "", times: [] });
+  // Pass progress is NOT rendered here — the match modal owns it. The center
+  // only keeps the completion listener (silent refresh) and the running flag
+  // (button states + the rail's "open the modal" pointer).
   // Per-suggestion chosen candidate; per-album manual search state.
   const [picked, setPicked] = useState<Record<number, string>>({});
   // Text filter and paging for the album list.
@@ -583,12 +684,14 @@ export function MetadataCenter({
   const [splitArtist, setSplitArtist] = useState<MbArtistRow | null>(null);
   // "Is really…" target: a credit name (and its auto-created page, if any).
   const [linkSource, setLinkSource] = useState<{ name: string; artistId: number | null } | null>(null);
-  // Two-step "Skip remaining" for the nav's pass-progress block.
-  const [confirmSkip, setConfirmSkip] = useState(false);
+  // "Persona of…" target: an artist page being linked to its human.
+  const [personaSource, setPersonaSource] = useState<{ id: number; name: string } | null>(null);
   const [artistFilter, setArtistFilter] = useState("");
   const [artistLimit, setArtistLimit] = useState(30);
-  // Which pane the right-hand side is showing.
-  const [pane, setPane] = useState<PaneId>("artists");
+  // Which pane the right-hand side is showing. Starts on the map — the
+  // landing effect only ever redirects AWAY from it (opt-out libraries), so
+  // the initial selection never visibly jumps.
+  const [pane, setPane] = useState<PaneId>("map");
   const [hideUndone, setHideUndone] = useState(false);
   const [changeLimit, setChangeLimit] = useState(25);
   // Per-library opt-out: false hides every MusicBrainz-backed pane, leaving
@@ -598,13 +701,18 @@ export function MetadataCenter({
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
-      const [rev, ms, fb, iss, unl, pend, ls] = await Promise.all([
+      const [rev, ms, fb, iss, unl, pend, pass, ls] = await Promise.all([
         invoke<MbReview>("mb_get_review", { libraryId }),
         invoke<MusicMatchState>("music_match_state", { libraryId }),
         invoke<TagFallbackRow[]>("get_music_tag_fallbacks", { libraryId }),
         invoke<ScanIssueRow[]>("get_music_scan_issues", { libraryId }),
         invoke<UnlinkedCredit[]>("get_unlinked_credits", { libraryId }),
-        invoke<{ id: number; label: string }[]>("get_pending_changes", { libraryId }),
+        invoke<
+          { id: number; label: string; kind: string; target: string; locked_ids: number[] }[]
+        >("get_pending_changes", { libraryId }),
+        invoke<{ id: number; target: string; label: string }[]>("get_pending_pass", {
+          libraryId,
+        }),
         invoke<Record<string, string>>("get_library_settings", { libraryId }),
       ]);
       setReview(rev);
@@ -613,7 +721,11 @@ export function MetadataCenter({
       setIssues(iss);
       setUnlinked(unl);
       setPending(pend);
+      setPendingPass(pass);
       setOnlineEnabled(ls["online_metadata"] !== "off");
+      // Outside surfaces (sidebar badge, library-page strip) mirror both
+      // queues — tell them whenever the center's view of them refreshes.
+      notifyPendingWorkChanged();
     } catch (e) {
       toast.error(String(e));
     } finally {
@@ -630,37 +742,16 @@ export function MetadataCenter({
     setAlbumLimit(30);
   }, [albumFilter]);
 
-  // A pass runs behind this panel (re-run here, or still going from the
-  // wizard): stream its progress and refresh when it lands.
+  // A pass runs behind this panel (started from here, or the wizard): the
+  // MODAL shows its progress; this only refreshes the lists when it lands.
   useEffect(() => {
-    const unProgress = listen<{ phase: string; done: number; total: number; name: string }>(
-      "music-enrich-progress",
-      (e) => {
-        const s = etaSamplesRef.current;
-        if (s.phase !== e.payload.phase) {
-          s.phase = e.payload.phase;
-          s.times = [];
-        }
-        s.times.push(performance.now());
-        if (s.times.length > 30) s.times.shift();
-        let etaSecs: number | null = null;
-        if (s.times.length >= 3) {
-          const avgMs = (s.times[s.times.length - 1] - s.times[0]) / (s.times.length - 1);
-          etaSecs = Math.round((avgMs * Math.max(0, e.payload.total - e.payload.done - 1)) / 1000);
-        }
-        setProgress({ done: e.payload.done, total: e.payload.total, name: e.payload.name, etaSecs });
-      },
-    );
     const unDone = listen<{ libraryId: string }>("music-enrich-done", (e) => {
-      setProgress(null);
-      setConfirmSkip(false);
       if (e.payload.libraryId === libraryId) {
         refresh();
         onChanged?.();
       }
     });
     return () => {
-      unProgress.then((fn) => fn());
       unDone.then((fn) => fn());
     };
   }, [libraryId, refresh, onChanged]);
@@ -708,17 +799,40 @@ export function MetadataCenter({
     run(`gaps:${albumId}`, () => invoke("mb_dismiss_gaps", { albumId }));
   const setIgnored = (entityId: number, ignored: boolean) =>
     run(`ignore:${entityId}`, () => invoke("mb_set_ignored", { entityId, ignored }));
+  // Ignoring gets a confirm (every other row action opens a dialog before
+  // touching anything; ignore is the one that would otherwise fire on a bare
+  // click). Un-ignoring stays instant — it only returns things to the pool.
+  const [confirmIgnore, setConfirmIgnore] = useState<{ entityId: number; name: string } | null>(
+    null,
+  );
+  // Combine from an album row: pick the partner album, then the shared
+  // configure dialog (keeper, mode) — same flow the grid's multi-select uses.
+  const [combinePartnerFor, setCombinePartnerFor] = useState<MbAlbumRow | null>(null);
+  const [partnerFilter, setPartnerFilter] = useState("");
+  const [combineSelect, setCombineSelect] = useState<AlbumSelection | null>(null);
 
+  // The pass runs in the wizard modal (match-only mode), not in this rail:
+  // embedded hosts (the wizard's review step) jump their own stepper back,
+  // everyone else opens the modal through the window event App/Sidebar own.
   const rerunMatching = async () => {
-    try {
-      await invoke("music_match_begin", { libraryId });
-      setMatchState((s) => (s ? { ...s, running: true } : s));
-    } catch (e) {
-      toast.error(String(e));
+    if (onRunPass) {
+      onRunPass();
+      return;
     }
+    window.dispatchEvent(
+      new CustomEvent("waverunner:open-match", { detail: { libraryId } }),
+    );
   };
 
   const albums = review?.albums ?? [];
+  // A staged split/combine has already decided these entities' fate — they
+  // dissolve when the rescan applies. Their rows leave the work lists and
+  // every edit locks until then (or until the staging is undone): a match or
+  // ignore made now would be silently discarded with the entity.
+  const stagedLockedIds = new Set(pending.flatMap((p) => p.locked_ids));
+  const stagedSplitNames = new Set(
+    pending.filter((p) => p.kind === "artist_split").map((p) => p.target),
+  );
   // Ignored entities have left the counting: the tallies (and the unmatched
   // work lists) only see what still wants matching. The map is where gray
   // lives and gets un-ignored.
@@ -730,11 +844,20 @@ export function MetadataCenter({
     albumFilter.trim() === "" ||
     `${a.title} ${a.artist_title ?? ""}`.toLowerCase().includes(albumFilter.trim().toLowerCase());
   const albumsUnmatched = albums.filter(
-    (a) => (a.state === "notfound" || a.state === "unchecked") && !a.ignored && albumMatches(a),
+    (a) =>
+      (a.state === "notfound" || a.state === "unchecked") &&
+      !a.ignored &&
+      !stagedLockedIds.has(a.album_id) &&
+      albumMatches(a),
   );
   const albumsIdentified = albums.filter(
     (a) => (a.state === "release" || a.state === "album") && albumMatches(a),
   );
+  // The identified list, split by how far the identification goes: a group
+  // match names the album but not the pressing, so its track list can't be
+  // checked yet — amber, one release-pick away from green.
+  const albumsReleaseUnknown = albumsIdentified.filter((a) => a.state === "album");
+  const albumsFullyIdentified = albumsIdentified.filter((a) => a.state === "release");
   const visibleChanges = (review?.changes ?? []).filter((c) => !hideUndone || !c.undone);
   const artists = review?.artists ?? [];
   const artistMatches = (a: MbArtistRow) =>
@@ -742,12 +865,18 @@ export function MetadataCenter({
   const artistsUnmatched = artists.filter(
     (a) => a.state !== "matched" && !a.ignored && artistMatches(a),
   );
+  const notStagedSplit = (a: MbArtistRow) =>
+    !stagedSplitNames.has(a.title.toLowerCase()) && !stagedLockedIds.has(a.artist_id);
   // The guide's stage-1/stage-3 boundary, made visible in the page structure:
   // owners unlock albums, features get unlocked BY albums. Split on the same
   // predicate the guide counts with, so its "N left" agrees with the header
   // its Go button lands on.
-  const artistsUnmatchedOwners = artistsUnmatched.filter((a) => a.album_count > 0);
-  const artistsUnmatchedFeatures = artistsUnmatched.filter((a) => a.album_count === 0);
+  const artistsUnmatchedOwners = artistsUnmatched.filter(
+    (a) => a.album_count > 0 && notStagedSplit(a),
+  );
+  const artistsUnmatchedFeatures = artistsUnmatched.filter(
+    (a) => a.album_count === 0 && notStagedSplit(a),
+  );
   const artistsIdentified = artists.filter((a) => a.state === "matched" && artistMatches(a));
   const artistsMatched = artists.filter((a) => a.state === "matched").length;
 
@@ -803,15 +932,22 @@ export function MetadataCenter({
   // on the next pass), 2: the albums themselves (matched albums prove their
   // credited artists), 3: feature-only leftovers. Rescans and passes advance
   // the stages on their own; the guide is a lens, not a gate.
+  // Staged rows are excluded everywhere the LISTS exclude them — a count
+  // must agree with the list its Go button lands on (staged splits/combines
+  // dissolve on the next rescan; their rows already left the work lists).
   const guideOwnerLeft = artists.filter(
-    (a) => a.state !== "matched" && !a.ignored && a.album_count > 0,
+    (a) => a.state !== "matched" && !a.ignored && a.album_count > 0 && notStagedSplit(a),
   ).length;
   const guideAlbumsLeft = albums.filter(
-    (a) => a.state !== "release" && a.state !== "album" && !a.ignored,
+    (a) =>
+      a.state !== "release" &&
+      a.state !== "album" &&
+      !a.ignored &&
+      !stagedLockedIds.has(a.album_id),
   ).length;
   const guideFeatureLeft = artistSuggestions.filter((s) => {
     const row = artists.find((a) => a.artist_id === s.payload.artist_id);
-    return !row ? true : !row.ignored && row.album_count === 0;
+    return !row ? true : !row.ignored && row.album_count === 0 && notStagedSplit(row);
   }).length;
   const guideStage =
     guideOwnerLeft > 0 ? 1 : guideAlbumsLeft > 0 ? 2 : guideFeatureLeft > 0 ? 3 : 0;
@@ -1043,29 +1179,28 @@ export function MetadataCenter({
   };
 
   // The library map's tree, flattened one level: albums grouped under their
-  // owning artist (containment instead of edges), feature-only artists as a
-  // dot grid below. "Done" is NOTHING RED — every node matched, group-matched
-  // (albums), or deliberately gray.
+  // CREDITED artists (containment instead of edges — a joint album chips
+  // under every member), feature-only artists as a dot grid below. "Done" is
+  // NOTHING RED — every node matched, group-matched (albums), or gray.
   const albumsByArtist = new Map<number, MbAlbumRow[]>();
   const orphanAlbums: MbAlbumRow[] = [];
   for (const al of albums) {
-    if (al.artist_id == null) {
+    if (al.artist_ids.length === 0) {
       orphanAlbums.push(al);
       continue;
     }
-    const list = albumsByArtist.get(al.artist_id);
-    if (list) list.push(al);
-    else albumsByArtist.set(al.artist_id, [al]);
+    for (const aid of al.artist_ids) {
+      const list = albumsByArtist.get(aid);
+      if (list) list.push(al);
+      else albumsByArtist.set(aid, [al]);
+    }
   }
   const albumRed = (a: MbAlbumRow) => !a.ignored && a.state !== "release" && a.state !== "album";
   const artistRed = (a: MbArtistRow) => !a.ignored && a.state !== "matched";
-  const ownerRows = artists
-    .filter((a) => albumsByArtist.has(a.artist_id))
-    .sort((a, b) => {
-      const ra = artistRed(a) || (albumsByArtist.get(a.artist_id) ?? []).some(albumRed) ? 0 : 1;
-      const rb = artistRed(b) || (albumsByArtist.get(b.artist_id) ?? []).some(albumRed) ? 0 : 1;
-      return ra - rb;
-    });
+  // Strictly alphabetical (the backend's sort_title order) — the map is a
+  // stable picture of the library, not a work queue; the guide's Go buttons
+  // and the Artists pane's ready-first lists carry the worklist role.
+  const ownerRows = artists.filter((a) => albumsByArtist.has(a.artist_id));
   const featureArtists = artists.filter((a) => !albumsByArtist.has(a.artist_id));
   const mapReds = artists.filter(artistRed).length + albums.filter(albumRed).length;
 
@@ -1082,8 +1217,10 @@ export function MetadataCenter({
     );
   }
 
-  // `count` is the size of the pane; `warn` is how much of it still wants
-  // attention. They differ for Albums and Artists, where most rows are fine.
+  // `count` is the size of the pane; `alert` (red) is the blocking work —
+  // unidentified owners / unidentified albums — and `warn` (amber) the softer
+  // tier: feature-only names and albums awaiting a release pick. Same colors
+  // as the pane's own section headings, so the rail predicts the page.
   // "Needs a decision" leads — it's required work, not reference — and it
   // only exists while there IS something to decide.
   // Opted out of online metadata: only the LOCAL panes remain — unlinked
@@ -1091,7 +1228,7 @@ export function MetadataCenter({
   // disappears rather than sitting permanently "unfinished".
   // The map leads: it hosts the guided process, so it gets the top slot and
   // Suggestions sits below the working panes it feeds.
-  const NAV: { id: PaneId; label: string; count: number; warn?: number }[] = [
+  const NAV: { id: PaneId; label: string; count: number; warn?: number; alert?: number }[] = [
     ...(onlineEnabled
       ? [
           {
@@ -1105,13 +1242,30 @@ export function MetadataCenter({
             id: "artists" as const,
             label: "Artists",
             count: artists.length,
-            warn: artists.filter((a) => a.state !== "matched" && !a.ignored).length,
+            // Staged-split rows are hidden from the pane's lists — keep the
+            // rail's numbers agreeing with what the click reveals.
+            alert: artists.filter(
+              (a) =>
+                a.state !== "matched" && !a.ignored && a.album_count > 0 && notStagedSplit(a),
+            ).length,
+            warn: artists.filter(
+              (a) =>
+                a.state !== "matched" && !a.ignored && a.album_count === 0 && notStagedSplit(a),
+            ).length,
           },
           {
             id: "albums" as const,
             label: "Albums",
             count: albums.length,
-            warn: counts.notfound + counts.unchecked,
+            alert: albums.filter(
+              (a) =>
+                (a.state === "notfound" || a.state === "unchecked") &&
+                !a.ignored &&
+                !stagedLockedIds.has(a.album_id),
+            ).length,
+            warn: albums.filter(
+              (a) => a.state === "album" && !a.ignored && !stagedLockedIds.has(a.album_id),
+            ).length,
           },
         ]
       : []),
@@ -1183,10 +1337,10 @@ export function MetadataCenter({
       {pending.length > 0 && (
         // mr-4: the host containers end at the modal edge (pr-0, so the pane
         // scrollbar can sit flush) — right spacing is each block's own job.
-        <div className="mb-3 mr-4 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2">
+        <div className="mb-3 mr-4 rounded-md border border-red-500/40 bg-red-500/5 px-3 py-2">
           <div className="flex items-center gap-3">
-            <TriangleAlert size={14} className="shrink-0 text-amber-300" />
-            <p className="min-w-0 flex-1 text-sm text-amber-200/90">
+            <TriangleAlert size={14} className="shrink-0 text-red-400" />
+            <p className="min-w-0 flex-1 text-sm text-red-200/90">
               {pending.length} staged {pending.length === 1 ? "change" : "changes"} — applied by the
               next rescan
             </p>
@@ -1208,12 +1362,90 @@ export function MetadataCenter({
             </Button>
           </div>
           {/* One line per staged action; each truncates on its own instead of
-              the whole batch collapsing into one clipped run-on. */}
-          <ul className="mt-1 space-y-0.5 pl-[26px]">
+              the whole batch collapsing into one clipped run-on. Undo reverts
+              the directive itself — nothing has applied yet, so no rescan. */}
+          {/* Height-capped: a long batch scrolls inside the banner instead of
+              shoving the actual work below the fold. */}
+          <ul className="mt-1 max-h-40 space-y-0.5 overflow-y-auto pl-[26px]">
             {pending.map((p) => (
               <li key={p.id} className="flex min-w-0 items-baseline gap-1.5 text-xs text-muted-foreground">
                 <span className="shrink-0">•</span>
                 <span className="min-w-0 truncate">{p.label}</span>
+                <button
+                  onClick={() =>
+                    run(`unstage:${p.id}`, () => invoke("unstage_pending_change", { id: p.id }))
+                  }
+                  disabled={busy}
+                  className="shrink-0 underline underline-offset-2 hover:text-foreground"
+                >
+                  {busyKey === `unstage:${p.id}` ? "…" : "Undo"}
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {/* Matches a pass has yet to cash in — the pass stamps the artists
+          their credits prove. Staged changes gate it (same rule the backend
+          enforces): rescan first, then pass. "Unmatch" per line rather than
+          "Undo": nothing staged here, undoing means forgetting the match. */}
+      {onlineEnabled && pendingPass.length > 0 && (
+        <div className="mb-3 mr-4 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2">
+          <div className="flex items-center gap-3">
+            <RefreshCw size={14} className="shrink-0 text-amber-300" />
+            <p className="min-w-0 flex-1 text-sm text-amber-200/90">
+              {pendingPass.length}{" "}
+              {pendingPass.some((p) => !/^\d+$/.test(p.target))
+                ? pendingPass.length === 1
+                  ? "item"
+                  : "items"
+                : pendingPass.length === 1
+                  ? "match"
+                  : "matches"}{" "}
+              waiting for a matching pass — it identifies the artists their credits prove
+            </p>
+            <Button
+              size="sm"
+              variant="outline"
+              className="shrink-0 gap-1.5"
+              disabled={busy || running || pending.length > 0}
+              title={pending.length > 0 ? "Staged changes need a rescan first" : undefined}
+              onClick={rerunMatching}
+            >
+              <RefreshCw size={13} />
+              {pending.length > 0 ? "Rescan first" : running ? "Pass running…" : "Run pass now"}
+            </Button>
+          </div>
+          {/* Same height cap as the staged banner — the queue can hold every
+              match of a long session. */}
+          <ul className="mt-1 max-h-40 space-y-0.5 overflow-y-auto pl-[26px]">
+            {pendingPass.map((p) => (
+              <li
+                key={p.id}
+                className="flex min-w-0 items-baseline gap-1.5 text-xs text-muted-foreground"
+              >
+                <span className="shrink-0">•</span>
+                <span className="min-w-0 truncate">{p.label}</span>
+                {/* Only album-match rows (bare album-id targets) can offer
+                    Unmatch. Re-check/search rows — merges, artist matches,
+                    credit changes, renames — have no match to forget; each
+                    one's undo is its own History entry, which dequeues it. */}
+                {/^\d+$/.test(p.target) && (
+                  <button
+                    onClick={() =>
+                      run(`passunmatch:${p.id}`, () =>
+                        invoke("mb_unmatch_entity", {
+                          kind: "album",
+                          entityId: parseInt(p.target, 10),
+                        }),
+                      )
+                    }
+                    disabled={busy}
+                    className="shrink-0 underline underline-offset-2 hover:text-foreground"
+                  >
+                    {busyKey === `passunmatch:${p.id}` ? "…" : "Unmatch"}
+                  </button>
+                )}
               </li>
             ))}
           </ul>
@@ -1231,7 +1463,11 @@ export function MetadataCenter({
           below a fold and the panel stops being one long scroll. */}
       {/* px-3 matches the pt-3 rhythm: buttons sit 12px off the modal edge,
           12px off the border-r, and 12px under the top rule. */}
-      <nav className="flex w-64 shrink-0 flex-col gap-0.5 border-r px-3 pt-3">
+      {/* gap-1, not gap-0.5: at 125%/150% display scaling a 2px gap is a
+          fractional device-pixel step, so alternating rows rendered on
+          half-pixels — the tiny warn icons visibly smeared off-center on
+          those rows. 4px stays integer at every common scale factor. */}
+      <nav className="flex w-64 shrink-0 flex-col gap-1 border-r px-3 pt-3">
         {NAV.map((n) => (
           <button
             key={n.id}
@@ -1252,9 +1488,19 @@ export function MetadataCenter({
                 </span>
               ) : (
                 <>
+                  {/* Digits have no descenders, so a line-box-centered icon
+                      reads a pixel low — the same lift CircleCheck gets. */}
+                  {/* scale-90: a circle fills its icon box while the triangle
+                      is inset, so at equal sizes the circle reads bigger. */}
+                  {(n.alert ?? 0) > 0 && (
+                    <span className="flex items-center gap-0.5 text-xs tabular-nums text-red-400">
+                      <CircleAlert size={12} className="-translate-y-px scale-90" />
+                      {n.alert}
+                    </span>
+                  )}
                   {(n.warn ?? 0) > 0 && (
                     <span className="flex items-center gap-0.5 text-xs tabular-nums text-amber-300">
-                      <TriangleAlert size={12} />
+                      <TriangleAlert size={12} className="-translate-y-px" />
                       {n.warn}
                     </span>
                   )}
@@ -1268,51 +1514,21 @@ export function MetadataCenter({
             </span>
           </button>
         ))}
+        {/* Progress lives in the match modal, not here — this is just the
+            pointer to it (App closes this center when the modal opens). */}
         {running && (
           <div className="mt-2 border-t pt-2">
-            <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+            <button
+              onClick={() =>
+                window.dispatchEvent(
+                  new CustomEvent("waverunner:open-match", { detail: { libraryId } }),
+                )
+              }
+              className="flex w-full items-center gap-1.5 rounded-md px-1 py-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
+            >
               <Spinner className="size-3" />
-              <span className="min-w-0 truncate">
-                {progress ? `${progress.done + 1}/${progress.total}` : "Matching…"}
-              </span>
-            </div>
-            {progress && (
-              <p className="mt-1 truncate text-[11px] text-muted-foreground">{progress.name}</p>
-            )}
-            {/* Two-step, same as the wizard footer: skipping a long pass
-                should never be a single stray click. */}
-            {confirmSkip ? (
-              <div className="mt-1 flex gap-1">
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  className="h-6 flex-1 px-2 text-xs"
-                  onClick={() => setConfirmSkip(false)}
-                >
-                  Keep going
-                </Button>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="h-6 flex-1 px-2 text-xs"
-                  onClick={() => {
-                    setConfirmSkip(false);
-                    invoke("music_match_skip").catch(() => {});
-                  }}
-                >
-                  Skip
-                </Button>
-              </div>
-            ) : (
-              <Button
-                size="sm"
-                variant="ghost"
-                className="mt-1 h-6 w-full px-2 text-xs"
-                onClick={() => setConfirmSkip(true)}
-              >
-                Skip remaining
-              </Button>
-            )}
+              Matching pass running — open
+            </button>
           </div>
         )}
         {/* Pinned to the bottom, apart from the work sections: History is the
@@ -1347,7 +1563,16 @@ export function MetadataCenter({
           (overflow clips at the padding edge), so rows slide flush beneath
           the border instead of stopping short. The base pt-1 keeps a focused
           input's ring from clipping. */}
-      <div ref={flipContainerRef} className="min-h-0 flex-1 space-y-4 overflow-y-auto pr-4 pt-3">
+      {/* overflow-anchor:none — Chromium's scroll anchoring compensates
+          scrollTop when content above the viewport shrinks, which pins the
+          on-screen cards in place after a card above is resolved. That both
+          reads as a scroll "jump" AND silences the FLIP animation (rect
+          deltas become zero, so nothing slides). With anchoring off, the
+          cards below visibly slide up into the freed space. */}
+      <div
+        ref={flipContainerRef}
+        className="min-h-0 flex-1 space-y-4 overflow-y-auto pr-4 pt-3 pb-4 [overflow-anchor:none]"
+      >
       {/* The library map: guide checklist up top (the grind order that
           actually converges — between stages the PASS does the multiplying),
           then the whole library as state-colored nodes. Fill carries state
@@ -1436,22 +1661,14 @@ export function MetadataCenter({
                   )}
                 </div>
               ))}
-              <div className="flex items-center gap-3 border-t bg-muted/30 px-3 py-2">
-                <p className="min-w-0 flex-1 text-xs text-muted-foreground">
-                  After answering a batch, run a matching pass — it cashes your answers in:
-                  identified artists unlock their albums, matched albums prove their artists.
-                </p>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="shrink-0 gap-1.5"
-                  disabled={running || busy}
-                  onClick={rerunMatching}
-                >
-                  <RefreshCw size={13} />
-                  {running ? "Pass running…" : "Run matching pass"}
-                </Button>
-              </div>
+              {/* Only offered while a pass has something to act on: queued
+                  matches, never-examined albums, or artists it can derive.
+                  (The queue alone isn't the test — artist matches and
+                  accepted cards don't enqueue, yet they're exactly what a
+                  pass cashes in.) Staged changes keep the row visible in its
+                  rescan-first form. */}
+              {/* No pass button here — the queue banner at the top owns it.
+                  (This whole checklist section is due for a redesign.) */}
             </div>
           ) : (
             <p className="text-sm text-muted-foreground">
@@ -1490,7 +1707,7 @@ export function MetadataCenter({
                   <ContextMenuTrigger
                     render={
                       <button
-                        onClick={() => setMatchArtist(a.artist_id)}
+                        onClick={() => !stagedLockedIds.has(a.artist_id) && setMatchArtist(a.artist_id)}
                         title={a.title}
                         className={`flex w-44 shrink-0 items-center gap-1.5 rounded px-1.5 py-0.5 text-left text-xs transition-colors hover:bg-accent/50 ${
                           a.ignored ? "text-muted-foreground" : ""
@@ -1510,12 +1727,26 @@ export function MetadataCenter({
                     <span className="min-w-0 truncate">{a.title}</span>
                   </ContextMenuTrigger>
                   <ContextMenuContent>
-                    <ContextMenuItem onClick={() => setMatchArtist(a.artist_id)}>
-                      Match…
-                    </ContextMenuItem>
-                    <ContextMenuItem onClick={() => setIgnored(a.artist_id, !a.ignored)}>
-                      {a.ignored ? "Un-ignore" : "Ignore"}
-                    </ContextMenuItem>
+                    {stagedLockedIds.has(a.artist_id) ? (
+                      <ContextMenuItem disabled>
+                        Staged for rescan — Undo the staged change to edit
+                      </ContextMenuItem>
+                    ) : (
+                      <>
+                        <ContextMenuItem onClick={() => setMatchArtist(a.artist_id)}>
+                          Match…
+                        </ContextMenuItem>
+                        <ContextMenuItem
+                          onClick={() =>
+                            a.ignored
+                              ? setIgnored(a.artist_id, false)
+                              : setConfirmIgnore({ entityId: a.artist_id, name: a.title })
+                          }
+                        >
+                          {a.ignored ? "Un-ignore" : "Ignore"}
+                        </ContextMenuItem>
+                      </>
+                    )}
                   </ContextMenuContent>
                 </ContextMenu>
                 <div className="flex min-w-0 flex-1 flex-wrap gap-1">
@@ -1524,7 +1755,7 @@ export function MetadataCenter({
                       <ContextMenuTrigger
                         render={
                           <button
-                            onClick={() => setMatchAlbum(al.album_id)}
+                            onClick={() => !stagedLockedIds.has(al.album_id) && setMatchAlbum(al.album_id)}
                             title={al.title}
                             className={`max-w-48 truncate rounded border px-1.5 py-0.5 text-[11px] transition-colors hover:brightness-125 ${
                               al.ignored
@@ -1541,12 +1772,26 @@ export function MetadataCenter({
                         {al.title}
                       </ContextMenuTrigger>
                       <ContextMenuContent>
-                        <ContextMenuItem onClick={() => setMatchAlbum(al.album_id)}>
-                          Match…
-                        </ContextMenuItem>
-                        <ContextMenuItem onClick={() => setIgnored(al.album_id, !al.ignored)}>
-                          {al.ignored ? "Un-ignore" : "Ignore"}
-                        </ContextMenuItem>
+                        {stagedLockedIds.has(al.album_id) ? (
+                          <ContextMenuItem disabled>
+                            Staged for rescan — Undo the staged change to edit
+                          </ContextMenuItem>
+                        ) : (
+                          <>
+                            <ContextMenuItem onClick={() => setMatchAlbum(al.album_id)}>
+                              Match…
+                            </ContextMenuItem>
+                            <ContextMenuItem
+                              onClick={() =>
+                                al.ignored
+                                  ? setIgnored(al.album_id, false)
+                                  : setConfirmIgnore({ entityId: al.album_id, name: al.title })
+                              }
+                            >
+                              {al.ignored ? "Un-ignore" : "Ignore"}
+                            </ContextMenuItem>
+                          </>
+                        )}
                       </ContextMenuContent>
                     </ContextMenu>
                   ))}
@@ -1564,7 +1809,7 @@ export function MetadataCenter({
                       <ContextMenuTrigger
                         render={
                           <button
-                            onClick={() => setMatchAlbum(al.album_id)}
+                            onClick={() => !stagedLockedIds.has(al.album_id) && setMatchAlbum(al.album_id)}
                             title={al.title}
                             className={`max-w-48 truncate rounded border px-1.5 py-0.5 text-[11px] transition-colors hover:brightness-125 ${
                               al.ignored
@@ -1581,12 +1826,26 @@ export function MetadataCenter({
                         {al.title}
                       </ContextMenuTrigger>
                       <ContextMenuContent>
-                        <ContextMenuItem onClick={() => setMatchAlbum(al.album_id)}>
-                          Match…
-                        </ContextMenuItem>
-                        <ContextMenuItem onClick={() => setIgnored(al.album_id, !al.ignored)}>
-                          {al.ignored ? "Un-ignore" : "Ignore"}
-                        </ContextMenuItem>
+                        {stagedLockedIds.has(al.album_id) ? (
+                          <ContextMenuItem disabled>
+                            Staged for rescan — Undo the staged change to edit
+                          </ContextMenuItem>
+                        ) : (
+                          <>
+                            <ContextMenuItem onClick={() => setMatchAlbum(al.album_id)}>
+                              Match…
+                            </ContextMenuItem>
+                            <ContextMenuItem
+                              onClick={() =>
+                                al.ignored
+                                  ? setIgnored(al.album_id, false)
+                                  : setConfirmIgnore({ entityId: al.album_id, name: al.title })
+                              }
+                            >
+                              {al.ignored ? "Un-ignore" : "Ignore"}
+                            </ContextMenuItem>
+                          </>
+                        )}
                       </ContextMenuContent>
                     </ContextMenu>
                   ))}
@@ -1608,7 +1867,7 @@ export function MetadataCenter({
                     <ContextMenuTrigger
                       render={
                         <button
-                          onClick={() => setMatchArtist(a.artist_id)}
+                          onClick={() => !stagedLockedIds.has(a.artist_id) && setMatchArtist(a.artist_id)}
                           title={a.title}
                           className={`flex max-w-48 items-center gap-1.5 rounded border px-1.5 py-0.5 text-[11px] transition-colors hover:brightness-125 ${
                             a.ignored
@@ -1623,12 +1882,26 @@ export function MetadataCenter({
                       <span className="min-w-0 truncate">{a.title}</span>
                     </ContextMenuTrigger>
                     <ContextMenuContent>
-                      <ContextMenuItem onClick={() => setMatchArtist(a.artist_id)}>
-                        Match…
-                      </ContextMenuItem>
-                      <ContextMenuItem onClick={() => setIgnored(a.artist_id, !a.ignored)}>
-                        {a.ignored ? "Un-ignore" : "Ignore"}
-                      </ContextMenuItem>
+                      {stagedLockedIds.has(a.artist_id) ? (
+                        <ContextMenuItem disabled>
+                          Staged for rescan — Undo the staged change to edit
+                        </ContextMenuItem>
+                      ) : (
+                        <>
+                          <ContextMenuItem onClick={() => setMatchArtist(a.artist_id)}>
+                            Match…
+                          </ContextMenuItem>
+                          <ContextMenuItem
+                            onClick={() =>
+                              a.ignored
+                                ? setIgnored(a.artist_id, false)
+                                : setConfirmIgnore({ entityId: a.artist_id, name: a.title })
+                            }
+                          >
+                            {a.ignored ? "Un-ignore" : "Ignore"}
+                          </ContextMenuItem>
+                        </>
+                      )}
                     </ContextMenuContent>
                   </ContextMenu>
                 ))}
@@ -1657,7 +1930,14 @@ export function MetadataCenter({
             />
           </div>
           {counts.unchecked > 0 && !running && (
-            <Button size="sm" variant="outline" className="shrink-0 gap-1.5" onClick={rerunMatching}>
+            <Button
+              size="sm"
+              variant="outline"
+              className="shrink-0 gap-1.5"
+              disabled={pending.length > 0}
+              title={pending.length > 0 ? "Staged changes need a rescan first" : undefined}
+              onClick={rerunMatching}
+            >
               <RefreshCw size={13} />
               Match {counts.unchecked}
             </Button>
@@ -1678,60 +1958,87 @@ export function MetadataCenter({
 
         {albumsUnmatched.length > 0 && (
           <div className="mb-8">
-            <h4 className="mb-1.5 flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-amber-300">
-              <TriangleAlert size={14} />
-              Unidentified ({albumsUnmatched.length})
+            <h4 className="mb-1.5 flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-red-400">
+              <CircleSlash size={14} />
+              Unmatched albums ({albumsUnmatched.length})
             </h4>
-            <div className="overflow-hidden rounded-md border border-amber-500/30">
+            <div className="overflow-hidden rounded-md border border-red-500/30">
               {albumsUnmatched.map((a, i) => (
-                <AlbumRow key={a.album_id} a={a} first={i === 0} onMatch={setMatchAlbum} />
+                <AlbumRow
+                  key={a.album_id}
+                  a={a}
+                  first={i === 0}
+                  onMatch={setMatchAlbum}
+                  onIgnore={(row) => setConfirmIgnore({ entityId: row.album_id, name: row.title })}
+                  onCombine={(row) => {
+                    setPartnerFilter("");
+                    setCombinePartnerFor(row);
+                  }}
+                />
               ))}
             </div>
           </div>
         )}
 
-        {albumsIdentified.length > 0 && (
+        {/* Group-matched albums know WHICH album they are but not which
+            release — one pick in the dialog away from green, so they get
+            their own amber shelf instead of hiding among the finished. */}
+        {albumsReleaseUnknown.length > 0 && (
+          <div className="mb-8">
+            <h4 className="mb-1.5 flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-amber-300">
+              <TriangleAlert size={14} />
+              Unmatched releases ({albumsReleaseUnknown.length})
+            </h4>
+            <p className="mb-1.5 text-xs text-muted-foreground">
+              The album is known, but not which release your files are — until one is picked, the
+              track list can’t be checked.
+            </p>
+            <div className="overflow-hidden rounded-md border border-amber-500/30">
+              {albumsReleaseUnknown.map((a, i) => (
+                <AlbumRow
+                  key={a.album_id}
+                  a={a}
+                  first={i === 0}
+                  onMatch={setMatchAlbum}
+                  onCombine={(row) => {
+                    setPartnerFilter("");
+                    setCombinePartnerFor(row);
+                  }}
+                />
+              ))}
+            </div>
+          </div>
+        )}
+
+        {albumsFullyIdentified.length > 0 && (
           <>
             <h4 className="mb-1.5 flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-emerald-400">
               <CircleCheck size={14} className="-translate-y-px" />
-              Identified ({albumsIdentified.length})
+              Identified ({albumsFullyIdentified.length})
             </h4>
             <div className="overflow-hidden rounded-md border border-emerald-500/30">
-              {albumsIdentified.slice(0, albumLimit).map((a, i) => (
-                <AlbumRow key={a.album_id} a={a} first={i === 0} onMatch={setMatchAlbum} />
+              {albumsFullyIdentified.slice(0, albumLimit).map((a, i) => (
+                <AlbumRow
+                  key={a.album_id}
+                  a={a}
+                  first={i === 0}
+                  onMatch={setMatchAlbum}
+                  onCombine={(row) => {
+                    setPartnerFilter("");
+                    setCombinePartnerFor(row);
+                  }}
+                />
               ))}
-              {albumsIdentified.length > albumLimit && (
+              {albumsFullyIdentified.length > albumLimit && (
                 <button
                   onClick={() => setAlbumLimit((n) => n + 100)}
                   className="w-full border-t px-3 py-1.5 text-xs text-muted-foreground hover:text-foreground"
                 >
-                  Show more of {albumsIdentified.length}
+                  Show more of {albumsFullyIdentified.length}
                 </button>
               )}
             </div>
           </>
-        )}
-        {running && (
-          <div className="mt-2 flex items-center gap-2 text-xs text-muted-foreground">
-            <Spinner className="size-3.5" />
-            <span className="min-w-0 truncate">
-              {progress
-                ? `Matching ${progress.done + 1}/${progress.total} — ${progress.name}${
-                    progress.etaSecs != null && progress.etaSecs >= 60
-                      ? ` · ~${Math.round(progress.etaSecs / 60)} min left`
-                      : ""
-                  }`
-                : "Matching against MusicBrainz…"}
-            </span>
-            <Button
-              size="sm"
-              variant="ghost"
-              className="h-6 shrink-0 px-2 text-xs"
-              onClick={() => invoke("music_match_skip").catch(() => {})}
-            >
-              Skip remaining
-            </Button>
-          </div>
         )}
       </section>
       )}
@@ -1807,15 +2114,15 @@ export function MetadataCenter({
           )}
           {artistsUnmatchedOwners.length > 0 && (
             <div className="mb-8">
-              <h4 className="mb-0.5 flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-amber-300">
-                <TriangleAlert size={14} />
-                Unidentified — have albums or loose tracks ({artistsUnmatchedOwners.length})
+              <h4 className="mb-0.5 flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-red-400">
+                <CircleSlash size={14} />
+                Unmatched artists with albums or loose tracks ({artistsUnmatchedOwners.length})
               </h4>
               <p className="mb-1.5 text-xs text-muted-foreground">
                 Each one identified unlocks their whole discography for automatic matching on the
                 next pass.
               </p>
-              <div className="overflow-hidden rounded-md border border-amber-500/30">
+              <div className="overflow-hidden rounded-md border border-red-500/30">
                 {[...artistsUnmatchedOwners].sort(readyFirst).map((a, i) => {
                   const sug = suggestionByArtist.get(a.artist_id);
                   return (
@@ -1827,6 +2134,8 @@ export function MetadataCenter({
                         onMatch={setMatchArtist}
                         onSplit={setSplitArtist}
                         onLink={(row) => setLinkSource({ name: row.title, artistId: row.artist_id })}
+                        onPersona={(row) => setPersonaSource({ id: row.artist_id, name: row.title })}
+                        onIgnore={(row) => setConfirmIgnore({ entityId: row.artist_id, name: row.title })}
                       />
                       {sug && renderArtistSuggestionBody(sug)}
                     </div>
@@ -1839,7 +2148,7 @@ export function MetadataCenter({
             <div className="mb-8">
               <h4 className="mb-0.5 flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-amber-300">
                 <TriangleAlert size={14} />
-                Unidentified — feature-only ({artistsUnmatchedFeatures.length})
+                Unmatched artists with only features ({artistsUnmatchedFeatures.length})
               </h4>
               <p className="mb-1.5 text-xs text-muted-foreground">
                 Credited on tracks or albums but own nothing here — usually resolved automatically
@@ -1857,6 +2166,8 @@ export function MetadataCenter({
                         onMatch={setMatchArtist}
                         onSplit={setSplitArtist}
                         onLink={(row) => setLinkSource({ name: row.title, artistId: row.artist_id })}
+                        onPersona={(row) => setPersonaSource({ id: row.artist_id, name: row.title })}
+                        onIgnore={(row) => setConfirmIgnore({ entityId: row.artist_id, name: row.title })}
                       />
                       {sug && renderArtistSuggestionBody(sug)}
                     </div>
@@ -1874,7 +2185,7 @@ export function MetadataCenter({
               </h4>
               <div className="overflow-hidden rounded-md border border-emerald-500/30">
                 {artistsIdentified.slice(0, artistLimit).map((a, i) => (
-                  <ArtistRow key={a.artist_id} a={a} first={i === 0} onMatch={setMatchArtist} />
+                  <ArtistRow key={a.artist_id} a={a} first={i === 0} onMatch={setMatchArtist} onPersona={(row) => setPersonaSource({ id: row.artist_id, name: row.title })} />
                 ))}
                 {artistsIdentified.length > artistLimit && (
                   <button
@@ -1940,7 +2251,7 @@ export function MetadataCenter({
                     }
                   >
                     {busyKey === `link:${u.name}` && <Spinner className="size-3" />}
-                    <GitMerge size={12} />
+                    <Equal size={12} />
                     Is “{u.near_miss_title}”
                   </Button>
                 )}
@@ -1951,8 +2262,8 @@ export function MetadataCenter({
                   disabled={busy}
                   onClick={() => setLinkSource({ name: u.name, artistId: null })}
                 >
-                  <GitMerge size={12} />
-                  Join
+                  <Equal size={12} />
+                  Alias
                 </Button>
               </div>
             ))}
@@ -2201,6 +2512,18 @@ export function MetadataCenter({
             }}
           />
         )}
+      {personaSource && (
+          <PersonaDialog
+            libraryId={libraryId}
+            personaId={personaSource.id}
+            personaName={personaSource.name}
+            onOpenChange={(o) => !o && setPersonaSource(null)}
+            onDone={() => {
+              refresh();
+              onChanged?.();
+            }}
+          />
+        )}
       {linkSource && (
           <LinkArtistDialog
             libraryId={libraryId}
@@ -2237,6 +2560,128 @@ export function MetadataCenter({
             }}
           />
         )}
+      {/* Combine, step 1: pick the album to fold together with. Step 2 is the
+          shared configure dialog (keeper + mode), same as the grid's flow. */}
+      <Dialog
+        open={combinePartnerFor !== null}
+        onOpenChange={(o) => !o && setCombinePartnerFor(null)}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Combine “{combinePartnerFor?.title}” with…</DialogTitle>
+          </DialogHeader>
+          <Input
+            autoFocus
+            value={partnerFilter}
+            onChange={(e) => setPartnerFilter(e.target.value)}
+            className="h-8 text-sm"
+            placeholder="Filter albums…"
+          />
+          <div className="max-h-72 overflow-y-auto rounded-md border">
+            {albums
+              .filter(
+                (a) =>
+                  a.album_id !== combinePartnerFor?.album_id &&
+                  !stagedLockedIds.has(a.album_id) &&
+                  (partnerFilter.trim() === "" ||
+                    `${a.title} ${a.artist_title ?? ""}`
+                      .toLowerCase()
+                      .includes(partnerFilter.trim().toLowerCase())),
+              )
+              .slice(0, 50)
+              .map((a, i) => (
+                <button
+                  key={a.album_id}
+                  className={`flex w-full items-baseline gap-2 px-3 py-1.5 text-left text-sm hover:bg-accent/50 ${
+                    i > 0 ? "border-t" : ""
+                  }`}
+                  onClick={() => {
+                    const from = combinePartnerFor;
+                    if (!from) return;
+                    setCombinePartnerFor(null);
+                    setCombineSelect({
+                      libraryId,
+                      picked: [
+                        { id: from.album_id, title: from.title },
+                        { id: a.album_id, title: a.title },
+                      ],
+                      keeperId: from.album_id,
+                      mode: "merge",
+                      busy: false,
+                      configuring: true,
+                    });
+                  }}
+                >
+                  <span className="min-w-0 truncate">{a.title}</span>
+                  {a.artist_title && (
+                    <span className="min-w-0 shrink-0 truncate text-xs text-muted-foreground">
+                      {a.artist_title}
+                    </span>
+                  )}
+                </button>
+              ))}
+          </div>
+        </DialogContent>
+      </Dialog>
+      {combineSelect && (
+        <CombineSelectedDialog
+          selection={combineSelect}
+          onKeeper={(id) => setCombineSelect((s) => (s ? { ...s, keeperId: id } : s))}
+          onMode={(m) => setCombineSelect((s) => (s ? { ...s, mode: m } : s))}
+          onOpenChange={(o) => {
+            if (!o) setCombineSelect(null);
+          }}
+          onConfirm={async (targetReleaseFolder) => {
+            const sel = combineSelect;
+            if (!sel || sel.keeperId == null) return;
+            setCombineSelect((s) => (s ? { ...s, busy: true } : s));
+            try {
+              await invoke("combine_albums_multi", {
+                libraryId,
+                sourceIds: sel.picked.filter((p) => p.id !== sel.keeperId).map((p) => p.id),
+                targetId: sel.keeperId,
+                mode: sel.mode,
+                targetReleaseFolder,
+              });
+              setCombineSelect(null);
+              // Staged — the banner picks it up on refresh.
+              await refresh();
+              onChanged?.();
+            } catch (e) {
+              toast.error(String(e));
+              setCombineSelect((s) => (s ? { ...s, busy: false } : s));
+            }
+          }}
+        />
+      )}
+      {/* Ignore confirmation — the one row action that would otherwise fire
+          on a bare click. Undoable from History regardless. */}
+      <Dialog open={confirmIgnore !== null} onOpenChange={(o) => !o && setConfirmIgnore(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Ignore “{confirmIgnore?.name}”?</DialogTitle>
+          </DialogHeader>
+          <p className="text-xs text-muted-foreground">
+            It leaves matching and every count, and shows gray on the library map. You can
+            un-ignore it there any time, or undo from History.
+          </p>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setConfirmIgnore(null)}>
+              Cancel
+            </Button>
+            <Button
+              disabled={busy}
+              onClick={() => {
+                const c = confirmIgnore;
+                setConfirmIgnore(null);
+                if (c) void setIgnored(c.entityId, true);
+              }}
+            >
+              Ignore
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       </div>
     </div>
     </div>

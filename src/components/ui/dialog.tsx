@@ -22,8 +22,16 @@ function DialogOverlay({
   return (
     <DialogPrimitive.Backdrop
       data-slot="dialog-overlay"
+      // pointer-events-auto: when dialogs STACK, every open popup stays
+      // interactive, so without this a click "outside" the top dialog fell
+      // through onto the dialog underneath and pressed its buttons. The
+      // backdrop swallowing the click means outside-press can only ever
+      // dismiss the top dialog — never operate what's behind it.
+      // POTENTIALLY TEMPORARY: stacked modals are currently ad hoc (dialogs
+      // just pile up); this patch holds until a real modal stacking system
+      // replaces it.
       className={cn(
-        "fixed inset-0 isolate z-50 bg-black/10 duration-100 supports-backdrop-filter:backdrop-blur-xs data-open:animate-in data-open:fade-in-0 data-closed:animate-out data-closed:fade-out-0",
+        "pointer-events-auto fixed inset-0 isolate z-50 bg-black/10 duration-100 supports-backdrop-filter:backdrop-blur-xs data-open:animate-in data-open:fade-in-0 data-closed:animate-out data-closed:fade-out-0",
         className
       )}
       {...props}

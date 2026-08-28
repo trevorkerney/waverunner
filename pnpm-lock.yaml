@@ -50,6 +50,9 @@ importers:
       clsx:
         specifier: ^2.1.1
         version: 2.1.1
+      country-flag-emoji-polyfill:
+        specifier: ^0.1.10
+        version: 0.1.10
       embla-carousel-react:
         specifier: ^8.6.0
         version: 8.6.0(react@19.2.4)
@@ -1122,6 +1125,9 @@ packages:
     peerDependenciesMeta:
       typescript:
         optional: true
+
+  country-flag-emoji-polyfill@0.1.10:
+    resolution: {integrity: sha512-5O50p2mq/d8+4AfHz3monRQaBA4TIQ0XcKqJUhCYR6SMsLqlO4m8f87og6R1D68Z1sNXGkjLkcEccuzC6T9i5g==}
 
   cross-spawn@7.0.6:
     resolution: {integrity: sha512-uV2QOWP2nWzsy2aMp8aRibhi9dlzF5Hgh5SHaB9OiTGEyDTiJJyx0uy51QXdyWbtAHNua4XJzUKca3OzKUd3vA==}
@@ -3169,6 +3175,8 @@ snapshots:
       parse-json: 5.2.0
     optionalDependencies:
       typescript: 5.8.3
+
+  country-flag-emoji-polyfill@0.1.10: {}
 
   cross-spawn@7.0.6:
     dependencies:

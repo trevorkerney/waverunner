@@ -1,3 +1,4 @@
+mod content_hash;
 mod commands;
 mod db;
 pub mod interactive;
@@ -270,6 +271,10 @@ pub fn run() {
             music_mb::mb_get_review,
             music_mb::mb_search_releases,
             music_mb::mb_group_releases,
+            music_mb::mb_artist_release_groups,
+            music_mb::mb_credit_check,
+            music_mb::mb_release_group_of,
+            music_edit::unstage_pending_change,
             music_mb::mb_apply_album_match,
             music_mb::mb_undo_batch,
             music_mb::mb_recheck_album,
@@ -279,11 +284,17 @@ pub fn run() {
             music_edit::search_credit_link_choices,
             music_edit::link_credit_name,
             music_edit::get_pending_changes,
+            music_mb::get_pending_pass,
+            music_mb::get_artist_personas,
+            music_mb::set_artist_persona,
+            music_mb::unset_artist_persona,
             music::get_unlinked_credits,
             music_mb::mb_status,
+            music_mb::mb_artist_unmatched_albums,
             music_mb::mb_search_entity,
             music_mb::mb_apply_entity_match,
             music_mb::mb_unmatch_entity,
+            music_mb::mb_unmatch_release,
             music_mb::mb_resolve_suggestion,
             music_mb::mb_undo_change,
             music_player::music_play_track,

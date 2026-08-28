@@ -137,6 +137,7 @@ import { ArtistDetailPage } from "@/components/music/ArtistDetailPage";
 import { PlaylistTrackList } from "@/components/music/PlaylistTrackList";
 import { HomePage } from "@/components/HomePage";
 import { CombineSelectedDialog, type AlbumSelection } from "@/components/music/CombineSelectedDialog";
+import { PendingWorkStrip, notifyPendingWorkChanged } from "@/components/music/PendingWork";
 import { EditCharacterNameDialog, type CharacterEditTarget } from "@/components/EditCharacterNameDialog";
 import { TmdbPersonSearchDialog } from "@/components/TmdbPersonSearchDialog";
 import { ArtistsGrid } from "@/components/music/ArtistsGrid";
@@ -413,6 +414,7 @@ export function MainContent({
       // STAGED: the directive applies on the next rescan, batched with any
       // other staged changes (the metadata center's pending banner offers it).
       toast("Combine staged — it applies on the next rescan");
+      notifyPendingWorkChanged();
     } catch (err) {
       toast.error(String(err));
       setAlbumSelect((s) => (s ? { ...s, busy: false } : s));
@@ -1294,6 +1296,13 @@ export function MainContent({
         <>
           {breadcrumbBar}
 
+          {/* Deferred-work strip: staged rescan changes and matches awaiting
+              a pass, with their actions — visible on every page of a music
+              library so queued work is never a surprise. */}
+          {selectedLibrary.format === "music" && (
+            <PendingWorkStrip libraryId={selectedLibrary.id} />
+          )}
+
           {/* Person-detail header */}
           {activeView?.kind === "person-detail" && !selectedEntry && (
             <PersonDetailHeader
@@ -1521,6 +1530,7 @@ export function MainContent({
         : selectedEntry.entry_type === "artist"
           ? <ArtistDetailPage
               entryId={selectedEntry.id}
+              libraryId={selectedLibrary!.id}
               getCoverUrl={getCoverUrl}
               getFullCoverUrl={getFullCoverUrl}
               onOpenAlbum={(album: MusicAlbumCard) => onNavigate({

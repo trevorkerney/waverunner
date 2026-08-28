@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { notifyPendingWorkChanged } from "./PendingWork";
 import { toast } from "sonner";
 import { Play, Disc3, Pencil, ListPlus, ListStart, ListEnd, Scissors, Undo2, ListChecks } from "lucide-react";
 import { Spinner } from "../ui/spinner";
@@ -135,7 +136,13 @@ export function AlbumDetailPage({
   // silently refetch so the credit line, title, and covers update in place.
   // Scrobbles too: a play count ticking over shouldn't need a manual reload.
   useEffect(() => {
-    const onRescanned = () => setReloadKey((k) => k + 1);
+    const onRescanned = () => {
+      setReloadKey((k) => k + 1);
+      // The MB chip fetches its own status and keys off mbKey — without this
+      // it keeps showing the state from before a metadata-center match/undo
+      // until you navigate away and back.
+      setMbKey((k) => k + 1);
+    };
     window.addEventListener("waverunner:library-rescanned", onRescanned);
     window.addEventListener("waverunner:track-scrobbled", onRescanned);
     return () => {
@@ -377,6 +384,7 @@ export function AlbumDetailPage({
                         // Staged — batched behind the next rescan with any
                         // other pending directives.
                         toast("Separation staged — it applies on the next rescan");
+                        notifyPendingWorkChanged();
                       } catch (e) {
                         toast.error(String(e));
                       }
@@ -405,6 +413,7 @@ export function AlbumDetailPage({
                       // Staged — the album returns as its own on the next
                       // rescan, batched with any other pending directives.
                       toast("Un-combine staged — it applies on the next rescan");
+                      notifyPendingWorkChanged();
                     } catch (e) {
                       toast.error(String(e));
                     }

@@ -847,6 +847,7 @@ pub async fn create_library(
                 .bind(&id)
                 .execute(&state.app_db)
                 .await;
+            let _ = purge_library_leftovers(&state.app_db, &id).await;
             Err(e)
         }
     }
@@ -894,6 +895,69 @@ pub(crate) fn emit_scan_state(app: &tauri::AppHandle, library_id: &str, name: &s
     );
 }
 
+/// Sweep what a library deletion's FK cascade cannot reach. Most domain
+/// tables hang off media_entry with ON DELETE CASCADE, but a handful hold
+/// loose entity ids with no FK at all (artist_persona, mb_derive_exhausted,
+/// mb_suppression, field_override), the app-wide `settings` table embeds
+/// library ids inside key strings, and mb_artist_lookup is a global cache —
+/// all of which used to survive deletion as invisible residue. Runs AFTER the
+/// library row is deleted; the sweeps are orphan-based rather than
+/// library-scoped (these tables don't know their library), which also mops up
+/// leaks from any earlier escape route.
+pub async fn purge_library_leftovers(
+    pool: &sqlx::SqlitePool,
+    library_id: &str,
+) -> Result<(), String> {
+    // Per-library settings keys: "…_sort_mode:<lib>" and "people_mode:<lib>:…".
+    sqlx::query("DELETE FROM settings WHERE key LIKE '%:' || ?1 OR key LIKE '%:' || ?1 || ':%'")
+        .bind(library_id)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    // Belt-and-braces for the entity tables themselves: their media_entry FK
+    // should cascade, but rows have historically escaped (migration windows
+    // run with foreign_keys OFF). Deleting them here re-triggers the cascades
+    // into their own side tables (aliases, releases, credits, …).
+    for t in ["artist", "album", "track"] {
+        sqlx::query(&format!(
+            "DELETE FROM {t} WHERE id NOT IN (SELECT id FROM media_entry)"
+        ))
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    sqlx::query(
+        "DELETE FROM artist_persona
+         WHERE persona_id NOT IN (SELECT id FROM media_entry)
+            OR parent_id NOT IN (SELECT id FROM media_entry)",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    sqlx::query("DELETE FROM mb_derive_exhausted WHERE entity_id NOT IN (SELECT id FROM media_entry)")
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    sqlx::query("DELETE FROM mb_suppression WHERE target_id NOT IN (SELECT id FROM media_entry)")
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    sqlx::query("DELETE FROM field_override WHERE entity_id NOT IN (SELECT id FROM media_entry)")
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    // The MB name-lookup cache exists to protect the rate limit across music
+    // libraries — it only becomes residue when no music library remains.
+    sqlx::query(
+        "DELETE FROM mb_artist_lookup
+         WHERE NOT EXISTS (SELECT 1 FROM library WHERE format = 'music')",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn cancel_library_creation(
     state: tauri::State<'_, AppState>,
@@ -930,6 +994,7 @@ pub async fn cleanup_incomplete_libraries(
             .bind(&id)
             .execute(app_db)
             .await;
+        let _ = purge_library_leftovers(app_db, &id).await;
     }
     Ok(())
 }
@@ -1104,6 +1169,8 @@ pub async fn delete_library(
         .execute(&state.app_db)
         .await
         .map_err(|e| e.to_string())?;
+
+    purge_library_leftovers(&state.app_db, &library_id).await?;
 
     Ok(())
 }
@@ -1456,22 +1523,21 @@ pub async fn get_entries(
                     "AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = al.id)"
                 };
                 let query_str = format!(
-                    "SELECT al.id, al.title, al.release_date, al.folder_path, al.selected_cover, me.parent_id, ar.title \
+                    "SELECT al.id, al.title, al.release_date, al.folder_path, al.selected_cover \
                      FROM album al \
                      JOIN media_entry me ON me.id = al.id \
-                     LEFT JOIN artist ar ON ar.id = me.parent_id \
                      WHERE me.library_id = ? \
                        AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = al.id) \
                        {marker} {order_clause}"
                 );
-                let rows: Vec<(i64, String, Option<String>, String, Option<String>, Option<i64>, Option<String>)> =
+                let rows: Vec<(i64, String, Option<String>, String, Option<String>)> =
                     sqlx::query_as(&query_str)
                         .bind(&library_id)
                         .fetch_all(&state.app_db)
                         .await
                         .map_err(|e| e.to_string())?;
-                // Multi-artist albums subtitle with the full credit instead of
-                // just the parent ("JAY-Z · Kanye West").
+                // The subtitle is the full artist credit ("JAY-Z · Kanye
+                // West") — the credit rows are the album's only artist record.
                 let credit_rows: Vec<(i64, String)> = sqlx::query_as(
                     "SELECT ac.album_id, ac.name FROM album_artist_credit ac                      JOIN media_entry me ON me.id = ac.album_id                      WHERE me.library_id = ? ORDER BY ac.album_id, ac.position",
                 )
@@ -1486,11 +1552,11 @@ pub async fn get_entries(
                 }
                 let entries: Vec<MediaEntry> = rows
                     .into_iter()
-                    .map(|(id, title, release_date, folder_path, selected_cover, parent_id, artist_title)| {
+                    .map(|(id, title, release_date, folder_path, selected_cover)| {
                         let covers = covers_map.remove(&folder_path).unwrap_or_default();
                         let credit_display = credits_by_album
                             .remove(&id)
-                            .filter(|names| names.len() >= 2)
+                            .filter(|names| !names.is_empty())
                             .map(|names| names.join(" · "));
                         MediaEntry {
                             id,
@@ -1498,13 +1564,13 @@ pub async fn get_entries(
                             year: release_date.as_ref().map(|d| d.chars().take(4).collect()),
                             end_year: None,
                             folder_path,
-                            parent_id,
+                            parent_id: None,
                             entry_type: "album".to_string(),
                             covers,
                             selected_cover,
                             child_count: 0,
                             season_display: None,
-                            collection_display: credit_display.or(artist_title),
+                            collection_display: credit_display,
                             role_display: None,
                             tmdb_id: None,
                             link_id: None,
@@ -1558,15 +1624,18 @@ pub async fn get_entries(
             .filter(|v| v == "credits" || v == "loved")
             .unwrap_or_else(|| "alpha".to_string());
 
-            // Artists whose every child album is sound-marked hide from the
-            // grid (a "Rain Sounds" artist is a folder artifact, not an
-            // artist); childless (feature-only) artists stay.
+            // Artists whose only presence is sound-marked containers hide
+            // from the grid (a "Rain Sounds" artist is a folder artifact, not
+            // an artist); credited artists and childless (feature-only)
+            // artists stay. An artist's remaining children are loose
+            // containers — album membership is the credit rows.
             let query_str = "SELECT mef.id, mef.title, mef.folder_path, mef.selected_cover \
                  FROM media_entry_full mef \
                  WHERE mef.library_id = ? AND mef.parent_id IS NULL AND mef.entry_type = 'artist' \
                    AND (NOT EXISTS (SELECT 1 FROM media_entry ch WHERE ch.parent_id = mef.id) \
                         OR EXISTS (SELECT 1 FROM media_entry ch WHERE ch.parent_id = mef.id \
-                                   AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = ch.id))) \
+                                   AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = ch.id)) \
+                        OR EXISTS (SELECT 1 FROM album_artist_credit ac WHERE ac.artist_id = mef.id)) \
                  ORDER BY mef.sort_title COLLATE NOCASE ASC"
                 .to_string();
 
@@ -1578,14 +1647,18 @@ pub async fn get_entries(
                     .map_err(|e| e.to_string())?;
 
             // Work counts per artist, split by release type, for the card
-            // subtitle ("5 albums · 2 EPs · 1 single").
+            // subtitle ("5 albums · 2 EPs · 1 single") — one credit-based
+            // query: every credited artist counts the album, joint or solo.
             let type_rows: Vec<(i64, String, i64)> = sqlx::query_as(
-                "SELECT me.parent_id, al.album_type, COUNT(*) \
-                 FROM album al JOIN media_entry me ON me.id = al.id \
-                 WHERE me.library_id = ? AND me.parent_id IS NOT NULL \
+                "SELECT COALESCE(p.parent_id, ac.artist_id) AS owner, al.album_type, COUNT(DISTINCT al.id) \
+                 FROM album_artist_credit ac \
+                 JOIN album al ON al.id = ac.album_id \
+                 JOIN media_entry me ON me.id = al.id \
+                 LEFT JOIN artist_persona p ON p.persona_id = ac.artist_id \
+                 WHERE me.library_id = ? AND ac.artist_id IS NOT NULL \
                    AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = al.id) \
                    AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = al.id) \
-                 GROUP BY me.parent_id, al.album_type",
+                 GROUP BY owner, al.album_type",
             )
             .bind(&library_id)
             .fetch_all(&state.app_db)
@@ -1595,31 +1668,6 @@ pub async fn get_entries(
                 std::collections::HashMap::new();
             for (artist_id, album_type, n) in type_rows {
                 counts_by_artist.entry(artist_id).or_default().push((album_type, n));
-            }
-            // Co-owned albums (album-level credit, parent is another member)
-            // count toward the member's own release totals too.
-            let credit_count_rows: Vec<(i64, String, i64)> = sqlx::query_as(
-                "SELECT an.artist_id, al.album_type, COUNT(DISTINCT al.id) \
-                 FROM album_artist_credit ac \
-                 JOIN album al ON al.id = ac.album_id \
-                 JOIN media_entry me ON me.id = al.id \
-                 JOIN artist_names an ON LOWER(an.name) = LOWER(ac.name) \
-                 JOIN media_entry ame ON ame.id = an.artist_id AND ame.library_id = me.library_id \
-                 WHERE me.library_id = ? AND (me.parent_id IS NULL OR me.parent_id != an.artist_id) \
-                   AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = al.id) \
-                   AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = al.id) \
-                 GROUP BY an.artist_id, al.album_type",
-            )
-            .bind(&library_id)
-            .fetch_all(&state.app_db)
-            .await
-            .map_err(|e| e.to_string())?;
-            for (artist_id, album_type, n) in credit_count_rows {
-                let entry = counts_by_artist.entry(artist_id).or_default();
-                match entry.iter_mut().find(|(ty, _)| *ty == album_type) {
-                    Some((_, existing)) => *existing += n,
-                    None => entry.push((album_type, n)),
-                }
             }
             // Feature credits on other artists' albums ("appears on N") — the
             // whole subtitle for feature-only artists.
@@ -1631,10 +1679,12 @@ pub async fn get_entries(
                  JOIN track_credit tc ON LOWER(tc.name) = LOWER(an.name) \
                  JOIN media_entry tme ON tme.id = tc.track_id AND tme.library_id = ame.library_id \
                  JOIN media_entry alme ON alme.id = tme.parent_id \
-                 WHERE ame.library_id = ? AND (alme.parent_id IS NULL OR alme.parent_id != a.id) \
+                 WHERE ame.library_id = ? \
                    AND NOT EXISTS (SELECT 1 FROM album_artist_credit ac2 \
                                    WHERE ac2.album_id = alme.id \
-                                     AND LOWER(ac2.name) IN (SELECT LOWER(name) FROM artist_names WHERE artist_id = a.id)) \
+                                     AND (ac2.artist_id = a.id \
+                                          OR ac2.artist_id IN (SELECT persona_id FROM artist_persona WHERE parent_id = a.id) \
+                                          OR LOWER(ac2.name) IN (SELECT LOWER(name) FROM artist_names WHERE artist_id = a.id))) \
                    AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = alme.id) \
                    AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = alme.id) \
                  GROUP BY a.id",
@@ -1975,7 +2025,8 @@ pub async fn search_entries(
                      WHERE mef.library_id = ? AND mef.entry_type = 'artist' AND mef.title LIKE ? \
                        AND (NOT EXISTS (SELECT 1 FROM media_entry ch WHERE ch.parent_id = mef.id) \
                             OR EXISTS (SELECT 1 FROM media_entry ch WHERE ch.parent_id = mef.id \
-                                       AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = ch.id))) \
+                                       AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = ch.id)) \
+                            OR EXISTS (SELECT 1 FROM album_artist_credit ac WHERE ac.artist_id = mef.id)) \
                      ORDER BY mef.sort_title COLLATE NOCASE ASC",
                 )
                 .bind(&library_id)
@@ -1983,12 +2034,11 @@ pub async fn search_entries(
                 .fetch_all(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
-            let album_rows: Vec<(i64, String, Option<String>, String, Option<String>, Option<i64>, Option<String>)> =
+            let album_rows: Vec<(i64, String, Option<String>, String, Option<String>)> =
                 sqlx::query_as(
-                    "SELECT al.id, al.title, al.release_date, al.folder_path, al.selected_cover, me.parent_id, ar.title \
+                    "SELECT al.id, al.title, al.release_date, al.folder_path, al.selected_cover \
                      FROM album al \
                      JOIN media_entry me ON me.id = al.id \
-                     LEFT JOIN artist ar ON ar.id = me.parent_id \
                      WHERE me.library_id = ? AND al.title LIKE ? \
                        AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = al.id) \
                        AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = al.id) \
@@ -1999,6 +2049,23 @@ pub async fn search_entries(
                 .fetch_all(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
+            // Subtitle = the full artist credit, gathered per matched album.
+            let mut search_credits: std::collections::HashMap<i64, Vec<String>> =
+                std::collections::HashMap::new();
+            if !album_rows.is_empty() {
+                let credit_rows: Vec<(i64, String)> = sqlx::query_as(
+                    "SELECT ac.album_id, ac.name FROM album_artist_credit ac \
+                     JOIN media_entry me ON me.id = ac.album_id \
+                     WHERE me.library_id = ? ORDER BY ac.album_id, ac.position",
+                )
+                .bind(&library_id)
+                .fetch_all(&state.app_db)
+                .await
+                .map_err(|e| e.to_string())?;
+                for (aid, name) in credit_rows {
+                    search_credits.entry(aid).or_default().push(name);
+                }
+            }
 
             let mut results: Vec<MediaEntry> = artist_rows
                 .into_iter()
@@ -2013,15 +2080,19 @@ pub async fn search_entries(
                 })
                 .collect();
             results.extend(album_rows.into_iter().map(
-                    |(id, title, release_date, folder_path, selected_cover, parent_id, artist_title)| {
+                    |(id, title, release_date, folder_path, selected_cover)| {
                         let covers = covers_map.remove(&folder_path).unwrap_or_default();
+                        let artist_title = search_credits
+                            .remove(&id)
+                            .filter(|names| !names.is_empty())
+                            .map(|names| names.join(" · "));
                         MediaEntry {
                             id,
                             title,
                             year: release_date.as_ref().map(|d| d.chars().take(4).collect()),
                             end_year: None,
                             folder_path,
-                            parent_id,
+                            parent_id: None,
                             entry_type: "album".to_string(),
                             covers,
                             selected_cover,
@@ -3370,12 +3441,11 @@ pub async fn get_entries_for_genre(
     if format == "music" {
         // Albums carrying the genre — same card shape the Albums grid uses
         // (artist subtitle, square art, local date re-sort support).
-        let rows: Vec<(i64, String, Option<String>, String, Option<String>, Option<i64>, Option<String>)> =
+        let rows: Vec<(i64, String, Option<String>, String, Option<String>)> =
             sqlx::query_as(
-                "SELECT al.id, al.title, al.release_date, al.folder_path, al.selected_cover, me.parent_id, ar.title \
+                "SELECT al.id, al.title, al.release_date, al.folder_path, al.selected_cover \
                  FROM album al \
                  JOIN media_entry me ON me.id = al.id \
-                 LEFT JOIN artist ar ON ar.id = me.parent_id \
                  JOIN album_genre ag ON ag.album_id = al.id \
                  JOIN genre g ON g.id = ag.genre_id \
                  WHERE me.library_id = ? AND g.name = ? \
@@ -3388,17 +3458,36 @@ pub async fn get_entries_for_genre(
             .fetch_all(&state.app_db)
             .await
             .map_err(|e| e.to_string())?;
+        // Artist-credit subtitles, same as the Albums grid.
+        let credit_rows: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT ac.album_id, ac.name FROM album_artist_credit ac \
+             JOIN media_entry me ON me.id = ac.album_id \
+             WHERE me.library_id = ? ORDER BY ac.album_id, ac.position",
+        )
+        .bind(&library_id)
+        .fetch_all(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+        let mut credits_by_album: std::collections::HashMap<i64, Vec<String>> =
+            std::collections::HashMap::new();
+        for (aid, name) in credit_rows {
+            credits_by_album.entry(aid).or_default().push(name);
+        }
         return Ok(rows
             .into_iter()
-            .map(|(id, title, release_date, folder_path, selected_cover, parent_id, artist_title)| {
+            .map(|(id, title, release_date, folder_path, selected_cover)| {
                 let covers = covers_map.remove(&folder_path).unwrap_or_default();
+                let artist_title = credits_by_album
+                    .remove(&id)
+                    .filter(|names| !names.is_empty())
+                    .map(|names| names.join(" · "));
                 MediaEntry {
                     id,
                     title,
                     year: release_date.as_ref().map(|d| d.chars().take(4).collect()),
                     end_year: None,
                     folder_path,
-                    parent_id,
+                    parent_id: None,
                     entry_type: "album".to_string(),
                     covers,
                     selected_cover,
@@ -5845,12 +5934,12 @@ pub async fn get_playlist_contents(
                 mef.sort_title, \
                 {SEASON_DISPLAY_EXPR} as season_display, \
                 {sort_date_expr} as sort_date, \
-                CASE WHEN mef.entry_type = 'track' THEN COALESCE(ptm.artist_name, par.title) END as track_artist \
+                CASE WHEN mef.entry_type = 'track' THEN COALESCE(ptm.artist_name, \
+                     (SELECT ac0.name FROM album_artist_credit ac0 \
+                      WHERE ac0.album_id = pal.id ORDER BY ac0.position LIMIT 1)) END as track_artist \
          FROM media_link ml \
          JOIN media_entry_full mef ON mef.id = ml.target_entry_id \
          LEFT JOIN album pal ON pal.id = mef.parent_id AND mef.entry_type = 'track' \
-         LEFT JOIN media_entry palme ON palme.id = pal.id \
-         LEFT JOIN artist par ON par.id = palme.parent_id \
          LEFT JOIN track_meta ptm ON ptm.track_id = mef.id \
          WHERE (ml.parent_playlist_id IS ? AND ml.parent_collection_id IS ?)"
     );
@@ -7467,6 +7556,98 @@ pub async fn rescan_library(
     rescan_result
 }
 
+/// Compute or refresh content fingerprints for every movie, show and episode
+/// in a video library, behind the (size, mtime) gate — a file whose stamp is
+/// unchanged is never re-read, so this costs nothing on a settled library and
+/// pays exactly once as a backfill. These fingerprints are what let a LATER
+/// rescan recognise a moved or renamed folder/file as the same item instead
+/// of deleting it and losing its match, history and covers.
+async fn refresh_video_fingerprints(
+    app: &tauri::AppHandle,
+    pool: &sqlx::SqlitePool,
+    library_id: &str,
+    bases: &[PathBuf],
+) -> Result<(), String> {
+    let resolve = |rel: &str| -> Option<PathBuf> {
+        bases
+            .iter()
+            .map(|b| b.join(rel))
+            .find(|p| p.exists())
+    };
+
+    // Movies and shows fingerprint a REPRESENTATIVE file inside their folder
+    // (largest at top level / first episode respectively); episodes are their
+    // own file.
+    for (table, recursive) in [("movie", false), ("show", true)] {
+        let rows: Vec<(i64, String, Option<String>, Option<i64>, Option<i64>)> =
+            sqlx::query_as(&format!(
+                "SELECT e.id, e.folder_path, e.content_hash, e.content_size, e.content_mtime
+                 FROM {table} e JOIN media_entry me ON me.id = e.id
+                 WHERE me.library_id = ?"
+            ))
+            .bind(library_id)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        for (id, rel, hash, size, mtime) in rows {
+            let Some(dir) = resolve(&rel) else { continue };
+            let Some(file) = representative_video(&dir, recursive) else { continue };
+            let stored_hash = hash.clone();
+            let Some((h, s, m)) = video_fingerprint(&file, Some((hash, size, mtime))) else {
+                continue;
+            };
+            if stored_hash.as_deref() == Some(h.as_str()) && size == Some(s) && mtime == Some(m) {
+                continue; // gate hit — nothing read, nothing to write
+            }
+            emit_scan_progress(app, library_id, &rel);
+            sqlx::query(&format!(
+                "UPDATE {table} SET content_hash = ?, content_size = ?, content_mtime = ? WHERE id = ?"
+            ))
+            .bind(&h)
+            .bind(s)
+            .bind(m)
+            .bind(id)
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        }
+    }
+
+    let eps: Vec<(i64, String, Option<String>, Option<i64>, Option<i64>)> = sqlx::query_as(
+        "SELECT ep.id, ep.file_path, ep.content_hash, ep.content_size, ep.content_mtime
+         FROM episode ep
+         JOIN season s ON s.id = ep.season_id
+         JOIN media_entry me ON me.id = s.show_id
+         WHERE me.library_id = ?",
+    )
+    .bind(library_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    for (id, rel, hash, size, mtime) in eps {
+        let Some(file) = resolve(&rel) else { continue };
+        let stored_hash = hash.clone();
+        let Some((h, s, m)) = video_fingerprint(&file, Some((hash, size, mtime))) else {
+            continue;
+        };
+        if stored_hash.as_deref() == Some(h.as_str()) && size == Some(s) && mtime == Some(m) {
+            continue;
+        }
+        emit_scan_progress(app, library_id, &rel);
+        sqlx::query(
+            "UPDATE episode SET content_hash = ?, content_size = ?, content_mtime = ? WHERE id = ?",
+        )
+        .bind(&h)
+        .bind(s)
+        .bind(m)
+        .bind(id)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 async fn rescan_video_library(
     app: &tauri::AppHandle,
     pool: &sqlx::SqlitePool,
@@ -7520,7 +7701,7 @@ async fn rescan_video_library(
     // Delete entries whose folders vanished from disk, OR whose folder's tag no longer matches
     // their type (a movie now under a show-tagged folder, or vice versa). A reclassification is a
     // delete here + a re-add as the correct kind below.
-    let to_delete: Vec<(i64, String)> = db_rows
+    let mut to_delete: Vec<(i64, String)> = db_rows
         .iter()
         .filter(|(_, p, _, et)| {
             !disk_paths.contains(p)
@@ -7528,6 +7709,106 @@ async fn rescan_video_library(
         })
         .map(|(id, p, _, _)| (*id, p.clone()))
         .collect();
+
+    // ── Fingerprint rescue for MOVED / RENAMED folders ──────────────────
+    // A folder-keyed entry whose path vanished is otherwise deleted outright,
+    // taking its TMDB match, watch history, playlist links, ratings and
+    // covers with it — and by path alone a rename is indistinguishable from a
+    // deletion. The content fingerprint tells them apart: when exactly one
+    // vanished entry and exactly one brand-new folder share a representative
+    // file, the existing row is RE-POINTED at the new path, so its id (and
+    // everything hanging off it) survives untouched. Strictly one-to-one —
+    // anything ambiguous falls through to delete + re-add, exactly as before.
+    let mut rescued: HashMap<String, String> = HashMap::new();
+    {
+        let kind_of: HashMap<String, bool> = db_rows
+            .iter()
+            .map(|(_, p, _, et)| (p.clone(), et.as_str() == "show"))
+            .collect();
+        let unclaimed: Vec<String> = disk_paths
+            .iter()
+            .filter(|p| !db_rows.iter().any(|(_, dp, _, _)| dp == *p))
+            .cloned()
+            .collect();
+
+        // Stored fingerprints of the vanished entries, grouped by hash.
+        let mut dead_by_hash: HashMap<String, Vec<(i64, String, bool)>> = HashMap::new();
+        for (id, path) in &to_delete {
+            let is_show = kind_of.get(path).copied().unwrap_or(false);
+            let table = if is_show { "show" } else { "movie" };
+            let row: Option<(Option<String>,)> =
+                sqlx::query_as(&format!("SELECT content_hash FROM {table} WHERE id = ?"))
+                    .bind(id)
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            if let Some((Some(h),)) = row {
+                if !h.is_empty() {
+                    dead_by_hash.entry(h).or_default().push((*id, path.clone(), is_show));
+                }
+            }
+        }
+
+        // Fingerprint the unclaimed folders (they'd be hashed on insert anyway).
+        let mut new_by_hash: HashMap<String, Vec<String>> = HashMap::new();
+        if !dead_by_hash.is_empty() {
+            for rel in &unclaimed {
+                let Some(base) = path_to_base.get(rel) else { continue };
+                let is_show = disk_kinds.get(rel).copied().unwrap_or(false);
+                let Some(file) = representative_video(&base.join(rel), is_show) else { continue };
+                if let Some((hash, _, _)) = video_fingerprint(&file, None) {
+                    new_by_hash.entry(hash).or_default().push(rel.clone());
+                }
+            }
+        }
+
+        for (hash, olds) in &dead_by_hash {
+            if olds.len() != 1 {
+                continue; // several vanished entries share this content
+            }
+            let (old_id, old_path, old_is_show) = &olds[0];
+            let Some(news) = new_by_hash.get(hash) else { continue };
+            if news.len() != 1 {
+                continue; // several candidate destinations
+            }
+            let new_path = &news[0];
+            // Kind must agree: a movie can't be rescued by a show folder.
+            if disk_kinds.get(new_path).copied().unwrap_or(false) != *old_is_show {
+                continue;
+            }
+            let table = if *old_is_show { "show" } else { "movie" };
+            sqlx::query(&format!("UPDATE {table} SET folder_path = ? WHERE id = ?"))
+                .bind(new_path)
+                .bind(old_id)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            // Cached artwork lives under the entry's rel path — carry the
+            // folder over and re-point any absolute cover selection at it.
+            let (old_cache, new_cache) = (cache_base.join(old_path), cache_base.join(new_path));
+            if old_cache.exists() && !new_cache.exists() {
+                if let Some(parent) = new_cache.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::rename(&old_cache, &new_cache);
+            }
+            if let (Some(o), Some(n)) = (old_cache.to_str(), new_cache.to_str()) {
+                let _ = sqlx::query(&format!(
+                    "UPDATE {table} SET selected_cover = REPLACE(selected_cover, ?, ?)
+                     WHERE id = ? AND selected_cover LIKE ? || '%'"
+                ))
+                .bind(o)
+                .bind(n)
+                .bind(old_id)
+                .bind(o)
+                .execute(pool)
+                .await;
+            }
+            rescued.insert(old_path.clone(), new_path.clone());
+        }
+        to_delete.retain(|(_, p)| !rescued.contains_key(p));
+    }
+
     let deleted_paths: HashSet<String> = to_delete.iter().map(|(_, p)| p.clone()).collect();
 
     for (id, rel_path) in &to_delete {
@@ -7540,10 +7821,12 @@ async fn rescan_video_library(
     }
 
     // Paths still represented by a surviving DB entry (on disk, correct kind).
+    // A rescued entry now lives at its NEW path — report it there, so the
+    // destination folder isn't ALSO inserted as a brand-new entry below.
     let surviving_paths: HashSet<String> = db_rows
         .iter()
         .filter(|(_, p, _, _)| !deleted_paths.contains(p))
-        .map(|(_, p, _, _)| p.clone())
+        .map(|(_, p, _, _)| rescued.get(p).cloned().unwrap_or_else(|| p.clone()))
         .collect();
 
     // Add disk folders not covered by a surviving entry (brand-new or just-reclassified),
@@ -7862,8 +8145,85 @@ async fn rescan_video_library(
                         }
                     };
 
+                // Fingerprint rescue inside the season: a renamed episode file
+                // (scene name → clean name, say) looks like a deletion plus an
+                // arrival by path alone, which would drop its watch history.
+                // Same content on both sides, one-to-one, means it's the same
+                // episode — re-point the row and keep everything attached.
+                let mut ep_rescued: HashSet<String> = HashSet::new();
+                {
+                    let gone: Vec<&(i64, String)> = db_episodes
+                        .iter()
+                        .filter(|(_, p)| !disk_episodes.contains(p))
+                        .collect();
+                    let arrived: Vec<&String> = disk_episodes
+                        .iter()
+                        .filter(|p| !db_episodes.iter().any(|(_, dp)| dp == *p))
+                        .collect();
+                    if !gone.is_empty() && !arrived.is_empty() {
+                        let mut dead: HashMap<String, Vec<i64>> = HashMap::new();
+                        for (id, _) in &gone {
+                            if let Ok(Some((Some(h),))) = sqlx::query_as::<_, (Option<String>,)>(
+                                "SELECT content_hash FROM episode WHERE id = ?",
+                            )
+                            .bind(id)
+                            .fetch_optional(pool)
+                            .await
+                            {
+                                if !h.is_empty() {
+                                    dead.entry(h).or_default().push(*id);
+                                }
+                            }
+                        }
+                        let mut fresh: HashMap<String, Vec<String>> = HashMap::new();
+                        if !dead.is_empty() {
+                            for rel in &arrived {
+                                let Some(abs) = base_paths
+                                    .iter()
+                                    .map(|(b, _)| b.join(rel.as_str()))
+                                    .find(|p| p.exists())
+                                else {
+                                    continue;
+                                };
+                                if let Some((h, _, _)) = video_fingerprint(&abs, None) {
+                                    fresh.entry(h).or_default().push((*rel).clone());
+                                }
+                            }
+                        }
+                        for (h, ids) in &dead {
+                            if ids.len() != 1 {
+                                continue;
+                            }
+                            let Some(paths) = fresh.get(h) else { continue };
+                            if paths.len() != 1 {
+                                continue;
+                            }
+                            if sqlx::query("UPDATE episode SET file_path = ? WHERE id = ?")
+                                .bind(&paths[0])
+                                .bind(ids[0])
+                                .execute(pool)
+                                .await
+                                .is_ok()
+                            {
+                                ep_rescued.insert(paths[0].clone());
+                            }
+                        }
+                    }
+                }
+
                 for (id, path) in &db_episodes {
                     if !disk_episodes.contains(path) {
+                        // Re-pointed above — the row lives on at its new path.
+                        let moved: Option<(String,)> =
+                            sqlx::query_as("SELECT file_path FROM episode WHERE id = ?")
+                                .bind(id)
+                                .fetch_optional(pool)
+                                .await
+                                .ok()
+                                .flatten();
+                        if moved.map(|(p,)| p != *path).unwrap_or(false) {
+                            continue;
+                        }
                         if let Err(e) = sqlx::query("DELETE FROM episode WHERE id = ?")
                             .bind(id)
                             .execute(pool)
@@ -7874,7 +8234,8 @@ async fn rescan_video_library(
                     }
                 }
 
-                let existing_ep_paths: HashSet<String> = db_episodes.iter().map(|(_, p)| p.clone()).collect();
+                let mut existing_ep_paths: HashSet<String> = db_episodes.iter().map(|(_, p)| p.clone()).collect();
+                existing_ep_paths.extend(ep_rescued);
 
                 for rel_path in &disk_episodes {
                     if existing_ep_paths.contains(rel_path) {
@@ -7922,6 +8283,14 @@ async fn rescan_video_library(
             Ok(w) => warnings.extend(w),
             Err(e) => warnings.push(format!("Skipped show '{}': {}", show_rel, e)),
         }
+    }
+
+    // Last: bring fingerprints up to date for everything that survived, so
+    // the NEXT rescan can recognise anything that moves. Gated on
+    // (size, mtime), so a settled library reads no files at all here.
+    let bases: Vec<PathBuf> = base_paths.iter().map(|(b, _)| b.clone()).collect();
+    if let Err(e) = refresh_video_fingerprints(app, pool, library_id, &bases).await {
+        warnings.push(format!("Content fingerprints skipped: {e}"));
     }
 
     Ok(warnings)
@@ -8663,6 +9032,70 @@ pub(crate) fn is_media_file(path: &std::path::Path, extensions: &[&str]) -> bool
             .and_then(|e| e.to_str())
             .map(|e| extensions.contains(&e.to_lowercase().as_str()))
             .unwrap_or(false)
+}
+
+/// The video file that stands for a folder when fingerprinting it. Movies:
+/// the LARGEST file at the top level, so a sample or trailer sitting beside
+/// the feature can't be picked. Shows: the first file in a sorted recursive
+/// walk (S01E01 in practice) — stable across a folder rename, which is the
+/// case the fingerprint exists to rescue.
+fn representative_video(dir: &std::path::Path, recursive: bool) -> Option<PathBuf> {
+    if recursive {
+        let mut found: Vec<PathBuf> = Vec::new();
+        collect_videos_recursive(dir, &mut found, 0);
+        found.sort();
+        return found.into_iter().next();
+    }
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| is_media_file(p, VIDEO_EXTENSIONS))
+        .max_by_key(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+}
+
+fn collect_videos_recursive(dir: &std::path::Path, out: &mut Vec<PathBuf>, depth: usize) {
+    if depth > 3 || out.len() > 64 {
+        return; // a representative only needs ONE hit; don't walk a whole show
+    }
+    let Ok(read) = std::fs::read_dir(dir) else { return };
+    let mut subdirs: Vec<PathBuf> = Vec::new();
+    for e in read.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            subdirs.push(p);
+        } else if is_media_file(&p, VIDEO_EXTENSIONS) {
+            out.push(p);
+        }
+    }
+    if !out.is_empty() {
+        return; // shallowest level with video wins — no need to go deeper
+    }
+    subdirs.sort();
+    for sub in subdirs {
+        collect_videos_recursive(&sub, out, depth + 1);
+        if !out.is_empty() {
+            return;
+        }
+    }
+}
+
+/// Fingerprint a video path behind the (size, mtime) gate. `stored` is what
+/// the DB already holds; when the stamp is unchanged the hash is returned
+/// as-is and the file is never re-read — which is what keeps a rescan of a
+/// terabyte library as fast as it is today. Returns (hash, size, mtime).
+fn video_fingerprint(
+    abs: &std::path::Path,
+    stored: Option<(Option<String>, Option<i64>, Option<i64>)>,
+) -> Option<(String, i64, i64)> {
+    let (size, mtime) = crate::content_hash::file_stamp(abs)?;
+    if let Some((Some(hash), Some(s), Some(m))) = stored {
+        if s == size && m == mtime && !hash.is_empty() {
+            return Some((hash, size, mtime));
+        }
+    }
+    let hash = crate::content_hash::hash_video_file(abs)?;
+    Some((hash, size, mtime))
 }
 
 fn parse_season_folder_name(name: &str) -> (String, Option<i32>) {

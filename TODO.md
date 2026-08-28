@@ -6,10 +6,52 @@
 
 ## now
 
-account for intentionally incomplete albums
-
 
 ## bugs / needs fixing
+
+i want 'indeterminate time remaining' on the scan phase like how 'about X minutes remaining' is on match phase
+
+new breadcrumbs functionality. it should just follow the user always. even when creating duplicates in history. the only thing that should reset it is clicking an option in the sidebar. overflow should not create scroll but follow the most recent - when going back by breadcrumbs, and if the breadcrumbs are overflowing, only show the next forward history to the clicked breadcrumb. for instance, if the user has really been digging and there are 30 things in the breadcrumbs: for one, it would definitely be overflowing. the user should also see the most recent fitting ones, and the cut off on the left side of the breadcrumbs section would ideally begin with an ellipsis (still a button tho). Say the user clicks the breadcrumb 4 options back from the most recent. there were 3 in front, say the breadcrumbs were numbered like so: 5 - 4 - 3 - 2 - 1, and the user clicked 4. since the breadcrumbs are overflowing, only 3 should show in front of 4, and greyed out (STILL A BUTTON). I want to always focus on showing previous history over forward history, so when the breadcrumbs are overflowing and the user has forward breadcrumbs, always only show the 1 closes to where the user clicked. The user can nav all the way forward by continually clicking the 1 forward history button until there is no more. im somewhat spitballing here just to have something to record my idea before I forget. what do you think about this one?
+
+make play button on movies/shows (as well as episode specific play buttons) show a loader if it takes longer than .2 seconds to bring up the player. sometimes the drive has to spin up
+
+trying to close app mid scan causes native alert to appear. need to use waverunner style modal.
+
+i renamed a folder from my source library and went and tried to play the song in waverunner and it definitely isnt ready for that, although i thought it'd be worse. the song appears to start playing at first but its stuck at 0:00 and shows the pause button like its playing and wont switch to play by clicking - its just stuck there.
+
+make rows on home page for libraries being scanned show 'scanning...' or 'matching...' with a loader, under the header, instead of the usual content
+
+noticed something when matching the release of THat Part by schoolboy Q. At first it said the album was by schoolboy Q and Kanye and the track was just Q. When I matched the release it flipped them. actually look into versions where Kanye is not on the song because he isnt on my track.
+
+deal with some artists getting weird white background person icon placeholder image
+
+maybe have a thing at the end of scan/matching passes (aside from the very first one) that lists what the last pass did.
+
+show "+ N more releases" on artist page in detail view on albums with more than 1 release
+
+consider how to deal with separating release-group and release release-dates on album pages.
+
+scanning libraries in sidebar should be limited to three lines and cut off with ellipsis if necessary. then let entry slot expand to 3 lines worth of space even when not needed so that sidebar isn't jumping up and down during rescan due to length changes in progress indicator as scanner progresses
+
+consider per-album display-title choice: release group name vs default release's name (e.g. DAMN. vs DAMN. COLLECTORS EDITION.). needs MB release titles stored on album_release; choice as field_override; materialize on toggle and recompute on release apply / default-release switch / unmatch. manual rename is the stopgap.
+
+need better modal stacking system - its a little crazy right now. consider animations for size differences when switching between modals.
+
+find good hover tooltip styling and apply it everywhere
+
+less rounded previous, next, play/pause buttons on video player
+
+account for intentionally incomplete albums
+
+make movies/tv covers on home page same width as music covers
+
+add gradients to screens and modals at the top and bottom where scrollable areas touch the edge of their window
+
+I was watching stranger things on prod and I noticed it wouldnt go into 'continue watching' when I closed it. i think it has something to do with me having marked it as watched previously - idk. either way, if something is played after being marked as or considered 'watched' it should become unwatched again until the user either watches it fully or remarks it as watched.
+
+any  way we could do a rough estimated total time on library creation/rescan (especially creation)
+
+dont allow user to click create button on create library menu until they have scrolled all the way down at least once
 
 i noticed navigating forward and back is working while metadata center is open. it shouldnt. it shouldnt work with any modal open unless the modal has its own nav.
 
@@ -44,6 +86,10 @@ WHOLE MUSIC SECTION NEEDS CONTEXT MENU IMPROVEMENTS
 
 ## changes / small new features
 
+settings checkbox for volume percentage display during playback
+
+music and sound video player: handle music videos as well as sounds that come with videos (asmr in my case). we'll get into discussion about this when time comes but some tracks have optional videos that should be watchable if desired. For tracks that have video, maybe just add another play button to watch the video alongside the audio. double clicking and any existing form of playing tracks should just play the audio normally. The existing video player can basically be used exactly as it functions in video libraries - there are a couple exceptions like I dont think it needs autoplay toggle or subtitle selection or audio track selection but other than that...
+
 ADHD mode: toggle in settings to allow video and music to be played at the same time
 
 export media covers zip
@@ -58,6 +104,8 @@ display images (png, jpg, webp, gif, etc) in extras, alongside the video extras 
 
 
 ## new features
+
+multi track player - play multiple audio tracks (and a video track if desired) at the same time. multi track player should have entire UI for controlling multiple playing tracks at once
 
 save cover sets. users should be able to save a set of media covers so that they can easily switch all media covers in a library to the saved set. 
 

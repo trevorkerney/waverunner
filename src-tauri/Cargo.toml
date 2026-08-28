@@ -36,6 +36,7 @@ libloading = "0.8"
 raw-window-handle = "0.6"
 futures = "0.3.32"
 lofty = "0.22"
+xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

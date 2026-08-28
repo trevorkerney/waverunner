@@ -119,6 +119,23 @@ function App() {
   const [mbReviewLibraryId, setMbReviewLibraryId] = useState<string | null>(null);
   // Video metadata center (TMDB match review), same shape.
   const [videoCenterLibraryId, setVideoCenterLibraryId] = useState<string | null>(null);
+  // Surfaces that can't reach this state (the pending-work strip) open the
+  // music metadata center through a window event, same pattern as open-rescan.
+  useEffect(() => {
+    const onOpen = (e: Event) => {
+      const libraryId = (e as CustomEvent).detail?.libraryId as string | undefined;
+      if (libraryId) setMbReviewLibraryId(libraryId);
+    };
+    window.addEventListener("waverunner:open-music-center", onOpen);
+    // The match-only wizard is about to open (Sidebar handles the launch) —
+    // close the center so the modal isn't buried under it.
+    const onOpenMatch = () => setMbReviewLibraryId(null);
+    window.addEventListener("waverunner:open-match", onOpenMatch);
+    return () => {
+      window.removeEventListener("waverunner:open-music-center", onOpen);
+      window.removeEventListener("waverunner:open-match", onOpenMatch);
+    };
+  }, []);
 
   // Video and music are fully mutually exclusive: starting either one STOPS
   // the other outright (bar/player gone), never just pauses it.
@@ -1233,6 +1250,33 @@ function App() {
     });
     return () => {
       unlisten.then((fn) => fn());
+    };
+  }, [openHome]);
+
+  // A matching pass rewrites albums, artists and credits as it runs, so the
+  // library it's working on is locked exactly like a scanning one: bounce out
+  // of it when a pass starts, and let the sidebar render it as busy. Without
+  // this, minimizing the match modal left the library fully browsable and
+  // editable underneath a live pass.
+  const [passLibs, setPassLibs] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    const unIter = listen<{ libraryId: string }>("music-enrich-iteration", (e) => {
+      const { libraryId } = e.payload;
+      setPassLibs((prev) => (prev.has(libraryId) ? prev : new Set(prev).add(libraryId)));
+      const v = navStateRef.current.view;
+      if (v && "libraryId" in v && v.libraryId === libraryId) openHome();
+    });
+    const unDone = listen<{ libraryId: string }>("music-enrich-done", (e) => {
+      setPassLibs((prev) => {
+        if (!prev.has(e.payload.libraryId)) return prev;
+        const next = new Set(prev);
+        next.delete(e.payload.libraryId);
+        return next;
+      });
+    });
+    return () => {
+      unIter.then((fn) => fn());
+      unDone.then((fn) => fn());
     };
   }, [openHome]);
 
@@ -2936,6 +2980,7 @@ function App() {
           onOpenHome={openHome}
           homeActive={activeView?.kind === "home"}
           scanningLibs={scanningLibs}
+          passLibs={passLibs}
           dockedMusic={
             musicCoverDocked && musicState.isActive
               ? (() => {

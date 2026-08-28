@@ -329,6 +329,141 @@ const MIGRATIONS: &[Migration] = &[
              WHERE kind = 'artist_match' AND status IN ('pending', 'notfound')",
         ],
     },
+    Migration {
+        id: 20,
+        app_version: "1.0.0-alpha.12.5",
+        description: "albums live on their credit rows — drop the artist parent",
+        requires_table: Some("album_artist_credit"),
+        // The artist→album parent edge is retired: membership on artist pages
+        // is album_artist_credit alone. Backfill a solo credit row (stamped
+        // with the parent's id) for any album that still lacks rows, then
+        // null the parent on every real album. Loose containers KEEP their
+        // parent — they're per-artist infrastructure, not credited albums.
+        statements: &[
+            "INSERT INTO album_artist_credit (album_id, position, name, artist_id)
+             SELECT al.id, 0, a.title, a.id FROM album al
+             JOIN media_entry me ON me.id = al.id
+             JOIN artist a ON a.id = me.parent_id
+             WHERE NOT EXISTS (SELECT 1 FROM album_artist_credit ac WHERE ac.album_id = al.id)
+               AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = al.id)
+               AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = al.id)",
+            "UPDATE media_entry SET parent_id = NULL
+             WHERE id IN (SELECT al.id FROM album al
+                          JOIN media_entry me2 ON me2.id = al.id
+                          WHERE me2.parent_id IS NOT NULL
+                            AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = al.id))",
+        ],
+    },
+    Migration {
+        id: 21,
+        app_version: "1.0.0-alpha.12.5",
+        description: "retract guessed images for unidentified artists",
+        requires_table: Some("artist_image_fetch"),
+        // The image sweep used to run for UNMATCHED artists too, where the
+        // Deezer fallback is a name search — a same-named stranger's face on
+        // an unidentified page. The sweep now requires an MBID; this clears
+        // the guessed results (fetched rows + one-shot stamps) for artists
+        // still unidentified, so they re-enter the queue the pass after
+        // they're matched. A fetched image the user explicitly SELECTED is
+        // kept — picking it made it a user choice, not a guess.
+        statements: &[
+            "DELETE FROM cached_images
+             WHERE origin = 'fetched'
+               AND entry_folder_path LIKE '_fetched/artists/%'
+               AND EXISTS (SELECT 1 FROM artist a
+                           WHERE a.id = CAST(SUBSTR(entry_folder_path, 18) AS INTEGER)
+                             AND (a.musicbrainz_id IS NULL OR a.musicbrainz_id = '')
+                             AND (a.selected_cover IS NULL
+                                  OR a.selected_cover <> cached_images.source_filename))",
+            "DELETE FROM artist_image_fetch
+             WHERE status <> 'has-own'
+               AND artist_id IN (SELECT a.id FROM artist a
+                                 WHERE a.musicbrainz_id IS NULL OR a.musicbrainz_id = '')",
+        ],
+    },
+    Migration {
+        id: 22,
+        app_version: "1.0.0-alpha.12.5",
+        description: "staged changes become undoable (kind/target/payload columns)",
+        requires_table: Some("pending_change"),
+        // Existing rows keep the defaults: kind '' marks a legacy row whose
+        // directive can't be reverted from here — un-staging one only removes
+        // the label.
+        statements: &[
+            "ALTER TABLE pending_change ADD COLUMN kind TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE pending_change ADD COLUMN target TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE pending_change ADD COLUMN payload TEXT NOT NULL DEFAULT '{}'",
+        ],
+    },
+    Migration {
+        id: 23,
+        app_version: "1.0.0-alpha.12.5",
+        description: "pending_pass queue — matches waiting for a matching pass, backfilled",
+        requires_table: Some("album_artist_credit"),
+        // The backfill derives what the queue would already contain had it
+        // existed: matched albums whose credits still name an unidentified,
+        // non-ignored artist — exactly the matches a pass has yet to cash in.
+        statements: &[
+            "CREATE TABLE IF NOT EXISTS pending_pass (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                library_id TEXT NOT NULL,
+                target TEXT NOT NULL DEFAULT '',
+                label TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE
+            )",
+            "INSERT INTO pending_pass (library_id, target, label)
+             SELECT me.library_id, CAST(al.id AS TEXT), 'Match \u{201c}' || al.title || '\u{201d}'
+             FROM album al
+             JOIN media_entry me ON me.id = al.id
+             WHERE EXISTS (SELECT 1 FROM field_override o
+                           WHERE o.entity_id = al.id
+                             AND o.field IN ('mb_release_id', 'mb_release_group_id')
+                             AND o.value IS NOT NULL AND o.value <> '')
+               AND EXISTS (
+                 SELECT 1 FROM artist a
+                 WHERE (a.musicbrainz_id IS NULL OR a.musicbrainz_id = '')
+                   AND NOT EXISTS (SELECT 1 FROM field_override oa
+                                   WHERE oa.entity_id = a.id AND oa.field = 'mb_artist_id'
+                                     AND oa.value IS NOT NULL AND oa.value <> '')
+                   AND NOT EXISTS (SELECT 1 FROM field_override ig
+                                   WHERE ig.entity_id = a.id AND ig.field = 'mb_ignored')
+                   AND (a.id IN (SELECT ac.artist_id FROM album_artist_credit ac
+                                 WHERE ac.album_id = al.id AND ac.artist_id IS NOT NULL)
+                     OR a.id IN (SELECT tc.artist_id FROM track_credit tc
+                                 JOIN media_entry tme ON tme.id = tc.track_id
+                                 WHERE tme.parent_id = al.id AND tc.artist_id IS NOT NULL)))",
+        ],
+    },
+    Migration {
+        id: 24,
+        app_version: "1.0.0-alpha.12.5",
+        description: "track.audio_hash — content fingerprint for rescan identity migration",
+        requires_table: Some("track"),
+        // Backfilled by the next rescan (the scanner hashes every file it
+        // reads); NULL until then just means no rescue hint yet.
+        statements: &["ALTER TABLE track ADD COLUMN audio_hash TEXT"],
+    },
+    Migration {
+        id: 25,
+        app_version: "1.0.0-alpha.12.5",
+        description: "movie/episode content fingerprints (+ size/mtime gate) for rescan identity",
+        requires_table: Some("movie"),
+        // Backfilled by the next video rescan. The size/mtime pair is the
+        // gate: unchanged means the stored hash still describes the file, so
+        // a rescan re-reads nothing and stays as fast as it is today.
+        statements: &[
+            "ALTER TABLE movie ADD COLUMN content_hash TEXT",
+            "ALTER TABLE movie ADD COLUMN content_size INTEGER",
+            "ALTER TABLE movie ADD COLUMN content_mtime INTEGER",
+            "ALTER TABLE episode ADD COLUMN content_hash TEXT",
+            "ALTER TABLE episode ADD COLUMN content_size INTEGER",
+            "ALTER TABLE episode ADD COLUMN content_mtime INTEGER",
+            "ALTER TABLE show ADD COLUMN content_hash TEXT",
+            "ALTER TABLE show ADD COLUMN content_size INTEGER",
+            "ALTER TABLE show ADD COLUMN content_mtime INTEGER",
+        ],
+    },
 ];
 
 /// Copy the database beside itself before the first migration of a run
@@ -643,6 +778,9 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             tagline TEXT,
             runtime INTEGER,
             maturity_rating_id INTEGER,
+            content_hash TEXT,
+            content_size INTEGER,
+            content_mtime INTEGER,
             FOREIGN KEY (id) REFERENCES media_entry(id) ON DELETE CASCADE,
             FOREIGN KEY (maturity_rating_id) REFERENCES maturity_rating(id)
         )",
@@ -741,6 +879,9 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             plot TEXT,
             tagline TEXT,
             maturity_rating_id INTEGER,
+            content_hash TEXT,
+            content_size INTEGER,
+            content_mtime INTEGER,
             FOREIGN KEY (id) REFERENCES media_entry(id) ON DELETE CASCADE,
             FOREIGN KEY (maturity_rating_id) REFERENCES maturity_rating(id)
         )",
@@ -857,6 +998,9 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             plot TEXT,
             runtime INTEGER,
             sort_order INTEGER NOT NULL DEFAULT 0,
+            content_hash TEXT,
+            content_size INTEGER,
+            content_mtime INTEGER,
             FOREIGN KEY (season_id) REFERENCES season(id) ON DELETE CASCADE,
             UNIQUE(season_id, episode_number)
         )",
@@ -988,6 +1132,7 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             track_number INTEGER,
             disc_number INTEGER,
             runtime INTEGER,
+            audio_hash TEXT,
             FOREIGN KEY (id) REFERENCES media_entry(id) ON DELETE CASCADE
         )",
     )
@@ -1350,13 +1495,82 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     // rescan-idempotent; these rows only record "written but not yet applied"
     // so the UI can show what a rescan will do instead of forcing a rescan
     // per action. Cleared when a rescan completes.
+    // kind/target/payload make a staged row UNDOABLE: kind names the directive
+    // family, target is the dedup key (staging the same split twice replaces
+    // the row instead of stacking), payload carries what the revert needs.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS pending_change (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             library_id TEXT NOT NULL,
             label TEXT NOT NULL,
+            kind TEXT NOT NULL DEFAULT '',
+            target TEXT NOT NULL DEFAULT '',
+            payload TEXT NOT NULL DEFAULT '{}',
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // Matches waiting for a matching pass to cash them in (stamp the artists
+    // their credits prove). Enqueued when an album match applies, removed on
+    // unmatch, cleared wholesale by a completed pass — the pass-side twin of
+    // pending_change above.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS pending_pass (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            library_id TEXT NOT NULL,
+            target TEXT NOT NULL DEFAULT '',
+            label TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // Personas: independent artist identities linked back to the human
+    // behind them (kiLL edward → J. Cole). NOT a merge — both pages live on
+    // with their own credits/matching (the persona may have its own MBID, or
+    // none: God). One parent per persona, one level deep. Distinct from
+    // artist_alias, which is spellings of a SINGLE identity.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS artist_persona (
+            persona_id INTEGER PRIMARY KEY,
+            parent_id INTEGER NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // Personas: independent artist identities linked back to the human
+    // behind them (kiLL edward → J. Cole). NOT a merge — both pages live on
+    // with their own credits/matching (the persona may have its own MBID, or
+    // none: God). One parent per persona, one level deep. Distinct from
+    // artist_alias, which is spellings of a SINGLE identity.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS artist_persona (
+            persona_id INTEGER PRIMARY KEY,
+            parent_id INTEGER NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // Derivation exhaustion: "this evidence was walked to completion and did
+    // not prove this entity" — the pass's memory, so it stops re-fetching the
+    // same groups/searches every run. Keys: an artist + the group/release id
+    // whose credits were walked, or an album + 'arid:<mbid>' for the
+    // artist-scoped notfound retry. Rows are deleted when the facts change
+    // (merge/alias renames the artist, unmatch restarts the album) so the
+    // walk earns exactly one retry per new fact. Failed fetches never write
+    // a row — the retry shield stays.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS mb_derive_exhausted (
+            entity_id INTEGER NOT NULL,
+            evidence_key TEXT NOT NULL,
+            PRIMARY KEY (entity_id, evidence_key)
         )",
     )
     .execute(&pool)

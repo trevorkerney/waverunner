@@ -212,10 +212,16 @@ pub async fn fetch_artist_images(
     library_id: &str,
     cancelled: impl Fn() -> bool,
 ) -> Result<usize, String> {
+    // IDENTIFIED artists only: Wikidata needs the MBID, and the Deezer
+    // fallback is a name search — a guess when the artist is unmatched (a
+    // same-named stranger's face on an unidentified page). Unmatched artists
+    // stay UNSTAMPED, so the pass after they're matched picks them up —
+    // images are one more thing the match cascade unlocks.
     let artists: Vec<(i64, String, String, Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT a.id, a.title, a.folder_path, a.selected_cover, a.musicbrainz_id
          FROM artist a JOIN media_entry me ON me.id = a.id
          WHERE me.library_id = ?
+           AND a.musicbrainz_id IS NOT NULL AND a.musicbrainz_id <> ''
            AND NOT EXISTS (SELECT 1 FROM artist_image_fetch f WHERE f.artist_id = a.id)
          ORDER BY a.sort_title COLLATE NOCASE",
     )

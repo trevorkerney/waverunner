@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
+import { PendingWorkBadge } from "@/components/music/PendingWork";
 import { Trash2, RefreshCw, FolderPlus, FolderCog, ChevronRight, Sparkles, Pencil, Home, CircleAlert, Music2, Settings2 } from "lucide-react";
 import { open as openFolderPicker } from "@tauri-apps/plugin-dialog";
 import { Spinner } from "@/components/ui/spinner";
@@ -78,6 +79,8 @@ interface SidebarProps {
   homeActive: boolean;
   /** Libraries with a scan/rescan in flight — locked rows with a spinner. */
   scanningLibs: Set<string>;
+  /** Libraries with a matching pass in flight — locked like a scanning one. */
+  passLibs: Set<string>;
 }
 
 export function Sidebar({
@@ -104,6 +107,7 @@ export function Sidebar({
   onOpenHome,
   homeActive,
   scanningLibs,
+  passLibs,
 }: SidebarProps) {
   const [width, setWidth] = useState(DEFAULT_WIDTH);
   const [dragging, setDragging] = useState(false);
@@ -256,7 +260,20 @@ export function Sidebar({
       launchWizard({ kind: "rescan", libraryId: lib.id, name: lib.name, format: lib.format });
     };
     window.addEventListener("waverunner:open-rescan", onOpenRescan);
-    return () => window.removeEventListener("waverunner:open-rescan", onOpenRescan);
+    // "Run a matching pass" from anywhere (center footer, queue banner,
+    // library-page strip) opens the match-only wizard — the pass runs in the
+    // normal modal, minimizable, instead of a rail spinner somewhere.
+    const onOpenMatch = (e: Event) => {
+      const libraryId = (e as CustomEvent).detail?.libraryId as string | undefined;
+      const lib = libraries.find((l) => l.id === libraryId);
+      if (!lib) return;
+      launchWizard({ kind: "match", libraryId: lib.id, name: lib.name, format: lib.format });
+    };
+    window.addEventListener("waverunner:open-match", onOpenMatch);
+    return () => {
+      window.removeEventListener("waverunner:open-rescan", onOpenRescan);
+      window.removeEventListener("waverunner:open-match", onOpenMatch);
+    };
   }, [libraries, launchWizard]);
 
 
@@ -369,7 +386,7 @@ export function Sidebar({
               // Matching in flight (MB/TMDB pass running behind a minimized
               // wizard): spinner in the chevron slot, live progress line
               // where the tree renders. Clicking brings the modal back.
-              if (matchStatus.has(lib.id)) {
+              if (matchStatus.has(lib.id) || passLibs.has(lib.id)) {
                 return (
                   <button
                     key={lib.id}
@@ -391,6 +408,19 @@ export function Sidebar({
                             ? lib.setup_stage
                             : "match") as "scan" | "match" | "review",
                         });
+                        return;
+                      }
+                      // A finished library running a pass (started from the
+                      // metadata center) has no setup stage to resume — open
+                      // the match wizard on the live pass instead. Without
+                      // this the row locks with no way back to the modal.
+                      if (passLibs.has(lib.id)) {
+                        launchWizard({
+                          kind: "match",
+                          libraryId: lib.id,
+                          name: lib.name,
+                          format: lib.format,
+                        });
                       }
                     }}
                     className="flex w-full flex-col text-left transition-colors hover:bg-sidebar-accent/50"
@@ -402,7 +432,7 @@ export function Sidebar({
                       <span className="min-w-0 flex-1 break-words">{lib.name}</span>
                     </span>
                     <span className="break-words pb-1 pl-6 pr-2 text-xs italic text-muted-foreground">
-                      {matchStatus.get(lib.id)}
+                      {matchStatus.get(lib.id) ?? "matching…"}
                     </span>
                   </button>
                 );
@@ -475,7 +505,10 @@ export function Sidebar({
                     <ContextMenuTrigger
                       render={
                         <button
-                          // Navigate only — expand/collapse is the chevron's job.
+                          // Navigate only — expand/collapse is the chevron's
+                          // job. Exception: a pass running with no wizard to
+                          // show it — the click reattaches the match modal
+                          // (launchWizard un-minimizes an existing one).
                           onClick={() => onSelectLibrary(lib)}
                         />
                       }
@@ -497,7 +530,12 @@ export function Sidebar({
                           className={`transition-transform ${expanded ? "rotate-90" : ""}`}
                         />
                       </span>
-                      <span className="min-w-0 flex-1 break-words">{lib.name}</span>
+                      {/* Badge rides right beside the name, not flushed to
+                          the row's far edge — the outer span owns flex-1. */}
+                      <span className="flex min-w-0 flex-1 items-start gap-1">
+                        <span className="min-w-0 break-words">{lib.name}</span>
+                        {lib.format === "music" && <PendingWorkBadge libraryId={lib.id} />}
+                      </span>
                     </ContextMenuTrigger>
                     <ContextMenuContent>
                       <ContextMenuItem onClick={() => setRenameTarget(lib)}>

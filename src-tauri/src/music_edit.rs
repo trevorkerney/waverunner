@@ -212,25 +212,23 @@ pub(crate) async fn reapply_album_overrides(
             .execute(pool)
             .await
             .map_err(|e| e.to_string())?;
-        // A single name means "one owner" — no credit rows, parent displays.
-        if names.len() >= 2 {
-            for (i, name) in names.iter().enumerate() {
-                sqlx::query(
-                    "INSERT INTO album_artist_credit (album_id, position, name) VALUES (?, ?, ?)",
-                )
-                .bind(album_id)
-                .bind(i as i64)
-                .bind(name)
-                .execute(pool)
-                .await
-                .map_err(|e| e.to_string())?;
-            }
+        // EVERY name is a credit row — including a solo one. The credit list
+        // is the only record of whose album this is (albums carry no artist
+        // parent), and because this hook re-runs after every rescan's
+        // reconcile, tag grouping can never drag the album back onto a
+        // phantom credit ("Soundtrack", "Halo 2"). The first name's page is
+        // created if missing (alias-aware) so the album lands somewhere real.
+        for (i, name) in names.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO album_artist_credit (album_id, position, name) VALUES (?, ?, ?)",
+            )
+            .bind(album_id)
+            .bind(i as i64)
+            .bind(name)
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
         }
-        // OWNERSHIP rides the credit: the album reparents onto the first
-        // name (resolved alias-aware, page created if missing). An explicit
-        // user credit beats the tag-derived parent — and because this hook
-        // re-runs after every rescan's reconcile, tag grouping can never
-        // drag the album back under a phantom ("Soundtrack", "Halo 2").
         if let Some(first) = names.first() {
             let lib: Option<(String,)> =
                 sqlx::query_as("SELECT library_id FROM media_entry WHERE id = ?")
@@ -239,14 +237,7 @@ pub(crate) async fn reapply_album_overrides(
                     .await
                     .map_err(|e| e.to_string())?;
             if let Some((library_id,)) = lib {
-                let owner =
-                    crate::music::resolve_or_create_artist(pool, &library_id, first).await?;
-                sqlx::query("UPDATE media_entry SET parent_id = ? WHERE id = ?")
-                    .bind(owner)
-                    .bind(album_id)
-                    .execute(pool)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                crate::music::resolve_or_create_artist(pool, &library_id, first).await?;
             }
         }
     }
@@ -418,6 +409,7 @@ pub(crate) async fn split_artist_inner(
         source_names.push(source_name.clone());
     }
     let members_json = serde_json::to_string(&members).map_err(|e| e.to_string())?;
+    let mut written: Vec<String> = Vec::new();
     for name in &source_names {
         if members.iter().any(|m| m.eq_ignore_ascii_case(name)) {
             continue; // never map a member's own name onto the split
@@ -432,6 +424,7 @@ pub(crate) async fn split_artist_inner(
         .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
+        written.push(name.clone());
     }
 
     // Album-combine directives are keyed by SCAN-TIME tag identity (artist +
@@ -456,6 +449,11 @@ pub(crate) async fn split_artist_inner(
     stage_pending_change(
         pool,
         &library_id,
+        "artist_split",
+        &source_name.to_lowercase(),
+        // artist_id: the entity this staging DISSOLVES — the UI locks it
+        // (any edit made now would be discarded when the rescan applies).
+        &serde_json::json!({ "sources": written, "artist_id": artist_id }),
         &format!("Split \u{201c}{source_name}\u{201d} into {}", members.join(" · ")),
     )
     .await?;
@@ -540,7 +538,7 @@ pub async fn search_artist_choices(
     let prefix = format!("{escaped}%");
     let rows: Vec<(i64, String, Option<String>, String, i64)> = sqlx::query_as(
         "SELECT a.id, a.title, a.selected_cover, a.folder_path,
-                (SELECT COUNT(*) FROM media_entry c WHERE c.parent_id = a.id)
+                (SELECT COUNT(*) FROM album_artist_credit c WHERE c.artist_id = a.id)
          FROM artist a
          JOIN media_entry me ON me.id = a.id
          WHERE me.library_id = ?1 AND a.id != ?2 AND a.title LIKE ?3 ESCAPE '\\'
@@ -603,7 +601,7 @@ pub async fn resolve_artist_choices(
         // hit here would silently attach albums to the wrong page.
         let row: Option<(i64, String, Option<String>, String, i64)> = sqlx::query_as(
             "SELECT a.id, a.title, a.selected_cover, a.folder_path,
-                    (SELECT COUNT(*) FROM media_entry c WHERE c.parent_id = a.id)
+                    (SELECT COUNT(*) FROM album_artist_credit c WHERE c.artist_id = a.id)
              FROM artist a
              JOIN media_entry me ON me.id = a.id
              WHERE me.library_id = ?1 AND a.id != ?2 AND a.title = ?3 COLLATE NOCASE
@@ -655,7 +653,7 @@ pub async fn search_credit_link_choices(
     let prefix = format!("{escaped}%");
     let rows: Vec<(i64, String, Option<String>, String, i64)> = sqlx::query_as(
         "SELECT a.id, a.title, a.selected_cover, a.folder_path,
-                (SELECT COUNT(*) FROM media_entry c WHERE c.parent_id = a.id)
+                (SELECT COUNT(*) FROM album_artist_credit c WHERE c.artist_id = a.id)
          FROM artist a
          JOIN media_entry me ON me.id = a.id
          WHERE me.library_id = ?1 AND a.id != ?2 AND a.title LIKE ?3 ESCAPE '\\'
@@ -705,6 +703,7 @@ pub async fn link_credit_name(
     if name.is_empty() {
         return Err("No credit name given".to_string());
     }
+    ensure_not_staged(pool, target_artist_id).await?;
     let target: Option<(String,)> = sqlx::query_as(
         "SELECT a.title FROM artist a JOIN media_entry me ON me.id = a.id
          WHERE a.id = ? AND me.library_id = ?",
@@ -732,6 +731,8 @@ pub async fn link_credit_name(
         return Err(format!("\u{201c}{name}\u{201d} already resolves to {target_title}"));
     }
     crate::music_mb::merge_artists(pool, &library_id, target_artist_id, &target_title, source_id, &name)
+        .await?;
+    crate::music_mb::enqueue_pass_recheck(pool, &library_id, target_artist_id, &target_title, &name)
         .await
 }
 
@@ -880,6 +881,7 @@ pub async fn set_track_fields(
 ) -> Result<(), String> {
     let pool = &state.app_db;
     let (library_id, _rel) = track_context(pool, track_id).await?;
+    let credits_before = track_credit_names(pool, track_id).await?;
     let mut credits_changed = false;
     for (field, value) in &fields {
         if !TRACK_FIELDS.contains(&field.as_str()) {
@@ -912,8 +914,29 @@ pub async fn set_track_fields(
     if credits_changed {
         // Newly credited names get artist pages (appears-on) right away.
         crate::music::ensure_credit_artists(pool, &library_id).await?;
+        // Actually-different credits on a matched album are fresh evidence a
+        // pass can walk — surface that in the queue. (Saving the dialog with
+        // the credits untouched arms nothing.)
+        if track_credit_names(pool, track_id).await? != credits_before {
+            crate::music_mb::enqueue_track_credit_recheck(pool, &library_id, track_id).await?;
+        }
     }
     Ok(())
+}
+
+/// A track's credit names in order — the before/after probe the edit and
+/// reset paths use to tell a real credit change from a no-op save.
+async fn track_credit_names(pool: &SqlitePool, track_id: i64) -> Result<Vec<String>, String> {
+    Ok(sqlx::query_as::<_, (String,)>(
+        "SELECT name FROM track_credit WHERE track_id = ? ORDER BY position",
+    )
+    .bind(track_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .into_iter()
+    .map(|(n,)| n)
+    .collect())
 }
 
 /// Drop a track's user overrides and restore its columns from the file's own
@@ -925,6 +948,7 @@ pub async fn reset_track_fields(
 ) -> Result<(), String> {
     let pool = &state.app_db;
     let (library_id, rel) = track_context(pool, track_id).await?;
+    let credits_before = track_credit_names(pool, track_id).await?;
     sqlx::query("DELETE FROM field_override WHERE entity_id = ? AND tier = 'user'")
         .bind(track_id)
         .execute(pool)
@@ -964,6 +988,11 @@ pub async fn reset_track_fields(
             .map_err(|e| e.to_string())?;
     if let Some((release_id,)) = release_id {
         crate::music::write_track_side_tables(pool, track_id, release_id, &scanned, true).await?;
+        // Reverting to tag credits is a credit change like any other — if the
+        // tags name someone the album's match evidence could prove, queue it.
+        if track_credit_names(pool, track_id).await? != credits_before {
+            crate::music_mb::enqueue_track_credit_recheck(pool, &library_id, track_id).await?;
+        }
     }
     Ok(())
 }
@@ -1012,10 +1041,10 @@ pub async fn get_album_edit(
     .map(|(n,)| n)
     .collect();
     if artist_credits.is_empty() {
-        // Single-owner album: prefill with the parent artist so adding a
-        // co-artist is one row away.
+        // Credit-less album (no artist tags anywhere): nothing to prefill —
+        // every credited album carries its rows, solo included.
         let owner: Option<(String,)> = sqlx::query_as(
-            "SELECT a.title FROM artist a JOIN media_entry me ON me.parent_id = a.id WHERE me.id = ?",
+            "SELECT ac.name FROM album_artist_credit ac WHERE ac.album_id = ? ORDER BY ac.position LIMIT 1",
         )
         .bind(album_id)
         .fetch_optional(pool)
@@ -1046,6 +1075,15 @@ pub async fn set_album_fields(
     fields: HashMap<String, serde_json::Value>,
 ) -> Result<(), String> {
     let pool = &state.app_db;
+    ensure_not_staged(pool, album_id).await?;
+    // Before-images for the two fields that arm pass work when they actually
+    // change — a save with them untouched must enqueue nothing.
+    let (title_before,): (String,) = sqlx::query_as("SELECT title FROM album WHERE id = ?")
+        .bind(album_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    let credits_before = album_credit_names(pool, album_id).await?;
     for (field, value) in &fields {
         if !ALBUM_FIELDS.contains(&field.as_str()) {
             return Err(format!("Unknown album field: {field}"));
@@ -1074,20 +1112,47 @@ pub async fn set_album_fields(
         upsert_override(pool, album_id, field, &stored).await?;
     }
     reapply_album_overrides(pool, album_id).await?;
-    if fields.contains_key("artist_credits") {
-        // Newly credited co-artists get pages (and the album in their
-        // discography) immediately.
-        let library_id: Option<(String,)> =
-            sqlx::query_as("SELECT library_id FROM media_entry WHERE id = ?")
+    let library_id: Option<(String,)> =
+        sqlx::query_as("SELECT library_id FROM media_entry WHERE id = ?")
+            .bind(album_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    if let Some((lib,)) = library_id {
+        if fields.contains_key("artist_credits") {
+            // Newly credited co-artists get pages (and the album in their
+            // discography) immediately.
+            crate::music::ensure_credit_artists(pool, &lib).await?;
+            if album_credit_names(pool, album_id).await? != credits_before {
+                crate::music_mb::enqueue_album_credit_recheck(pool, &lib, album_id).await?;
+            }
+        }
+        if fields.contains_key("title") {
+            let (title_after,): (String,) = sqlx::query_as("SELECT title FROM album WHERE id = ?")
                 .bind(album_id)
-                .fetch_optional(pool)
+                .fetch_one(pool)
                 .await
                 .map_err(|e| e.to_string())?;
-        if let Some((lib,)) = library_id {
-            crate::music::ensure_credit_artists(pool, &lib).await?;
+            if title_after != title_before {
+                crate::music_mb::requeue_renamed_album(pool, &lib, album_id).await?;
+            }
         }
     }
     Ok(())
+}
+
+/// An album's credit names in order — before/after probe for real changes.
+async fn album_credit_names(pool: &SqlitePool, album_id: i64) -> Result<Vec<String>, String> {
+    Ok(sqlx::query_as::<_, (String,)>(
+        "SELECT name FROM album_artist_credit WHERE album_id = ? ORDER BY position",
+    )
+    .bind(album_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .into_iter()
+    .map(|(n,)| n)
+    .collect())
 }
 
 #[derive(Serialize)]
@@ -1132,6 +1197,8 @@ pub async fn set_artist_fields(
     fields: HashMap<String, serde_json::Value>,
 ) -> Result<(), String> {
     let pool = &state.app_db;
+    ensure_not_staged(pool, artist_id).await?;
+    let mut renamed = false;
     for (field, value) in &fields {
         if field == "biography" {
             let bio = value.as_str().unwrap_or_default().trim().to_string();
@@ -1156,6 +1223,7 @@ pub async fn set_artist_fields(
             .await
             .map_err(|e| e.to_string())?;
         if !old_name.eq_ignore_ascii_case(&new_name) {
+            renamed = true;
             // The tag name lives on as an alias — identity survives the rename.
             sqlx::query("INSERT OR IGNORE INTO artist_alias (artist_id, name) VALUES (?, ?)")
                 .bind(artist_id)
@@ -1167,6 +1235,19 @@ pub async fn set_artist_fields(
         upsert_override(pool, artist_id, "title", &new_name).await?;
     }
     reapply_artist_overrides(pool, artist_id).await?;
+    if renamed {
+        // The walks compare names — a corrected spelling deserves the fresh
+        // walk a merge gets, and the queue should say a pass has work.
+        let library_id: Option<(String,)> =
+            sqlx::query_as("SELECT library_id FROM media_entry WHERE id = ?")
+                .bind(artist_id)
+                .fetch_optional(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        if let Some((lib,)) = library_id {
+            crate::music_mb::requeue_renamed_artist(pool, &lib, artist_id).await?;
+        }
+    }
     Ok(())
 }
 
@@ -1178,6 +1259,7 @@ pub async fn reset_artist_fields(
     state: State<'_, AppState>,
     artist_id: i64,
 ) -> Result<(), String> {
+    ensure_not_staged(&state.app_db, artist_id).await?;
     sqlx::query("DELETE FROM field_override WHERE entity_id = ? AND tier = 'user'")
         .bind(artist_id)
         .execute(&state.app_db)
@@ -1194,6 +1276,7 @@ pub async fn reset_album_fields(
     state: State<'_, AppState>,
     album_id: i64,
 ) -> Result<(), String> {
+    ensure_not_staged(&state.app_db, album_id).await?;
     sqlx::query("DELETE FROM field_override WHERE entity_id = ? AND tier = 'user'")
         .bind(album_id)
         .execute(&state.app_db)
@@ -1298,9 +1381,10 @@ pub async fn get_combine_info(
     let mut out = Vec::with_capacity(album_ids.len());
     for id in album_ids {
         let Some((title, artist)) = sqlx::query_as::<_, (String, Option<String>)>(
-            "SELECT al.title, ar.title FROM album al
-             JOIN media_entry me ON me.id = al.id
-             LEFT JOIN artist ar ON ar.id = me.parent_id
+            "SELECT al.title,
+                    (SELECT ac.name FROM album_artist_credit ac
+                     WHERE ac.album_id = al.id ORDER BY ac.position LIMIT 1)
+             FROM album al
              WHERE al.id = ?",
         )
         .bind(id)
@@ -1409,6 +1493,9 @@ pub async fn combine_albums_multi(
         if ok.is_none() {
             return Err("Album not found in this library".to_string());
         }
+        // Combining into (or out of) an album another staged action will
+        // dissolve is contradictory — staged = immutable.
+        ensure_not_staged(pool, *id).await?;
     }
 
     let editions_of = |album_id: i64| async move {
@@ -1506,6 +1593,7 @@ pub async fn combine_albums_multi(
     .map_err(|e| e.to_string())?;
 
     let mut directives: Vec<(String, String, String)> = Vec::new();
+    let mut staged_source_ids: Vec<i64> = Vec::new();
     for src in &sources {
         let (src_artist, src_title) = album_tag_identity(pool, &library_id, *src).await?;
         let src_name = title_of(*src).await?;
@@ -1539,14 +1627,16 @@ pub async fn combine_albums_multi(
             ));
         }
         directives.push((src_artist, src_title, src_name));
+        staged_source_ids.push(*src);
     }
     if directives.is_empty() {
         return Err("These albums are already combined".to_string());
     }
 
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+    let mut directive_ids: Vec<i64> = Vec::new();
     for (src_artist, src_title, src_name) in &directives {
-        sqlx::query(
+        let res = sqlx::query(
             "INSERT INTO album_combine
              (library_id, source_artist, source_title, target_artist, target_title, mode,
               target_folder, source_name, target_name)
@@ -1564,16 +1654,152 @@ pub async fn combine_albums_multi(
         .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
+        directive_ids.push(res.last_insert_rowid());
     }
     tx.commit().await.map_err(|e| e.to_string())?;
     let combined: Vec<String> =
         directives.iter().map(|(_, _, n)| format!("\u{201c}{n}\u{201d}")).collect();
+    // A merge rewrites the keeper's track list, so an applied MusicBrainz
+    // match stops being proven — the rescan drops it (apply_album_combines)
+    // and the album needs rematching against its full track list. Said here,
+    // at staging time, so it never comes as a surprise.
+    let drops_match = mode == "merge"
+        && sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS (SELECT 1 FROM field_override
+             WHERE entity_id = ? AND field IN ('mb_release_id', 'mb_release_group_id')
+               AND value IS NOT NULL AND value <> '')",
+        )
+        .bind(target_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| e.to_string())?
+            != 0;
     stage_pending_change(
         pool,
         &library_id,
-        &format!("Combine {} into \u{201c}{tgt_name}\u{201d}", combined.join(", ")),
+        "album_combine",
+        "",
+        // source_album_ids: the entries this staging DISSOLVES (they fold
+        // into the target on rescan) — the UI locks them.
+        &serde_json::json!({ "ids": directive_ids, "source_album_ids": staged_source_ids }),
+        &format!(
+            "Combine {} into \u{201c}{tgt_name}\u{201d}{}",
+            combined.join(", "),
+            if drops_match {
+                " — clears its MusicBrainz match; rematch after the rescan"
+            } else {
+                ""
+            }
+        ),
     )
     .await?;
+    Ok(())
+}
+
+/// Is this entity frozen by a staged rescan action? True for split-source
+/// artists and combine-source albums (both DISSOLVE when the rescan applies),
+/// and for albums CREDITED to a staged-split artist — those survive, but
+/// their credit spine is about to be rewritten, so edits wait too. The name
+/// checks cover legacy rows staged before payloads carried entity ids.
+pub(crate) async fn is_staged_for_rescan(
+    pool: &SqlitePool,
+    entity_id: i64,
+) -> Result<bool, String> {
+    let lib: Option<(String,)> =
+        sqlx::query_as("SELECT library_id FROM media_entry WHERE id = ?")
+            .bind(entity_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    let Some((library_id,)) = lib else { return Ok(false) };
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT kind, target, payload FROM pending_change WHERE library_id = ?",
+    )
+    .bind(&library_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    if rows.is_empty() {
+        return Ok(false);
+    }
+
+    // The staged populations, gathered once.
+    let mut split_artist_ids: Vec<i64> = Vec::new();
+    let mut split_targets: Vec<String> = Vec::new();
+    let mut combine_source_ids: Vec<i64> = Vec::new();
+    for (kind, target, payload) in rows {
+        let p: serde_json::Value =
+            serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null);
+        match kind.as_str() {
+            "artist_split" => {
+                if let Some(id) = p["artist_id"].as_i64() {
+                    split_artist_ids.push(id);
+                }
+                if !target.is_empty() {
+                    split_targets.push(target);
+                }
+            }
+            "album_combine" => combine_source_ids.extend(
+                p["source_album_ids"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|v| v.as_i64()),
+            ),
+            _ => {}
+        }
+    }
+    if split_artist_ids.is_empty() && split_targets.is_empty() && combine_source_ids.is_empty() {
+        return Ok(false);
+    }
+
+    if combine_source_ids.contains(&entity_id) || split_artist_ids.contains(&entity_id) {
+        return Ok(true);
+    }
+    let title: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT COALESCE(ar.title, al.title) FROM media_entry me
+         LEFT JOIN artist ar ON ar.id = me.id
+         LEFT JOIN album al ON al.id = me.id
+         WHERE me.id = ?",
+    )
+    .bind(entity_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let title_l = title.and_then(|(t,)| t).map(|t| t.to_lowercase());
+    if title_l.as_deref().is_some_and(|t| split_targets.iter().any(|s| s == t)) {
+        return Ok(true);
+    }
+
+    // Albums credited to a staged-split artist: the split rewrites their
+    // credit rows on rescan, so they wait with it.
+    let credits: Vec<(String, Option<i64>)> = sqlx::query_as(
+        "SELECT ac.name, ac.artist_id FROM album_artist_credit ac WHERE ac.album_id = ?",
+    )
+    .bind(entity_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    for (name, artist_id) in credits {
+        if artist_id.is_some_and(|id| split_artist_ids.contains(&id))
+            || split_targets.iter().any(|s| *s == name.to_lowercase())
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// STAGED = IMMUTABLE: edits and matches on an entity a staged action will
+/// dissolve would be silently discarded when the rescan applies — refuse
+/// them with the way out named.
+pub(crate) async fn ensure_not_staged(pool: &SqlitePool, entity_id: i64) -> Result<(), String> {
+    if is_staged_for_rescan(pool, entity_id).await? {
+        return Err(
+            "Staged for rescan — undo the staged change (metadata center banner) or rescan first"
+                .to_string(),
+        );
+    }
     Ok(())
 }
 
@@ -1581,18 +1807,39 @@ pub async fn combine_albums_multi(
 /// list. The directive itself is already durable and rescan-idempotent; this
 /// row only says "written but not applied yet", so decisions batch behind ONE
 /// rescan instead of forcing one per action. Any successful rescan clears the
-/// list.
+/// list. `kind` + `payload` make the row UNDOABLE (unstage_pending_change
+/// reverts the directive); a non-empty `target` dedups — restaging the same
+/// action replaces its row instead of stacking duplicates.
 pub(crate) async fn stage_pending_change(
     pool: &SqlitePool,
     library_id: &str,
+    kind: &str,
+    target: &str,
+    payload: &serde_json::Value,
     label: &str,
 ) -> Result<(), String> {
-    sqlx::query("INSERT INTO pending_change (library_id, label) VALUES (?, ?)")
+    if !target.is_empty() {
+        sqlx::query(
+            "DELETE FROM pending_change WHERE library_id = ? AND kind = ? AND target = ?",
+        )
         .bind(library_id)
-        .bind(label)
+        .bind(kind)
+        .bind(target)
         .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
+    }
+    sqlx::query(
+        "INSERT INTO pending_change (library_id, label, kind, target, payload) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(library_id)
+    .bind(label)
+    .bind(kind)
+    .bind(target)
+    .bind(payload.to_string())
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -1600,6 +1847,15 @@ pub(crate) async fn stage_pending_change(
 pub struct PendingChange {
     pub id: i64,
     pub label: String,
+    /// Directive family ('' = legacy row, revert unavailable).
+    pub kind: String,
+    /// Dedup key — for splits, the lowercased source name (the UI hides that
+    /// artist's row while the split is staged).
+    pub target: String,
+    /// Entities this staging DISSOLVES on rescan (split-source artists,
+    /// combine-source albums) — the UI locks every edit on them, since any
+    /// change made now would be discarded when the rescan applies.
+    pub locked_ids: Vec<i64>,
 }
 
 /// The staged actions a rescan will apply, oldest first.
@@ -1608,14 +1864,120 @@ pub async fn get_pending_changes(
     state: State<'_, AppState>,
     library_id: String,
 ) -> Result<Vec<PendingChange>, String> {
-    let rows: Vec<(i64, String)> = sqlx::query_as(
-        "SELECT id, label FROM pending_change WHERE library_id = ? ORDER BY id",
+    let rows: Vec<(i64, String, String, String, String)> = sqlx::query_as(
+        "SELECT id, label, kind, target, payload FROM pending_change WHERE library_id = ? ORDER BY id",
     )
     .bind(&library_id)
     .fetch_all(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
-    Ok(rows.into_iter().map(|(id, label)| PendingChange { id, label }).collect())
+    Ok(rows
+        .into_iter()
+        .map(|(id, label, kind, target, payload)| {
+            let p: serde_json::Value =
+                serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null);
+            let locked_ids: Vec<i64> = match kind.as_str() {
+                "artist_split" => p["artist_id"].as_i64().into_iter().collect(),
+                "album_combine" => p["source_album_ids"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|v| v.as_i64())
+                    .collect(),
+                _ => Vec::new(),
+            };
+            PendingChange { id, label, kind, target, locked_ids }
+        })
+        .collect())
+}
+
+/// Un-stage one pending change: revert the directive it wrote and drop the
+/// row — the library returns to exactly how it stood before the action, no
+/// rescan needed (nothing had applied yet).
+#[tauri::command]
+pub async fn unstage_pending_change(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    let pool = &state.app_db;
+    let row: Option<(String, String, String)> =
+        sqlx::query_as("SELECT library_id, kind, payload FROM pending_change WHERE id = ?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    let Some((library_id, kind, payload)) = row else {
+        return Ok(()); // already gone
+    };
+    let p: serde_json::Value = serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null);
+    match kind.as_str() {
+        "artist_split" => {
+            for s in p["sources"].as_array().into_iter().flatten() {
+                if let Some(name) = s.as_str() {
+                    sqlx::query(
+                        "DELETE FROM artist_split WHERE library_id = ? AND source_name = ?",
+                    )
+                    .bind(&library_id)
+                    .bind(name)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        "album_combine" => {
+            for cid in p["ids"].as_array().into_iter().flatten() {
+                if let Some(cid) = cid.as_i64() {
+                    sqlx::query("DELETE FROM album_combine WHERE id = ?")
+                        .bind(cid)
+                        .execute(pool)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        "combine_removed" => {
+            // Un-staging an un-combine (or a separate that removed a combine)
+            // puts the deleted directive back.
+            let r = &p["row"];
+            sqlx::query(
+                "INSERT INTO album_combine
+                 (library_id, source_artist, source_title, target_artist, target_title, mode,
+                  target_folder, source_name, target_name)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&library_id)
+            .bind(r["source_artist"].as_str().unwrap_or_default())
+            .bind(r["source_title"].as_str().unwrap_or_default())
+            .bind(r["target_artist"].as_str().unwrap_or_default())
+            .bind(r["target_title"].as_str().unwrap_or_default())
+            .bind(r["mode"].as_str().unwrap_or("versions"))
+            .bind(r["target_folder"].as_str())
+            .bind(r["source_name"].as_str())
+            .bind(r["target_name"].as_str())
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        }
+        "release_split" => {
+            if let Some(folder) = p["folder_path"].as_str() {
+                sqlx::query(
+                    "DELETE FROM album_release_split WHERE library_id = ? AND folder_path = ?",
+                )
+                .bind(&library_id)
+                .bind(folder)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            }
+        }
+        // Legacy rows (pre-undo staging) carry no revert data — removing the
+        // label is all that can be done.
+        _ => {}
+    }
+    sqlx::query("DELETE FROM pending_change WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// An album folded into this one by a user combine — the undo list.
@@ -1670,6 +2032,29 @@ pub async fn get_album_absorbed(
         .collect())
 }
 
+/// Full copy of a combine directive, taken BEFORE deleting it — what
+/// un-staging the deletion needs to put the row back.
+async fn combine_row_snapshot(
+    pool: &SqlitePool,
+    combine_id: i64,
+) -> Result<serde_json::Value, String> {
+    let row: (String, String, String, String, String, Option<String>, Option<String>, Option<String>) =
+        sqlx::query_as(
+            "SELECT source_artist, source_title, target_artist, target_title, mode,
+                    target_folder, source_name, target_name
+             FROM album_combine WHERE id = ?",
+        )
+        .bind(combine_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({
+        "source_artist": row.0, "source_title": row.1, "target_artist": row.2,
+        "target_title": row.3, "mode": row.4, "target_folder": row.5,
+        "source_name": row.6, "target_name": row.7,
+    }))
+}
+
 /// Undo one combine: the folded-in album returns as its own album on the next
 /// scan (nothing on disk moves, and the tracks keep their ids/history).
 /// Returns the library to rescan.
@@ -1686,6 +2071,7 @@ pub async fn undo_album_combine(
             .await
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "That combine no longer exists".to_string())?;
+    let snapshot = combine_row_snapshot(pool, combine_id).await?;
     sqlx::query("DELETE FROM album_combine WHERE id = ?")
         .bind(combine_id)
         .execute(pool)
@@ -1695,6 +2081,9 @@ pub async fn undo_album_combine(
     stage_pending_change(
         pool,
         &library_id,
+        "combine_removed",
+        "",
+        &serde_json::json!({ "row": snapshot }),
         &format!("Un-combine \u{201c}{name}\u{201d} back into its own album"),
     )
     .await?;
@@ -1755,6 +2144,7 @@ pub async fn split_album_release(
                 .await
                 .map_err(|e| e.to_string())?;
                 if let Some((id,)) = existing {
+                    let snapshot = combine_row_snapshot(pool, id).await?;
                     sqlx::query("DELETE FROM album_combine WHERE id = ?")
                         .bind(id)
                         .execute(pool)
@@ -1763,6 +2153,9 @@ pub async fn split_album_release(
                     stage_pending_change(
                         pool,
                         &library_id,
+                        "combine_removed",
+                        "",
+                        &serde_json::json!({ "row": snapshot }),
                         &format!("Separate an edition of \u{201c}{}\u{201d}", album_title_for(pool, album_id).await?),
                     )
                     .await?;
@@ -1784,6 +2177,9 @@ pub async fn split_album_release(
     stage_pending_change(
         pool,
         &library_id,
+        "release_split",
+        &folder_path.to_lowercase(),
+        &serde_json::json!({ "folder_path": folder_path }),
         &format!("Separate an edition of \u{201c}{}\u{201d}", album_title_for(pool, album_id).await?),
     )
     .await?;

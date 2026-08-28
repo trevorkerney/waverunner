@@ -82,6 +82,10 @@ pub struct ScannedTrack {
     /// itself is rewritten to members[0] (the canonical parent). Empty = the
     /// album artist is a single artist, no credit rows written.
     pub album_artist_credits: Vec<String>,
+    /// Audio-region content fingerprint ("a:…"), or full-file ("f:…") when
+    /// the container couldn't be parsed. None = unreadable. A rescan HINT for
+    /// identity migration (moves/renames), never identity itself.
+    pub audio_hash: Option<String>,
 }
 
 #[derive(Debug)]
@@ -363,6 +367,7 @@ fn read_track(abs: &Path, rel: &str, disc_folder_no: Option<i64>) -> Result<Scan
         credits,
         sound: false,
         album_artist_credits: Vec::new(),
+        audio_hash: crate::content_hash::hash_file(abs),
     })
 }
 
@@ -1051,8 +1056,8 @@ async fn insert_track_rows(
     .map_err(|e| e.to_string())?;
     let id = res.last_insert_rowid();
     sqlx::query(
-        "INSERT INTO track (id, title, sort_title, file_path, sort_order, track_number, disc_number, runtime)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO track (id, title, sort_title, file_path, sort_order, track_number, disc_number, runtime, audio_hash)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(id)
     .bind(&t.title)
@@ -1062,6 +1067,7 @@ async fn insert_track_rows(
     .bind(t.track_number)
     .bind(t.disc_number)
     .bind(t.duration_secs)
+    .bind(&t.audio_hash)
     .execute(pool)
     .await
     .map_err(|e| e.to_string())?;
@@ -1168,11 +1174,13 @@ async fn link_album_genres(
 }
 
 /// Insert a freshly scanned album (entry + rows + releases + tracks + covers).
+/// Albums carry NO artist parent — membership on artist pages is entirely the
+/// album_artist_credit rows written at the end of this function. (Loose
+/// containers are the one deliberate exception; see ensure_loose_container.)
 async fn insert_album(
     pool: &SqlitePool,
     library_id: &str,
     cache_base: &Path,
-    parent: Option<i64>,
     album: &ScannedAlbum,
     sort_order: i64,
 ) -> Result<i64, String> {
@@ -1181,10 +1189,9 @@ async fn insert_album(
 
     let title = album_title_of(album);
     let res = sqlx::query(
-        "INSERT INTO media_entry (library_id, parent_id, entry_type_id) VALUES (?, ?, ?)",
+        "INSERT INTO media_entry (library_id, parent_id, entry_type_id) VALUES (?, NULL, ?)",
     )
     .bind(library_id)
-    .bind(parent)
     .bind(album_type)
     .execute(pool)
     .await
@@ -1373,7 +1380,7 @@ async fn reconcile_album(
             let sort_order = track_sort_order(t, ti);
             if let Some(track_id) = existing_tracks.remove(&t.rel) {
                 sqlx::query(
-                    "UPDATE track SET title = ?, sort_title = ?, sort_order = ?, track_number = ?, disc_number = ?, runtime = ?
+                    "UPDATE track SET title = ?, sort_title = ?, sort_order = ?, track_number = ?, disc_number = ?, runtime = ?, audio_hash = ?
                      WHERE id = ?",
                 )
                 .bind(&t.title)
@@ -1382,6 +1389,7 @@ async fn reconcile_album(
                 .bind(t.track_number)
                 .bind(t.disc_number)
                 .bind(t.duration_secs)
+                .bind(&t.audio_hash)
                 .bind(track_id)
                 .execute(pool)
                 .await
@@ -1433,6 +1441,12 @@ async fn reconcile_album(
 /// `parent` (an artist entry id, or None for the library-root container that
 /// takes artist-less tracks). Containers are flagged in loose_album and
 /// excluded from every album-facing surface. Returns (album_id, release_id).
+///
+/// DELIBERATE EXCEPTION: containers are the only "albums" that still use
+/// media_entry.parent_id. Real albums live on their album_artist_credit rows;
+/// a container is per-artist infrastructure with exactly one owner by
+/// definition, has no credit of its own, and its identity IS (library,
+/// artist, sound) — the parent column states that directly.
 async fn ensure_loose_container(
     pool: &SqlitePool,
     library_id: &str,
@@ -2440,13 +2454,14 @@ pub async fn ensure_credit_artists(pool: &SqlitePool, library_id: &str) -> Resul
     names.sort_by_key(|n| n.to_lowercase());
 
     // Punctuation-blind keys of every existing artist name, most-albums-first
-    // so the real "J. Cole" is the suggested keep-target over any lookalike.
+    // (by credit rows — albums have no artist parent) so the real "J. Cole"
+    // is the suggested keep-target over any lookalike.
     let existing: Vec<(i64, String, String)> = sqlx::query_as(
         "SELECT a.id, a.title, an.name FROM artist a
          JOIN media_entry me ON me.id = a.id
          JOIN artist_names an ON an.artist_id = a.id
          WHERE me.library_id = ?
-         ORDER BY (SELECT COUNT(*) FROM media_entry c WHERE c.parent_id = a.id) DESC, a.id ASC",
+         ORDER BY (SELECT COUNT(*) FROM album_artist_credit ac WHERE ac.artist_id = a.id) DESC, a.id ASC",
     )
     .bind(library_id)
     .fetch_all(pool)
@@ -2741,6 +2756,7 @@ pub(crate) async fn apply_album_combines(
         }
     }
 
+    let mut merge_target_folders: Vec<String> = Vec::new();
     for (di, origin, src) in pulled {
         let d = &directives[di];
         // Locate the target by index so the fold can borrow mutably.
@@ -2763,15 +2779,67 @@ pub(crate) async fn apply_album_combines(
         }
         match found {
             Some((Some(ai), bi)) => {
+                if d.4 == "merge" {
+                    let f = artists[ai].albums[bi].folder_rel.clone();
+                    if !merge_target_folders.contains(&f) {
+                        merge_target_folders.push(f);
+                    }
+                }
                 fold_album(&mut artists[ai].albums[bi], src, &d.4, d.5.as_deref())
             }
-            Some((None, bi)) => fold_album(&mut orphans.albums[bi], src, &d.4, d.5.as_deref()),
+            Some((None, bi)) => {
+                if d.4 == "merge" {
+                    let f = orphans.albums[bi].folder_rel.clone();
+                    if !merge_target_folders.contains(&f) {
+                        merge_target_folders.push(f);
+                    }
+                }
+                fold_album(&mut orphans.albums[bi], src, &d.4, d.5.as_deref())
+            }
             None => match origin {
                 // Target absent this scan — put the source back untouched.
                 Origin::Artist(ai) => artists[ai].albums.push(src),
                 Origin::Orphan => orphans.albums.push(src),
             },
         }
+    }
+
+    // A merge rewrites the keeper's track list, which invalidates any
+    // MusicBrainz match applied to the OLD list: the album would keep reading
+    // "Matched" while the merged-in tracks never received the release's
+    // credits. Resetting identity and stamps HERE — before reconcile — makes
+    // this same rescan rebuild tag credits for every track uniformly, and a
+    // fresh match then applies the release to the complete album. (Versions
+    // mode keeps its match: the keeper's own track list doesn't change.)
+    for folder in merge_target_folders {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT al.id FROM album al JOIN media_entry me ON me.id = al.id
+             WHERE me.library_id = ? AND al.folder_path = ?",
+        )
+        .bind(library_id)
+        .bind(&folder)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        let Some((album_id,)) = row else { continue };
+        sqlx::query(
+            "DELETE FROM field_override WHERE entity_id = ?
+             AND field IN ('mb_release_id', 'mb_release_group_id')",
+        )
+        .bind(album_id)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        sqlx::query("DELETE FROM mb_credit_fetch WHERE album_id = ?")
+            .bind(album_id)
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        sqlx::query("DELETE FROM album_match_gap WHERE album_id = ?")
+            .bind(album_id)
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -2825,11 +2893,6 @@ pub async fn scan_music_library(
                 id
             }
         };
-        let start: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM media_entry WHERE parent_id = ?")
-            .bind(artist_id)
-            .fetch_one(pool)
-            .await
-            .map_err(|e| e.to_string())?;
         let mut sorted = artist.albums;
         sorted.sort_by_key(album_sort_key);
         for (j, album) in sorted.iter().enumerate() {
@@ -2843,8 +2906,7 @@ pub async fn scan_music_library(
                 built,
                 build_total,
             );
-            insert_album(pool, library_id, cache_base, Some(artist_id), album, start.0 + j as i64)
-                .await?;
+            insert_album(pool, library_id, cache_base, album, j as i64).await?;
             built += 1;
         }
         if !artist.loose.is_empty() {
@@ -2865,7 +2927,7 @@ pub async fn scan_music_library(
         }
     }
 
-    // Material naming no artist at all: albums at the root, artist-less loose
+    // Material naming no artist at all: credit-less albums, artist-less loose
     // tracks under the library-root container.
     for (j, album) in orphans.albums.iter().enumerate() {
         crate::commands::emit_scan_progress_phased(
@@ -2876,7 +2938,7 @@ pub async fn scan_music_library(
             built,
             build_total,
         );
-        insert_album(pool, library_id, cache_base, None, album, j as i64).await?;
+        insert_album(pool, library_id, cache_base, album, j as i64).await?;
         built += 1;
     }
     if !orphans.loose.is_empty() {
@@ -3030,6 +3092,9 @@ pub async fn rescan_music_library(
         .iter()
         .filter_map(|(_, p, parent)| parent.map(|a| (p.clone(), a)))
         .collect();
+    // Which track ids existed BEFORE this scan — the hash rescue in the sweep
+    // only pairs disappeared rows with rows created THIS scan.
+    let original_track_ids: HashSet<i64> = db_tracks.iter().map(|(id, _, _)| *id).collect();
     let mut existing_tracks: HashMap<String, i64> =
         db_tracks.into_iter().map(|(id, p, _)| (p, id)).collect();
 
@@ -3143,22 +3208,16 @@ pub async fn rescan_music_library(
                         .execute(pool)
                         .await
                         .map_err(|e| e.to_string())?;
-                    // Reparent — the album-artist tag may have changed.
-                    sqlx::query("UPDATE media_entry SET parent_id = ? WHERE id = ?")
-                        .bind(artist_id)
-                        .bind(album_id)
-                        .execute(pool)
-                        .await
-                        .map_err(|e| e.to_string())?;
+                    // No reparent: a changed album-artist tag moves the album
+                    // through its CREDIT rows — reconcile_album rewrites them
+                    // from tags (unless MusicBrainz already owns them).
                     reconcile_album(pool, library_id, cache_base, album_id, album, &mut existing_tracks)
                         .await?;
                 }
                 None => {
                     // Fresh entries; any old same-path entries left in
                     // existing_tracks are stale and belong to the sweep.
-                    let id =
-                        insert_album(pool, library_id, cache_base, Some(artist_id), album, j as i64)
-                            .await?;
+                    let id = insert_album(pool, library_id, cache_base, album, j as i64).await?;
                     seen_album_ids.insert(id);
                 }
             }
@@ -3212,16 +3271,11 @@ pub async fn rescan_music_library(
                     .execute(pool)
                     .await
                     .map_err(|e| e.to_string())?;
-                sqlx::query("UPDATE media_entry SET parent_id = NULL WHERE id = ?")
-                    .bind(album_id)
-                    .execute(pool)
-                    .await
-                    .map_err(|e| e.to_string())?;
                 reconcile_album(pool, library_id, cache_base, album_id, album, &mut existing_tracks)
                     .await?;
             }
             None => {
-                let id = insert_album(pool, library_id, cache_base, None, album, j as i64).await?;
+                let id = insert_album(pool, library_id, cache_base, album, j as i64).await?;
                 seen_album_ids.insert(id);
             }
         }
@@ -3249,8 +3303,86 @@ pub async fn rescan_music_library(
     }
 
     // Global sweeps for anything the scan never claimed.
-    // 1. Tracks whose files are gone (or are now unreadable).
-    for (_, track_id) in existing_tracks {
+    // 1. Tracks whose files are gone (or are now unreadable) — after the
+    //    hash rescue: a disappeared row whose audio fingerprint reappeared at
+    //    exactly one path CREATED THIS SCAN is the same recording moved or
+    //    renamed (retagging can't change the fingerprint — it covers the
+    //    audio region only). Its identity migrates — plays, loved, playlist
+    //    links, user overrides and MB ids — instead of dying with the path.
+    //    Strictly one-to-one: duplicate rips legitimately share hashes, and
+    //    history must never be spliced onto a guess, so any ambiguity falls
+    //    through to today's delete + add.
+    let dead: Vec<(String, i64)> = existing_tracks.into_iter().collect();
+    let mut dead_by_hash: HashMap<String, Vec<i64>> = HashMap::new();
+    for (_, id) in &dead {
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT audio_hash FROM track WHERE id = ?")
+                .bind(id)
+                .fetch_optional(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        if let Some((Some(h),)) = row {
+            dead_by_hash.entry(h).or_default().push(*id);
+        }
+    }
+    for (hash, olds) in dead_by_hash {
+        if olds.len() != 1 {
+            continue; // several vanished copies share this sound — ambiguous
+        }
+        let old_id = olds[0];
+        let mut news: Vec<i64> = sqlx::query_as::<_, (i64,)>(
+            "SELECT t.id FROM track t JOIN media_entry me ON me.id = t.id
+             WHERE me.library_id = ? AND t.audio_hash = ? AND t.id != ?",
+        )
+        .bind(library_id)
+        .bind(&hash)
+        .bind(old_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|(id,)| id)
+        .filter(|id| !original_track_ids.contains(id))
+        .collect();
+        if news.len() != 1 {
+            continue; // no reappearance, or several candidates — ambiguous
+        }
+        let new_id = news.remove(0);
+        // Same recording, new row: everything attached to the old identity
+        // moves over. Credits/tags stay the NEW row's (tags are truth for
+        // organization); history/curation follow the sound.
+        sqlx::query("UPDATE music_play SET track_id = ? WHERE track_id = ?")
+            .bind(new_id)
+            .bind(old_id)
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO track_loved (track_id, loved_at)
+             SELECT ?, loved_at FROM track_loved WHERE track_id = ?",
+        )
+        .bind(new_id)
+        .bind(old_id)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        sqlx::query("UPDATE media_link SET target_entry_id = ? WHERE target_entry_id = ?")
+            .bind(new_id)
+            .bind(old_id)
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        // User edits and MB recording ids ride along; collisions (the new
+        // row somehow already has the field) keep the new row's value and
+        // the leftovers die with the old row.
+        sqlx::query("UPDATE OR IGNORE field_override SET entity_id = ? WHERE entity_id = ?")
+            .bind(new_id)
+            .bind(old_id)
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    for (_, track_id) in dead {
         sqlx::query("DELETE FROM media_entry WHERE id = ?")
             .bind(track_id)
             .execute(pool)
@@ -3587,24 +3719,9 @@ pub(crate) async fn resolve_credit_ids(pool: &SqlitePool, library_id: &str) -> R
     // every credit row in the library (~thousands), and each autocommit
     // statement costs SQLite a journal sync — several thousand fsyncs made
     // the scan look hung at its tail. Batched, it's one sync.
+    // (The old parent→solo-row backfill is gone with the artist parent
+    // itself: write_album_credits guarantees rows on every insert/reconcile.)
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
-
-    // Rowless albums first, so the fresh rows are stamped below. The parent's
-    // title is the owner for an album scanned without a joint credit.
-    sqlx::query(
-        "INSERT INTO album_artist_credit (album_id, position, name, artist_id)
-         SELECT al.id, 0, a.title, a.id FROM album al
-         JOIN media_entry me ON me.id = al.id
-         JOIN artist a ON a.id = me.parent_id
-         WHERE me.library_id = ?
-           AND NOT EXISTS (SELECT 1 FROM album_artist_credit ac WHERE ac.album_id = al.id)
-           AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = al.id)
-           AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = al.id)",
-    )
-    .bind(library_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| e.to_string())?;
 
     let track_rows: Vec<(i64, i64, String, Option<i64>)> = sqlx::query_as(
         "SELECT tc.track_id, tc.position, tc.name, tc.artist_id FROM track_credit tc
@@ -3790,7 +3907,14 @@ pub async fn get_artist_detail(
              FROM album al
              JOIN media_entry me ON me.id = al.id
              WHERE EXISTS (SELECT 1 FROM album_artist_credit ac
-                           WHERE ac.album_id = al.id AND ac.artist_id = ?1)
+                           WHERE ac.album_id = al.id
+                             AND (ac.artist_id = ?1
+                                  -- An alter ego's records are this artist's
+                                  -- records: same human, so they belong in
+                                  -- the discography rather than the
+                                  -- appears-on shelf below.
+                                  OR ac.artist_id IN (SELECT persona_id FROM artist_persona
+                                                      WHERE parent_id = ?1)))
                AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = al.id)
                AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = al.id)
              ORDER BY al.sort_order, al.release_date, al.sort_title COLLATE NOCASE",
@@ -3852,7 +3976,9 @@ pub async fn get_artist_detail(
     // the whole page for feature-only artists, a bonus section for the rest.
     let appears_rows: Vec<(i64, String, Option<String>, String, Option<String>, Option<String>, i64)> =
         sqlx::query_as(
-            "SELECT DISTINCT al.id, al.title, al.release_date, al.folder_path, al.selected_cover, ar2.title,
+            "SELECT DISTINCT al.id, al.title, al.release_date, al.folder_path, al.selected_cover,
+                    (SELECT ac0.name FROM album_artist_credit ac0
+                     WHERE ac0.album_id = al.id ORDER BY ac0.position LIMIT 1),
                     (SELECT COUNT(DISTINCT tc2.track_id) FROM track_credit tc2
                      JOIN media_entry tme2 ON tme2.id = tc2.track_id
                      WHERE tme2.parent_id = al.id AND tc2.artist_id = ?1)
@@ -3860,11 +3986,13 @@ pub async fn get_artist_detail(
              JOIN media_entry tme ON tme.id = tc.track_id
              JOIN album al ON al.id = tme.parent_id
              JOIN media_entry ame ON ame.id = al.id
-             LEFT JOIN artist ar2 ON ar2.id = ame.parent_id
              WHERE ame.library_id = ?2
                AND tc.artist_id = ?1
                AND NOT EXISTS (SELECT 1 FROM album_artist_credit ac
-                               WHERE ac.album_id = al.id AND ac.artist_id = ?1)
+                               WHERE ac.album_id = al.id
+                                 AND (ac.artist_id = ?1
+                                      OR ac.artist_id IN (SELECT persona_id FROM artist_persona
+                                                          WHERE parent_id = ?1)))
                AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = al.id)
                AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = al.id)
              ORDER BY al.release_date, al.sort_title COLLATE NOCASE",
@@ -4017,16 +4145,15 @@ pub async fn get_album_detail(
     entry_id: i64,
 ) -> Result<AlbumDetail, String> {
     let pool = &state.app_db;
-    let (library_id, parent_id, title, release_date, folder_path, selected_cover, album_type): (
+    let (library_id, title, release_date, folder_path, selected_cover, album_type): (
         String,
-        Option<i64>,
         String,
         Option<String>,
         String,
         Option<String>,
         String,
     ) = sqlx::query_as(
-        "SELECT me.library_id, me.parent_id, al.title, al.release_date, al.folder_path, al.selected_cover, al.album_type
+        "SELECT me.library_id, al.title, al.release_date, al.folder_path, al.selected_cover, al.album_type
          FROM album al JOIN media_entry me ON me.id = al.id WHERE al.id = ?",
     )
     .bind(entry_id)
@@ -4034,15 +4161,28 @@ pub async fn get_album_detail(
     .await
     .map_err(|e| e.to_string())?;
 
-    // Artist-less albums (no artist tags anywhere) live at the library root.
+    // The album's artist is its FIRST credit row (albums have no artist
+    // parent). Credit-less albums (no artist tags anywhere) have neither.
+    let first_credit: Option<(String, Option<i64>)> = sqlx::query_as(
+        "SELECT name, artist_id FROM album_artist_credit
+         WHERE album_id = ? ORDER BY position LIMIT 1",
+    )
+    .bind(entry_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    // Display the linked artist's CANONICAL title when the credit resolves
+    // (same rule as credit_view) — the raw credit string only when it doesn't.
+    let parent_id: Option<i64> = first_credit.as_ref().and_then(|(_, aid)| *aid);
     let artist_title: Option<String> = match parent_id {
-        Some(pid) => sqlx::query_as::<_, (String,)>("SELECT title FROM artist WHERE id = ?")
-            .bind(pid)
+        Some(aid) => sqlx::query_as::<_, (String,)>("SELECT title FROM artist WHERE id = ?")
+            .bind(aid)
             .fetch_optional(pool)
             .await
             .map_err(|e| e.to_string())?
-            .map(|(t,)| t),
-        None => None,
+            .map(|(t,)| t)
+            .or_else(|| first_credit.as_ref().map(|(n, _)| n.clone())),
+        None => first_credit.as_ref().map(|(n, _)| n.clone()),
     };
 
     let genres: Vec<(String,)> = sqlx::query_as(
@@ -4199,7 +4339,8 @@ pub async fn get_music_counts(
             COALESCE(SUM(CASE WHEN met.name = 'artist'
                 AND (NOT EXISTS (SELECT 1 FROM media_entry ch WHERE ch.parent_id = me.id)
                      OR EXISTS (SELECT 1 FROM media_entry ch WHERE ch.parent_id = me.id
-                                AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = ch.id)))
+                                AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = ch.id))
+                     OR EXISTS (SELECT 1 FROM album_artist_credit ac WHERE ac.artist_id = me.id))
                 THEN 1 ELSE 0 END), 0),
             COALESCE(SUM(CASE WHEN met.name = 'album'
                 AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = me.id)
@@ -4313,7 +4454,9 @@ pub async fn get_music_tracks(
         sqlx::query_as(&format!(
             "SELECT t.id, t.title, t.file_path, t.runtime, tm.artist_name,
                     al.id, al.title, COALESCE((SELECT 1 FROM loose_album la WHERE la.album_id = al.id), 0),
-                    alme.parent_id,
+                    COALESCE((SELECT ac0.artist_id FROM album_artist_credit ac0
+                              WHERE ac0.album_id = alme.id ORDER BY ac0.position LIMIT 1),
+                             alme.parent_id),
                     (SELECT COUNT(*) FROM music_play mp WHERE mp.track_id = t.id AND mp.scrobbled = 1),
                     EXISTS(SELECT 1 FROM track_loved tl WHERE tl.track_id = t.id),
                     al.folder_path, al.selected_cover
@@ -4414,7 +4557,10 @@ pub async fn get_track_queue_items(
         let row: Option<(String, String, Option<i64>, Option<String>, String, Option<String>, Option<i64>, Option<i64>, i64, i64, Option<String>, Option<String>)> =
             sqlx::query_as(
                 "SELECT t.title, t.file_path, t.runtime, tm.artist_name, me.library_id,
-                        al.title, al.id, alme.parent_id,
+                        al.title, al.id,
+                        COALESCE((SELECT ac0.artist_id FROM album_artist_credit ac0
+                                  WHERE ac0.album_id = alme.id ORDER BY ac0.position LIMIT 1),
+                                 alme.parent_id),
                         COALESCE((SELECT 1 FROM loose_album la WHERE la.album_id = al.id), 0),
                         EXISTS(SELECT 1 FROM track_loved tl WHERE tl.track_id = t.id),
                         al.folder_path, al.selected_cover
@@ -4545,6 +4691,15 @@ pub(crate) async fn artist_loved_counts(
     // Credit rows carry stamped artist_ids (every album has rows, solo
     // included), so this reads them directly — no name resolution, no
     // parent_id fallback.
+    //
+    // The final UNION rolls a PERSONA's loves up to the human behind it (an
+    // alter ego's loves are the same person's), while the persona keeps its
+    // own tally. UNION not SUM: a track credited to both identities is one
+    // love, not two.
+    //
+    // NB: this string uses `\` line continuations, which strip the newlines —
+    // so a `--` comment inside the SQL would swallow everything after it.
+    // Explanations live out here for that reason.
     sqlx::query_as(
         "WITH loved AS ( \
              SELECT tl.track_id, ar.album_id, \
@@ -4565,7 +4720,12 @@ pub(crate) async fn artist_loved_counts(
              JOIN track_credit tc ON tc.track_id = l.track_id \
              WHERE l.loose AND tc.artist_id IS NOT NULL \
          ) \
-         SELECT artist_id, COUNT(DISTINCT track_id) FROM attributed GROUP BY artist_id",
+         SELECT artist_id, COUNT(DISTINCT track_id) FROM ( \
+             SELECT artist_id, track_id FROM attributed \
+             UNION \
+             SELECT p.parent_id, a.track_id FROM attributed a \
+             JOIN artist_persona p ON p.persona_id = a.artist_id \
+         ) GROUP BY artist_id",
     )
     .bind(library_id)
     .fetch_all(pool)
@@ -4658,7 +4818,7 @@ pub async fn get_unlinked_credits(
          JOIN media_entry me ON me.id = a.id
          JOIN artist_names an ON an.artist_id = a.id
          WHERE me.library_id = ?
-         ORDER BY (SELECT COUNT(*) FROM media_entry c WHERE c.parent_id = a.id) DESC, a.id ASC",
+         ORDER BY (SELECT COUNT(*) FROM album_artist_credit ac WHERE ac.artist_id = a.id) DESC, a.id ASC",
     )
     .bind(&library_id)
     .fetch_all(pool)
@@ -4705,13 +4865,12 @@ pub async fn get_music_tag_fallbacks(
     state: State<'_, AppState>,
     library_id: String,
 ) -> Result<Vec<TagFallbackRow>, String> {
-    let rows: Vec<(i64, String, String, Option<i64>, i64, Option<i64>, Option<String>)> = sqlx::query_as(
+    let rows: Vec<(i64, String, String, Option<i64>, i64, Option<String>)> = sqlx::query_as(
         "SELECT t.id, t.title, t.file_path, t.track_number,
                 COALESCE((SELECT 1 FROM loose_album la WHERE la.album_id = me.parent_id), 0),
-                alme.parent_id, tm.artist_name
+                tm.artist_name
          FROM track t
          JOIN media_entry me ON me.id = t.id
-         LEFT JOIN media_entry alme ON alme.id = me.parent_id
          LEFT JOIN track_meta tm ON tm.track_id = t.id
          WHERE me.library_id = ?
            AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = me.parent_id)
@@ -4723,12 +4882,11 @@ pub async fn get_music_tag_fallbacks(
     .map_err(|e| e.to_string())?;
 
     let mut out = Vec::new();
-    for (id, title, file_path, track_number, is_loose, album_parent, artist_name) in rows {
+    for (id, title, file_path, track_number, is_loose, artist_name) in rows {
         let mut missing = Vec::new();
         if title.is_empty() {
             missing.push("title".to_string());
         }
-        let _ = album_parent;
         if artist_name.as_deref().unwrap_or("").is_empty() {
             missing.push("artist".to_string());
         }
@@ -4798,6 +4956,7 @@ mod tests {
             credits: vec![],
             sound: false,
         album_artist_credits: Vec::new(),
+        audio_hash: None,
         };
         ScannedAlbum {
             identity_override: None,
@@ -4892,6 +5051,7 @@ mod tests {
             credits: credits.iter().map(|c| c.to_string()).collect(),
             sound: false,
         album_artist_credits: Vec::new(),
+        audio_hash: None,
         }
     }
 
@@ -4934,7 +5094,8 @@ mod tests {
             &["Feature Test"],
             1,
         )]);
-        let album_id = insert_album(&pool, "lib1", &dir, Some(artist_id), &v1, 0).await.unwrap();
+        let _ = artist_id;
+        let album_id = insert_album(&pool, "lib1", &dir, &v1, 0).await.unwrap();
         let credits: Vec<(String,)> = sqlx::query_as(
             "SELECT tc.name FROM track_credit tc JOIN media_entry me ON me.id = tc.track_id
              WHERE me.parent_id = ? ORDER BY tc.position",
@@ -5260,6 +5421,7 @@ mod tests {
             credits: vec![],
             sound: false,
         album_artist_credits: Vec::new(),
+        audio_hash: None,
             };
             (t, folder.to_string(), PathBuf::from(format!(r"X:\m\{folder}")))
         };

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { notifyPendingWorkChanged } from "./PendingWork";
 import { toast } from "sonner";
 import {
   Dialog,
@@ -822,6 +823,7 @@ export function SplitArtistDialog({
       // forcing its own. The metadata center's pending banner shows the batch
       // and offers the rescan.
       toast("Split staged — it applies on the next rescan");
+      notifyPendingWorkChanged();
     } catch (e) {
       toast.error(String(e));
     } finally {

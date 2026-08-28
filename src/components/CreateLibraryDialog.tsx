@@ -43,7 +43,11 @@ import { FolderOpen, Film, Music, Server, HardDrive, Plus, X, Check } from "luci
 export type WizardMode =
   | { kind: "create" }
   | { kind: "resume"; libraryId: string; name: string; format: string; stage: "scan" | "match" | "review" }
-  | { kind: "rescan"; libraryId: string; name: string; format: string };
+  | { kind: "rescan"; libraryId: string; name: string; format: string }
+  // Matching pass only — opens on the match step already running (invoking
+  // it WAS the yes; no elective screen). Attaches to an in-flight pass
+  // harmlessly, since starting while running is a backend no-op.
+  | { kind: "match"; libraryId: string; name: string; format: string };
 
 interface CreateLibraryDialogProps {
   open: boolean;
@@ -124,6 +128,8 @@ export function CreateLibraryDialog({
   // Last-known done/total per music match sub-phase (albums → artists →
   // images), feeding the sub-stepper under the main timeline.
   const [subProgress, setSubProgress] = useState<Record<string, { done: number; total: number }>>({});
+  // Which sweep of the pass's no-progress loop is running (1-based, cap 3).
+  const [passSweep, setPassSweep] = useState(1);
   // Rolling per-step timestamps for the time-remaining estimate: average gap
   // between recent steps × steps left. Reset when the pass changes phase
   // (albums → artists) since their per-step costs differ.
@@ -266,9 +272,24 @@ export function CreateLibraryDialog({
         }));
       },
     );
+    // Sweep counter: the pass loops until a sweep makes no progress (cap 3),
+    // and each new sweep RESETS the per-phase counters — without this label a
+    // glance away and back reads as the pass losing ground. Shown from sweep
+    // 1 so the model is taught before the first reset ever happens.
+    const unIteration = listen<{ libraryId: string; iteration: number }>(
+      "music-enrich-iteration",
+      (e) => {
+        if (e.payload.libraryId !== libraryId) return;
+        setPassSweep(e.payload.iteration);
+        // Fresh sweep, fresh sections — stale "(N)" chips from the previous
+        // sweep would misread as this sweep's totals.
+        if (e.payload.iteration > 1) setSubProgress({});
+      },
+    );
     const unDone = listen<{ libraryId: string; error?: string }>("music-enrich-done", async (e) => {
       if (e.payload.libraryId !== libraryId) return;
       setMatchProgress(null);
+      setPassSweep(1);
       if (e.payload.error) {
         toast.error(`MusicBrainz matching failed: ${e.payload.error}. You can retry from the metadata center.`);
       }
@@ -276,6 +297,7 @@ export function CreateLibraryDialog({
     });
     return () => {
       unProgress.then((fn) => fn());
+      unIteration.then((fn) => fn());
       unDone.then((fn) => fn());
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -301,7 +323,17 @@ export function CreateLibraryDialog({
     } else {
       setLibraryId(mode.libraryId);
       setLibraryName(mode.name);
-      if (mode.kind === "rescan" || mode.stage === "scan") {
+      if (mode.kind === "match") {
+        void (async () => {
+          await enterMatch(mode.libraryId);
+          setMatchPhase("running");
+          try {
+            await invoke("music_match_begin", { libraryId: mode.libraryId });
+          } catch (e) {
+            toast.error(String(e));
+          }
+        })();
+      } else if (mode.kind === "rescan" || mode.stage === "scan") {
         setStep(2);
         void runRescan(mode.libraryId);
       } else if (mode.stage === "match") {
@@ -639,7 +671,10 @@ export function CreateLibraryDialog({
       ? onlineMetadata
         ? steps
         : steps.filter((s) => s.n <= 2)
-      : steps.filter((s) => s.n !== 1);
+      : mode.kind === "match"
+        ? // Match-only runs: no setup, no scan — the timeline is honest.
+          steps.filter((s) => s.n >= 3)
+        : steps.filter((s) => s.n !== 1);
 
   const estMinutes =
     uncheckedCount != null
@@ -651,7 +686,9 @@ export function CreateLibraryDialog({
       ? "Create Library"
       : mode.kind === "rescan"
         ? `Rescan — ${libraryName}`
-        : `Finish setup — ${libraryName}`;
+        : mode.kind === "match"
+          ? `Matching pass — ${libraryName}`
+          : `Finish setup — ${libraryName}`;
 
   return (
     // Outside clicks MINIMIZE a running wizard (steps 2+); the setup form
@@ -700,6 +737,14 @@ export function CreateLibraryDialog({
           {/* Match sub-stages (music): albums → identify (credit-derived
               artist ids) → artists (suggestion search) → images, each with
               its own done/total so the counter doesn't look like it resets. */}
+          {/* The sweep line never resets — it's the lap counter the resetting
+              sub-stages sit under. Shown from sweep 1 so the first reset
+              reads as progression, not the pass losing ground. */}
+          {step === 3 && matchPhase === "running" && effFormat === "music" && (
+            <p className="mt-2 text-center text-[11px] text-muted-foreground">
+              <span className="font-medium text-foreground">Sweep {passSweep}</span> of up to 3
+            </p>
+          )}
           {step === 3 && matchPhase === "running" && effFormat === "music" && (
             <div className="mt-1 flex items-center justify-center gap-2 text-[11px]">
               {(
@@ -800,6 +845,17 @@ export function CreateLibraryDialog({
                   void runRescan(libId);
                 }}
                 onDecisionsChange={setDecisionsLeft}
+                // A pass requested from the review step runs in THIS wizard:
+                // jump back to the match step already running.
+                onRunPass={() => {
+                  if (!libraryId) return;
+                  setHeightAnimating(true);
+                  setStep(3);
+                  setMatchPhase("running");
+                  void invoke("music_match_begin", { libraryId }).catch((e) =>
+                    toast.error(String(e)),
+                  );
+                }}
               />
             ) : (
               <VideoMetadataCenter libraryId={libraryId} reloadKey={centerReloadKey} />
@@ -964,7 +1020,10 @@ export function CreateLibraryDialog({
               )}
 
               {step === 2 && (
-                <div className="flex w-full min-w-0 flex-col items-center gap-3 overflow-hidden py-6 text-center">
+                // pt < pb, same treatment as the Match block below: the
+                // header's scan sub-stepper adds its own breathing room
+                // above, so equal padding read as top-heavy.
+                <div className="flex w-full min-w-0 flex-col items-center gap-3 overflow-hidden pt-3 pb-6 text-center">
                   <Spinner className="size-6" />
                   <p className="w-full min-w-0 truncate px-2 text-sm font-medium">
                     {scanProgress?.phase === "read-tags"
@@ -1004,17 +1063,11 @@ export function CreateLibraryDialog({
                     </p>
                     {uncheckedCount != null && (
                       <p className="mt-2 text-xs text-muted-foreground">
-                        {/* Albums and artists are separate phases of the pass,
-                            and either can be the only one with work — a
-                            post-split rescan has 0 new albums but new member
-                            artists to look up. */}
-                        {[
-                          `${uncheckedCount} ${uncheckedCount === 1 ? "album" : "albums"}`,
-                          uncheckedArtists > 0 &&
-                            `${uncheckedArtists} ${uncheckedArtists === 1 ? "artist" : "artists"}`,
-                        ]
-                          .filter(Boolean)
-                          .join(" · ")}{" "}
+                        {/* Albums and artists are separate phases of the pass
+                            — BOTH counts always show, zeros included, so "0
+                            albums" can never read as "nothing to do" while
+                            artists still have work (or vice versa). */}
+                        {`${uncheckedCount} ${uncheckedCount === 1 ? "album" : "albums"} · ${uncheckedArtists} ${uncheckedArtists === 1 ? "artist" : "artists"}`}{" "}
                         to check
                         {estMinutes != null && (uncheckedCount > 0 || uncheckedArtists > 0)
                           ? ` · about ${estMinutes} ${estMinutes === 1 ? "minute" : "minutes"} — MusicBrainz allows ~1 request per second`
