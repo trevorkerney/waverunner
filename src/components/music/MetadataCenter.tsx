@@ -104,6 +104,9 @@ interface MbAlbumRow {
   artist_ids: number[];
   /** User said "stop counting this" — gray on the map, out of every count. */
   ignored: boolean;
+  /** User declared the album deliberately partial — missing release tracks
+   *  are expected and stop surfacing/counting. */
+  partial: boolean;
 }
 
 interface MbChange {
@@ -196,7 +199,7 @@ interface MetadataCenterProps {
   onRunPass?: () => void;
 }
 
-type PaneId = "map" | "albums" | "artists" | "credits" | "gaps" | "files" | "history";
+type PaneId = "queue" | "map" | "albums" | "artists" | "credits" | "gaps" | "files" | "history";
 
 /** A credit name resolving to no artist — the residue the scan refused to
  *  guess about (usually a lookalike routed to a merge suggestion instead of
@@ -385,6 +388,455 @@ function LinkArtistDialog({
         </div>
       </DialogContent>
     </Dialog>
+  );
+}
+
+interface TagFixTrack {
+  track_title: string;
+  album_title: string | null;
+  file_path: string;
+  /** Which tag carries the spelling: "artist tag" | "track title" | "credits". */
+  source: string;
+}
+
+interface TagFixAlbum {
+  album_title: string;
+  folder_path: string;
+}
+
+/** An alias spelling that still lives in the files' tags. kind 'misspelling'
+ *  = user-declared debt (retag + rescan, and this card says exactly which
+ *  files); kind 'variant' = neutral, waiting for the user to classify. */
+interface TagFix {
+  artist_id: number;
+  canonical: string;
+  wrong: string;
+  kind: string;
+  tracks: TagFixTrack[];
+  track_total: number;
+  albums: TagFixAlbum[];
+}
+
+/** The fix-at-source card. Declared misspellings say what to retag and where;
+ *  neutral variants ask the question instead — "It's a misspelling" starts
+ *  the nagging, "It's a nickname" ends it forever. Only the user ever
+ *  classifies; the machine records spellings without opinions. */
+function TagFixCard({
+  fix,
+  busy,
+  busyKey,
+  onSetKind,
+}: {
+  fix: TagFix;
+  busy: boolean;
+  busyKey: string | null;
+  onSetKind: (fix: TagFix, kind: "misspelling" | "nickname") => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const extra = fix.track_total - fix.tracks.length;
+  const declared = fix.kind === "misspelling";
+  const summary = [
+    fix.track_total > 0 &&
+      `${fix.track_total} track tag${fix.track_total === 1 ? "" : "s"}`,
+    fix.albums.length > 0 &&
+      `${fix.albums.length} album tag${fix.albums.length === 1 ? "" : "s"}`,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  const spin = busyKey?.startsWith(`aliaskind:${fix.artist_id}:${fix.wrong}`);
+  return (
+    <div className="rounded-md border p-3">
+      <div className="flex items-center gap-3">
+        <p className="min-w-0 flex-1 text-sm">
+          {declared ? (
+            <>
+              “{fix.wrong}” should be “{fix.canonical}”
+            </>
+          ) : (
+            <>
+              “{fix.wrong}” — a spelling of “{fix.canonical}”
+            </>
+          )}
+          <span className="block text-[11px] text-muted-foreground">
+            {declared
+              ? `${summary} still carry the old spelling — fix them at the source, then rescan`
+              : `in ${summary} — a misspelling to fix, or a nickname to keep?`}
+          </span>
+        </p>
+        <button
+          type="button"
+          onClick={() => setOpen((o) => !o)}
+          className="shrink-0 text-[11px] text-muted-foreground underline underline-offset-2 hover:text-foreground"
+        >
+          {open ? "hide files" : "show files"}
+        </button>
+        {!declared && (
+          <Button
+            size="sm"
+            variant="outline"
+            className="shrink-0 gap-1.5"
+            disabled={busy}
+            title="Wrong text — flags these files for retagging until the spelling is gone"
+            onClick={() => onSetKind(fix, "misspelling")}
+          >
+            {spin && <Spinner className="size-3" />}
+            It’s a misspelling
+          </Button>
+        )}
+        <Button
+          size="sm"
+          variant="outline"
+          className="shrink-0 gap-1.5"
+          disabled={busy}
+          title="Intended moniker, not a typo — keeps resolving here, never flagged"
+          onClick={() => onSetKind(fix, "nickname")}
+        >
+          {spin && declared && <Spinner className="size-3" />}
+          It’s a nickname
+        </Button>
+      </div>
+      {open && (
+        <div className="mt-2 overflow-hidden rounded-md border">
+          {fix.albums.map((al, i) => (
+            <div key={`al-${al.folder_path}`} className={`px-3 py-1.5 ${i > 0 ? "border-t" : ""}`}>
+              <span className="block text-xs">
+                album-artist tag on <span className="font-medium">{al.album_title}</span>
+              </span>
+              <span className="block min-w-0 break-all font-mono text-[11px] text-muted-foreground">
+                {al.folder_path}
+              </span>
+            </div>
+          ))}
+          {fix.tracks.map((t, i) => (
+            <div
+              key={`t-${t.file_path}`}
+              className={`px-3 py-1.5 ${i > 0 || fix.albums.length > 0 ? "border-t" : ""}`}
+            >
+              <span className="block text-xs">
+                “{t.track_title}”{t.album_title ? ` on ${t.album_title}` : ""}
+                <span className="text-muted-foreground"> · in the {t.source}</span>
+              </span>
+              <span className="block min-w-0 break-all font-mono text-[11px] text-muted-foreground">
+                {t.file_path}
+              </span>
+            </div>
+          ))}
+          {extra > 0 && (
+            <p className="border-t px-3 py-1.5 text-[11px] text-muted-foreground">
+              +{extra} more track{extra === 1 ? "" : "s"}
+            </p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+interface ClusterMember {
+  /** null = a bare credit spelling with no artist page of its own. */
+  artist_id: number | null;
+  name: string;
+  albums: number;
+  unmatched_albums: number;
+  tracks: number;
+  mbid: string | null;
+}
+
+interface IdentityCluster {
+  key: string;
+  /** Most-albums-first — members[0] is the natural survivor default. */
+  members: ClusterMember[];
+  /** Unmatched albums across members: pass work resolving this unlocks. */
+  unlocks: number;
+}
+
+interface ClusterCandidate {
+  kind: string;
+  mbid: string;
+  title: string;
+  subtitle: string;
+  detail: string | null;
+  score: number;
+}
+
+/** One MB search for the whole cluster: confirming a candidate merges every
+ *  spelling into the survivor, matches it, and lets the ordinary artist-match
+ *  path adopt MusicBrainz's canonical name — so which tag spelling "survives"
+ *  stops mattering. */
+function ClusterMatchDialog({
+  libraryId,
+  cluster,
+  survivorId,
+  onOpenChange,
+  onDone,
+}: {
+  libraryId: string;
+  cluster: IdentityCluster;
+  survivorId: number;
+  onOpenChange: (open: boolean) => void;
+  onDone: () => void;
+}) {
+  const survivorName =
+    cluster.members.find((m) => m.artist_id === survivorId)?.name ?? cluster.members[0]?.name ?? "";
+  const [query, setQuery] = useState(survivorName);
+  const [results, setResults] = useState<ClusterCandidate[] | null>(null);
+  const [searching, setSearching] = useState(false);
+  const [applying, setApplying] = useState<string | null>(null);
+  const searchedOnce = useRef(false);
+
+  const search = async (q: string) => {
+    if (!q.trim()) return;
+    setSearching(true);
+    try {
+      const rows = await invoke<ClusterCandidate[]>("mb_search_entity", {
+        kind: "artist",
+        query: q,
+      });
+      setResults(rows);
+    } catch (e) {
+      toast.error(String(e));
+      setResults([]);
+    } finally {
+      setSearching(false);
+    }
+  };
+  useEffect(() => {
+    if (!searchedOnce.current) {
+      searchedOnce.current = true;
+      search(survivorName);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const apply = async (mbid: string) => {
+    setApplying(mbid);
+    try {
+      await invoke("mb_resolve_cluster", {
+        libraryId,
+        survivorId,
+        mergeArtistIds: cluster.members
+          .filter((m) => m.artist_id != null && m.artist_id !== survivorId)
+          .map((m) => m.artist_id as number),
+        mergeNames: cluster.members.filter((m) => m.artist_id == null).map((m) => m.name),
+      });
+      await invoke("mb_apply_entity_match", { kind: "artist", entityId: survivorId, mbid });
+      toast.success(
+        `${cluster.members.length} spellings resolved to one matched artist.`,
+      );
+      onOpenChange(false);
+      onDone();
+    } catch (e) {
+      toast.error(String(e));
+      setApplying(null);
+    }
+  };
+
+  return (
+    <Dialog open onOpenChange={onOpenChange}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Who is this artist?</DialogTitle>
+        </DialogHeader>
+        <p className="text-xs text-muted-foreground">
+          Confirming merges {cluster.members.map((m) => `“${m.name}”`).join(", ")} into one page,
+          matches it to MusicBrainz, and adopts the canonical name — every old spelling lives on as
+          an alias. Undoable from History.
+        </p>
+        <div className="flex gap-2">
+          <Input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") search(query);
+            }}
+            placeholder="Search MusicBrainz artists, or paste an artist URL/ID…"
+            className="h-8 text-sm"
+          />
+          <Button
+            size="sm"
+            variant="outline"
+            className="shrink-0"
+            disabled={searching}
+            onClick={() => search(query)}
+          >
+            {searching ? <Spinner className="size-3" /> : <Search size={13} />}
+          </Button>
+        </div>
+        <div className="max-h-64 overflow-y-auto rounded-md border">
+          {(results ?? []).map((r, i) => (
+            <div
+              key={r.mbid}
+              className={`flex items-center gap-2 px-2 py-1.5 ${i === 0 ? "" : "border-t"}`}
+            >
+              <div className="min-w-0 flex-1">
+                <p className="truncate text-sm">{r.title}</p>
+                <p className="truncate text-[11px] text-muted-foreground">
+                  {r.subtitle}
+                  {r.detail ? ` · ${r.detail}` : ""}
+                </p>
+              </div>
+              <button
+                type="button"
+                className="shrink-0 text-[11px] text-muted-foreground underline underline-offset-2 hover:text-foreground"
+                onClick={() => openUrl(`https://musicbrainz.org/artist/${r.mbid}`)}
+              >
+                view
+              </button>
+              <Button size="sm" disabled={applying !== null} onClick={() => apply(r.mbid)}>
+                {applying === r.mbid && <Spinner className="size-3" />}
+                Yes, it&apos;s them
+              </Button>
+            </div>
+          ))}
+          {(results ?? []).length === 0 && (
+            <p className="flex items-center gap-1.5 px-2 py-1.5 text-[11px] text-muted-foreground">
+              <Search size={12} />
+              {searching ? "Searching…" : results === null ? "Searching…" : "No candidates found"}
+            </p>
+          )}
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/** One suspected identity, every spelling of it, and the whole resolution in
+ *  one card — replaces the old pairwise "Merge A into B" cards, which never
+ *  showed how many spellings existed or what name would come out the end. */
+function ClusterCard({
+  cluster,
+  busy,
+  busyKey,
+  onMatch,
+  onMergeOnly,
+  onEject,
+}: {
+  cluster: IdentityCluster;
+  busy: boolean;
+  busyKey: string | null;
+  onMatch: (cluster: IdentityCluster, survivorId: number) => void;
+  onMergeOnly: (cluster: IdentityCluster, survivorId: number) => void;
+  onEject: (name: string) => void;
+}) {
+  const pages = cluster.members.filter((m) => m.artist_id != null);
+  const matchedPages = pages.filter((m) => m.mbid);
+  const distinctIds = new Set(matchedPages.map((m) => m.mbid)).size;
+  // A matched member is the only safe survivor (the absorbed page's own id
+  // would be lost); otherwise the biggest page leads.
+  const defaultSurvivor = (matchedPages[0] ?? pages[0])?.artist_id ?? null;
+  const [survivor, setSurvivor] = useState<number | null>(defaultSurvivor);
+  const effSurvivor = pages.some((m) => m.artist_id === survivor) ? survivor : defaultSurvivor;
+  const survivorName = cluster.members.find((m) => m.artist_id === effSurvivor)?.name;
+  // Exactly one matched member = identity already settled; merging into it is
+  // a one-click quick win, no MB search needed.
+  const identityKnown = distinctIds === 1 && matchedPages.length >= 1;
+  // Two members holding DIFFERENT MusicBrainz ids are provably different
+  // artists — merging is off the table; only ejections make sense.
+  const conflicted = distinctIds >= 2;
+
+  const counts = (m: ClusterMember) => {
+    const parts = [
+      m.albums > 0 && `${m.albums} album${m.albums === 1 ? "" : "s"}`,
+      m.tracks > 0 && `${m.tracks} track credit${m.tracks === 1 ? "" : "s"}`,
+    ].filter(Boolean);
+    return parts.length > 0 ? parts.join(" · ") : "credits only";
+  };
+
+  return (
+    <div data-flip-id={`cluster-${cluster.key}`} className="rounded-md border p-3">
+      <div className="mb-2 flex items-center justify-between gap-3">
+        <p className="min-w-0 text-sm font-medium">
+          <GitMerge size={14} className="mr-1.5 inline text-muted-foreground" />
+          One artist, {cluster.members.length} spellings?
+        </p>
+      </div>
+      <div className="mb-2 overflow-hidden rounded-md border">
+        {cluster.members.map((m, i) => (
+          <label
+            key={m.name}
+            className={`flex items-center gap-2 px-2 py-1.5 ${i === 0 ? "" : "border-t"} ${
+              m.artist_id != null && !conflicted ? "cursor-pointer" : ""
+            }`}
+          >
+            {!conflicted && (
+              <input
+                type="radio"
+                disabled={m.artist_id == null || busy || (identityKnown && !m.mbid)}
+                checked={effSurvivor === m.artist_id && m.artist_id != null}
+                onChange={() => setSurvivor(m.artist_id)}
+                className="accent-primary"
+              />
+            )}
+            <span className="min-w-0 flex-1">
+              <span className="block truncate text-sm">“{m.name}”</span>
+              <span className="block text-[11px] text-muted-foreground">{counts(m)}</span>
+            </span>
+            {m.mbid && (
+              <span className="shrink-0 rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] text-emerald-300">
+                matched
+              </span>
+            )}
+            <button
+              type="button"
+              disabled={busy}
+              onClick={(e) => {
+                e.preventDefault();
+                onEject(m.name);
+              }}
+              className="shrink-0 text-[11px] text-muted-foreground underline underline-offset-2 hover:text-foreground"
+            >
+              {busyKey === `eject:${m.name}` ? "…" : "not the same"}
+            </button>
+          </label>
+        ))}
+      </div>
+      {conflicted ? (
+        <p className="text-[11px] text-muted-foreground">
+          Two of these hold different MusicBrainz identities — provably separate artists. If a
+          spelling doesn&apos;t belong here, mark it &ldquo;not the same&rdquo;.
+        </p>
+      ) : (
+        <div className="flex flex-wrap items-center gap-2">
+          {identityKnown ? (
+            <Button
+              size="sm"
+              className="gap-1.5"
+              disabled={busy || effSurvivor == null}
+              onClick={() => onMergeOnly(cluster, effSurvivor as number)}
+            >
+              {busyKey === `cluster:${cluster.key}` && <Spinner className="size-3" />}
+              Merge all into “{survivorName}”
+            </Button>
+          ) : (
+            <>
+              <Button
+                size="sm"
+                className="gap-1.5"
+                disabled={busy || effSurvivor == null}
+                onClick={() => onMatch(cluster, effSurvivor as number)}
+              >
+                Match…
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                className="gap-1.5"
+                disabled={busy || effSurvivor == null}
+                onClick={() => onMergeOnly(cluster, effSurvivor as number)}
+              >
+                {busyKey === `cluster:${cluster.key}` && <Spinner className="size-3" />}
+                Merge only
+              </Button>
+            </>
+          )}
+          <span className="text-[11px] text-muted-foreground">
+            {identityKnown
+              ? "already matched — one click finishes it"
+              : "the radio picks the surviving page; Match adopts the MusicBrainz name either way"}
+          </span>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -633,6 +1085,8 @@ const KIND_WORD: Record<string, string> = {
   artist_rename: "renamed",
   artist_persona: "persona",
   album_year: "date",
+  alias_kind: "alias",
+  album_partial: "partial",
   artist_merge: "artist merge",
   artist_mbid: "artist match",
   album_match: "album match",
@@ -686,6 +1140,12 @@ export function MetadataCenter({
   const [linkSource, setLinkSource] = useState<{ name: string; artistId: number | null } | null>(null);
   // "Persona of…" target: an artist page being linked to its human.
   const [personaSource, setPersonaSource] = useState<{ id: number; name: string } | null>(null);
+  const [clusters, setClusters] = useState<IdentityCluster[]>([]);
+  const [tagFixes, setTagFixes] = useState<TagFix[]>([]);
+  const [clusterMatch, setClusterMatch] = useState<{
+    cluster: IdentityCluster;
+    survivorId: number;
+  } | null>(null);
   const [artistFilter, setArtistFilter] = useState("");
   const [artistLimit, setArtistLimit] = useState(30);
   // Which pane the right-hand side is showing. Starts on the map — the
@@ -701,7 +1161,7 @@ export function MetadataCenter({
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
-      const [rev, ms, fb, iss, unl, pend, pass, ls] = await Promise.all([
+      const [rev, ms, fb, iss, unl, pend, pass, ls, clus, tf] = await Promise.all([
         invoke<MbReview>("mb_get_review", { libraryId }),
         invoke<MusicMatchState>("music_match_state", { libraryId }),
         invoke<TagFallbackRow[]>("get_music_tag_fallbacks", { libraryId }),
@@ -714,6 +1174,8 @@ export function MetadataCenter({
           libraryId,
         }),
         invoke<Record<string, string>>("get_library_settings", { libraryId }),
+        invoke<IdentityCluster[]>("mb_identity_clusters", { libraryId }),
+        invoke<TagFix[]>("get_tag_fixes", { libraryId }),
       ]);
       setReview(rev);
       setMatchState(ms);
@@ -722,6 +1184,8 @@ export function MetadataCenter({
       setUnlinked(unl);
       setPending(pend);
       setPendingPass(pass);
+      setClusters(clus);
+      setTagFixes(tf);
       setOnlineEnabled(ls["online_metadata"] !== "off");
       // Outside surfaces (sidebar badge, library-page strip) mirror both
       // queues — tell them whenever the center's view of them refreshes.
@@ -747,6 +1211,11 @@ export function MetadataCenter({
   useEffect(() => {
     const unDone = listen<{ libraryId: string }>("music-enrich-done", (e) => {
       if (e.payload.libraryId === libraryId) {
+        // Our own drain emits this per applied item — refreshing then would
+        // both collapse the frozen list mid-aim and flood the DB with reads
+        // that contend with the next item's writes. The drain does its own
+        // single refresh at the end.
+        if (quickDrainingRef.current) return;
         refresh();
         onChanged?.();
       }
@@ -784,6 +1253,122 @@ export function MetadataCenter({
     run(`resolve:${suggestionId}:${accept}`, () =>
       invoke("mb_resolve_suggestion", { libraryId, suggestionId, accept }),
     );
+  const mergeCluster = (c: IdentityCluster, survivorId: number) =>
+    run(`cluster:${c.key}`, async () => {
+      const survivorName = c.members.find((m) => m.artist_id === survivorId)?.name ?? "";
+      await invoke("mb_resolve_cluster", {
+        libraryId,
+        survivorId,
+        mergeArtistIds: c.members
+          .filter((m) => m.artist_id != null && m.artist_id !== survivorId)
+          .map((m) => m.artist_id as number),
+        mergeNames: c.members.filter((m) => m.artist_id == null).map((m) => m.name),
+      });
+      toast.success(`${c.members.length} spellings merged into “${survivorName}”.`);
+    });
+  const ejectMember = (name: string) =>
+    run(`eject:${name}`, () => invoke("mb_keep_separate", { libraryId, name }));
+  const setAliasKind = (fix: TagFix, kind: "misspelling" | "nickname") =>
+    run(`aliaskind:${fix.artist_id}:${fix.wrong}`, async () => {
+      await invoke("set_alias_kind", {
+        libraryId,
+        artistId: fix.artist_id,
+        name: fix.wrong,
+        kind,
+      });
+      toast.success(
+        kind === "nickname"
+          ? `“${fix.wrong}” kept as a nickname of ${fix.canonical}.`
+          : `“${fix.wrong}” flagged — its files stay listed until retagged.`,
+      );
+    });
+
+  // ── Quick-win staging queue ───────────────────────────────────────────
+  // Each apply costs a rate-limited MusicBrainz round-trip, so clicking one
+  // at a time makes the USER the rate limiter. Two-phase, like everything
+  // staged in this app: clicks only MARK rows (instant, reversible, zero
+  // layout shift), an explicit Apply processes them serially, and while it
+  // runs every button in the band is locked — a list must never reflow
+  // under a cursor that's about to click (that's how wrong rows get hit).
+  // One refresh at the end instead of one per item.
+  const quickQueueRef = useRef<QuickWin[]>([]);
+  const quickDrainingRef = useRef(false);
+  const [quickDraining, setQuickDraining] = useState(false);
+  const [queuedQuickKeys, setQueuedQuickKeys] = useState<Set<string>>(new Set());
+  const [doneQuickKeys, setDoneQuickKeys] = useState<Set<string>>(new Set());
+  const [activeQuickKey, setActiveQuickKey] = useState<string | null>(null);
+  const quickWinKey = (w: QuickWin) => (w.t === "cluster" ? `qw-c-${w.c.key}` : `qw-s-${w.s.id}`);
+  const execQuickWin = async (w: QuickWin) => {
+    if (w.t === "cluster") {
+      const survivor = w.c.members.find((m) => m.artist_id != null && m.mbid);
+      if (!survivor) return;
+      await invoke("mb_resolve_cluster", {
+        libraryId,
+        survivorId: survivor.artist_id,
+        mergeArtistIds: w.c.members
+          .filter((m) => m.artist_id != null && m.artist_id !== survivor.artist_id)
+          .map((m) => m.artist_id as number),
+        mergeNames: w.c.members.filter((m) => m.artist_id == null).map((m) => m.name),
+      });
+    } else if (w.t === "artist") {
+      await invoke("mb_apply_entity_match", {
+        kind: "artist",
+        entityId: w.s.payload.artist_id,
+        mbid: w.s.payload.candidates![0].mbid,
+        mbidKind: null,
+      });
+    } else {
+      await invoke("mb_apply_entity_match", {
+        kind: "album",
+        entityId: w.s.payload.album_id,
+        mbid: w.s.payload.groups![0].group_id,
+        mbidKind: "release-group",
+      });
+    }
+  };
+  const applyQueuedQuickWins = async () => {
+    if (quickDrainingRef.current || quickQueueRef.current.length === 0) return;
+    quickDrainingRef.current = true;
+    setQuickDraining(true);
+    try {
+      for (;;) {
+        const w = quickQueueRef.current.shift();
+        if (!w) break;
+        const k = quickWinKey(w);
+        setActiveQuickKey(k);
+        setQueuedQuickKeys(new Set(quickQueueRef.current.map(quickWinKey)));
+        try {
+          await execQuickWin(w);
+          // Done rows stay in place, inert, until the single end refresh —
+          // no row ever vanishes while its neighbors are being aimed at.
+          setDoneQuickKeys((prev) => new Set(prev).add(k));
+        } catch (e) {
+          // The item's card survives the end-of-drain refresh; the rest of
+          // the queue keeps going.
+          toast.error(String(e));
+        }
+      }
+    } finally {
+      quickDrainingRef.current = false;
+      setActiveQuickKey(null);
+      await refresh();
+      // Collapse happens only now, while the whole band is still locked.
+      setDoneQuickKeys(new Set());
+      setQuickDraining(false);
+      onChanged?.();
+    }
+  };
+  // Stage/unstage — a second click before Apply takes the row back out.
+  const toggleQuickWin = (w: QuickWin) => {
+    if (quickDrainingRef.current) return;
+    const k = quickWinKey(w);
+    if (queuedQuickKeys.has(k)) {
+      quickQueueRef.current = quickQueueRef.current.filter((x) => quickWinKey(x) !== k);
+    } else {
+      quickQueueRef.current.push(w);
+    }
+    setQueuedQuickKeys(new Set(quickQueueRef.current.map(quickWinKey)));
+  };
   const undo = (batchId: number) =>
     run(`undo:${batchId}`, () => invoke("mb_undo_batch", { libraryId, batchId }));
   const recheck = (albumId: number) =>
@@ -797,6 +1382,11 @@ export function MetadataCenter({
     });
   const dismissGaps = (albumId: number) =>
     run(`gaps:${albumId}`, () => invoke("mb_dismiss_gaps", { albumId }));
+  const markPartial = (albumId: number) =>
+    run(`partial:${albumId}`, async () => {
+      await invoke("mb_set_partial", { entityId: albumId, partial: true });
+      toast.success("Marked deliberately partial — missing release tracks stop counting.");
+    });
   const setIgnored = (entityId: number, ignored: boolean) =>
     run(`ignore:${entityId}`, () => invoke("mb_set_ignored", { entityId, ignored }));
   // Ignoring gets a confirm (every other row action opens a dialog before
@@ -881,13 +1471,14 @@ export function MetadataCenter({
   const artistsMatched = artists.filter((a) => a.state === "matched").length;
 
   const albumSuggestions = review?.suggestions.filter((s) => s.kind === "album_match") ?? [];
-  const mergeSuggestions = review?.suggestions.filter((s) => s.kind === "artist_merge") ?? [];
   const artistSuggestions = review?.suggestions.filter((s) => s.kind === "artist_match") ?? [];
 
   // No gate: decisions lead the nav and their count nags, but every pane
   // stays open — the user decided required-answering wasn't worth the wall.
+  // Pairwise merge suggestions became identity clusters (live-computed, one
+  // card per suspected identity) — each cluster counts as one decision.
   const decisionsPending =
-    albumSuggestions.length + mergeSuggestions.length + artistSuggestions.length;
+    albumSuggestions.length + clusters.length + artistSuggestions.length;
   useEffect(() => {
     // Only report once real data is in, not the initial empty state.
     if (review) onDecisionsChange?.(decisionsPending);
@@ -909,7 +1500,13 @@ export function MetadataCenter({
   // (or a just-flipped setting) redirects to the local ground.
   useEffect(() => {
     if (!review || onlineEnabled) return;
-    if (pane === "artists" || pane === "albums" || pane === "gaps" || pane === "map")
+    if (
+      pane === "artists" ||
+      pane === "albums" ||
+      pane === "gaps" ||
+      pane === "map" ||
+      pane === "queue"
+    )
       setPane("files");
   }, [review, onlineEnabled, pane]);
   // Each OPEN lands on the Library map — the guided process is the home, and
@@ -922,6 +1519,8 @@ export function MetadataCenter({
   useEffect(() => {
     if (!review || landedRef.current) return;
     landedRef.current = true;
+    // The map is home — the whole-library picture; the guided queue sits one
+    // click below it.
     setPane(!onlineEnabled ? "files" : "map");
   }, [review, onlineEnabled]);
 
@@ -973,14 +1572,10 @@ export function MetadataCenter({
   // One uncertain-album-match card — rendered at the top of the Albums pane,
   // where the stage-2 work lives (there is no Suggestions pane; every card
   // sits with the list it belongs to).
-  const renderAlbumCard = (s: MbSuggestion) => (
-    <div key={s.id} data-flip-id={`sug-${s.id}`} className="rounded-md border p-3">
-      <p className="text-sm font-medium">
-        {s.payload.album_title}
-        {s.payload.artist_title && (
-          <span className="text-muted-foreground"> — {s.payload.artist_title}</span>
-        )}
-      </p>
+  // Body only (candidate radios + Apply/Dismiss) — the Albums pane wraps it
+  // in a titled card; the Next-up queue expands it inline under its row.
+  const renderAlbumSuggestionBody = (s: MbSuggestion) => (
+    <>
       {/* More than one album on MusicBrainz answers to this name, which is
           exactly when a machine should not choose. */}
       <p className="text-xs text-muted-foreground">
@@ -1047,6 +1642,18 @@ export function MetadataCenter({
           Dismiss suggestion
         </Button>
       </div>
+    </>
+  );
+
+  const renderAlbumCard = (s: MbSuggestion) => (
+    <div key={s.id} data-flip-id={`sug-${s.id}`} className="rounded-md border p-3">
+      <p className="text-sm font-medium">
+        {s.payload.album_title}
+        {s.payload.artist_title && (
+          <span className="text-muted-foreground"> — {s.payload.artist_title}</span>
+        )}
+      </p>
+      {renderAlbumSuggestionBody(s)}
     </div>
   );
 
@@ -1203,11 +1810,33 @@ export function MetadataCenter({
   const ownerRows = artists.filter((a) => albumsByArtist.has(a.artist_id));
   const featureArtists = artists.filter((a) => !albumsByArtist.has(a.artist_id));
   const mapReds = artists.filter(artistRed).length + albums.filter(albumRed).length;
+  // Completion share over the same population the map colors (ignored
+  // entities are out of both sides, per doctrine). floor() so 100 can only
+  // ever mean literally nothing red — 99.9% done still reads 99%.
+  const mapTotal =
+    artists.filter((a) => !a.ignored).length + albums.filter((a) => !a.ignored).length;
+  const mapPct = mapTotal === 0 ? 100 : Math.floor(((mapTotal - mapReds) / mapTotal) * 100);
 
   // FLIP for the decision cards: resolving one slides the rest up into the
   // gap instead of snapping (shared recipe — see useFlipList).
   const flipContainerRef = useRef<HTMLDivElement>(null);
   useFlipList(flipContainerRef);
+
+  // Panes share one scroll container, so a bare setPane strands the user at
+  // whatever scrollTop the last pane left. Every navigation goes through
+  // here: switch, then (post-commit) land on the named section or the top.
+  const [paneAnchor, setPaneAnchor] = useState<string | null>(null);
+  useEffect(() => {
+    if (!paneAnchor) return;
+    const el = paneAnchor === "__top" ? null : document.getElementById(paneAnchor);
+    if (el) el.scrollIntoView({ block: "start" });
+    else flipContainerRef.current?.scrollTo({ top: 0 });
+    setPaneAnchor(null);
+  }, [pane, paneAnchor]);
+  const goTo = (p: PaneId, anchor?: string) => {
+    setPaneAnchor(anchor ?? "__top");
+    setPane(p);
+  };
 
   if (loading && !review) {
     return (
@@ -1216,6 +1845,108 @@ export function MetadataCenter({
       </div>
     );
   }
+
+  // ── The Next-up queue: every actionable decision ranked payoff ÷ effort ──
+  // Quick wins are confirm-tier (one credible answer already on the card, one
+  // click each); Big unlocks are search-tier but worth the typing, biggest
+  // payoff first. Payoff = albums the decision unlocks for the next pass.
+  // Bands are visible and labeled (the user's pick over a seamless ranked
+  // feed) so the ordering is legible, never mysterious.
+  const clusterTier = (c: IdentityCluster): "oneclick" | "search" | "conflicted" => {
+    const ids = new Set(
+      c.members.filter((m) => m.artist_id != null && m.mbid).map((m) => m.mbid),
+    ).size;
+    return ids >= 2 ? "conflicted" : ids === 1 ? "oneclick" : "search";
+  };
+  const artistRowById = new Map(artists.map((a) => [a.artist_id, a]));
+  // Cluster members resolve through their cluster card — they must not also
+  // appear as lone artist entries, or the queue double-counts the work.
+  const clusterMemberIds = new Set(
+    clusters.flatMap((c) =>
+      c.members.filter((m) => m.artist_id != null).map((m) => m.artist_id as number),
+    ),
+  );
+  const artistSugRow = (s: MbSuggestion) => {
+    const row = s.payload.artist_id != null ? artistRowById.get(s.payload.artist_id) : undefined;
+    return row && !row.ignored && notStagedSplit(row) ? row : undefined;
+  };
+  type QuickWin =
+    | { t: "cluster"; c: IdentityCluster; unlocks: number }
+    | { t: "artist"; s: MbSuggestion; unlocks: number }
+    | { t: "album"; s: MbSuggestion; unlocks: number };
+  const quickWins: QuickWin[] = [
+    ...clusters
+      .filter((c) => clusterTier(c) === "oneclick")
+      .map((c) => ({ t: "cluster" as const, c, unlocks: c.unlocks })),
+    ...artistSuggestions
+      .filter((s) => (s.payload.candidates?.length ?? 0) === 1)
+      .flatMap((s) => {
+        const row = artistSugRow(s);
+        return row ? [{ t: "artist" as const, s, unlocks: row.album_count }] : [];
+      }),
+    ...albumSuggestions
+      .filter(
+        (s) =>
+          (s.payload.groups?.length ?? 0) === 1 &&
+          s.payload.album_id != null &&
+          !stagedLockedIds.has(s.payload.album_id),
+      )
+      .map((s) => ({ t: "album" as const, s, unlocks: 0 })),
+  ].sort((a, b) => b.unlocks - a.unlocks);
+  type BigUnlock =
+    | { t: "cluster"; c: IdentityCluster; unlocks: number }
+    | { t: "artist_sug"; s: MbSuggestion; unlocks: number }
+    | { t: "artist"; a: MbArtistRow; unlocks: number }
+    | { t: "album_sug"; s: MbSuggestion; unlocks: number };
+  const bigUnlocks: BigUnlock[] = [
+    ...clusters
+      .filter((c) => clusterTier(c) === "search")
+      .map((c) => ({ t: "cluster" as const, c, unlocks: c.unlocks })),
+    ...artistSuggestions
+      .filter((s) => (s.payload.candidates?.length ?? 0) > 1)
+      .flatMap((s) => {
+        const row = artistSugRow(s);
+        return row ? [{ t: "artist_sug" as const, s, unlocks: row.album_count }] : [];
+      }),
+    ...artists
+      .filter(
+        (a) =>
+          a.state !== "matched" &&
+          !a.ignored &&
+          a.album_count > 0 &&
+          notStagedSplit(a) &&
+          !suggestionByArtist.has(a.artist_id) &&
+          !clusterMemberIds.has(a.artist_id),
+      )
+      .map((a) => ({ t: "artist" as const, a, unlocks: a.album_count })),
+    ...albumSuggestions
+      .filter(
+        (s) =>
+          (s.payload.groups?.length ?? 0) > 1 &&
+          s.payload.album_id != null &&
+          !stagedLockedIds.has(s.payload.album_id),
+      )
+      .map((s) => ({ t: "album_sug" as const, s, unlocks: 0 })),
+  ].sort((a, b) => b.unlocks - a.unlocks);
+  // Declared misspellings nag (Source fixes band + File problems); neutral
+  // variants wait quietly under File problems for the user to classify.
+  const declaredFixes = tagFixes.filter((f) => f.kind === "misspelling");
+  const variantFixes = tagFixes.filter((f) => f.kind === "variant");
+  const conflictedClusters = clusters.filter((c) => clusterTier(c) === "conflicted").length;
+  // Cleanup tallies: low-payoff residue, shown as pointers, never lists —
+  // deciding these before the pass has run is usually wasted work.
+  const cleanupFeatures = artists.filter(
+    (a) =>
+      a.state !== "matched" &&
+      !a.ignored &&
+      a.album_count === 0 &&
+      notStagedSplit(a) &&
+      !suggestionByArtist.has(a.artist_id) &&
+      !clusterMemberIds.has(a.artist_id),
+  ).length;
+  const cleanupAlbums = albums.filter(
+    (a) => a.state === "notfound" && !a.ignored && !stagedLockedIds.has(a.album_id),
+  ).length;
 
   // `count` is the size of the pane; `alert` (red) is the blocking work —
   // unidentified owners / unidentified albums — and `warn` (amber) the softer
@@ -1226,8 +1957,9 @@ export function MetadataCenter({
   // Opted out of online metadata: only the LOCAL panes remain — unlinked
   // credits, file problems (and History below). Everything MusicBrainz-backed
   // disappears rather than sitting permanently "unfinished".
-  // The map leads: it hosts the guided process, so it gets the top slot and
-  // Suggestions sits below the working panes it feeds.
+  // The map keeps the top slot (the whole-library picture); the guided queue
+  // sits right under it, deliberately numberless — it's a PATH, not a pile,
+  // and its bands already say how much of each kind is waiting.
   const NAV: { id: PaneId; label: string; count: number; warn?: number; alert?: number }[] = [
     ...(onlineEnabled
       ? [
@@ -1236,6 +1968,11 @@ export function MetadataCenter({
             label: "Library map",
             // Rendered as a status word, not numbers — "complete" is the
             // map's whole promise (nothing red), a count is just noise.
+            count: 0,
+          },
+          {
+            id: "queue" as const,
+            label: "Most efficient actions",
             count: 0,
           },
           {
@@ -1291,8 +2028,8 @@ export function MetadataCenter({
     {
       id: "files",
       label: "File problems",
-      count: fallbacks.length + issues.length,
-      warn: issues.length,
+      count: fallbacks.length + issues.length + tagFixes.length,
+      warn: issues.length + declaredFixes.length,
     },
   ];
   // History is pinned to the nav's bottom, apart from the work sections — a
@@ -1471,7 +2208,7 @@ export function MetadataCenter({
         {NAV.map((n) => (
           <button
             key={n.id}
-            onClick={() => setPane(n.id)}
+            onClick={() => goTo(n.id)}
             className={`flex items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm transition-colors ${
               pane === n.id ? "bg-accent text-foreground" : "text-muted-foreground hover:text-foreground"
             }`}
@@ -1482,9 +2219,9 @@ export function MetadataCenter({
             <span className="flex shrink-0 items-center gap-1">
               {n.id === "map" ? (
                 <span
-                  className={`text-xs ${mapReds > 0 ? "text-amber-300" : "text-emerald-400"}`}
+                  className={`text-xs tabular-nums ${mapReds > 0 ? "text-amber-300" : "text-emerald-400"}`}
                 >
-                  {mapReds > 0 ? "incomplete" : "complete"}
+                  {mapPct}%
                 </span>
               ) : (
                 <>
@@ -1541,7 +2278,7 @@ export function MetadataCenter({
             footer) all read as one rhythm. */}
         <div className="-mx-3 mt-auto border-t px-3 pb-3 pt-3">
           <button
-            onClick={() => setPane("history")}
+            onClick={() => goTo("history")}
             className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm transition-colors ${
               pane === "history"
                 ? "bg-accent text-foreground"
@@ -1578,6 +2315,482 @@ export function MetadataCenter({
           then the whole library as state-colored nodes. Fill carries state
           alongside color (solid / light / hollow / muted) so red-green
           colorblindness never hides the difference. */}
+      {/* Next up: the guided grind, banded by payoff ÷ effort. Work
+          top-down; when the quick wins run dry the pass card says to cash in
+          what's queued; cleanup and features stay parked at the bottom
+          because deciding them before a pass is usually wasted work. */}
+      {pane === "queue" && (
+        <section className="space-y-6">
+          {quickWins.length === 0 && bigUnlocks.length === 0 && pendingPass.length === 0 ? (
+            <div className="flex items-center gap-3 rounded-md border border-emerald-500/40 bg-emerald-500/5 px-3 py-2">
+              <CircleCheck size={15} className="shrink-0 text-emerald-400" />
+              <p className="text-sm text-emerald-200/90">
+                Nothing queued. {cleanupFeatures + cleanupAlbums > 0
+                  ? "Only low-yield cleanup remains below."
+                  : "This library is fully resolved."}
+              </p>
+            </div>
+          ) : (
+            <p className="text-xs text-muted-foreground">
+              Every open decision, most efficient first.
+            </p>
+          )}
+          {quickWins.length > 0 && (
+            <div>
+              <div className="mb-1.5 flex items-center gap-3">
+                <h4 className="flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-emerald-300">
+                  <CircleCheck size={14} />
+                  Quick wins ({quickWins.length}) — click to queue, then apply
+                </h4>
+                {(queuedQuickKeys.size > 0 || quickDraining) && (
+                  <Button
+                    size="sm"
+                    className="ml-auto shrink-0 gap-1.5"
+                    disabled={quickDraining}
+                    onClick={applyQueuedQuickWins}
+                  >
+                    {quickDraining && <Spinner className="size-3" />}
+                    {quickDraining
+                      ? `Applying ${Math.min(doneQuickKeys.size + 1, doneQuickKeys.size + queuedQuickKeys.size + 1)} of ${doneQuickKeys.size + queuedQuickKeys.size + 1}…`
+                      : `Apply ${queuedQuickKeys.size} queued`}
+                  </Button>
+                )}
+              </div>
+              <div className="overflow-hidden rounded-md border border-emerald-500/30">
+                {quickWins.map((w, i) => {
+                  const qk = quickWinKey(w);
+                  const isActive = activeQuickKey === qk;
+                  const isQueued = queuedQuickKeys.has(qk);
+                  const isDone = doneQuickKeys.has(qk);
+                  return (
+                  <div
+                    key={
+                      w.t === "cluster" ? `qc-${w.c.key}` : `qs-${w.s.id}`
+                    }
+                    className={`flex items-center gap-3 px-3 py-2 ${i === 0 ? "" : "border-t"}`}
+                  >
+                    <div className="min-w-0 flex-1 text-sm">
+                      {w.t === "cluster" && (
+                        <>
+                          {w.c.members.map((m) => `“${m.name}”`).join(" + ")} are one artist
+                          <span className="block text-[11px] text-muted-foreground">
+                            merges into the matched page — every spelling becomes an alias
+                          </span>
+                        </>
+                      )}
+                      {w.t === "artist" && (
+                        <>
+                          “{w.s.payload.artist_name}” — one MusicBrainz artist answers
+                          <span className="block truncate text-[11px] text-muted-foreground">
+                            {w.s.payload.candidates?.[0]?.title}
+                            {w.s.payload.candidates?.[0]?.subtitle
+                              ? ` · ${w.s.payload.candidates[0].subtitle}`
+                              : ""}
+                          </span>
+                        </>
+                      )}
+                      {w.t === "album" && (
+                        <>
+                          “{w.s.payload.album_title}” — one release group found
+                          <span className="block truncate text-[11px] text-muted-foreground">
+                            {w.s.payload.groups?.[0]?.title}
+                            {w.s.payload.groups?.[0]?.first_release_date
+                              ? ` · ${w.s.payload.groups[0].first_release_date}`
+                              : ""}
+                          </span>
+                        </>
+                      )}
+                    </div>
+                    {/* Trust, then verify: every quick win links its MB
+                        candidate so "one click" never means "blind click". */}
+                    {w.t === "cluster" && (
+                      <>
+                        {(() => {
+                          const survivor = w.c.members.find(
+                            (m) => m.artist_id != null && m.mbid,
+                          );
+                          return survivor?.mbid ? (
+                            <button
+                              type="button"
+                              className="shrink-0 text-[11px] text-muted-foreground underline underline-offset-2 hover:text-foreground"
+                              onClick={() =>
+                                openUrl(`https://musicbrainz.org/artist/${survivor.mbid}`)
+                              }
+                            >
+                              view
+                            </button>
+                          ) : null;
+                        })()}
+                        <Button
+                          size="sm"
+                          variant={isQueued ? "outline" : "default"}
+                          className="shrink-0 gap-1.5"
+                          disabled={quickDraining || isDone}
+                          title={isQueued ? "Click again to remove from the queue" : undefined}
+                          onClick={() => toggleQuickWin(w)}
+                        >
+                          {isActive && <Spinner className="size-3" />}
+                          {isDone ? "Done" : isActive ? "Applying…" : isQueued ? "Queued ✓" : "Merge"}
+                        </Button>
+                      </>
+                    )}
+                    {w.t === "artist" && (
+                      <>
+                        <button
+                          type="button"
+                          className="shrink-0 text-[11px] text-muted-foreground underline underline-offset-2 hover:text-foreground"
+                          onClick={() =>
+                            openUrl(
+                              `https://musicbrainz.org/artist/${w.s.payload.candidates![0].mbid}`,
+                            )
+                          }
+                        >
+                          view
+                        </button>
+                        <Button
+                          size="sm"
+                          variant={isQueued ? "outline" : "default"}
+                          className="shrink-0 gap-1.5"
+                          disabled={quickDraining || isDone}
+                          title={isQueued ? "Click again to remove from the queue" : undefined}
+                          onClick={() => toggleQuickWin(w)}
+                        >
+                          {isActive && <Spinner className="size-3" />}
+                          {isDone
+                            ? "Done"
+                            : isActive
+                              ? "Applying…"
+                              : isQueued
+                                ? "Queued ✓"
+                                : "Yes, it’s them"}
+                        </Button>
+                      </>
+                    )}
+                    {w.t === "album" && (
+                      <>
+                        <button
+                          type="button"
+                          className="shrink-0 text-[11px] text-muted-foreground underline underline-offset-2 hover:text-foreground"
+                          onClick={() =>
+                            openUrl(
+                              `https://musicbrainz.org/release-group/${w.s.payload.groups![0].group_id}`,
+                            )
+                          }
+                        >
+                          view
+                        </button>
+                        <Button
+                          size="sm"
+                          variant={isQueued ? "outline" : "default"}
+                          className="shrink-0 gap-1.5"
+                          disabled={quickDraining || isDone}
+                          title={isQueued ? "Click again to remove from the queue" : undefined}
+                          onClick={() => toggleQuickWin(w)}
+                        >
+                          {isActive && <Spinner className="size-3" />}
+                          {isDone ? "Done" : isActive ? "Applying…" : isQueued ? "Queued ✓" : "Match"}
+                        </Button>
+                      </>
+                    )}
+                  </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+          {pendingPass.length > 0 && (
+            <div className="flex items-center gap-3 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2">
+              <RefreshCw size={14} className="shrink-0 text-amber-300" />
+              <p className="min-w-0 flex-1 text-sm text-amber-200/90">
+                {pendingPass.length} decision{pendingPass.length === 1 ? "" : "s"} waiting for a
+                matching pass — cash them in before grinding further.
+              </p>
+              <Button
+                size="sm"
+                variant="outline"
+                className="shrink-0 gap-1.5"
+                disabled={busy || running || pending.length > 0}
+                title={pending.length > 0 ? "Staged changes need a rescan first" : undefined}
+                onClick={rerunMatching}
+              >
+                <RefreshCw size={13} />
+                {pending.length > 0 ? "Rescan first" : running ? "Pass running…" : "Run pass now"}
+              </Button>
+            </div>
+          )}
+          {bigUnlocks.length > 0 && (
+            <div>
+              <h4 className="mb-1.5 flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-amber-300">
+                <TriangleAlert size={14} />
+                Big unlocks ({bigUnlocks.length}) — worth a search
+              </h4>
+              <div className="overflow-hidden rounded-md border border-amber-500/30">
+                {bigUnlocks.slice(0, 15).map((w, i) => (
+                  <div
+                    key={
+                      w.t === "cluster"
+                        ? `bc-${w.c.key}`
+                        : w.t === "artist"
+                          ? `ba-${w.a.artist_id}`
+                          : `bs-${w.s.id}`
+                    }
+                    className={i === 0 ? "" : "border-t"}
+                  >
+                  <div className="flex items-center gap-3 px-3 py-2">
+                    <div className="min-w-0 flex-1 truncate text-sm">
+                      {w.t === "cluster" && (
+                        <>
+                          {w.c.members.map((m) => `“${m.name}”`).join(" + ")}
+                          <span className="ml-1.5 text-[11px] text-muted-foreground">
+                            same artist? — settle who they are
+                          </span>
+                        </>
+                      )}
+                      {w.t === "artist_sug" && (
+                        <>
+                          “{w.s.payload.artist_name}”
+                          <span className="ml-1.5 text-[11px] text-muted-foreground">
+                            {w.s.payload.candidates?.length} candidates — pick the right one
+                          </span>
+                        </>
+                      )}
+                      {w.t === "artist" && (
+                        <>
+                          “{w.a.title}”
+                          <span className="ml-1.5 text-[11px] text-muted-foreground">
+                            {w.a.album_count} album{w.a.album_count === 1 ? "" : "s"} here,
+                            unidentified
+                          </span>
+                        </>
+                      )}
+                      {w.t === "album_sug" && (
+                        <>
+                          “{w.s.payload.album_title}”
+                          <span className="ml-1.5 text-[11px] text-muted-foreground">
+                            {w.s.payload.groups?.length} possible albums — pick one
+                          </span>
+                        </>
+                      )}
+                    </div>
+                    {w.t === "cluster" && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="shrink-0"
+                        disabled={busy}
+                        onClick={() => {
+                          const pages = w.c.members.filter((m) => m.artist_id != null);
+                          if (pages[0])
+                            setClusterMatch({
+                              cluster: w.c,
+                              survivorId: pages[0].artist_id as number,
+                            });
+                        }}
+                      >
+                        Match…
+                      </Button>
+                    )}
+                    {w.t === "artist" && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="shrink-0"
+                        disabled={busy}
+                        onClick={() => setMatchArtist(w.a.artist_id)}
+                      >
+                        Match…
+                      </Button>
+                    )}
+                  </div>
+                  {/* Suggestion rows carry their candidate picker inline,
+                      always open — the decision happens IN the queue. */}
+                  {w.t === "artist_sug" && (
+                    <div className="pt-1">{renderArtistSuggestionBody(w.s)}</div>
+                  )}
+                  {w.t === "album_sug" && (
+                    <div className="px-3 pb-2.5 pt-1">{renderAlbumSuggestionBody(w.s)}</div>
+                  )}
+                  </div>
+                ))}
+              </div>
+              {bigUnlocks.length > 15 && (
+                <p className="mt-1 text-[11px] text-muted-foreground">
+                  +{bigUnlocks.length - 15} more — the full lists live in Artists and Albums.
+                </p>
+              )}
+            </div>
+          )}
+          {declaredFixes.length > 0 && (
+            <div>
+              <h4 className="mb-0.5 flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+                <FileWarning size={14} />
+                Source fixes ({declaredFixes.length}) — retag, then rescan
+              </h4>
+              <p className="mb-1.5 text-xs text-muted-foreground">
+                Misspellings you flagged that still live in the files&rsquo; tags. Waverunner keeps
+                them pointing at the right artist meanwhile — but the real fix is in the tags.
+              </p>
+              <div className="space-y-2">
+                {declaredFixes.slice(0, 3).map((f) => (
+                  <TagFixCard
+                    key={`${f.artist_id}:${f.wrong}`}
+                    fix={f}
+                    busy={busy}
+                    busyKey={busyKey}
+                    onSetKind={setAliasKind}
+                  />
+                ))}
+              </div>
+              {declaredFixes.length > 3 && (
+                <p className="mt-1 text-[11px] text-muted-foreground">
+                  +{declaredFixes.length - 3} more under File problems.
+                </p>
+              )}
+            </div>
+          )}
+          {(cleanupFeatures > 0 ||
+            cleanupAlbums > 0 ||
+            unlinked.length > 0 ||
+            variantFixes.length > 0 ||
+            (review?.gaps.length ?? 0) > 0 ||
+            conflictedClusters > 0) && (
+            <div>
+              <h4 className="mb-1.5 text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+                Cleanup — low yield, fine to leave for last
+              </h4>
+              <div className="overflow-hidden rounded-md border">
+                {cleanupFeatures > 0 && (
+                  <div className="flex items-center gap-3 px-3 py-2">
+                    <p className="min-w-0 flex-1 text-sm text-muted-foreground">
+                      {cleanupFeatures} feature-only artist{cleanupFeatures === 1 ? "" : "s"} —
+                      usually resolve themselves once albums are matched
+                    </p>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="shrink-0"
+                      onClick={() => goTo("artists", "sec-artists-features")}
+                    >
+                      View
+                    </Button>
+                  </div>
+                )}
+                {cleanupAlbums > 0 && (
+                  <div
+                    className={`flex items-center gap-3 px-3 py-2 ${cleanupFeatures > 0 ? "border-t" : ""}`}
+                  >
+                    <p className="min-w-0 flex-1 text-sm text-muted-foreground">
+                      {cleanupAlbums} album{cleanupAlbums === 1 ? "" : "s"} MusicBrainz couldn’t
+                      find — manual search, rename, or ignore
+                    </p>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="shrink-0"
+                      onClick={() => goTo("albums", "sec-albums-unmatched")}
+                    >
+                      View
+                    </Button>
+                  </div>
+                )}
+                {unlinked.length > 0 && (
+                  <div
+                    className={`flex items-center gap-3 px-3 py-2 ${
+                      cleanupFeatures > 0 || cleanupAlbums > 0 ? "border-t" : ""
+                    }`}
+                  >
+                    <p className="min-w-0 flex-1 text-sm text-muted-foreground">
+                      {unlinked.length} unlinked credit{unlinked.length === 1 ? "" : "s"} — names
+                      resolving to no artist page
+                    </p>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="shrink-0"
+                      onClick={() => goTo("credits")}
+                    >
+                      View
+                    </Button>
+                  </div>
+                )}
+                {variantFixes.length > 0 && (
+                  <div
+                    className={`flex items-center gap-3 px-3 py-2 ${
+                      cleanupFeatures > 0 || cleanupAlbums > 0 || unlinked.length > 0
+                        ? "border-t"
+                        : ""
+                    }`}
+                  >
+                    <p className="min-w-0 flex-1 text-sm text-muted-foreground">
+                      {variantFixes.length} spelling variant{variantFixes.length === 1 ? "" : "s"}{" "}
+                      to classify — misspellings to fix, or nicknames to keep
+                    </p>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="shrink-0"
+                      onClick={() => goTo("files", "sec-files-variants")}
+                    >
+                      View
+                    </Button>
+                  </div>
+                )}
+                {(review?.gaps.length ?? 0) > 0 && (
+                  <div
+                    className={`flex items-center gap-3 px-3 py-2 ${
+                      cleanupFeatures > 0 ||
+                      cleanupAlbums > 0 ||
+                      unlinked.length > 0 ||
+                      variantFixes.length > 0
+                        ? "border-t"
+                        : ""
+                    }`}
+                  >
+                    <p className="min-w-0 flex-1 text-sm text-muted-foreground">
+                      {review!.gaps.length} matched album{review!.gaps.length === 1 ? "" : "s"}{" "}
+                      whose track lists differ from the MusicBrainz release
+                    </p>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="shrink-0"
+                      onClick={() => goTo("gaps")}
+                    >
+                      View
+                    </Button>
+                  </div>
+                )}
+                {conflictedClusters > 0 && (
+                  <div
+                    className={`flex items-center gap-3 px-3 py-2 ${
+                      cleanupFeatures > 0 ||
+                      cleanupAlbums > 0 ||
+                      unlinked.length > 0 ||
+                      variantFixes.length > 0 ||
+                      (review?.gaps.length ?? 0) > 0
+                        ? "border-t"
+                        : ""
+                    }`}
+                  >
+                    <p className="min-w-0 flex-1 text-sm text-muted-foreground">
+                      {conflictedClusters} name group{conflictedClusters === 1 ? "" : "s"} holding
+                      different MusicBrainz identities — provably separate; eject the stranger
+                    </p>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="shrink-0"
+                      onClick={() => goTo("artists", "sec-artists-clusters")}
+                    >
+                      View
+                    </Button>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </section>
+      )}
       {pane === "map" && (
         <section className="space-y-4">
           {mapReds === 0 ? (
@@ -1595,7 +2808,7 @@ export function MetadataCenter({
                     1,
                     "Match your artists",
                     guideOwnerLeft,
-                    mergeSuggestions.length + artistSuggestionsOwners.length,
+                    clusters.length + artistSuggestionsOwners.length,
                     "artists",
                     "Artists with albums in your library first — each one identified unlocks their whole discography for automatic matching on the next pass.",
                   ],
@@ -1654,7 +2867,7 @@ export function MetadataCenter({
                       size="sm"
                       variant="outline"
                       className="shrink-0"
-                      onClick={() => setPane(target)}
+                      onClick={() => goTo(target)}
                     >
                       Go
                     </Button>
@@ -1957,7 +3170,7 @@ export function MetadataCenter({
         )}
 
         {albumsUnmatched.length > 0 && (
-          <div className="mb-8">
+          <div className="mb-8" id="sec-albums-unmatched">
             <h4 className="mb-1.5 flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-red-400">
               <CircleSlash size={14} />
               Unmatched albums ({albumsUnmatched.length})
@@ -2068,46 +3281,27 @@ export function MetadataCenter({
               high-leverage answers, features usually resolve themselves once
               albums are matched. Matched ones are reference — below, cut
               short. */}
-          {mergeSuggestions.length > 0 && (
-            <div className="mb-8">
-              <h4 className="mb-1.5 flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-amber-300">
+          {clusters.length > 0 && (
+            <div className="mb-8" id="sec-artists-clusters">
+              <h4 className="mb-0.5 flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-amber-300">
                 <GitMerge size={14} />
-                Suggested merges ({mergeSuggestions.length})
+                Resolve identities ({clusters.length})
               </h4>
+              <p className="mb-1.5 text-xs text-muted-foreground">
+                Names that look like one artist spelled differently. Match settles who they are,
+                merges every spelling, and adopts the MusicBrainz name — biggest unlocks first.
+              </p>
               <div className="space-y-2">
-                {mergeSuggestions.map((s) => (
-                  <div
-                    key={s.id}
-                    data-flip-id={`sug-${s.id}`}
-                    className="flex items-center justify-between gap-3 rounded-md border p-3"
-                  >
-                    <p className="min-w-0 text-sm">
-                      <GitMerge size={14} className="mr-1.5 inline text-muted-foreground" />
-                      Merge <span className="font-medium">“{s.payload.other_name}”</span> into{" "}
-                      <span className="font-medium">“{s.payload.keep_title}”</span>
-                    </p>
-                    <div className="flex shrink-0 gap-2">
-                      <Button
-                        size="sm"
-                        className="gap-1.5"
-                        disabled={busy}
-                        onClick={() => resolve(s.id, true)}
-                      >
-                        {busyKey === `resolve:${s.id}:true` && <Spinner className="size-3" />}
-                        Merge
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        className="gap-1.5"
-                        disabled={busy}
-                        onClick={() => resolve(s.id, false)}
-                      >
-                        {busyKey === `resolve:${s.id}:false` && <Spinner className="size-3" />}
-                        Keep separate
-                      </Button>
-                    </div>
-                  </div>
+                {clusters.map((c) => (
+                  <ClusterCard
+                    key={c.key}
+                    cluster={c}
+                    busy={busy}
+                    busyKey={busyKey}
+                    onMatch={(cluster, survivorId) => setClusterMatch({ cluster, survivorId })}
+                    onMergeOnly={mergeCluster}
+                    onEject={ejectMember}
+                  />
                 ))}
               </div>
             </div>
@@ -2145,7 +3339,7 @@ export function MetadataCenter({
             </div>
           )}
           {artistsUnmatchedFeatures.length > 0 && (
-            <div className="mb-8">
+            <div className="mb-8" id="sec-artists-features">
               <h4 className="mb-0.5 flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-amber-300">
                 <TriangleAlert size={14} />
                 Unmatched artists with only features ({artistsUnmatchedFeatures.length})
@@ -2286,8 +3480,10 @@ export function MetadataCenter({
             These albums matched, but some tracks couldn’t be paired with the release. MusicBrainz
             data — artist credits included — was <span className="font-medium">not</span> applied to
             those tracks, so they keep whatever their tags said. Fix the tags at the source, rescan,
-            then <span className="font-medium">Re-check</span>. <span className="font-medium">Ignore</span> just
-            hides the warning — nothing about the match or your files changes, and it returns on the
+            then <span className="font-medium">Re-check</span>.{" "}
+            <span className="font-medium">Partial</span> declares the missing tracks deliberate —
+            you only keep part of this album — and holds through every future check.{" "}
+            <span className="font-medium">Ignore</span> just hides the warning — it returns on the
             next check.
           </p>
           <div className="space-y-2">
@@ -2326,6 +3522,19 @@ export function MetadataCenter({
                         {busyKey === `recheck:${g.album_id}` && <Spinner className="size-3" />}
                         Re-check
                       </Button>
+                      {theirs > 0 && (
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="gap-1.5"
+                          disabled={busy}
+                          title="You deliberately keep only part of this album — the missing release tracks stop counting, durably. Undo from History."
+                          onClick={() => markPartial(g.album_id)}
+                        >
+                          {busyKey === `partial:${g.album_id}` && <Spinner className="size-3" />}
+                          Partial
+                        </Button>
+                      )}
                       <Button
                         size="sm"
                         variant="ghost"
@@ -2379,6 +3588,53 @@ export function MetadataCenter({
 
       {/* File-level notes. Both are long by nature and neither is actionable
           inside waverunner, so they collapse to a line you open on purpose. */}
+      {pane === "files" && declaredFixes.length > 0 && (
+        <div className="mb-6">
+          <h4 className="mb-0.5 flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-amber-300">
+            <FileWarning size={14} />
+            Misspellings still in tags ({declaredFixes.length})
+          </h4>
+          <p className="mb-1.5 text-xs text-muted-foreground">
+            Spellings you flagged as wrong that the files still carry. Retag them at the source and
+            rescan — each entry disappears once its tags are clean.
+          </p>
+          <div className="space-y-2">
+            {declaredFixes.map((f) => (
+              <TagFixCard
+                key={`${f.artist_id}:${f.wrong}`}
+                fix={f}
+                busy={busy}
+                busyKey={busyKey}
+                onSetKind={setAliasKind}
+              />
+            ))}
+          </div>
+        </div>
+      )}
+      {pane === "files" && variantFixes.length > 0 && (
+        <div className="mb-6" id="sec-files-variants">
+          <h4 className="mb-0.5 flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+            <FileWarning size={14} />
+            Spelling variants to classify ({variantFixes.length})
+          </h4>
+          <p className="mb-1.5 text-xs text-muted-foreground">
+            Alternate spellings recorded by merges and matches, still present in your files. The
+            machine takes no position: call each one a misspelling (flags its files for retagging)
+            or a nickname (kept as intended, never flagged). Undoable from History either way.
+          </p>
+          <div className="space-y-2">
+            {variantFixes.map((f) => (
+              <TagFixCard
+                key={`${f.artist_id}:${f.wrong}`}
+                fix={f}
+                busy={busy}
+                busyKey={busyKey}
+                onSetKind={setAliasKind}
+              />
+            ))}
+          </div>
+        </div>
+      )}
       {pane === "files" && fallbacks.length > 0 && (
         <Collapsible
           title={`Incomplete tags (${fallbacks.length})`}
@@ -2487,7 +3743,7 @@ export function MetadataCenter({
           Every matched album's track list agrees with its release.
         </p>
       )}
-      {pane === "files" && fallbacks.length === 0 && issues.length === 0 && (
+      {pane === "files" && fallbacks.length === 0 && issues.length === 0 && tagFixes.length === 0 && (
         <p className="py-8 text-center text-sm text-muted-foreground">
           Every file read cleanly and carried the tags it needed.
         </p>
@@ -2509,6 +3765,18 @@ export function MetadataCenter({
                 // A staged split changes the pending banner — refetch.
                 refresh();
               }
+            }}
+          />
+        )}
+      {clusterMatch && (
+          <ClusterMatchDialog
+            libraryId={libraryId}
+            cluster={clusterMatch.cluster}
+            survivorId={clusterMatch.survivorId}
+            onOpenChange={(o) => !o && setClusterMatch(null)}
+            onDone={() => {
+              refresh();
+              onChanged?.();
             }}
           />
         )}

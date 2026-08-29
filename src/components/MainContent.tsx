@@ -1320,11 +1320,24 @@ export function MainContent({
               grid keeps its full width and nothing hovers over it. */}
           {!selectedEntry && albumSelect && selectedLibrary?.id === albumSelect.libraryId && (
             <div className="flex items-center gap-3 border-b border-border px-4 py-2">
-              <p className="flex-1 text-sm">
-                <span className="font-medium">{albumSelect.picked.length} selected</span>
-                <span className="ml-2 text-muted-foreground">
-                  Click albums to add or remove them.
-                </span>
+              {/* Search stays live in selection mode — picking albums that
+                  don't share a page one search would show them on is the
+                  whole point (select "Demo Magnetic", search "death", pick
+                  "Death Magnetic"). Selection survives filter changes. */}
+              <div className="relative flex flex-1">
+                <Search
+                  size={14}
+                  className="absolute left-2.5 top-1/2 z-10 -translate-y-1/2 text-muted-foreground"
+                />
+                <ClearableInput
+                  value={search}
+                  onValueChange={onSearchChange}
+                  placeholder="Search..."
+                  className="h-8 pl-8 text-sm"
+                />
+              </div>
+              <p className="shrink-0 text-sm font-medium">
+                {albumSelect.picked.length} selected
               </p>
               <Button
                 size="sm"

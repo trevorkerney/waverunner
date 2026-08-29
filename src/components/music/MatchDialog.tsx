@@ -301,7 +301,13 @@ export function MatchDialog({
     }
     let stale = false;
     setLoadingReleases(true);
-    invoke<GroupRelease[]>("mb_group_releases", { groupId })
+    invoke<GroupRelease[]>("mb_group_releases", {
+      groupId,
+      // The matched release (album kind stores it as status.mbid): the
+      // backend pins it into the list if the group pages past it, so the
+      // green "current" always has a row to sit on.
+      currentReleaseId: status?.mbid ?? null,
+    })
       .then((rows) => {
         if (!stale) setGroupReleases(rows);
       })
@@ -314,7 +320,9 @@ export function MatchDialog({
     return () => {
       stale = true;
     };
-  }, [open, groupId]);
+    // status?.mbid: applying/unmatching a release must refetch so the pinned
+    // "current" row tracks the actual match, not the one from dialog-open.
+  }, [open, groupId, status?.mbid]);
 
   // A track whose credited artist is matched searches THAT catalogue, not
   // all of MusicBrainz — same certainty move as the album dialog browsing

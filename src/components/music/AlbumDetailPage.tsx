@@ -2,14 +2,14 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { notifyPendingWorkChanged } from "./PendingWork";
 import { toast } from "sonner";
-import { Play, Disc3, Pencil, ListPlus, ListStart, ListEnd, Scissors, Undo2, ListChecks } from "lucide-react";
+import { Play, Disc3, Pencil, ListPlus, ListStart, ListEnd, Scissors, Star, Undo2, ListChecks } from "lucide-react";
+import { RenameDialog } from "../RenameDialog";
 import { Spinner } from "../ui/spinner";
 import { MusicAlbumDetail, MusicRelease, MusicQueueItem, MusicTrack } from "../../types";
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "../ui/dropdown-menu";
 import {
@@ -86,6 +86,8 @@ export function AlbumDetailPage({
   const [absorbed, setAbsorbed] = useState<
     { combine_id: number; name: string; mode: string }[]
   >([]);
+  // Release whose label is being renamed in the versions menu.
+  const [renameRelease, setRenameRelease] = useState<MusicRelease | null>(null);
 
   // Navigations clear the page (spinner); edit-triggered refetches are silent
   // and keep the selected release when it still exists.
@@ -360,39 +362,103 @@ export function AlbumDetailPage({
                   <Disc3 size={13} />
                   {releaseLabel(release)}
                 </DropdownMenuTrigger>
-                <DropdownMenuContent align="start">
+                {/* One row per release: pick to view/play it; facts line
+                    (codec · tracks · folder) tells your copies apart when the
+                    labels can't; per-row actions — set default, rename label,
+                    separate — instead of one ambiguous footer verb. */}
+                <DropdownMenuContent align="start" className="w-[380px]">
                   {detail.releases.map((r) => (
-                    <DropdownMenuItem key={r.id} onClick={() => setReleaseId(r.id)}>
-                      {releaseLabel(r)}
-                      {r.is_default && (
-                        <span className="ml-auto pl-3 text-xs text-muted-foreground">default</span>
-                      )}
+                    <DropdownMenuItem
+                      key={r.id}
+                      onClick={() => setReleaseId(r.id)}
+                      className="items-start gap-2 py-2"
+                    >
+                      <span className="mt-1 flex size-3.5 shrink-0 items-center justify-center">
+                        {r.id === releaseId ? (
+                          <Disc3 size={14} />
+                        ) : (
+                          <span className="block size-2.5 rounded-full border border-muted-foreground/50" />
+                        )}
+                      </span>
+                      <span className="min-w-0 flex-1">
+                        <span className="flex items-center gap-1.5">
+                          <span className="truncate text-sm">{releaseLabel(r)}</span>
+                          {r.is_default && (
+                            <span className="shrink-0 text-[10px] text-muted-foreground">
+                              default
+                            </span>
+                          )}
+                          {r.has_mb_tag && (
+                            <span
+                              className="shrink-0 rounded bg-emerald-500/15 px-1 py-px text-[10px] text-emerald-300"
+                              title="This copy's files carry a MusicBrainz release id"
+                            >
+                              MB
+                            </span>
+                          )}
+                        </span>
+                        <span className="block truncate text-[11px] text-muted-foreground">
+                          {[
+                            `${r.tracks.length} track${r.tracks.length === 1 ? "" : "s"}`,
+                            r.folder,
+                          ]
+                            .filter(Boolean)
+                            .join(" · ")}
+                        </span>
+                      </span>
+                      <span className="flex shrink-0 items-center gap-0.5">
+                        {!r.is_default && (
+                          <button
+                            type="button"
+                            title="Make this the default release"
+                            className="rounded p-1 text-muted-foreground hover:bg-foreground/10 hover:text-foreground"
+                            onClick={async (e) => {
+                              e.stopPropagation();
+                              e.preventDefault();
+                              try {
+                                await invoke("set_default_release", { releaseId: r.id });
+                                setReloadKey((k) => k + 1);
+                              } catch (err) {
+                                toast.error(String(err));
+                              }
+                            }}
+                          >
+                            <Star size={13} />
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          title="Rename this release's label"
+                          className="rounded p-1 text-muted-foreground hover:bg-foreground/10 hover:text-foreground"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            e.preventDefault();
+                            setRenameRelease(r);
+                          }}
+                        >
+                          <Pencil size={13} />
+                        </button>
+                        <button
+                          type="button"
+                          title="Separate into its own album (staged — applies on the next rescan)"
+                          className="rounded p-1 text-muted-foreground hover:bg-foreground/10 hover:text-foreground"
+                          onClick={async (e) => {
+                            e.stopPropagation();
+                            e.preventDefault();
+                            try {
+                              await invoke<string>("split_album_release", { releaseId: r.id });
+                              toast("Separation staged — it applies on the next rescan");
+                              notifyPendingWorkChanged();
+                            } catch (err) {
+                              toast.error(String(err));
+                            }
+                          }}
+                        >
+                          <Scissors size={13} />
+                        </button>
+                      </span>
                     </DropdownMenuItem>
                   ))}
-                  <DropdownMenuSeparator />
-                  {/* Pull the SHOWN edition out into an album of its own —
-                      undoes scanner grouping or a combine, whichever put it
-                      here. Applies on the rescan it kicks off. */}
-                  <DropdownMenuItem
-                    disabled={release == null}
-                    onClick={async () => {
-                      if (!release) return;
-                      try {
-                        await invoke<string>("split_album_release", {
-                          releaseId: release.id,
-                        });
-                        // Staged — batched behind the next rescan with any
-                        // other pending directives.
-                        toast("Separation staged — it applies on the next rescan");
-                        notifyPendingWorkChanged();
-                      } catch (e) {
-                        toast.error(String(e));
-                      }
-                    }}
-                  >
-                    <Scissors size={13} />
-                    Separate “{release ? releaseLabel(release) : ""}”
-                  </DropdownMenuItem>
                 </DropdownMenuContent>
               </DropdownMenu>
             )}
@@ -622,6 +688,20 @@ export function AlbumDetailPage({
           }}
           allowLoose
           onMoved={handleSaved}
+        />
+      )}
+      {renameRelease && (
+        <RenameDialog
+          open
+          onOpenChange={(o) => {
+            if (!o) setRenameRelease(null);
+          }}
+          title="Rename release label"
+          initialValue={renameRelease.label ?? "Original"}
+          onSubmit={async (v) => {
+            await invoke("set_release_label", { releaseId: renameRelease.id, label: v });
+            setReloadKey((k) => k + 1);
+          }}
         />
       )}
     </div>

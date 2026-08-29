@@ -251,6 +251,12 @@ export interface MusicRelease {
   is_default: boolean;
   disc_count: number;
   year: string | null;
+  /** Folder leaf — the versions menu's differentiator when labels collide. */
+  folder: string;
+  /** Distinct codecs of this release's tracks ("FLAC", "WAV"). */
+  codecs: string[];
+  /** The files carry a MusicBrainz release id — this copy pins the release. */
+  has_mb_tag: boolean;
   tracks: MusicTrack[];
 }
 

@@ -27,6 +27,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Switch } from "@/components/ui/switch";
 import { MetadataCenter } from "@/components/music/MetadataCenter";
+import { latestEnrichProgress } from "@/hooks/enrichProgress";
 import { VideoMetadataCenter } from "@/components/VideoMetadataCenter";
 import { runBulkMatch } from "@/components/tmdbMatchEngine";
 import type { Library, TmdbBulkTargets } from "@/types";
@@ -146,6 +147,9 @@ export function CreateLibraryDialog({
   const [confirmExit, setConfirmExit] = useState(false);
   // Two-step "Skip remaining" during the match run — see the footer.
   const [confirmSkip, setConfirmSkip] = useState(false);
+  // Rescan's Stop button was pressed — disable it and wait for the backend
+  // to notice the flag (per file in read-tags, between artists in build).
+  const [stopRequested, setStopRequested] = useState(false);
   const [centerReloadKey, setCenterReloadKey] = useState(0);
   // The library the wizard is driving (created here, or resumed/rescanned).
   const [libraryId, setLibraryId] = useState<string | null>(null);
@@ -243,6 +247,23 @@ export function CreateLibraryDialog({
   // step in flight (the component stays mounted while minimized).
   useEffect(() => {
     if (!isOpen || step !== 3 || matchPhase !== "running" || effFormat !== "music") return;
+    // The pass may already be mid-item by the time this listener attaches
+    // (the backend emits immediately; attaching is async) — seed the display
+    // from the always-on cache so item 1 shows instead of "Starting…".
+    const cached = libraryId ? latestEnrichProgress(libraryId) : null;
+    if (cached) {
+      setMatchProgress({
+        done: cached.done,
+        total: cached.total,
+        name: cached.name,
+        phase: cached.phase,
+        etaSecs: null,
+      });
+      setSubProgress((prev) => ({
+        ...prev,
+        [cached.phase]: { done: cached.done, total: cached.total },
+      }));
+    }
     const unProgress = listen<{ phase: string; done: number; total: number; name: string }>(
       "music-enrich-progress",
       (e) => {
@@ -272,6 +293,29 @@ export function CreateLibraryDialog({
         }));
       },
     );
+    // Second seed, AFTER registration lands: launching the pass from this
+    // modal means the first seed above ran before event 1 even existed, and
+    // event 1 can fire while listen() is still registering — missed by both.
+    // By the time registration resolves, any such event is in the module
+    // cache (that listener has existed since app start), so one more read
+    // closes the window for good.
+    unProgress.then(() => {
+      const cached = libraryId ? latestEnrichProgress(libraryId) : null;
+      if (!cached) return;
+      setMatchProgress((prev) =>
+        prev ?? {
+          done: cached.done,
+          total: cached.total,
+          name: cached.name,
+          phase: cached.phase,
+          etaSecs: null,
+        },
+      );
+      setSubProgress((prev) => ({
+        [cached.phase]: { done: cached.done, total: cached.total },
+        ...prev,
+      }));
+    });
     // Sweep counter: the pass loops until a sweep makes no progress (cap 3),
     // and each new sweep RESETS the per-phase counters — without this label a
     // glance away and back reads as the pass losing ground. Shown from sweep
@@ -514,6 +558,7 @@ export function CreateLibraryDialog({
     creatingGlobal = true;
     setScanProgress(null);
     setScanSub({});
+    setStopRequested(false);
     try {
       await invoke("rescan_library", { libraryId: libId });
       if (managesSetupRow) {
@@ -522,7 +567,14 @@ export function CreateLibraryDialog({
       onCreated();
       await enterMatch(libId);
     } catch (e) {
-      toast.error(String(e));
+      // A user-initiated stop is not an error: nothing was written that a
+      // later rescan won't complete (read phase writes nothing; build stops
+      // between artists and never sweeps).
+      if (String(e).toLowerCase().includes("cancelled")) {
+        toast("Rescan stopped — nothing lost.");
+      } else {
+        toast.error(String(e));
+      }
       closeWizard();
     } finally {
       setCreating(false);
@@ -1038,6 +1090,26 @@ export function CreateLibraryDialog({
                   <p className="min-h-4 w-full min-w-0 truncate px-2 text-xs text-muted-foreground">
                     {scanProgress?.folder || "Reading folders…"}
                   </p>
+                  {/* Rescans stop safely: the read phase writes nothing and
+                      the build phase stops between artists — a later rescan
+                      simply completes the rest. (Create scans cancel through
+                      the X / confirm-exit flow instead.) */}
+                  {mode.kind === "rescan" && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="mt-1"
+                      disabled={stopRequested}
+                      onClick={() => {
+                        setStopRequested(true);
+                        void invoke("cancel_library_creation").catch((e) =>
+                          toast.error(String(e)),
+                        );
+                      }}
+                    >
+                      {stopRequested ? "Stopping…" : "Stop rescan"}
+                    </Button>
+                  )}
                 </div>
               )}
 

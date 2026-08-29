@@ -736,6 +736,91 @@ pub async fn link_credit_name(
         .await
 }
 
+/// Rename one release's label. Stored as a folder-keyed pref (release rows
+/// are rebuilt every rescan) and applied live — an in-app preference, instant
+/// like the rest of them.
+#[tauri::command]
+pub async fn set_release_label(
+    state: State<'_, AppState>,
+    release_id: i64,
+    label: String,
+) -> Result<(), String> {
+    let pool = &state.app_db;
+    let label = label.trim().to_string();
+    if label.is_empty() {
+        return Err("Label cannot be empty".to_string());
+    }
+    let row: Option<(i64, String)> =
+        sqlx::query_as("SELECT album_id, folder_path FROM album_release WHERE id = ?")
+            .bind(release_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    let Some((album_id, folder)) = row else {
+        return Err("Release not found".to_string());
+    };
+    sqlx::query(
+        "INSERT INTO album_release_pref (album_id, folder_path, label, is_default)
+         VALUES (?, ?, ?, 0)
+         ON CONFLICT(album_id, folder_path) DO UPDATE SET label = excluded.label",
+    )
+    .bind(album_id)
+    .bind(&folder)
+    .bind(&label)
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    sqlx::query("UPDATE album_release SET label = ? WHERE id = ?")
+        .bind(&label)
+        .bind(release_id)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Choose which release is the album's default (the one the page opens on and
+/// Play plays). Folder-keyed pref + live flip, rescan-proof.
+#[tauri::command]
+pub async fn set_default_release(
+    state: State<'_, AppState>,
+    release_id: i64,
+) -> Result<(), String> {
+    let pool = &state.app_db;
+    let row: Option<(i64, String)> =
+        sqlx::query_as("SELECT album_id, folder_path FROM album_release WHERE id = ?")
+            .bind(release_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    let Some((album_id, folder)) = row else {
+        return Err("Release not found".to_string());
+    };
+    sqlx::query(
+        "INSERT INTO album_release_pref (album_id, folder_path, label, is_default)
+         VALUES (?, ?, NULL, 1)
+         ON CONFLICT(album_id, folder_path) DO UPDATE SET is_default = 1",
+    )
+    .bind(album_id)
+    .bind(&folder)
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    sqlx::query("UPDATE album_release_pref SET is_default = 0 WHERE album_id = ? AND folder_path != ?")
+        .bind(album_id)
+        .bind(&folder)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    sqlx::query("UPDATE album_release SET is_default = (id = ?) WHERE album_id = ?")
+        .bind(release_id)
+        .bind(album_id)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 async fn covers_for_folder(
     pool: &SqlitePool,
     library_id: &str,
@@ -1225,12 +1310,14 @@ pub async fn set_artist_fields(
         if !old_name.eq_ignore_ascii_case(&new_name) {
             renamed = true;
             // The tag name lives on as an alias — identity survives the rename.
-            sqlx::query("INSERT OR IGNORE INTO artist_alias (artist_id, name) VALUES (?, ?)")
-                .bind(artist_id)
-                .bind(&old_name)
-                .execute(pool)
-                .await
-                .map_err(|e| e.to_string())?;
+            sqlx::query(
+                "INSERT OR IGNORE INTO artist_alias (artist_id, name, kind) VALUES (?, ?, 'variant')",
+            )
+            .bind(artist_id)
+            .bind(&old_name)
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
         }
         upsert_override(pool, artist_id, "title", &new_name).await?;
     }

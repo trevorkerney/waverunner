@@ -7499,6 +7499,9 @@ pub async fn rescan_library(
         .await
         .map_err(|e| e.to_string())?
         .unwrap_or_default();
+    // Shared with creation — a stale cancel from an earlier stopped run must
+    // not abort this one at the first check.
+    state.cancel_creation.store(false, Ordering::SeqCst);
     emit_scan_state(&app, &library_id, &lib_name, "started");
 
     // Returns per-item warnings (skipped episodes/seasons/shows). A bad item no
@@ -7530,7 +7533,7 @@ pub async fn rescan_library(
                     .iter()
                     .map(|p| (PathBuf::from(p), sound_paths.contains(p)))
                     .collect();
-                crate::music::rescan_music_library(&app, &state.app_db, &library_id, &base_paths, &cache_base).await?;
+                crate::music::rescan_music_library(&app, &state.app_db, &library_id, &base_paths, &cache_base, &state.cancel_creation).await?;
                 // The MusicBrainz pass is NOT auto-spawned — the wizard's match
                 // step (or the metadata center) drives it, if the user elects it.
                 // Music surfaces per-file problems via music_scan_issue, not

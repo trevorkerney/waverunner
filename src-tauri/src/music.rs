@@ -86,6 +86,11 @@ pub struct ScannedTrack {
     /// the container couldn't be parsed. None = unreadable. A rescan HINT for
     /// identity migration (moves/renames), never identity itself.
     pub audio_hash: Option<String>,
+    /// (size, mtime) captured at read time — the rescan gate: a file whose
+    /// stamp is unchanged next scan reuses its stored hash instead of being
+    /// re-read end to end. None = stat failed.
+    pub content_size: Option<i64>,
+    pub content_mtime: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -247,7 +252,17 @@ fn parse_credits(artist_display: &str, extra_artists: &[String], title: &str) ->
 // ---------------------------------------------------------------------------
 
 /// Read one audio file's tags + properties. Err(reason) = failed the tag bar.
-fn read_track(abs: &Path, rel: &str, disc_folder_no: Option<i64>) -> Result<ScannedTrack, String> {
+/// `prior` is the previous scan's (hash, size, mtime) for this path: when the
+/// file's current stamp matches, the stored hash is reused and the audio
+/// region is never read — the tag probe (headers + tag blocks, kilobytes) is
+/// all that touches the disk. Retagging bumps mtime, so changed tags always
+/// re-read AND re-hash naturally.
+fn read_track(
+    abs: &Path,
+    rel: &str,
+    disc_folder_no: Option<i64>,
+    prior: Option<&(String, i64, i64)>,
+) -> Result<ScannedTrack, String> {
     let tagged = Probe::open(abs)
         .map_err(|e| format!("unreadable file: {e}"))?
         .read()
@@ -342,6 +357,18 @@ fn read_track(abs: &Path, rel: &str, disc_folder_no: Option<i64>) -> Result<Scan
         }
     }
 
+    // The rescan gate: unchanged (size, mtime) means the stored hash still
+    // describes the audio — reuse it and skip reading the region entirely.
+    let stamp = crate::content_hash::file_stamp(abs);
+    let audio_hash = match (stamp, prior) {
+        (Some((size, mtime)), Some((hash, p_size, p_mtime)))
+            if size == *p_size && mtime == *p_mtime =>
+        {
+            Some(hash.clone())
+        }
+        _ => crate::content_hash::hash_file(abs),
+    };
+
     Ok(ScannedTrack {
         rel: rel.to_string(),
         abs: abs.to_path_buf(),
@@ -367,7 +394,9 @@ fn read_track(abs: &Path, rel: &str, disc_folder_no: Option<i64>) -> Result<Scan
         credits,
         sound: false,
         album_artist_credits: Vec::new(),
-        audio_hash: crate::content_hash::hash_file(abs),
+        audio_hash,
+        content_size: stamp.map(|(s, _)| s),
+        content_mtime: stamp.map(|(_, m)| m),
     })
 }
 
@@ -587,14 +616,20 @@ fn finalize_album_releases(album: &mut ScannedAlbum) {
 /// Scan one base folder into tag-grouped albums plus loose tracks (pre
 /// MBID-merge, pre artist grouping). Only files the reader cannot open land
 /// in `issues` — under-tagged files import via fallbacks. Reading tags is the
-/// slow part of a scan, so progress is reported per folder as it goes and the
-/// cancel flag (when given) is honored mid-read.
+/// slow part of a scan (the content hash reads the whole audio region), so
+/// files are read by a small worker pool — serially the disk sat at queue
+/// depth 1 and the phase was bounded by single-stream throughput — with
+/// results reassembled in file order, so everything downstream stays
+/// deterministic. The cancel flag (when given) is honored per file.
 pub fn scan_base(
     base: &Path,
     // Base is sounds-typed — every track scanned here carries the flag.
     sound: bool,
     issues: &mut Vec<ScanIssue>,
     cancel: Option<&AtomicBool>,
+    // Previous scan's per-file (hash, size, mtime), keyed by rel path — the
+    // unchanged-file gate. None (create scans) or a miss hashes fresh.
+    prior: Option<&HashMap<String, (String, i64, i64)>>,
     // (folder, files done, files total) — the walk collects the whole file
     // list before any tag is read, so the total is exact and free.
     mut on_progress: impl FnMut(&str, usize, usize),
@@ -602,25 +637,72 @@ pub fn scan_base(
     let mut files = Vec::new();
     walk_audio(base, base, &mut files);
     let total_files = files.len();
-    let mut tagged = Vec::new();
-    let mut last_folder: Option<String> = None;
-    for (i, (abs, folder_rel, disc_no)) in files.into_iter().enumerate() {
-        if let Some(cancel) = cancel {
-            if cancel.load(Ordering::SeqCst) {
-                return Err("Library creation cancelled".to_string());
+
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, 8);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let slots: Vec<std::sync::Mutex<Option<Result<ScannedTrack, String>>>> =
+        (0..total_files).map(|_| std::sync::Mutex::new(None)).collect();
+    let files_ref = &files;
+    let slots_ref = &slots;
+    let next_ref = &next;
+    std::thread::scope(|s| {
+        let (tx, rx) = std::sync::mpsc::channel::<usize>();
+        for _ in 0..workers {
+            let tx = tx.clone();
+            s.spawn(move || loop {
+                if let Some(cancel) = cancel {
+                    if cancel.load(Ordering::SeqCst) {
+                        break;
+                    }
+                }
+                let i = next_ref.fetch_add(1, Ordering::SeqCst);
+                if i >= total_files {
+                    break;
+                }
+                let (abs, _, disc_no) = &files_ref[i];
+                let rel = rel_of(abs, base);
+                let prior_entry = prior.and_then(|m| m.get(&rel));
+                let res = read_track(abs, &rel, *disc_no, prior_entry);
+                *slots_ref[i].lock().unwrap() = Some(res);
+                let _ = tx.send(i);
+            });
+        }
+        drop(tx);
+        // Progress from the completion stream, throttled: the old per-folder
+        // cadence made sense serially; parallel completions interleave
+        // folders, so report on folder change and every 10th file.
+        let mut done = 0usize;
+        let mut last_folder: Option<String> = None;
+        while let Ok(i) = rx.recv() {
+            done += 1;
+            let folder = files_ref[i].1.as_str();
+            if last_folder.as_deref() != Some(folder) || done % 10 == 0 || done == total_files {
+                let shown = if folder.is_empty() {
+                    base.to_string_lossy().into_owned()
+                } else {
+                    folder.to_string()
+                };
+                on_progress(&shown, done, total_files);
+                last_folder = Some(folder.to_string());
             }
         }
-        if last_folder.as_deref() != Some(folder_rel.as_str()) {
-            let shown = if folder_rel.is_empty() {
-                base.to_string_lossy().into_owned()
-            } else {
-                folder_rel.clone()
-            };
-            on_progress(&shown, i, total_files);
-            last_folder = Some(folder_rel.clone());
+    });
+    if let Some(cancel) = cancel {
+        if cancel.load(Ordering::SeqCst) {
+            return Err("Scan cancelled".to_string());
         }
-        let rel = rel_of(&abs, base);
-        match read_track(&abs, &rel, disc_no) {
+    }
+
+    let mut tagged = Vec::new();
+    for (i, slot) in slots.into_iter().enumerate() {
+        let Some(res) = slot.into_inner().unwrap() else {
+            continue; // only possible on cancel, which returned above
+        };
+        let folder_rel = files[i].1.clone();
+        match res {
             Ok(mut t) => {
                 t.sound = sound;
                 // Sounds are fully virtual: no tag- or folder-derived albums.
@@ -640,7 +722,10 @@ pub fn scan_base(
                 };
                 tagged.push((t, folder_rel, folder_abs));
             }
-            Err(reason) => issues.push(ScanIssue { file_path: rel, reason }),
+            Err(reason) => issues.push(ScanIssue {
+                file_path: rel_of(&files[i].0, base),
+                reason,
+            }),
         }
     }
     Ok(assemble_albums(tagged))
@@ -1056,8 +1141,8 @@ async fn insert_track_rows(
     .map_err(|e| e.to_string())?;
     let id = res.last_insert_rowid();
     sqlx::query(
-        "INSERT INTO track (id, title, sort_title, file_path, sort_order, track_number, disc_number, runtime, audio_hash)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO track (id, title, sort_title, file_path, sort_order, track_number, disc_number, runtime, audio_hash, content_size, content_mtime)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(id)
     .bind(&t.title)
@@ -1068,6 +1153,8 @@ async fn insert_track_rows(
     .bind(t.disc_number)
     .bind(t.duration_secs)
     .bind(&t.audio_hash)
+    .bind(t.content_size)
+    .bind(t.content_mtime)
     .execute(pool)
     .await
     .map_err(|e| e.to_string())?;
@@ -1078,7 +1165,7 @@ async fn insert_track_rows(
 /// One-file tag read for the editor's reset/hints paths (no disc-folder
 /// context — the tag's own disc number, else 1).
 pub(crate) fn read_track_at(abs: &Path, rel: &str) -> Result<ScannedTrack, String> {
-    read_track(abs, rel, None)
+    read_track(abs, rel, None, None)
 }
 
 /// `write_credits: false` preserves existing track_credit rows — used when
@@ -1273,7 +1360,54 @@ async fn insert_album(
     )
     .await?;
     crate::music_edit::reapply_album_overrides(pool, album_entry_id).await?;
+    apply_release_prefs(pool, album_entry_id).await?;
     Ok(album_entry_id)
+}
+
+/// Re-stomp the user's per-release preferences (custom label, chosen default)
+/// onto freshly rebuilt album_release rows. Prefs key on FOLDER because the
+/// rows themselves get new ids every rescan; a pref whose folder no longer
+/// exists simply matches nothing.
+pub(crate) async fn apply_release_prefs(pool: &SqlitePool, album_id: i64) -> Result<(), String> {
+    let prefs: Vec<(String, Option<String>, i64)> = sqlx::query_as(
+        "SELECT folder_path, label, is_default FROM album_release_pref WHERE album_id = ?",
+    )
+    .bind(album_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    if prefs.is_empty() {
+        return Ok(());
+    }
+    for (folder, label, _) in &prefs {
+        if let Some(label) = label {
+            sqlx::query("UPDATE album_release SET label = ? WHERE album_id = ? AND folder_path = ?")
+                .bind(label)
+                .bind(album_id)
+                .bind(folder)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    if let Some((folder, _, _)) = prefs.iter().find(|(_, _, d)| *d != 0) {
+        let hit: Option<(i64,)> =
+            sqlx::query_as("SELECT id FROM album_release WHERE album_id = ? AND folder_path = ?")
+                .bind(album_id)
+                .bind(folder)
+                .fetch_optional(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        if let Some((rid,)) = hit {
+            sqlx::query("UPDATE album_release SET is_default = (id = ?) WHERE album_id = ?")
+                .bind(rid)
+                .bind(album_id)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 /// Reconcile an existing album entry against a fresh scan: update the album
@@ -1380,7 +1514,7 @@ async fn reconcile_album(
             let sort_order = track_sort_order(t, ti);
             if let Some(track_id) = existing_tracks.remove(&t.rel) {
                 sqlx::query(
-                    "UPDATE track SET title = ?, sort_title = ?, sort_order = ?, track_number = ?, disc_number = ?, runtime = ?, audio_hash = ?
+                    "UPDATE track SET title = ?, sort_title = ?, sort_order = ?, track_number = ?, disc_number = ?, runtime = ?, audio_hash = ?, content_size = ?, content_mtime = ?
                      WHERE id = ?",
                 )
                 .bind(&t.title)
@@ -1390,6 +1524,8 @@ async fn reconcile_album(
                 .bind(t.disc_number)
                 .bind(t.duration_secs)
                 .bind(&t.audio_hash)
+                .bind(t.content_size)
+                .bind(t.content_mtime)
                 .bind(track_id)
                 .execute(pool)
                 .await
@@ -1429,6 +1565,7 @@ async fn reconcile_album(
     )
     .await?;
     crate::music_edit::reapply_album_overrides(pool, album_entry_id).await?;
+    apply_release_prefs(pool, album_entry_id).await?;
     Ok(())
 }
 
@@ -2386,7 +2523,7 @@ pub(crate) async fn insert_artist_row(
 /// mark folds together with its full typographic Unicode class (MusicBrainz
 /// canonicalizes to U+2010 hyphens, curly apostrophes, …). Key collisions
 /// only ever produce merge SUGGESTIONS, so aggressive collapsing is safe.
-fn credit_name_key(s: &str) -> String {
+pub(crate) fn credit_name_key(s: &str) -> String {
     let cleaned: String = s
         .to_lowercase()
         .chars()
@@ -2855,7 +2992,7 @@ pub async fn scan_music_library(
     sound: bool,
 ) -> Result<(), String> {
     let mut issues = Vec::new();
-    let ScanOutput { albums, loose } = scan_base(base_path, sound, &mut issues, Some(cancel), |folder, done, total| {
+    let ScanOutput { albums, loose } = scan_base(base_path, sound, &mut issues, Some(cancel), None, |folder, done, total| {
         crate::commands::emit_scan_progress_phased(app, library_id, folder, "read-tags", done, total);
     })?;
     write_issues(pool, library_id, &issues, sound).await?;
@@ -2970,8 +3107,29 @@ pub async fn rescan_music_library(
     // (base, is_sounds) — sounds-typed bases sound-mark everything they yield.
     base_paths: &[(PathBuf, bool)],
     cache_base: &Path,
+    cancel: &AtomicBool,
 ) -> Result<(), String> {
     clear_issues(pool, library_id).await?;
+
+    // The unchanged-file gate: every track's stored (hash, size, mtime), so
+    // files whose stamp still matches skip the full audio read entirely and
+    // read-tags costs a stat + tag probe. Rows without stamps (pre-gate data)
+    // simply miss and hash once.
+    let prior: HashMap<String, (String, i64, i64)> = sqlx::query_as::<
+        _,
+        (String, Option<String>, Option<i64>, Option<i64>),
+    >(
+        "SELECT t.file_path, t.audio_hash, t.content_size, t.content_mtime
+         FROM track t JOIN media_entry me ON me.id = t.id
+         WHERE me.library_id = ?",
+    )
+    .bind(library_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .into_iter()
+    .filter_map(|(rel, h, s, m)| Some((rel, (h?, s?, m?))))
+    .collect();
 
     let mut all_albums = Vec::new();
     let mut all_loose = Vec::new();
@@ -2980,19 +3138,29 @@ pub async fn rescan_music_library(
     // per base (the total honestly grows as later bases are discovered).
     let mut files_offset = 0usize;
     for (base_path, sound) in base_paths {
+        if cancel.load(Ordering::SeqCst) {
+            return Err("Rescan cancelled".to_string());
+        }
         let mut issues = Vec::new();
         let mut base_total = 0usize;
-        let out = scan_base(base_path, *sound, &mut issues, None, |folder, done, total| {
-            base_total = total;
-            crate::commands::emit_scan_progress_phased(
-                app,
-                library_id,
-                folder,
-                "read-tags",
-                files_offset + done,
-                files_offset + total,
-            );
-        })?;
+        let out = scan_base(
+            base_path,
+            *sound,
+            &mut issues,
+            Some(cancel),
+            Some(&prior),
+            |folder, done, total| {
+                base_total = total;
+                crate::commands::emit_scan_progress_phased(
+                    app,
+                    library_id,
+                    folder,
+                    "read-tags",
+                    files_offset + done,
+                    files_offset + total,
+                );
+            },
+        )?;
         files_offset += base_total;
         all_albums.extend(out.albums);
         all_loose.extend(out.loose);
@@ -3134,6 +3302,12 @@ pub async fn rescan_music_library(
     };
 
     for artist in artists {
+        // Cancel lands BETWEEN artists, never mid-artist: each finished
+        // artist is fully reconciled, the end-of-scan sweep never runs, and
+        // the next rescan simply completes the rest. Nothing is deleted.
+        if cancel.load(Ordering::SeqCst) {
+            return Err("Rescan cancelled".to_string());
+        }
         crate::commands::emit_scan_progress_phased(app, library_id, &artist.title, "build", built, build_total);
         let artist_id = match artist_by_lower.get(&artist.title.to_lowercase()) {
             Some(id) => {
@@ -4079,6 +4253,13 @@ pub struct ReleaseView {
     pub is_default: bool,
     pub disc_count: i64,
     pub year: Option<String>,
+    /// Folder leaf — the versions menu's differentiator when labels collide.
+    pub folder: String,
+    /// Distinct codecs of this release's tracks, uppercased ("FLAC", "WAV").
+    pub codecs: Vec<String>,
+    /// The FILES carry a MusicBrainz release id — this copy can pin the
+    /// album's release exactly.
+    pub has_mb_tag: bool,
     pub tracks: Vec<TrackView>,
 }
 
@@ -4194,15 +4375,16 @@ pub async fn get_album_detail(
     .await
     .map_err(|e| e.to_string())?;
 
-    let release_rows: Vec<(i64, Option<String>, i64, i64, Option<String>)> = sqlx::query_as(
-        "SELECT id, label, is_default, disc_count, release_date
+    let release_rows: Vec<(i64, Option<String>, i64, i64, Option<String>, String, Option<String>)> =
+        sqlx::query_as(
+            "SELECT id, label, is_default, disc_count, release_date, folder_path, mb_release_id
          FROM album_release WHERE album_id = ?
          ORDER BY is_default DESC, label",
-    )
-    .bind(entry_id)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| e.to_string())?;
+        )
+        .bind(entry_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
 
     // Every name each library artist answers to (title + aliases), for
     // linking credits to their pages — displayed under current artist titles.
@@ -4241,12 +4423,13 @@ pub async fn get_album_detail(
     }
 
     let mut releases = Vec::new();
-    for (rid, label, is_default, disc_count, rdate) in release_rows {
-        let track_rows: Vec<(i64, String, Option<i64>, Option<i64>, Option<i64>, Option<String>, String, i64, i64)> =
+    for (rid, label, is_default, disc_count, rdate, folder_path, mb_release_id) in release_rows {
+        let track_rows: Vec<(i64, String, Option<i64>, Option<i64>, Option<i64>, Option<String>, String, i64, i64, Option<String>)> =
             sqlx::query_as(
                 "SELECT t.id, t.title, t.track_number, t.disc_number, t.runtime, tm.artist_name, t.file_path,
                         (SELECT COUNT(*) FROM music_play mp WHERE mp.track_id = t.id AND mp.scrobbled = 1),
-                        EXISTS(SELECT 1 FROM track_loved tl WHERE tl.track_id = t.id)
+                        EXISTS(SELECT 1 FROM track_loved tl WHERE tl.track_id = t.id),
+                        tm.codec
                  FROM track t
                  JOIN track_release tr ON tr.track_id = t.id
                  LEFT JOIN track_meta tm ON tm.track_id = t.id
@@ -4258,7 +4441,14 @@ pub async fn get_album_detail(
             .await
             .map_err(|e| e.to_string())?;
         let mut tracks = Vec::new();
-        for (id, title, track_number, disc_number, runtime, artist_name, rel, play_count, loved) in track_rows {
+        let mut codecs: Vec<String> = Vec::new();
+        for (id, title, track_number, disc_number, runtime, artist_name, rel, play_count, loved, codec) in track_rows {
+            if let Some(c) = codec.filter(|c| !c.is_empty()) {
+                let c = c.to_uppercase();
+                if !codecs.contains(&c) {
+                    codecs.push(c);
+                }
+            }
             tracks.push(TrackView {
                 id,
                 title,
@@ -4278,6 +4468,13 @@ pub async fn get_album_detail(
             is_default: is_default != 0,
             disc_count,
             year: rdate.map(|d| d.chars().take(4).collect()),
+            folder: folder_path
+                .rsplit(['\\', '/'])
+                .next()
+                .unwrap_or(&folder_path)
+                .to_string(),
+            codecs,
+            has_mb_tag: mb_release_id.as_deref().is_some_and(|m| !m.is_empty()),
             tracks,
         });
     }
@@ -4955,8 +5152,10 @@ mod tests {
             flag_compilation: false,
             credits: vec![],
             sound: false,
-        album_artist_credits: Vec::new(),
-        audio_hash: None,
+            album_artist_credits: Vec::new(),
+            audio_hash: None,
+            content_size: None,
+            content_mtime: None,
         };
         ScannedAlbum {
             identity_override: None,
@@ -5050,8 +5249,10 @@ mod tests {
             flag_compilation: false,
             credits: credits.iter().map(|c| c.to_string()).collect(),
             sound: false,
-        album_artist_credits: Vec::new(),
-        audio_hash: None,
+            album_artist_credits: Vec::new(),
+            audio_hash: None,
+            content_size: None,
+            content_mtime: None,
         }
     }
 
@@ -5418,10 +5619,12 @@ mod tests {
                 mb_release_id: None,
                 mb_release_group_id: None,
                 flag_compilation: false,
-            credits: vec![],
-            sound: false,
-        album_artist_credits: Vec::new(),
-        audio_hash: None,
+                credits: vec![],
+                sound: false,
+                album_artist_credits: Vec::new(),
+                audio_hash: None,
+                content_size: None,
+                content_mtime: None,
             };
             (t, folder.to_string(), PathBuf::from(format!(r"X:\m\{folder}")))
         };
@@ -5468,7 +5671,7 @@ mod tests {
             return;
         }
         let mut issues = Vec::new();
-        let out = scan_base(&base, false, &mut issues, None, |_, _, _| {}).expect("scan");
+        let out = scan_base(&base, false, &mut issues, None, None, |_, _, _| {}).expect("scan");
         assert!(issues.is_empty(), "well-tagged folder produced issues: {:?}",
             issues.iter().map(|i| format!("{}: {}", i.file_path, i.reason)).collect::<Vec<_>>());
         let albums = out.albums;

@@ -464,6 +464,60 @@ const MIGRATIONS: &[Migration] = &[
             "ALTER TABLE show ADD COLUMN content_mtime INTEGER",
         ],
     },
+    Migration {
+        id: 26,
+        app_version: "1.0.0-alpha.12.5",
+        description: "artist_alias.kind — misspelling (fix tags at source) vs nickname (intended)",
+        requires_table: Some("artist_alias"),
+        // 'misspelling' is the nagging default: the alias's literal spelling
+        // still appearing in credits surfaces a fix-at-source card. The user
+        // demotes intended monikers ("God" → Kanye) to 'nickname', which
+        // resolves identically but never nags.
+        statements: &["ALTER TABLE artist_alias ADD COLUMN kind TEXT NOT NULL DEFAULT 'misspelling'"],
+    },
+    Migration {
+        id: 27,
+        app_version: "1.0.0-alpha.12.5",
+        description: "alias kind 'variant' — neutral until the user declares; machine rows re-kinded",
+        requires_table: Some("artist_alias"),
+        // Migration 26's default claimed INTENT ("this spelling is wrong")
+        // for rows the automatic same-MBID merge created — a claim only a
+        // human can make ("Yasiin Bey" is not a misspelling of "Mos Def").
+        // Everything becomes neutral 'variant'; 'misspelling' now only ever
+        // comes from an explicit user declaration. Every insert path names
+        // the kind explicitly, so the old column default is inert.
+        statements: &["UPDATE artist_alias SET kind = 'variant' WHERE kind = 'misspelling'"],
+    },
+    Migration {
+        id: 28,
+        app_version: "1.0.0-alpha.12.5",
+        description: "track content_size/content_mtime — the rescan gate music never had",
+        requires_table: Some("track"),
+        // Same shape as migration 25 gave video: an unchanged (size, mtime)
+        // pair means the stored audio_hash still describes the file, so a
+        // rescan skips re-reading the audio region entirely. NULL until the
+        // next scan stamps it — those rows hash once more, then gate forever.
+        statements: &[
+            "ALTER TABLE track ADD COLUMN content_size INTEGER",
+            "ALTER TABLE track ADD COLUMN content_mtime INTEGER",
+        ],
+    },
+    Migration {
+        id: 29,
+        app_version: "1.0.0-alpha.12.5",
+        description: "album_release_pref — user labels + chosen default for an album's releases",
+        requires_table: Some("album_release"),
+        // Folder-keyed because album_release rows are rebuilt (new ids) every
+        // rescan; prefs re-apply on top at each album's reconcile tail.
+        statements: &["CREATE TABLE IF NOT EXISTS album_release_pref (
+            album_id INTEGER NOT NULL,
+            folder_path TEXT NOT NULL,
+            label TEXT,
+            is_default INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (album_id, folder_path),
+            FOREIGN KEY (album_id) REFERENCES album(id) ON DELETE CASCADE
+        )"],
+    },
 ];
 
 /// Copy the database beside itself before the first migration of a run
@@ -576,6 +630,17 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
         .after_connect(|conn, _meta| {
             Box::pin(async move {
                 sqlx::query("PRAGMA foreign_keys = ON")
+                    .execute(&mut *conn)
+                    .await?;
+                // WAL: readers never block writers (the default rollback
+                // journal made any big read — a center refresh — able to
+                // fail a concurrent apply with "database is locked").
+                // busy_timeout: when two WRITERS do collide, wait instead
+                // of failing — 5s outlasts any single statement here.
+                sqlx::query("PRAGMA journal_mode = WAL")
+                    .execute(&mut *conn)
+                    .await?;
+                sqlx::query("PRAGMA busy_timeout = 5000")
                     .execute(&mut *conn)
                     .await?;
                 Ok(())
@@ -1133,6 +1198,10 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             disc_number INTEGER,
             runtime INTEGER,
             audio_hash TEXT,
+            -- Rescan gate (migration 28): unchanged pair = stored hash still
+            -- valid, the audio region is never re-read.
+            content_size INTEGER,
+            content_mtime INTEGER,
             FOREIGN KEY (id) REFERENCES media_entry(id) ON DELETE CASCADE
         )",
     )
@@ -1194,6 +1263,23 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             mb_release_id TEXT,
             is_default INTEGER NOT NULL DEFAULT 0,
             disc_count INTEGER NOT NULL DEFAULT 1,
+            FOREIGN KEY (album_id) REFERENCES album(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // User preferences for an album's releases — custom labels and the chosen
+    // default. Keyed by FOLDER (the stable identity): album_release rows are
+    // rebuilt with fresh ids on every rescan, and these get re-applied on top
+    // (apply_release_prefs at each album's reconcile tail). Migration 29.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS album_release_pref (
+            album_id INTEGER NOT NULL,
+            folder_path TEXT NOT NULL,
+            label TEXT,
+            is_default INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (album_id, folder_path),
             FOREIGN KEY (album_id) REFERENCES album(id) ON DELETE CASCADE
         )",
     )
@@ -1287,6 +1373,12 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             artist_id INTEGER NOT NULL,
             name TEXT NOT NULL,
+            -- 'variant' (neutral — recorded, resolves, claims nothing),
+            -- 'misspelling' (USER-declared wrong text — nags with a
+            -- fix-at-source card while the spelling survives in tags), or
+            -- 'nickname' (USER-declared intended moniker — never nags).
+            -- Only humans write the non-neutral kinds. Migrations 26/27.
+            kind TEXT NOT NULL DEFAULT 'variant',
             FOREIGN KEY (artist_id) REFERENCES artist(id) ON DELETE CASCADE
         )",
     )

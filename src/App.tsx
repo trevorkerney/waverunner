@@ -2750,10 +2750,19 @@ function App() {
 
   useEffect(() => {
     const onMouseDown = (e: MouseEvent) => {
+      if (e.button !== 3 && e.button !== 4) return;
+      // A modal is open (metadata center, wizard, match dialogs, …): the page
+      // behind it must not navigate under the overlay. Every modal renders
+      // through ui/dialog, so one DOM probe covers them all — swallow the
+      // press entirely rather than letting it fall through.
+      if (document.querySelector('[data-slot="dialog-content"]')) {
+        e.preventDefault();
+        return;
+      }
       if (e.button === 3) {
         e.preventDefault();
         goBack();
-      } else if (e.button === 4) {
+      } else {
         e.preventDefault();
         goForward();
       }
