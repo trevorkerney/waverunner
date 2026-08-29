@@ -9,6 +9,8 @@
 
 ## bugs / needs fixing
 
+consider volume equalization methods like how Apple/Spotify match all tracks -14DBFS volume. Consider making this equalization optional in settings and maybe allow user to choose level of equalization
+
 seems like opening settings modal when window is small causes the modal to overflow horizontally. need to figure something out here (this may be fixed on dev by now, idk, but on prod its happening)
 
 i want 'indeterminate time remaining' on the scan phase like how 'about X minutes remaining' is on match phase

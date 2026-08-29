@@ -1781,7 +1781,7 @@ pub async fn combine_albums_multi(
     // at staging time, so it never comes as a surprise.
     let drops_match = mode == "merge"
         && sqlx::query_scalar::<_, i64>(
-            "SELECT EXISTS (SELECT 1 FROM release_match WHERE album_id = ?)",
+            "SELECT EXISTS (SELECT 1 FROM release_match WHERE album_id = ? AND mb_release_id <> '')",
         )
         .bind(target_id)
         .fetch_one(pool)

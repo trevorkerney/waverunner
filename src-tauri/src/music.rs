@@ -1537,13 +1537,15 @@ async fn reconcile_album(
         // carries MB-authored credits the tag re-parse must not clobber; an
         // unpinned sibling (or one whose pin a merge just dropped) rebuilds
         // from tags like any unmatched album.
+        // A sentinel "no MB counterpart" row is NOT a pin — that release's
+        // credits stay tag-authored and must keep rebuilding from tags.
         let release_pinned = crate::music_mb::release_match_of(
             pool,
             album_entry_id,
             &release.folder_rel,
         )
         .await?
-        .is_some();
+        .is_some_and(|(v, _)| !v.is_empty());
         let write_release_credits = write_credits || !release_pinned;
 
         for (ti, t) in release.tracks.iter().enumerate() {
@@ -4544,7 +4546,7 @@ pub async fn get_album_detail(
             has_mb_tag: mb_release_id.as_deref().is_some_and(|m| !m.is_empty()),
             mb_matched: crate::music_mb::release_match_of(pool, entry_id, &folder_path)
                 .await?
-                .is_some(),
+                .is_some_and(|(v, _)| !v.is_empty()),
             tracks,
         });
     }
@@ -4561,7 +4563,7 @@ pub async fn get_album_detail(
     // Matched to a MusicBrainz release — the page offers a track-list check.
     // Per-release pins: ANY release holding one qualifies the card.
     let mb_matched: bool = sqlx::query_as::<_, (i64,)>(
-        "SELECT EXISTS(SELECT 1 FROM release_match rm WHERE rm.album_id = ?)",
+        "SELECT EXISTS(SELECT 1 FROM release_match rm WHERE rm.album_id = ? AND rm.mb_release_id <> '')",
     )
     .bind(entry_id)
     .fetch_one(pool)

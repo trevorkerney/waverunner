@@ -304,6 +304,7 @@ pub fn run() {
             music_mb::mb_set_partial,
             music_edit::set_release_label,
             music_edit::set_default_release,
+            music_mb::mb_set_release_no_mb,
             music_edit::reveal_track_file,
             music_edit::open_release_folder,
             music_mb::mb_undo_change,
