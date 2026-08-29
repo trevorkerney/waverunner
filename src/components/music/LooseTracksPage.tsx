@@ -14,6 +14,7 @@ import { AddToPlaylistDialog } from "../AddToPlaylistDialog";
 import { MoveToCollectionDialog } from "./MoveToCollectionDialog";
 import { PlayingIndicator } from "./PlayingIndicator";
 import { LoveButton, LoveMenuItem } from "./LoveButton";
+import { RevealMenuItem } from "./RevealMenuItem";
 import { LibraryTrackRow, MusicQueueItem } from "../../types";
 import { fmtTrackTime, fmtAlbumRuntime, trackDisplayTitle } from "./musicQueue";
 
@@ -308,6 +309,7 @@ export function LooseTracksPage({
                   <ListPlus size={14} />
                   Add to playlist
                 </ContextMenuItem>
+                <RevealMenuItem resolve={() => t.id} />
               </ContextMenuContent>
             </ContextMenu>
           );

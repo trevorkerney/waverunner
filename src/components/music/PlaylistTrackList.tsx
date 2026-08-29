@@ -15,6 +15,7 @@ import { TrackEditDialog } from "./EditDialogs";
 import { MatchDialog } from "./MatchDialog";
 import { PlayingIndicator } from "./PlayingIndicator";
 import { LoveButton, LoveMenuItem } from "./LoveButton";
+import { RevealMenuItem } from "./RevealMenuItem";
 import { MediaEntry, MusicQueueItem, TrackQueueInfo } from "../../types";
 import { fmtTrackTime, trackDisplayTitle } from "./musicQueue";
 import { useDeselectOnBackgroundClick } from "./useTrackSelection";
@@ -386,6 +387,7 @@ export function PlaylistTrackList({
                 Add to playlist
               </ContextMenuItem>
             )}
+            <RevealMenuItem resolve={() => menuEntry?.id ?? null} />
             {menuEntry?.link_id != null && (
               <ContextMenuItem
                 variant="destructive"

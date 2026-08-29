@@ -45,6 +45,10 @@ export interface MbStatus {
   /** A staged rescan action will dissolve this entity — the dialog names the
    *  state and hides every mutating control. */
   staged: boolean;
+  /** Albums: releases of the card holding their own pinned pressing / total
+   *  releases. The "2 of 4 versions pinned" line. */
+  matched_releases: number;
+  total_releases: number;
 }
 
 interface MbCandidateRow {
@@ -175,6 +179,8 @@ export function MatchDialog({
   open,
   onOpenChange,
   onChanged,
+  releaseId,
+  releaseLabel,
 }: {
   kind: MbEntityKind;
   entityId: number;
@@ -182,6 +188,13 @@ export function MatchDialog({
   onOpenChange: (open: boolean) => void;
   /** A match was applied or cleared — the host should refetch. */
   onChanged?: () => void;
+  /** Albums: WHICH release of the card this dialog is matching — the version
+   *  the album page was viewing. Applies pin that release; status and the
+   *  track-list diff read it. Absent (metadata center), the default release. */
+  releaseId?: number | null;
+  /** Display name for that release, shown so "matched" can't be misread as
+   *  card-wide when the card holds several versions. */
+  releaseLabel?: string | null;
 }) {
   const [status, setStatus] = useState<MbStatus | null>(null);
   const [query, setQuery] = useState("");
@@ -218,12 +231,16 @@ export function MatchDialog({
   const [justApplied, setJustApplied] = useState(false);
 
   const load = useCallback(async () => {
-    const s = await invoke<MbStatus>("mb_status", { kind, entityId });
+    const s = await invoke<MbStatus>("mb_status", {
+      kind,
+      entityId,
+      releaseDbId: releaseId ?? null,
+    });
     setStatus(s);
     setQuery(s.title);
     setContext(s.context ?? "");
     return s;
-  }, [kind, entityId]);
+  }, [kind, entityId, releaseId]);
 
   useEffect(() => {
     if (!open) return;
@@ -354,7 +371,14 @@ export function MatchDialog({
   const apply = async (mbid: string, mbidKind?: string) => {
     setBusy(`apply:${mbid}`);
     try {
-      await invoke("mb_apply_entity_match", { kind, entityId, mbid, mbidKind });
+      await invoke("mb_apply_entity_match", {
+        kind,
+        entityId,
+        mbid,
+        mbidKind,
+        // Release applies pin the version this dialog was opened on.
+        releaseDbId: releaseId ?? null,
+      });
       // No success toast — the status card flips to Matched right here in
       // view, which says it better than a popup.
       await load();
@@ -468,7 +492,7 @@ export function MatchDialog({
     setBusy("unmatch");
     try {
       if (releaseStage) {
-        await invoke("mb_unmatch_release", { entityId });
+        await invoke("mb_unmatch_release", { entityId, releaseDbId: releaseId ?? null });
         toast.success("Release unmatched — the album match stays. Pick a release below.");
       } else {
         await invoke("mb_unmatch_entity", { kind, entityId });
@@ -590,8 +614,22 @@ export function MatchDialog({
               )}
               {!status?.mbid && status?.release_group_id && !stagedLock && (
                 <p className="mt-0.5 text-[11px] text-muted-foreground">
-                  Matched to the album, but not to a specific release — so its track list can’t be
-                  checked. Pick your release below.
+                  Matched to the album, but{" "}
+                  {releaseLabel ? `“${releaseLabel}” isn’t` : "not"} pinned to a specific release —
+                  so its track list can’t be checked. Pick your release below.
+                </p>
+              )}
+              {/* Multi-version cards: matching is PER VERSION — say which one
+                  this dialog is about and how the card stands overall. */}
+              {kind === "album" && (status?.total_releases ?? 0) > 1 && !stagedLock && (
+                <p className="mt-0.5 text-[11px] text-muted-foreground">
+                  {releaseLabel ? (
+                    <>
+                      This match is for the <span className="font-medium">“{releaseLabel}”</span>{" "}
+                      version ·{" "}
+                    </>
+                  ) : null}
+                  {status!.matched_releases} of {status!.total_releases} versions pinned
                 </p>
               )}
               {stagedLock && (
@@ -1170,28 +1208,47 @@ export function MbStatusChip({
   entityId,
   reloadKey = 0,
   onClick,
+  releaseId,
 }: {
   kind: MbEntityKind;
   entityId: number;
   reloadKey?: number;
   onClick?: () => void;
+  /** Albums: scope the chip to one release of the card — the version the
+   *  page is viewing — so "Matched" tracks the version, not the card. */
+  releaseId?: number | null;
 }) {
   const [status, setStatus] = useState<MbStatus | null>(null);
   const [loaded, setLoaded] = useState(false);
 
   useEffect(() => {
     let alive = true;
-    setLoaded(false);
-    invoke<MbStatus>("mb_status", { kind, entityId })
+    // Refetches (version switch, post-match reload) keep the OLD chip on
+    // screen until the new status lands — blanking it collapsed the header
+    // for a frame and everything below jumped. Only a change of ENTITY
+    // starts from scratch.
+    invoke<MbStatus>("mb_status", { kind, entityId, releaseDbId: releaseId ?? null })
       .then((s) => alive && setStatus(s))
       .catch(() => alive && setStatus(null))
       .finally(() => alive && setLoaded(true));
     return () => {
       alive = false;
     };
-  }, [kind, entityId, reloadKey]);
+  }, [kind, entityId, reloadKey, releaseId]);
+  useEffect(() => {
+    setLoaded(false);
+    setStatus(null);
+  }, [kind, entityId]);
 
-  if (!loaded) return null;
+  if (!loaded && !status) {
+    // Reserve the chip's exact footprint while the first load is in flight —
+    // the header must not reflow when it appears.
+    return (
+      <span className="invisible inline-block rounded-full border px-2 py-0.5 text-[11px]">
+        MusicBrainz · …
+      </span>
+    );
+  }
   const st = mbStateOf(status);
   // Same traffic light as the metadata center's lists and the library map:
   // green identified, amber one step short (album known but not the release,

@@ -15,6 +15,7 @@ import { AddToPlaylistDialog } from "../AddToPlaylistDialog";
 import { useDeselectOnBackgroundClick } from "./useTrackSelection";
 import { PlayingIndicator } from "./PlayingIndicator";
 import { LoveButton, LoveMenuItem } from "./LoveButton";
+import { RevealMenuItem } from "./RevealMenuItem";
 import { LibraryTrackRow, MusicQueueItem } from "../../types";
 import { fmtTrackTime, trackDisplayTitle } from "./musicQueue";
 
@@ -398,6 +399,7 @@ export function TracksPage({ libraryId, onPlayQueue, currentTrackId, playing, on
               <ListPlus size={14} />
               Add to playlist
             </ContextMenuItem>
+            <RevealMenuItem resolve={() => menuTrackRef.current} />
           </ContextMenuContent>
         </ContextMenu>
       )}

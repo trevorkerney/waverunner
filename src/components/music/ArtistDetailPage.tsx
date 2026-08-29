@@ -19,6 +19,7 @@ import { MatchDialog, MbStatusChip } from "./MatchDialog";
 import { PersonaDialog } from "./PersonaDialog";
 import { PlayingIndicator } from "./PlayingIndicator";
 import { LoveButton, LoveMenuItem } from "./LoveButton";
+import { RevealMenuItem } from "./RevealMenuItem";
 import { MusicArtistDetail, MusicAlbumCard, MusicAlbumDetail, MusicQueueItem, MusicTrack } from "../../types";
 import { queueFromRelease, defaultRelease, trackDisplayTitle, fmtTrackTime, fmtAlbumRuntime } from "./musicQueue";
 import { useDeselectOnBackgroundClick } from "./useTrackSelection";
@@ -786,6 +787,7 @@ export function ArtistDetailPage({
                 Add to playlist
               </ContextMenuItem>
             )}
+            <RevealMenuItem resolve={() => menuTrackRef.current?.id ?? null} />
           </ContextMenuContent>
         </ContextMenu>
       )}
@@ -890,6 +892,7 @@ export function ArtistDetailPage({
                         Add to playlist
                       </ContextMenuItem>
                     )}
+                    <RevealMenuItem resolve={() => t.id} />
                   </ContextMenuContent>
                 </ContextMenu>
               );
@@ -1021,6 +1024,7 @@ export function ArtistDetailPage({
                     Add to playlist
                   </ContextMenuItem>
                 )}
+                <RevealMenuItem resolve={() => menuTrackRef.current?.id ?? null} />
               </ContextMenuContent>
             </ContextMenu>
           )}

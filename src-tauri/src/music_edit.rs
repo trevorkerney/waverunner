@@ -306,8 +306,10 @@ async fn track_context(pool: &SqlitePool, track_id: i64) -> Result<(String, Stri
 }
 
 async fn resolve_abs(pool: &SqlitePool, library_id: &str, rel: &str) -> Result<PathBuf, String> {
+    // Sounds bases included: sound tracks resolve through here too.
     let bases: Vec<(String,)> = sqlx::query_as(
-        "SELECT path FROM library_path WHERE library_id = ? AND kind = 'music' ORDER BY sort_order, id",
+        "SELECT path FROM library_path WHERE library_id = ? AND kind IN ('music', 'sounds')
+         ORDER BY sort_order, id",
     )
     .bind(library_id)
     .fetch_all(pool)
@@ -320,6 +322,33 @@ async fn resolve_abs(pool: &SqlitePool, library_id: &str, rel: &str) -> Result<P
         }
     }
     Err("File not found under the library's music folders".to_string())
+}
+
+/// Open Explorer with the track's file selected.
+#[tauri::command]
+pub async fn reveal_track_file(state: State<'_, AppState>, track_id: i64) -> Result<(), String> {
+    let pool = &state.app_db;
+    let (library_id, rel) = track_context(pool, track_id).await?;
+    let abs = resolve_abs(pool, &library_id, &rel).await?;
+    tauri_plugin_opener::reveal_item_in_dir(&abs).map_err(|e| e.to_string())
+}
+
+/// Open a release's source folder in Explorer.
+#[tauri::command]
+pub async fn open_release_folder(state: State<'_, AppState>, release_id: i64) -> Result<(), String> {
+    let pool = &state.app_db;
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT me.library_id, ar.folder_path FROM album_release ar
+         JOIN media_entry me ON me.id = ar.album_id WHERE ar.id = ?",
+    )
+    .bind(release_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let (library_id, rel) = row.ok_or_else(|| "Release not found".to_string())?;
+    let abs = resolve_abs(pool, &library_id, &rel).await?;
+    tauri_plugin_opener::open_path(abs.to_string_lossy().to_string(), None::<String>)
+        .map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1752,9 +1781,7 @@ pub async fn combine_albums_multi(
     // at staging time, so it never comes as a surprise.
     let drops_match = mode == "merge"
         && sqlx::query_scalar::<_, i64>(
-            "SELECT EXISTS (SELECT 1 FROM field_override
-             WHERE entity_id = ? AND field IN ('mb_release_id', 'mb_release_group_id')
-               AND value IS NOT NULL AND value <> '')",
+            "SELECT EXISTS (SELECT 1 FROM release_match WHERE album_id = ?)",
         )
         .bind(target_id)
         .fetch_one(pool)

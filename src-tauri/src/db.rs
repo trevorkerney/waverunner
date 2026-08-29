@@ -518,6 +518,51 @@ const MIGRATIONS: &[Migration] = &[
             FOREIGN KEY (album_id) REFERENCES album(id) ON DELETE CASCADE
         )"],
     },
+    Migration {
+        id: 30,
+        app_version: "1.0.0-alpha.12.5",
+        description: "per-release MusicBrainz matches — each release pins its own pressing",
+        requires_table: Some("album_release"),
+        // The release id moves from one album-level field_override slot to a
+        // folder-keyed row per release. Existing matches migrate onto the
+        // release whose FILES carry that id (the honest owner), else the
+        // default release. album_match_gap gains the same folder scope (PK
+        // change = rebuild; diffs recompute at the next apply/re-check).
+        statements: &[
+            "CREATE TABLE IF NOT EXISTS release_match (
+                album_id INTEGER NOT NULL,
+                folder_path TEXT NOT NULL,
+                mb_release_id TEXT NOT NULL,
+                tier TEXT NOT NULL DEFAULT 'mb',
+                PRIMARY KEY (album_id, folder_path),
+                FOREIGN KEY (album_id) REFERENCES album(id) ON DELETE CASCADE
+            )",
+            "INSERT OR IGNORE INTO release_match (album_id, folder_path, mb_release_id, tier)
+             SELECT f.entity_id,
+                    COALESCE(
+                      (SELECT ar.folder_path FROM album_release ar
+                       WHERE ar.album_id = f.entity_id AND ar.mb_release_id = f.value LIMIT 1),
+                      (SELECT ar.folder_path FROM album_release ar
+                       WHERE ar.album_id = f.entity_id AND ar.is_default = 1 LIMIT 1)),
+                    f.value, f.tier
+             FROM field_override f
+             WHERE f.field = 'mb_release_id' AND f.value IS NOT NULL AND f.value <> ''
+               AND EXISTS (SELECT 1 FROM album_release ar WHERE ar.album_id = f.entity_id)",
+            "DELETE FROM field_override WHERE field = 'mb_release_id'",
+            "DROP TABLE IF EXISTS album_match_gap",
+            "CREATE TABLE album_match_gap (
+                album_id INTEGER NOT NULL,
+                folder_path TEXT NOT NULL DEFAULT '',
+                side TEXT NOT NULL,
+                disc INTEGER NOT NULL,
+                position INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                counterpart TEXT,
+                PRIMARY KEY (album_id, folder_path, side, disc, position),
+                FOREIGN KEY (album_id) REFERENCES album(id) ON DELETE CASCADE
+            )",
+        ],
+    },
 ];
 
 /// Copy the database beside itself before the first migration of a run
@@ -1501,12 +1546,33 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS album_match_gap (
             album_id INTEGER NOT NULL,
+            -- Which release of the album this diff belongs to (folder-keyed,
+            -- like every per-release store — release row ids don't survive
+            -- rescans). Migration 30.
+            folder_path TEXT NOT NULL DEFAULT '',
             side TEXT NOT NULL,
             disc INTEGER NOT NULL,
             position INTEGER NOT NULL,
             title TEXT NOT NULL,
             counterpart TEXT,
-            PRIMARY KEY (album_id, side, disc, position),
+            PRIMARY KEY (album_id, folder_path, side, disc, position),
+            FOREIGN KEY (album_id) REFERENCES album(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // Per-release MusicBrainz match: WHICH pressing each release of an album
+    // is. The group id stays album-level (the card IS the group); every
+    // release can pin its own pressing. Folder-keyed because album_release
+    // rows are rebuilt with fresh ids on every rescan. Migration 30.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS release_match (
+            album_id INTEGER NOT NULL,
+            folder_path TEXT NOT NULL,
+            mb_release_id TEXT NOT NULL,
+            tier TEXT NOT NULL DEFAULT 'mb',
+            PRIMARY KEY (album_id, folder_path),
             FOREIGN KEY (album_id) REFERENCES album(id) ON DELETE CASCADE
         )",
     )

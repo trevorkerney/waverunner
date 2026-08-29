@@ -257,6 +257,8 @@ export interface MusicRelease {
   codecs: string[];
   /** The files carry a MusicBrainz release id — this copy pins the release. */
   has_mb_tag: boolean;
+  /** This release holds its own pinned MusicBrainz pressing. */
+  mb_matched: boolean;
   tracks: MusicTrack[];
 }
 

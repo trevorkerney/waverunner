@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { notifyPendingWorkChanged } from "./PendingWork";
 import { toast } from "sonner";
-import { Play, Disc3, Pencil, ListPlus, ListStart, ListEnd, Scissors, Star, Undo2, ListChecks } from "lucide-react";
+import { Play, Disc3, Pencil, ListPlus, ListStart, ListEnd, Scissors, Star, ListChecks, FolderOpen } from "lucide-react";
 import { RenameDialog } from "../RenameDialog";
 import { Spinner } from "../ui/spinner";
 import { MusicAlbumDetail, MusicRelease, MusicQueueItem, MusicTrack } from "../../types";
@@ -23,6 +23,7 @@ import { MatchDialog, MbStatusChip } from "./MatchDialog";
 import { MoveToCollectionDialog } from "./MoveToCollectionDialog";
 import { PlayingIndicator } from "./PlayingIndicator";
 import { LoveButton, LoveMenuItem } from "./LoveButton";
+import { RevealMenuItem } from "./RevealMenuItem";
 import { albumCover, queueFromRelease, defaultRelease, fmtTrackTime, fmtAlbumRuntime, trackDisplayTitle } from "./musicQueue";
 
 interface AlbumDetailPageProps {
@@ -82,10 +83,6 @@ export function AlbumDetailPage({
   const [matchOpen, setMatchOpen] = useState(false);
   const [matchTrack, setMatchTrack] = useState<{ id: number; title: string } | null>(null);
   const [mbKey, setMbKey] = useState(0);
-  // Albums the user folded into this one — each undoable.
-  const [absorbed, setAbsorbed] = useState<
-    { combine_id: number; name: string; mode: string }[]
-  >([]);
   // Release whose label is being renamed in the versions menu.
   const [renameRelease, setRenameRelease] = useState<MusicRelease | null>(null);
 
@@ -153,21 +150,6 @@ export function AlbumDetailPage({
     };
   }, []);
 
-  useEffect(() => {
-    let cancelled = false;
-    invoke<{ combine_id: number; name: string; mode: string }[]>("get_album_absorbed", {
-      albumId: entryId,
-    })
-      .then((rows) => {
-        if (!cancelled) setAbsorbed(rows);
-      })
-      .catch(() => {
-        if (!cancelled) setAbsorbed([]);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [entryId, reloadKey]);
 
   // Consume the focus request once per nonce: select the row and scroll it to
   // the viewport center. Waits for detail so the rows exist to scroll to.
@@ -343,6 +325,7 @@ export function AlbumDetailPage({
                 kind="album"
                 entityId={detail.id}
                 reloadKey={mbKey}
+                releaseId={releaseId}
                 onClick={() => setMatchOpen(true)}
               />
             </div>
@@ -388,14 +371,14 @@ export function AlbumDetailPage({
                               default
                             </span>
                           )}
-                          {r.has_mb_tag && (
+                          {!r.mb_matched && r.has_mb_tag ? (
                             <span
-                              className="shrink-0 rounded bg-emerald-500/15 px-1 py-px text-[10px] text-emerald-300"
-                              title="This copy's files carry a MusicBrainz release id"
+                              className="shrink-0 rounded border border-muted-foreground/30 px-1 py-px text-[10px] text-muted-foreground"
+                              title="Files carry a MusicBrainz release id — the next matching pass pins it automatically"
                             >
                               MB
                             </span>
-                          )}
+                          ) : null}
                         </span>
                         <span className="block truncate text-[11px] text-muted-foreground">
                           {[
@@ -426,6 +409,20 @@ export function AlbumDetailPage({
                             <Star size={13} />
                           </button>
                         )}
+                        <button
+                          type="button"
+                          title="Open this release's folder in Explorer"
+                          className="rounded p-1 text-muted-foreground hover:bg-foreground/10 hover:text-foreground"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            e.preventDefault();
+                            invoke("open_release_folder", { releaseId: r.id }).catch((err) =>
+                              toast.error(String(err)),
+                            );
+                          }}
+                        >
+                          <FolderOpen size={13} />
+                        </button>
                         <button
                           type="button"
                           title="Rename this release's label"
@@ -463,35 +460,6 @@ export function AlbumDetailPage({
               </DropdownMenu>
             )}
           </div>
-          {/* Albums you folded into this one. Undo returns each to being its
-              own album on the next scan — nothing on disk moves. */}
-          {absorbed.length > 0 && (
-            <p className="mt-2 flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-muted-foreground">
-              <span>Combined from</span>
-              {absorbed.map((a) => (
-                <button
-                  key={a.combine_id}
-                  onClick={async () => {
-                    try {
-                      await invoke<string>("undo_album_combine", {
-                        combineId: a.combine_id,
-                      });
-                      // Staged — the album returns as its own on the next
-                      // rescan, batched with any other pending directives.
-                      toast("Un-combine staged — it applies on the next rescan");
-                      notifyPendingWorkChanged();
-                    } catch (e) {
-                      toast.error(String(e));
-                    }
-                  }}
-                  className="group/undo inline-flex items-center gap-1 rounded border px-1.5 py-0.5 transition-colors hover:border-foreground/30 hover:text-foreground"
-                >
-                  <span className="max-w-48 truncate">{a.name}</span>
-                  <Undo2 size={11} className="opacity-50 group-hover/undo:opacity-100" />
-                </button>
-              ))}
-            </p>
-          )}
         </div>
       </div>
 
@@ -633,6 +601,7 @@ export function AlbumDetailPage({
                         Add to playlist
                       </ContextMenuItem>
                     )}
+                    <RevealMenuItem resolve={() => t.id} />
                   </ContextMenuContent>
                 </ContextMenu>
               );
@@ -645,6 +614,8 @@ export function AlbumDetailPage({
         entityId={detail.id}
         open={matchOpen}
         onOpenChange={setMatchOpen}
+        releaseId={releaseId}
+        releaseLabel={release ? releaseLabel(release) : null}
         onChanged={() => {
           setMbKey((k) => k + 1);
           setReloadKey((k) => k + 1);

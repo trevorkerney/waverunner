@@ -471,16 +471,22 @@ export function CreateLibraryDialog({
       // A pass already running (resumed mid-match after an app restart with
       // the flag still set is impossible — RUNNING dies with the app — but a
       // center-triggered pass may be live): show its progress instead.
-      if (ms.running) setMatchPhase("running");
+      if (ms.running) {
+        setMatchPhase("running");
+      } else if (ms.unchecked === 0 && ms.unchecked_artists === 0) {
+        // Nothing for a pass to do — the elect screen would only offer a
+        // disabled Start, so go straight to review.
+        await enterReview(libId);
+      }
     } catch {
       setUncheckedCount(null);
       setUncheckedArtists(0);
     }
   }
 
-  async function enterReview() {
+  async function enterReview(libIdOverride?: string) {
     setConfirmSkip(false);
-    const libId = libraryId;
+    const libId = libIdOverride ?? libraryId;
     if (managesSetupRow && libId) {
       try {
         await invoke("set_library_setup_stage", { libraryId: libId, stage: "review" });

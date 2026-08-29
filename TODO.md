@@ -9,6 +9,8 @@
 
 ## bugs / needs fixing
 
+seems like opening settings modal when window is small causes the modal to overflow horizontally. need to figure something out here (this may be fixed on dev by now, idk, but on prod its happening)
+
 i want 'indeterminate time remaining' on the scan phase like how 'about X minutes remaining' is on match phase
 
 new breadcrumbs functionality. it should just follow the user always. even when creating duplicates in history. the only thing that should reset it is clicking an option in the sidebar. overflow should not create scroll but follow the most recent - when going back by breadcrumbs, and if the breadcrumbs are overflowing, only show the next forward history to the clicked breadcrumb. for instance, if the user has really been digging and there are 30 things in the breadcrumbs: for one, it would definitely be overflowing. the user should also see the most recent fitting ones, and the cut off on the left side of the breadcrumbs section would ideally begin with an ellipsis (still a button tho). Say the user clicks the breadcrumb 4 options back from the most recent. there were 3 in front, say the breadcrumbs were numbered like so: 5 - 4 - 3 - 2 - 1, and the user clicked 4. since the breadcrumbs are overflowing, only 3 should show in front of 4, and greyed out (STILL A BUTTON). I want to always focus on showing previous history over forward history, so when the breadcrumbs are overflowing and the user has forward breadcrumbs, always only show the 1 closes to where the user clicked. The user can nav all the way forward by continually clicking the 1 forward history button until there is no more. im somewhat spitballing here just to have something to record my idea before I forget. what do you think about this one?

@@ -900,48 +900,71 @@ fn folder_cover_files(dir: &Path) -> Vec<(String, CoverSource)> {
 
 fn desired_covers(folder_abs: &Path, album: Option<&ScannedAlbum>) -> Vec<(String, CoverSource)> {
     let mut out = folder_cover_files(folder_abs);
-    if out.is_empty() {
-        if let Some(album) = album {
-            let def = &album.releases[album.default_release];
-            // The default release's folder next (editions keep their own art).
-            out = folder_cover_files(&def.folder_abs);
-            if out.is_empty() {
-                // Disc subfolders (CD1/Disc 2/…) — rips often keep a
-                // folder.jpg per disc with nothing at the album root. Names
-                // are prefixed with the disc folder so CD1/CD2 art coexists
-                // (selectable via Change cover) instead of deduping away.
-                let mut disc_dirs: Vec<PathBuf> = std::fs::read_dir(&def.folder_abs)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|e| e.ok())
-                    .map(|e| e.path())
-                    .filter(|p| {
-                        p.is_dir()
-                            && p.file_name()
-                                .map(|n| disc_folder_number(&n.to_string_lossy()).is_some())
-                                .unwrap_or(false)
-                    })
-                    .collect();
-                disc_dirs.sort();
-                for dir in disc_dirs {
-                    let dir_name = dir
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    for p in image_files_in(&dir) {
-                        if let Some(name) = p.file_name().map(|n| n.to_string_lossy().to_string()) {
-                            let keyed = format!("{dir_name}_{name}");
-                            if !out.iter().any(|(existing, _)| *existing == keyed) {
-                                out.push((keyed, CoverSource::File(p)));
-                            }
-                        }
-                    }
+    let Some(album) = album else { return out };
+
+    fn add(out: &mut Vec<(String, CoverSource)>, name: String, src: CoverSource) {
+        if !out.iter().any(|(existing, _)| *existing == name) {
+            out.push((name, src));
+        }
+    }
+
+    // Every release pools its art into the card, default release first so its
+    // bare (unprefixed) names keep matching cover rows cached by earlier
+    // builds. Art is looked for in each release's own folder AND every folder
+    // its tracks actually live in — disc subfolders (CD1/CD2 rips) and
+    // merged/combined-in source folders both surface through the track paths,
+    // which a release-folder-only walk would miss.
+    let mut order: Vec<usize> = (0..album.releases.len()).collect();
+    if album.default_release < order.len() {
+        let d = order.remove(album.default_release);
+        order.insert(0, d);
+    }
+    for idx in order {
+        let release = &album.releases[idx];
+        let mut folders: Vec<PathBuf> = vec![release.folder_abs.clone()];
+        for t in &release.tracks {
+            if let Some(parent) = t.abs.parent() {
+                if !folders.iter().any(|f| f.as_path() == parent) {
+                    folders.push(parent.to_path_buf());
                 }
             }
-            if out.is_empty() {
-                if let Some(first) = def.tracks.first() {
-                    out.push(("embedded.jpg".to_string(), CoverSource::Embedded(first.abs.clone())));
+        }
+        for folder in &folders {
+            // The album root and the default release's folder keep bare
+            // filenames; everything else is prefixed with its folder name so
+            // same-named art (folder.jpg everywhere) coexists in the picker
+            // instead of deduping away.
+            let bare = folder.as_path() == folder_abs
+                || (idx == album.default_release && folder == &release.folder_abs);
+            let prefix = if bare {
+                None
+            } else {
+                folder.file_name().map(|n| n.to_string_lossy().to_string())
+            };
+            let files = folder_cover_files(folder);
+            if files.is_empty() {
+                // No file art here: fall back to the embedded picture of the
+                // first track living in this folder, keyed per folder so each
+                // source's art still reaches the picker.
+                let first_here = release
+                    .tracks
+                    .iter()
+                    .find(|t| t.abs.parent() == Some(folder.as_path()));
+                if let Some(t) = first_here {
+                    let name = match &prefix {
+                        Some(p) => format!("{p}_embedded.jpg"),
+                        None => "embedded.jpg".to_string(),
+                    };
+                    add(&mut out, name, CoverSource::Embedded(t.abs.clone()));
                 }
+                continue;
+            }
+            for (name, src) in files {
+                let keyed = match &prefix {
+                    Some(p) => format!("{p}_{name}"),
+                    None => name,
+                };
+                add(&mut out, keyed, src);
             }
         }
     }
@@ -1510,6 +1533,19 @@ async fn reconcile_album(
         .map_err(|e| e.to_string())?;
         let release_id = res.last_insert_rowid();
 
+        // Credits are protected PER RELEASE: a release with a pinned pressing
+        // carries MB-authored credits the tag re-parse must not clobber; an
+        // unpinned sibling (or one whose pin a merge just dropped) rebuilds
+        // from tags like any unmatched album.
+        let release_pinned = crate::music_mb::release_match_of(
+            pool,
+            album_entry_id,
+            &release.folder_rel,
+        )
+        .await?
+        .is_some();
+        let write_release_credits = write_credits || !release_pinned;
+
         for (ti, t) in release.tracks.iter().enumerate() {
             let sort_order = track_sort_order(t, ti);
             if let Some(track_id) = existing_tracks.remove(&t.rel) {
@@ -1538,7 +1574,8 @@ async fn reconcile_album(
                     .execute(pool)
                     .await
                     .map_err(|e| e.to_string())?;
-                write_track_side_tables(pool, track_id, release_id, t, write_credits).await?;
+                write_track_side_tables(pool, track_id, release_id, t, write_release_credits)
+                    .await?;
             } else {
                 insert_track_rows(
                     pool,
@@ -2893,7 +2930,10 @@ pub(crate) async fn apply_album_combines(
         }
     }
 
-    let mut merge_target_folders: Vec<String> = Vec::new();
+    // (album folder, poured-into RELEASE folder) — a merge only invalidates
+    // the release whose track list actually changed; the card's other
+    // releases keep their own pinned pressings.
+    let mut merge_targets: Vec<(String, String)> = Vec::new();
     for (di, origin, src) in pulled {
         let d = &directives[di];
         // Locate the target by index so the fold can borrow mutably.
@@ -2914,21 +2954,51 @@ pub(crate) async fn apply_album_combines(
                 }
             }
         }
+        // A merge invalidates the poured-into release's pin ONLY on its FIRST
+        // application — the one that actually changes the track list, proven
+        // by the source still existing as its own album row. The directive is
+        // permanent and re-folds on every rescan; wiping the pin each time
+        // unmatched the release on every rescan (it did exactly that).
+        let first_application = if d.4 == "merge" {
+            sqlx::query_as::<_, (i64,)>(
+                "SELECT al.id FROM album al JOIN media_entry me ON me.id = al.id
+                 WHERE me.library_id = ? AND al.folder_path = ? AND LOWER(al.title) = ?",
+            )
+            .bind(library_id)
+            .bind(&src.folder_rel)
+            .bind(&d.1)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?
+            .is_some()
+        } else {
+            false
+        };
         match found {
             Some((Some(ai), bi)) => {
-                if d.4 == "merge" {
-                    let f = artists[ai].albums[bi].folder_rel.clone();
-                    if !merge_target_folders.contains(&f) {
-                        merge_target_folders.push(f);
+                if d.4 == "merge" && first_application {
+                    let t = &artists[ai].albums[bi];
+                    let rf = d
+                        .5
+                        .clone()
+                        .unwrap_or_else(|| t.releases[t.default_release].folder_rel.clone());
+                    let key = (t.folder_rel.clone(), rf);
+                    if !merge_targets.contains(&key) {
+                        merge_targets.push(key);
                     }
                 }
                 fold_album(&mut artists[ai].albums[bi], src, &d.4, d.5.as_deref())
             }
             Some((None, bi)) => {
-                if d.4 == "merge" {
-                    let f = orphans.albums[bi].folder_rel.clone();
-                    if !merge_target_folders.contains(&f) {
-                        merge_target_folders.push(f);
+                if d.4 == "merge" && first_application {
+                    let t = &orphans.albums[bi];
+                    let rf = d
+                        .5
+                        .clone()
+                        .unwrap_or_else(|| t.releases[t.default_release].folder_rel.clone());
+                    let key = (t.folder_rel.clone(), rf);
+                    if !merge_targets.contains(&key) {
+                        merge_targets.push(key);
                     }
                 }
                 fold_album(&mut orphans.albums[bi], src, &d.4, d.5.as_deref())
@@ -2941,39 +3011,34 @@ pub(crate) async fn apply_album_combines(
         }
     }
 
-    // A merge rewrites the keeper's track list, which invalidates any
-    // MusicBrainz match applied to the OLD list: the album would keep reading
-    // "Matched" while the merged-in tracks never received the release's
-    // credits. Resetting identity and stamps HERE — before reconcile — makes
-    // this same rescan rebuild tag credits for every track uniformly, and a
-    // fresh match then applies the release to the complete album. (Versions
-    // mode keeps its match: the keeper's own track list doesn't change.)
-    for folder in merge_target_folders {
+    // A merge rewrites ONE release's track list, which invalidates the
+    // pressing pinned to it: that release would keep reading matched while
+    // its merged-in tracks never received the release's credits. Dropping
+    // that release's pin HERE — before reconcile — makes this same rescan
+    // rebuild tag credits for its tracks uniformly (the per-release credits
+    // guard only protects pinned releases); a fresh pin then applies to the
+    // complete list. The album's GROUP identity and every other release's
+    // pin survive untouched. (Versions mode changes no track list at all.)
+    for (album_folder, release_folder) in merge_targets {
         let row: Option<(i64,)> = sqlx::query_as(
             "SELECT al.id FROM album al JOIN media_entry me ON me.id = al.id
              WHERE me.library_id = ? AND al.folder_path = ?",
         )
         .bind(library_id)
-        .bind(&folder)
+        .bind(&album_folder)
         .fetch_optional(pool)
         .await
         .map_err(|e| e.to_string())?;
         let Some((album_id,)) = row else { continue };
-        sqlx::query(
-            "DELETE FROM field_override WHERE entity_id = ?
-             AND field IN ('mb_release_id', 'mb_release_group_id')",
-        )
-        .bind(album_id)
-        .execute(pool)
-        .await
-        .map_err(|e| e.to_string())?;
-        sqlx::query("DELETE FROM mb_credit_fetch WHERE album_id = ?")
+        sqlx::query("DELETE FROM release_match WHERE album_id = ? AND folder_path = ?")
             .bind(album_id)
+            .bind(&release_folder)
             .execute(pool)
             .await
             .map_err(|e| e.to_string())?;
-        sqlx::query("DELETE FROM album_match_gap WHERE album_id = ?")
+        sqlx::query("DELETE FROM album_match_gap WHERE album_id = ? AND folder_path = ?")
             .bind(album_id)
+            .bind(&release_folder)
             .execute(pool)
             .await
             .map_err(|e| e.to_string())?;
@@ -4260,6 +4325,8 @@ pub struct ReleaseView {
     /// The FILES carry a MusicBrainz release id — this copy can pin the
     /// album's release exactly.
     pub has_mb_tag: bool,
+    /// This release holds its own pinned MusicBrainz pressing.
+    pub mb_matched: bool,
     pub tracks: Vec<TrackView>,
 }
 
@@ -4475,6 +4542,9 @@ pub async fn get_album_detail(
                 .to_string(),
             codecs,
             has_mb_tag: mb_release_id.as_deref().is_some_and(|m| !m.is_empty()),
+            mb_matched: crate::music_mb::release_match_of(pool, entry_id, &folder_path)
+                .await?
+                .is_some(),
             tracks,
         });
     }
@@ -4489,11 +4559,15 @@ pub async fn get_album_detail(
     .0 != 0;
 
     // Matched to a MusicBrainz release — the page offers a track-list check.
-    // Read from the durable store, not from album_release: that row is rebuilt
-    // by every rescan and only carries an id when the FILE tags had one.
-    let mb_matched: bool = crate::music_mb::mb_id(pool, entry_id, crate::music_mb::MB_RELEASE)
-        .await?
-        .is_some();
+    // Per-release pins: ANY release holding one qualifies the card.
+    let mb_matched: bool = sqlx::query_as::<_, (i64,)>(
+        "SELECT EXISTS(SELECT 1 FROM release_match rm WHERE rm.album_id = ?)",
+    )
+    .bind(entry_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .0 != 0;
 
     Ok(AlbumDetail {
         id: entry_id,
@@ -5353,13 +5427,23 @@ mod tests {
             .unwrap();
         assert_eq!(album_type, "single");
 
-        // Once MusicBrainz has provided credits (stamp 'matched'), a rescan's
-        // tag re-parse must NOT clobber them.
+        // Once MusicBrainz has provided credits, a rescan's tag re-parse must
+        // NOT clobber them. MB credits only ever exist where a release is
+        // PINNED (release_match, folder-keyed) — that's the per-release guard
+        // reconcile reads; the fetch stamp alone protects album title/type.
         sqlx::query("INSERT OR REPLACE INTO mb_credit_fetch (album_id, status) VALUES (?, 'matched')")
             .bind(album_id)
             .execute(&pool)
             .await
             .unwrap();
+        sqlx::query(
+            "INSERT OR REPLACE INTO release_match (album_id, folder_path, mb_release_id, tier)
+             VALUES (?, 'Feature Test\\A1', 'test-release-mbid', 'mb')",
+        )
+        .bind(album_id)
+        .execute(&pool)
+        .await
+        .unwrap();
         sqlx::query("DELETE FROM track_credit WHERE track_id = ?")
             .bind(track_id_v1)
             .execute(&pool)

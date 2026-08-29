@@ -327,11 +327,10 @@ pub async fn music_match_state(
                                           WHERE x.entity_id = a.id AND x.evidence_key = f.value))
              OR EXISTS (SELECT 1 FROM track_credit tc
                         JOIN media_entry tme ON tme.id = tc.track_id
-                        JOIN field_override f ON f.entity_id = tme.parent_id
-                           AND f.field = 'mb_release_id'
+                        JOIN release_match rm ON rm.album_id = tme.parent_id
                         WHERE tc.artist_id = a.id
                           AND NOT EXISTS (SELECT 1 FROM mb_derive_exhausted x
-                                          WHERE x.entity_id = a.id AND x.evidence_key = f.value))
+                                          WHERE x.entity_id = a.id AND x.evidence_key = rm.mb_release_id))
              OR NOT EXISTS (SELECT 1 FROM mb_suggestion s
                             WHERE s.library_id = ?1 AND s.kind = 'artist_match'
                               AND s.target_key = CAST(a.id AS TEXT)))",
@@ -510,30 +509,59 @@ async fn enrich_albums(
             serde_json::json!({ "libraryId": library_id, "phase": "albums", "done": i, "total": total, "name": title }),
         );
         // A release id in the FILES is the only certainty about which pressing
-        // this is, so it wins outright and brings track credits with it.
-        let tagged_release: Option<(Option<String>,)> = sqlx::query_as(
-            "SELECT mb_release_id FROM album_release WHERE album_id = ? AND is_default = 1",
+        // a copy is, so it wins outright and brings track credits with it.
+        // Per release: EVERY release whose files carry an id pins itself (a
+        // card holding four pressings gets four matches), skipping releases
+        // already matched so re-passes cost nothing.
+        let tagged_releases: Vec<(String, String)> = sqlx::query_as(
+            "SELECT ar.folder_path, ar.mb_release_id FROM album_release ar
+             WHERE ar.album_id = ?
+               AND ar.mb_release_id IS NOT NULL AND ar.mb_release_id <> ''
+               AND NOT EXISTS (SELECT 1 FROM release_match rm
+                               WHERE rm.album_id = ar.album_id
+                                 AND rm.folder_path = ar.folder_path)",
+        )
+        .bind(album_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        if !tagged_releases.is_empty() {
+            let mut applied_any = false;
+            let mut transient = false;
+            for (folder, release_id) in tagged_releases {
+                match fetch_release(client, &release_id).await {
+                    Ok(Some(full)) => {
+                        apply_release(pool, library_id, album_id, &title, &full, TIER_MB, &folder)
+                            .await?;
+                        applied_any = true;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        eprintln!("musicbrainz tagged release '{title}': {e}");
+                        transient = true; // unstamped, retried next pass
+                    }
+                }
+            }
+            if applied_any {
+                stamp(pool, album_id, "matched").await?;
+                matched += 1;
+                continue;
+            }
+            if transient {
+                continue;
+            }
+        }
+        // Files tagged but every release already matched: the album is settled
+        // — don't fall through to a pointless search.
+        let already_matched: Option<(i64,)> = sqlx::query_as(
+            "SELECT 1 FROM release_match WHERE album_id = ? LIMIT 1",
         )
         .bind(album_id)
         .fetch_optional(pool)
         .await
         .map_err(|e| e.to_string())?;
-        if let Some((Some(release_id),)) = tagged_release {
-            if !release_id.is_empty() {
-                match fetch_release(client, &release_id).await {
-                    Ok(Some(full)) => {
-                        apply_release(pool, library_id, album_id, &title, &full, TIER_MB).await?;
-                        stamp(pool, album_id, "matched").await?;
-                        matched += 1;
-                        continue;
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        eprintln!("musicbrainz tagged release '{title}': {e}");
-                        continue; // transient — unstamped, retried next pass
-                    }
-                }
-            }
+        if already_matched.is_some() && prior_stamp == "matched" {
+            continue;
         }
 
         // Otherwise identify the ALBUM only. Attempts run strongest-evidence
@@ -857,6 +885,64 @@ pub async fn mb_set_partial(
         batch,
     )
     .await
+}
+
+// ── Per-release match store ─────────────────────────────────────────────
+// WHICH pressing each release of an album is. Folder-keyed (release rows are
+// rebuilt every rescan); the group id stays album-level in field_override.
+
+pub(crate) async fn release_match_of(
+    pool: &SqlitePool,
+    album_id: i64,
+    folder: &str,
+) -> Result<Option<(String, String)>, String> {
+    sqlx::query_as(
+        "SELECT mb_release_id, tier FROM release_match WHERE album_id = ? AND folder_path = ?",
+    )
+    .bind(album_id)
+    .bind(folder)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())
+}
+
+pub(crate) async fn set_release_match(
+    pool: &SqlitePool,
+    album_id: i64,
+    folder: &str,
+    mbid: &str,
+    tier: &str,
+) -> Result<(), String> {
+    sqlx::query(
+        "INSERT INTO release_match (album_id, folder_path, mb_release_id, tier)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(album_id, folder_path) DO UPDATE
+            SET mb_release_id = excluded.mb_release_id, tier = excluded.tier",
+    )
+    .bind(album_id)
+    .bind(folder)
+    .bind(mbid)
+    .bind(tier)
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// The album's default release's folder — the target when no release is
+/// named (center-launched dialogs, legacy undo payloads).
+pub(crate) async fn default_release_folder(
+    pool: &SqlitePool,
+    album_id: i64,
+) -> Result<Option<String>, String> {
+    Ok(sqlx::query_as::<_, (String,)>(
+        "SELECT folder_path FROM album_release WHERE album_id = ? AND is_default = 1",
+    )
+    .bind(album_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .map(|(f,)| f))
 }
 
 /// Forget an id at every tier — what Unmatch means.
@@ -1884,10 +1970,14 @@ async fn apply_release(
     // Provenance for the ids this writes: TIER_USER when a person picked the
     // release, TIER_MB when the automatic pass resolved it.
     tier: &str,
+    // WHICH release of the album this pressing is — its folder. Credits, the
+    // track-list diff, and the match itself all scope to this release; other
+    // releases of the card keep their own matches untouched.
+    folder: &str,
 ) -> Result<(), String> {
     // Which tracks the two sides disagree about — recorded before anything is
     // applied, since the disagreements are precisely what won't be applied.
-    record_match_gaps(pool, album_id, &full.tracks).await?;
+    record_match_gaps(pool, album_id, folder, &full.tracks).await?;
 
     // Everything below is ONE action — applying this release — so it shares a
     // batch and undoes as a unit.
@@ -1896,11 +1986,11 @@ async fn apply_release(
     // Pre-match ids, captured before they're overwritten — the "before" of
     // the match log written at the end of this function.
     let prev_group_id = mb_id(pool, album_id, MB_RELEASE_GROUP).await?.map(|(v, _)| v);
-    let prev_release_id = mb_id(pool, album_id, MB_RELEASE).await?.map(|(v, _)| v);
+    let prev_release_id = release_match_of(pool, album_id, folder).await?.map(|(v, _)| v);
 
-    // Credits: replace our parsed guesses on the default release's tracks.
+    // Credits: replace our parsed guesses on this release's tracks.
     if !suppressed(pool, "track_credits", album_id).await? {
-        let changes = apply_release_credits(pool, album_id, &full.tracks).await?;
+        let changes = apply_release_credits(pool, album_id, folder, &full.tracks).await?;
         if !changes.is_empty() {
             let before: HashMap<String, Vec<String>> = changes
                 .iter()
@@ -2074,18 +2164,11 @@ async fn apply_release(
         }
     }
 
-    // Remember WHICH release this is, durably. The album_release row also gets
-    // it for the current session's convenience, but that row is deleted and
-    // rebuilt by the next rescan — field_override is the copy that lasts.
-    set_mb_id(pool, album_id, MB_RELEASE, &full.release_id, tier).await?;
-    sqlx::query(
-        "UPDATE album_release SET mb_release_id = ? WHERE album_id = ? AND is_default = 1",
-    )
-    .bind(&full.release_id)
-    .bind(album_id)
-    .execute(pool)
-    .await
-    .map_err(|e| e.to_string())?;
+    // Remember WHICH pressing THIS release is, durably — folder-keyed so the
+    // match survives the rescan rebuilding release rows. (album_release's own
+    // mb_release_id column stays purely tag-derived: it reports what the
+    // FILES say, this table records what was matched.)
+    set_release_match(pool, album_id, folder, &full.release_id, tier).await?;
     if let Some(rg) = &full.release_group_id {
         set_mb_id(pool, album_id, MB_RELEASE_GROUP, rg, tier).await?;
         sqlx::query("UPDATE album SET mb_release_group_id = ? WHERE id = ?")
@@ -2111,10 +2194,13 @@ async fn apply_release(
             &serde_json::json!({
                 "release_group_id": prev_group_id,
                 "release_id": prev_release_id,
+                // Which release the ids belong to — undo restores precisely.
+                "folder": folder,
             }),
             &serde_json::json!({
                 "release_group_id": full.release_group_id,
                 "release_id": full.release_id,
+                "folder": folder,
             }),
             batch,
         )
@@ -2130,6 +2216,7 @@ async fn apply_release(
 async fn apply_release_credits(
     pool: &SqlitePool,
     album_id: i64,
+    folder: &str,
     mb_tracks: &[MbTrack],
 ) -> Result<Vec<(i64, Vec<String>, Vec<String>)>, String> {
     let ours: Vec<(i64, String, Option<i64>, Option<i64>)> = sqlx::query_as(
@@ -2137,9 +2224,10 @@ async fn apply_release_credits(
          FROM track t
          JOIN track_release tr ON tr.track_id = t.id
          JOIN album_release ar ON ar.id = tr.release_id
-         WHERE ar.album_id = ? AND ar.is_default = 1",
+         WHERE ar.album_id = ? AND ar.folder_path = ?",
     )
     .bind(album_id)
+    .bind(folder)
     .fetch_all(pool)
     .await
     .map_err(|e| e.to_string())?;
@@ -2225,6 +2313,7 @@ pub struct MbGapCounts {
 async fn record_match_gaps(
     pool: &SqlitePool,
     album_id: i64,
+    folder: &str,
     mb_tracks: &[MbTrack],
 ) -> Result<MbGapCounts, String> {
     let ours: Vec<(String, Option<i64>, Option<i64>)> = sqlx::query_as(
@@ -2232,9 +2321,10 @@ async fn record_match_gaps(
          FROM track t
          JOIN track_release tr ON tr.track_id = t.id
          JOIN album_release ar ON ar.id = tr.release_id
-         WHERE ar.album_id = ? AND ar.is_default = 1",
+         WHERE ar.album_id = ? AND ar.folder_path = ?",
     )
     .bind(album_id)
+    .bind(folder)
     .fetch_all(pool)
     .await
     .map_err(|e| e.to_string())?;
@@ -2262,17 +2352,19 @@ async fn record_match_gaps(
         }
     }
 
-    sqlx::query("DELETE FROM album_match_gap WHERE album_id = ?")
+    sqlx::query("DELETE FROM album_match_gap WHERE album_id = ? AND folder_path = ?")
         .bind(album_id)
+        .bind(folder)
         .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
     for (side, disc, position, title, counterpart) in &gaps {
         sqlx::query(
             "INSERT OR REPLACE INTO album_match_gap
-             (album_id, side, disc, position, title, counterpart) VALUES (?, ?, ?, ?, ?, ?)",
+             (album_id, folder_path, side, disc, position, title, counterpart) VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(album_id)
+        .bind(folder)
         .bind(side)
         .bind(disc)
         .bind(position)
@@ -2368,10 +2460,9 @@ async fn enrich_artist_mbids(
                  JOIN field_override f ON f.entity_id = ac.album_id
                     AND f.field = 'mb_release_group_id'
                  WHERE ac.artist_id = a.id LIMIT 1),
-                (SELECT f.value FROM track_credit tc
+                (SELECT rm.mb_release_id FROM track_credit tc
                  JOIN media_entry tme ON tme.id = tc.track_id
-                 JOIN field_override f ON f.entity_id = tme.parent_id
-                    AND f.field = 'mb_release_id'
+                 JOIN release_match rm ON rm.album_id = tme.parent_id
                  WHERE tc.artist_id = a.id LIMIT 1)
          FROM artist a
          JOIN media_entry me ON me.id = a.id
@@ -2596,9 +2687,7 @@ async fn harvest_group_credits(
            AND EXISTS (SELECT 1 FROM field_override f
                        WHERE f.entity_id = al.id AND f.field = 'mb_release_group_id'
                          AND f.value IS NOT NULL AND f.value <> '')
-           AND NOT EXISTS (SELECT 1 FROM field_override r
-                           WHERE r.entity_id = al.id AND r.field = 'mb_release_id'
-                             AND r.value IS NOT NULL AND r.value <> '')
+           AND NOT EXISTS (SELECT 1 FROM release_match rm WHERE rm.album_id = al.id)
            AND (EXISTS (SELECT 1 FROM album_artist_credit ac
                         JOIN artist a ON a.id = ac.artist_id
                         WHERE ac.album_id = al.id
@@ -3221,9 +3310,11 @@ pub async fn get_tag_fixes(
         let wrong_lower = wrong.to_lowercase();
         let rows: Vec<(String, Option<String>, String, Option<String>, i64)> = sqlx::query_as(
             "SELECT t.title, alb.title, t.file_path, tm.artist_name,
-                    EXISTS (SELECT 1 FROM field_override f
-                            WHERE f.entity_id = tme.parent_id
-                              AND f.field = 'mb_release_id')
+                    EXISTS (SELECT 1 FROM track_release tr
+                            JOIN album_release ar ON ar.id = tr.release_id
+                            JOIN release_match rm ON rm.album_id = ar.album_id
+                                                 AND rm.folder_path = ar.folder_path
+                            WHERE tr.track_id = tme.id)
              FROM track_credit tc
              JOIN media_entry tme ON tme.id = tc.track_id
              JOIN track t ON t.id = tc.track_id
@@ -3272,7 +3363,8 @@ pub async fn get_tag_fixes(
              WHERE me.library_id = ?1 AND LOWER(ac.name) = LOWER(?2)
                AND NOT EXISTS (SELECT 1 FROM field_override f
                                WHERE f.entity_id = ac.album_id
-                                 AND f.field IN ('mb_release_group_id', 'mb_release_id'))
+                                 AND f.field = 'mb_release_group_id')
+               AND NOT EXISTS (SELECT 1 FROM release_match rm WHERE rm.album_id = ac.album_id)
              ORDER BY alb.sort_title COLLATE NOCASE",
         )
         .bind(&library_id)
@@ -3798,6 +3890,9 @@ pub struct MbGapAlbum {
     pub album_id: i64,
     pub title: String,
     pub artist_title: Option<String>,
+    /// Which release of the album this diff is for — the release's label,
+    /// when the card holds more than one. None = single-release album.
+    pub release_label: Option<String>,
     pub rows: Vec<MbGapRow>,
 }
 
@@ -3935,9 +4030,8 @@ pub async fn mb_get_review(state: State<'_, AppState>, library_id: String) -> Re
     let album_rows: Vec<(i64, String, String, i64, i64, i64, i64)> = sqlx::query_as(
         "SELECT al.id, al.title,
                 CASE
-                  WHEN EXISTS (SELECT 1 FROM field_override o
-                               WHERE o.entity_id = al.id AND o.field = 'mb_release_id'
-                                 AND o.value IS NOT NULL AND o.value <> '') THEN 'release'
+                  WHEN EXISTS (SELECT 1 FROM release_match rm
+                               WHERE rm.album_id = al.id) THEN 'release'
                   WHEN EXISTS (SELECT 1 FROM field_override o
                                WHERE o.entity_id = al.id AND o.field = 'mb_release_group_id'
                                  AND o.value IS NOT NULL AND o.value <> '') THEN 'album'
@@ -4024,12 +4118,31 @@ pub async fn mb_get_review(state: State<'_, AppState>, library_id: String) -> Re
         })
         .collect();
 
-    let gap_rows: Vec<(i64, String, Option<String>, String, i64, i64, String, Option<String>)> =
-        sqlx::query_as(
+    let gap_rows: Vec<(
+        i64,
+        String,
+        Option<String>,
+        String,
+        i64,
+        i64,
+        String,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(
             "SELECT al.id, al.title,
                     (SELECT ac.name FROM album_artist_credit ac
                      WHERE ac.album_id = al.id ORDER BY ac.position LIMIT 1),
-                    g.side, g.disc, g.position, g.title, g.counterpart
+                    g.side, g.disc, g.position, g.title, g.counterpart,
+                    -- The diff's release label — shown when the card holds
+                    -- several releases, each with its own comparison.
+                    CASE WHEN (SELECT COUNT(*) FROM album_release ar2
+                               WHERE ar2.album_id = al.id) > 1
+                         THEN (SELECT COALESCE(ar.label, 'Original')
+                               FROM album_release ar
+                               WHERE ar.album_id = al.id
+                                 AND ar.folder_path = g.folder_path)
+                         ELSE NULL
+                    END
              FROM album_match_gap g
              JOIN album al ON al.id = g.album_id
              JOIN media_entry me ON me.id = al.id
@@ -4039,16 +4152,28 @@ pub async fn mb_get_review(state: State<'_, AppState>, library_id: String) -> Re
                AND NOT (g.side = 'mb'
                         AND EXISTS (SELECT 1 FROM field_override pt
                                     WHERE pt.entity_id = al.id AND pt.field = 'mb_partial'))
-             ORDER BY al.sort_title COLLATE NOCASE, g.side, g.disc, g.position",
+             ORDER BY al.sort_title COLLATE NOCASE, g.folder_path, g.side, g.disc, g.position",
         )
         .bind(&library_id)
         .fetch_all(pool)
         .await
         .map_err(|e| e.to_string())?;
     let mut gaps: Vec<MbGapAlbum> = Vec::new();
-    for (album_id, title, artist_title, side, disc, position, gap_title, counterpart) in gap_rows {
-        if gaps.last().map(|g| g.album_id) != Some(album_id) {
-            gaps.push(MbGapAlbum { album_id, title, artist_title, rows: Vec::new() });
+    for (album_id, title, artist_title, side, disc, position, gap_title, counterpart, release_label) in
+        gap_rows
+    {
+        // One card per (album, release): a multi-version card can hold a
+        // clean box set AND a mismatched remaster at once.
+        if gaps.last().map(|g| (g.album_id, g.release_label.clone()))
+            != Some((album_id, release_label.clone()))
+        {
+            gaps.push(MbGapAlbum {
+                album_id,
+                title,
+                artist_title,
+                release_label,
+                rows: Vec::new(),
+            });
         }
         gaps.last_mut().unwrap().rows.push(MbGapRow {
             side,
@@ -4121,22 +4246,36 @@ pub async fn mb_undo_batch(
     Ok(())
 }
 
-/// Re-compare a matched album against its release — after retagging and a
+/// Re-compare a matched album against its release(s) — after retagging and a
 /// rescan, this is what clears the warning (or shows what's still off).
+/// Per-release matches: every matched release re-diffs; counts are summed.
 #[tauri::command]
 pub async fn mb_recheck_album(
     state: State<'_, AppState>,
     album_id: i64,
 ) -> Result<MbGapCounts, String> {
     let pool = &state.app_db;
-    let Some((mb_release_id, _)) = mb_id(pool, album_id, MB_RELEASE).await? else {
+    let matches: Vec<(String, String)> = sqlx::query_as(
+        "SELECT folder_path, mb_release_id FROM release_match WHERE album_id = ?",
+    )
+    .bind(album_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    if matches.is_empty() {
         return Err("this album isn't matched to a MusicBrainz release".to_string());
-    };
+    }
     let client = mb_client()?;
-    let full = fetch_release(&client, &mb_release_id)
-        .await?
-        .ok_or_else(|| "release has no usable track data".to_string())?;
-    record_match_gaps(pool, album_id, &full.tracks).await
+    let mut totals = MbGapCounts { ours: 0, mb: 0 };
+    for (folder, mb_release_id) in matches {
+        let full = fetch_release(&client, &mb_release_id)
+            .await?
+            .ok_or_else(|| "release has no usable track data".to_string())?;
+        let counts = record_match_gaps(pool, album_id, &folder, &full.tracks).await?;
+        totals.ours += counts.ours;
+        totals.mb += counts.mb;
+    }
+    Ok(totals)
 }
 
 // ---------------------------------------------------------------------------
@@ -4175,6 +4314,10 @@ pub struct MbStatus {
     /// A staged rescan action (split/combine) will dissolve this entity —
     /// the dialog shows the state and hides every mutating control.
     pub staged: bool,
+    /// Albums only: how many of the card's releases hold their own pinned
+    /// pressing, out of how many releases exist. The badge's "2 of 4".
+    pub matched_releases: i64,
+    pub total_releases: i64,
 }
 
 /// The library an entity belongs to. Every album, artist and track is a
@@ -4198,17 +4341,48 @@ fn mb_field_for(kind: &str) -> Result<&'static str, String> {
 }
 
 /// Everything the match UI needs about one entity, for any of the three kinds.
+/// For albums, `release_db_id` scopes the release-level facts (pinned
+/// pressing, track-list diff) to the VERSION the dialog was opened on;
+/// absent, the default release.
 #[tauri::command]
 pub async fn mb_status(
     state: State<'_, AppState>,
     kind: String,
     entity_id: i64,
+    release_db_id: Option<i64>,
 ) -> Result<MbStatus, String> {
     let pool = &state.app_db;
-    let field = mb_field_for(&kind)?;
-    let (mut mbid, mut tier) = match mb_id(pool, entity_id, field).await? {
-        Some((v, t)) => (Some(v), Some(t)),
-        None => (None, None),
+    // Albums: which release's view of the card this status is.
+    let album_folder: Option<String> = if kind == "album" {
+        match release_db_id {
+            Some(rid) => sqlx::query_as::<_, (String,)>(
+                "SELECT folder_path FROM album_release WHERE id = ? AND album_id = ?",
+            )
+            .bind(rid)
+            .bind(entity_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?
+            .map(|(f,)| f),
+            None => default_release_folder(pool, entity_id).await?,
+        }
+    } else {
+        None
+    };
+    let (mut mbid, mut tier) = if kind == "album" {
+        match &album_folder {
+            Some(folder) => match release_match_of(pool, entity_id, folder).await? {
+                Some((v, t)) => (Some(v), Some(t)),
+                None => (None, None),
+            },
+            None => (None, None),
+        }
+    } else {
+        let field = mb_field_for(&kind)?;
+        match mb_id(pool, entity_id, field).await? {
+            Some((v, t)) => (Some(v), Some(t)),
+            None => (None, None),
+        }
     };
     // Artists identified before their ids were stored durably still carry one
     // on the artist row; the list already falls back to it, so this must too.
@@ -4297,19 +4471,27 @@ pub async fn mb_status(
         }
     };
 
+    let mut matched_releases = 0i64;
+    let mut total_releases = 0i64;
     let (release_group_id, gap_count, gap_ours, gap_mb, searched_not_found) = if kind == "album" {
         let rg = mb_id(pool, entity_id, MB_RELEASE_GROUP).await?.map(|(v, _)| v);
-        let gaps: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM album_match_gap WHERE album_id = ?")
-                .bind(entity_id)
-                .fetch_one(pool)
-                .await
-                .map_err(|e| e.to_string())?;
-        let (ours, theirs): (i64, i64) = sqlx::query_as(
-            "SELECT COALESCE(SUM(side = 'ours'), 0), COALESCE(SUM(side = 'mb'), 0)
-             FROM album_match_gap WHERE album_id = ?",
+        // Diff counts scope to the release this status views — each version
+        // carries its own comparison against its own pinned pressing.
+        let folder = album_folder.clone().unwrap_or_default();
+        let gaps: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM album_match_gap WHERE album_id = ? AND folder_path = ?",
         )
         .bind(entity_id)
+        .bind(&folder)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        let (ours, theirs): (i64, i64) = sqlx::query_as(
+            "SELECT COALESCE(SUM(side = 'ours'), 0), COALESCE(SUM(side = 'mb'), 0)
+             FROM album_match_gap WHERE album_id = ? AND folder_path = ?",
+        )
+        .bind(entity_id)
+        .bind(&folder)
         .fetch_one(pool)
         .await
         .map_err(|e| e.to_string())?;
@@ -4320,6 +4502,16 @@ pub async fn mb_status(
         .fetch_one(pool)
         .await
         .map_err(|e| e.to_string())?;
+        let (m, t): (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM release_match rm WHERE rm.album_id = ?1),
+                    (SELECT COUNT(*) FROM album_release ar WHERE ar.album_id = ?1)",
+        )
+        .bind(entity_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        matched_releases = m;
+        total_releases = t;
         (rg, gaps.0, ours, theirs, nf.0 != 0)
     } else if kind == "artist" {
         // The pass's name lookup — same signal the artists list reads, so the
@@ -4351,6 +4543,8 @@ pub async fn mb_status(
         gap_ours,
         gap_mb,
         searched_not_found,
+        matched_releases,
+        total_releases,
         ignored,
         staged,
     })
@@ -4385,9 +4579,7 @@ pub async fn mb_artist_unmatched_albums(
                 EXISTS (SELECT 1 FROM mb_credit_fetch f WHERE f.album_id = al.id)
          FROM album al
          JOIN album_artist_credit ac ON ac.album_id = al.id AND ac.artist_id = ?
-         WHERE NOT EXISTS (SELECT 1 FROM field_override o
-                           WHERE o.entity_id = al.id AND o.field = 'mb_release_id'
-                             AND o.value IS NOT NULL AND o.value <> '')
+         WHERE NOT EXISTS (SELECT 1 FROM release_match rm WHERE rm.album_id = al.id)
            AND NOT EXISTS (SELECT 1 FROM field_override o
                            WHERE o.entity_id = al.id AND o.field = 'mb_release_group_id'
                              AND o.value IS NOT NULL AND o.value <> '')
@@ -4770,6 +4962,9 @@ pub async fn mb_apply_entity_match(
     // one pressing and rewrites track credits from it. Defaults to the album
     // reading, since that is what a search now returns.
     mbid_kind: Option<String>,
+    // Release applies: WHICH release of the album (db row id) the pressing
+    // pins — the version the dialog was opened on. None = default release.
+    release_db_id: Option<i64>,
 ) -> Result<(), String> {
     let pool = &state.app_db;
     // Staged = immutable: a match on an entity a staged rescan action will
@@ -4790,7 +4985,8 @@ pub async fn mb_apply_entity_match(
     match kind.as_str() {
         "album" => {
             if mbid_kind.as_deref() == Some("release") {
-                return mb_apply_album_match(app, state, library_id, entity_id, mbid).await;
+                return mb_apply_album_match(app, state, library_id, entity_id, mbid, release_db_id)
+                    .await;
             }
             let (title,): (String,) = sqlx::query_as("SELECT title FROM album WHERE id = ?")
                 .bind(entity_id)
@@ -5137,7 +5333,9 @@ pub async fn mb_unmatch_entity(
             .execute(pool)
             .await
             .map_err(|e| e.to_string())?;
-        sqlx::query("UPDATE album_release SET mb_release_id = NULL WHERE album_id = ?")
+        // Every release's pin goes — full unmatch is the card-wide start-over.
+        // (album_release.mb_release_id stays: it's tag truth, not match state.)
+        sqlx::query("DELETE FROM release_match WHERE album_id = ?")
             .bind(entity_id)
             .execute(pool)
             .await
@@ -5180,29 +5378,62 @@ pub async fn mb_unmatch_entity(
     Ok(())
 }
 
-/// First stage of a two-stage unmatch: forget WHICH release the album is,
-/// keep WHICH album it is (the group). The dialog drops back to the release
-/// picker; applying a new release overwrites whatever the old one wrote.
+/// First stage of a two-stage unmatch: forget WHICH pressing a release is,
+/// keep WHICH album the card is (the group). The dialog drops back to the
+/// release picker; applying a new release overwrites whatever the old one
+/// wrote. `release_db_id` scopes to one version; absent, every version's
+/// pin is forgotten (the center's start-over). Note: a release whose FILES
+/// carry the id will be re-pinned by the next pass — tags are certainty.
 #[tauri::command]
 pub async fn mb_unmatch_release(
     app: AppHandle,
     state: State<'_, AppState>,
     entity_id: i64,
+    release_db_id: Option<i64>,
 ) -> Result<(), String> {
     let pool = &state.app_db;
     let library_id = library_of(pool, entity_id).await?;
-    clear_mb_id(pool, entity_id, MB_RELEASE).await?;
-    sqlx::query("UPDATE album_release SET mb_release_id = NULL WHERE album_id = ?")
+    let folder: Option<String> = match release_db_id {
+        Some(rid) => sqlx::query_as::<_, (String,)>(
+            "SELECT folder_path FROM album_release WHERE id = ? AND album_id = ?",
+        )
+        .bind(rid)
         .bind(entity_id)
-        .execute(pool)
+        .fetch_optional(pool)
         .await
-        .map_err(|e| e.to_string())?;
-    // Track-list comparison was against the forgotten release.
-    sqlx::query("DELETE FROM album_match_gap WHERE album_id = ?")
-        .bind(entity_id)
-        .execute(pool)
-        .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?
+        .map(|(f,)| f),
+        None => None,
+    };
+    match &folder {
+        Some(f) => {
+            sqlx::query("DELETE FROM release_match WHERE album_id = ? AND folder_path = ?")
+                .bind(entity_id)
+                .bind(f)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            // Track-list comparison was against the forgotten release.
+            sqlx::query("DELETE FROM album_match_gap WHERE album_id = ? AND folder_path = ?")
+                .bind(entity_id)
+                .bind(f)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        None => {
+            sqlx::query("DELETE FROM release_match WHERE album_id = ?")
+                .bind(entity_id)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            sqlx::query("DELETE FROM album_match_gap WHERE album_id = ?")
+                .bind(entity_id)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
     let _ = app.emit(
         "music-enrich-done",
         serde_json::json!({ "libraryId": library_id, "updated": 0, "albumsMatched": 0, "processed": 0, "pendingReview": 0 }),
@@ -5596,9 +5827,10 @@ pub(crate) async fn enqueue_track_credit_recheck(
         "SELECT al.id, al.title FROM media_entry tme
          JOIN album al ON al.id = tme.parent_id
          WHERE tme.id = ?
-           AND EXISTS (SELECT 1 FROM field_override f
-                       WHERE f.entity_id = al.id
-                         AND f.field IN ('mb_release_group_id', 'mb_release_id'))
+           AND (EXISTS (SELECT 1 FROM field_override f
+                        WHERE f.entity_id = al.id
+                          AND f.field = 'mb_release_group_id')
+             OR EXISTS (SELECT 1 FROM release_match rm WHERE rm.album_id = al.id))
            AND NOT EXISTS (SELECT 1 FROM field_override ig
                            WHERE ig.entity_id = al.id AND ig.field = 'mb_ignored')
            AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = al.id)
@@ -5634,9 +5866,10 @@ pub(crate) async fn enqueue_album_credit_recheck(
 ) -> Result<(), String> {
     let gate: Option<(String, i64, i64)> = sqlx::query_as(
         "SELECT al.title,
-                EXISTS (SELECT 1 FROM field_override f
-                        WHERE f.entity_id = al.id
-                          AND f.field IN ('mb_release_group_id', 'mb_release_id'))
+                (EXISTS (SELECT 1 FROM field_override f
+                         WHERE f.entity_id = al.id
+                           AND f.field = 'mb_release_group_id')
+                  OR EXISTS (SELECT 1 FROM release_match rm WHERE rm.album_id = al.id))
                 AND EXISTS (SELECT 1 FROM album_artist_credit ac
                             JOIN artist a ON a.id = ac.artist_id
                             WHERE ac.album_id = al.id
@@ -5758,8 +5991,7 @@ pub(crate) async fn requeue_renamed_artist(
                         WHERE ac.artist_id = a.id)
              OR EXISTS (SELECT 1 FROM track_credit tc
                         JOIN media_entry tme ON tme.id = tc.track_id
-                        JOIN field_override f ON f.entity_id = tme.parent_id
-                           AND f.field = 'mb_release_id'
+                        JOIN release_match rm ON rm.album_id = tme.parent_id
                         WHERE tc.artist_id = a.id))",
     )
     .bind(artist_id)
@@ -5820,7 +6052,9 @@ async fn clear_suppressions(pool: &SqlitePool, entity_id: i64) -> Result<(), Str
 }
 
 /// Apply a chosen release to an album (modal candidate pick or manual search
-/// result). Same application path as a confident auto-match.
+/// result). Same application path as a confident auto-match. `release_db_id`
+/// names WHICH release of the album this pressing is — the version the user
+/// was viewing; absent (metadata-center dialogs), the default release.
 #[tauri::command]
 pub async fn mb_apply_album_match(
     app: AppHandle,
@@ -5828,10 +6062,26 @@ pub async fn mb_apply_album_match(
     library_id: String,
     album_id: i64,
     mb_release_id: String,
+    release_db_id: Option<i64>,
 ) -> Result<(), String> {
     let pool = &state.app_db;
     crate::music_edit::ensure_not_staged(pool, album_id).await?;
     clear_suppressions(pool, album_id).await?;
+    let folder = match release_db_id {
+        Some(rid) => sqlx::query_as::<_, (String,)>(
+            "SELECT folder_path FROM album_release WHERE id = ? AND album_id = ?",
+        )
+        .bind(rid)
+        .bind(album_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?
+        .map(|(f,)| f)
+        .ok_or("Release not found on this album")?,
+        None => default_release_folder(pool, album_id)
+            .await?
+            .ok_or("Album has no releases")?,
+    };
     let client = mb_client()?;
     let (album_title,): (String,) = sqlx::query_as("SELECT title FROM album WHERE id = ?")
         .bind(album_id)
@@ -5841,7 +6091,7 @@ pub async fn mb_apply_album_match(
     let full = fetch_release(&client, &mb_release_id)
         .await?
         .ok_or_else(|| "release has no usable track data".to_string())?;
-    apply_release(pool, &library_id, album_id, &album_title, &full, TIER_USER).await?;
+    apply_release(pool, &library_id, album_id, &album_title, &full, TIER_USER, &folder).await?;
     stamp(pool, album_id, "matched").await?;
     sqlx::query(
         "UPDATE mb_suggestion SET status = 'accepted'
@@ -6287,24 +6537,32 @@ pub async fn mb_undo_change(
                 .map_err(|e| e.to_string())?;
         }
         "album_match" => {
-            // Forget the ids the match wrote (every tier), un-stamp the fetch
-            // so the album reads unchecked, and restore whatever id stood
-            // before. The suppression written below keeps the automatic pass
-            // from re-concluding the same match next pass; Unmatch clears it
-            // for a true start-over.
-            clear_mb_id(pool, target_id, MB_RELEASE).await?;
+            // Forget the ids the match wrote, un-stamp the fetch so the album
+            // reads unchecked, and restore whatever stood before. Release
+            // pins are per-release (folder in the payload; legacy payloads
+            // fall back to the default release). The suppression written
+            // below keeps the automatic pass from re-concluding the same
+            // match next pass; Unmatch clears it for a true start-over.
+            let folder = match before["folder"].as_str().filter(|s| !s.is_empty()) {
+                Some(f) => Some(f.to_string()),
+                None => default_release_folder(pool, target_id).await?,
+            };
+            if let Some(f) = &folder {
+                sqlx::query("DELETE FROM release_match WHERE album_id = ? AND folder_path = ?")
+                    .bind(target_id)
+                    .bind(f)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                sqlx::query("DELETE FROM album_match_gap WHERE album_id = ? AND folder_path = ?")
+                    .bind(target_id)
+                    .bind(f)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
             clear_mb_id(pool, target_id, MB_RELEASE_GROUP).await?;
             sqlx::query("UPDATE album SET mb_release_group_id = NULL WHERE id = ?")
-                .bind(target_id)
-                .execute(pool)
-                .await
-                .map_err(|e| e.to_string())?;
-            sqlx::query("UPDATE album_release SET mb_release_id = NULL WHERE album_id = ?")
-                .bind(target_id)
-                .execute(pool)
-                .await
-                .map_err(|e| e.to_string())?;
-            sqlx::query("DELETE FROM album_match_gap WHERE album_id = ?")
                 .bind(target_id)
                 .execute(pool)
                 .await
@@ -6332,8 +6590,8 @@ pub async fn mb_undo_change(
                     .map_err(|e| e.to_string())?;
             }
             let prev_release = before["release_id"].as_str().filter(|s| !s.is_empty());
-            if let Some(r) = prev_release {
-                set_mb_id(pool, target_id, MB_RELEASE, r, TIER_MB).await?;
+            if let (Some(r), Some(f)) = (prev_release, &folder) {
+                set_release_match(pool, target_id, f, r, TIER_MB).await?;
             }
             if prev_group.is_some() || prev_release.is_some() {
                 stamp(pool, target_id, "matched").await?;

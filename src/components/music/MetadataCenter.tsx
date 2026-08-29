@@ -135,6 +135,8 @@ interface MbGapAlbum {
   album_id: number;
   title: string;
   artist_title: string | null;
+  /** Which release of a multi-version card this diff belongs to. */
+  release_label: string | null;
   rows: MbGapRow[];
 }
 
@@ -3492,7 +3494,7 @@ export function MetadataCenter({
               const theirs = g.rows.length - mine;
               return (
                 <div
-                  key={g.album_id}
+                  key={`${g.album_id}:${g.release_label ?? ""}`}
                   className="rounded-md border border-amber-500/40 bg-amber-500/5 p-3"
                 >
                   <div className="flex items-start justify-between gap-3">
@@ -3500,6 +3502,11 @@ export function MetadataCenter({
                       <span className="font-medium">{g.title}</span>
                       {g.artist_title && (
                         <span className="text-muted-foreground"> — {g.artist_title}</span>
+                      )}
+                      {g.release_label && (
+                        <span className="ml-1.5 rounded border border-muted-foreground/30 px-1 py-px text-[10px] text-muted-foreground">
+                          {g.release_label}
+                        </span>
                       )}
                       <span className="mt-0.5 flex items-center gap-1 text-xs text-amber-200/90">
                         <TriangleAlert size={12} className="shrink-0" />
