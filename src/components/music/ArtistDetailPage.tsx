@@ -20,6 +20,7 @@ import { PersonaDialog } from "./PersonaDialog";
 import { PlayingIndicator } from "./PlayingIndicator";
 import { LoveButton, LoveMenuItem } from "./LoveButton";
 import { RevealMenuItem } from "./RevealMenuItem";
+import { CodecBadge } from "./CodecBadge";
 import { MusicArtistDetail, MusicAlbumCard, MusicAlbumDetail, MusicQueueItem, MusicTrack } from "../../types";
 import { queueFromRelease, defaultRelease, trackDisplayTitle, fmtTrackTime, fmtAlbumRuntime } from "./musicQueue";
 import { useDeselectOnBackgroundClick } from "./useTrackSelection";
@@ -484,6 +485,11 @@ export function ArtistDetailPage({
                                       loved={t.loved}
                                       reveal="group-hover/track:opacity-100"
                                     />
+                                    <CodecBadge
+                                      codec={t.codec}
+                                      bitrate={t.bitrate_kbps}
+                                      mode={t.bitrate_mode}
+                                    />
                                     <span className="w-12 shrink-0 text-right font-mono text-xs text-muted-foreground">
                                       {fmtTrackTime(t.runtime_secs)}
                                     </span>
@@ -856,6 +862,7 @@ export function ArtistDetailPage({
                     )}
                   </span>
                   <LoveButton trackId={t.id} loved={t.loved} reveal="group-hover/track:opacity-100" />
+                  <CodecBadge codec={t.codec} bitrate={t.bitrate_kbps} mode={t.bitrate_mode} />
                   <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
                     {fmtTrackTime(t.runtime_secs)}
                   </span>

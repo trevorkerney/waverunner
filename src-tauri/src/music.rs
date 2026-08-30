@@ -63,6 +63,9 @@ pub struct ScannedTrack {
     pub codec: String,
     pub bitrate_kbps: Option<i64>,
     pub sample_rate_hz: Option<i64>,
+    /// MP3 only: "cbr" | "vbr", read from the frame headers (mp3_frames).
+    /// None for other codecs, or when too little parsed to say.
+    pub bitrate_mode: Option<String>,
     pub mb_recording_id: Option<String>,
     pub mb_release_id: Option<String>,
     pub mb_release_group_id: Option<String>,
@@ -257,11 +260,21 @@ fn parse_credits(artist_display: &str, extra_artists: &[String], title: &str) ->
 /// region is never read — the tag probe (headers + tag blocks, kilobytes) is
 /// all that touches the disk. Retagging bumps mtime, so changed tags always
 /// re-read AND re-hash naturally.
+/// The previous scan's record of one file — the rescan gate's input.
+pub struct PriorStamp {
+    pub hash: String,
+    pub size: i64,
+    pub mtime: i64,
+    /// Stored MP3 CBR/VBR verdict, reused alongside the hash when the stamp
+    /// matches so the frame sampling is paid once per file.
+    pub bitrate_mode: Option<String>,
+}
+
 fn read_track(
     abs: &Path,
     rel: &str,
     disc_folder_no: Option<i64>,
-    prior: Option<&(String, i64, i64)>,
+    prior: Option<&PriorStamp>,
 ) -> Result<ScannedTrack, String> {
     let tagged = Probe::open(abs)
         .map_err(|e| format!("unreadable file: {e}"))?
@@ -272,7 +285,25 @@ fn read_track(
     let duration_secs = props.duration().as_secs() as i64;
     let bitrate_kbps = props.audio_bitrate().map(|b| b as i64);
     let sample_rate_hz = props.sample_rate().map(|s| s as i64);
-    let codec = format!("{:?}", tagged.file_type()).to_lowercase();
+    let file_type = tagged.file_type();
+    let mut codec = format!("{:?}", file_type).to_lowercase();
+    // An MP4 container hides its real codec — AAC (lossy) or ALAC (lossless)
+    // — behind the generic probe; a typed read names it.
+    if file_type == lofty::file::FileType::Mp4 {
+        if let Ok(mut f) = std::fs::File::open(abs) {
+            if let Ok(mp4) =
+                lofty::mp4::Mp4File::read_from(&mut f, lofty::config::ParseOptions::new())
+            {
+                codec = match mp4.properties().codec() {
+                    lofty::mp4::Mp4Codec::AAC => "aac".to_string(),
+                    lofty::mp4::Mp4Codec::ALAC => "alac".to_string(),
+                    lofty::mp4::Mp4Codec::MP3 => "mp3".to_string(),
+                    lofty::mp4::Mp4Codec::FLAC => "flac".to_string(),
+                    _ => codec,
+                };
+            }
+        }
+    }
 
     // Universal import: missing tags degrade to fallbacks instead of
     // excluding the file. Only literally unreadable files (the two errors
@@ -360,13 +391,24 @@ fn read_track(
     // The rescan gate: unchanged (size, mtime) means the stored hash still
     // describes the audio — reuse it and skip reading the region entirely.
     let stamp = crate::content_hash::file_stamp(abs);
-    let audio_hash = match (stamp, prior) {
-        (Some((size, mtime)), Some((hash, p_size, p_mtime)))
-            if size == *p_size && mtime == *p_mtime =>
-        {
-            Some(hash.clone())
+    let unchanged = match (stamp, prior) {
+        (Some((size, mtime)), Some(p)) => size == p.size && mtime == p.mtime,
+        _ => false,
+    };
+    let audio_hash = if unchanged {
+        prior.map(|p| p.hash.clone())
+    } else {
+        crate::content_hash::hash_file(abs)
+    };
+    // MP3 CBR/VBR is read from the frames — sampled once, then carried by
+    // the stamp gate like the hash. Other codecs get no verdict.
+    let bitrate_mode = if codec == "mpeg" {
+        match prior.and_then(|p| p.bitrate_mode.clone()) {
+            Some(m) if unchanged => Some(m),
+            _ => crate::mp3_frames::bitrate_mode(abs).map(|m| m.to_string()),
         }
-        _ => crate::content_hash::hash_file(abs),
+    } else {
+        None
     };
 
     Ok(ScannedTrack {
@@ -384,6 +426,7 @@ fn read_track(
         codec,
         bitrate_kbps,
         sample_rate_hz,
+        bitrate_mode,
         mb_recording_id: grab(&ItemKey::MusicBrainzRecordingId),
         mb_release_id: grab(&ItemKey::MusicBrainzReleaseId),
         mb_release_group_id: grab(&ItemKey::MusicBrainzReleaseGroupId),
@@ -629,7 +672,7 @@ pub fn scan_base(
     cancel: Option<&AtomicBool>,
     // Previous scan's per-file (hash, size, mtime), keyed by rel path — the
     // unchanged-file gate. None (create scans) or a miss hashes fresh.
-    prior: Option<&HashMap<String, (String, i64, i64)>>,
+    prior: Option<&HashMap<String, PriorStamp>>,
     // (folder, files done, files total) — the walk collects the whole file
     // list before any tag is read, so the total is exact and free.
     mut on_progress: impl FnMut(&str, usize, usize),
@@ -1212,14 +1255,15 @@ pub(crate) async fn write_track_side_tables(
     .await
     .map_err(|e| e.to_string())?;
     sqlx::query(
-        "INSERT INTO track_meta (track_id, artist_name, mb_recording_id, codec, bitrate_kbps, sample_rate_hz)
-         VALUES (?, ?, ?, ?, ?, ?)
+        "INSERT INTO track_meta (track_id, artist_name, mb_recording_id, codec, bitrate_kbps, sample_rate_hz, bitrate_mode)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(track_id) DO UPDATE SET
             artist_name = excluded.artist_name,
             mb_recording_id = excluded.mb_recording_id,
             codec = excluded.codec,
             bitrate_kbps = excluded.bitrate_kbps,
-            sample_rate_hz = excluded.sample_rate_hz",
+            sample_rate_hz = excluded.sample_rate_hz,
+            bitrate_mode = excluded.bitrate_mode",
     )
     .bind(track_id)
     .bind(t.artist.as_deref().unwrap_or(&t.album_artist))
@@ -1227,6 +1271,7 @@ pub(crate) async fn write_track_side_tables(
     .bind(&t.codec)
     .bind(t.bitrate_kbps)
     .bind(t.sample_rate_hz)
+    .bind(&t.bitrate_mode)
     .execute(pool)
     .await
     .map_err(|e| e.to_string())?;
@@ -3182,12 +3227,13 @@ pub async fn rescan_music_library(
     // files whose stamp still matches skip the full audio read entirely and
     // read-tags costs a stat + tag probe. Rows without stamps (pre-gate data)
     // simply miss and hash once.
-    let prior: HashMap<String, (String, i64, i64)> = sqlx::query_as::<
+    let prior: HashMap<String, PriorStamp> = sqlx::query_as::<
         _,
-        (String, Option<String>, Option<i64>, Option<i64>),
+        (String, Option<String>, Option<i64>, Option<i64>, Option<String>),
     >(
-        "SELECT t.file_path, t.audio_hash, t.content_size, t.content_mtime
+        "SELECT t.file_path, t.audio_hash, t.content_size, t.content_mtime, tm.bitrate_mode
          FROM track t JOIN media_entry me ON me.id = t.id
+         LEFT JOIN track_meta tm ON tm.track_id = t.id
          WHERE me.library_id = ?",
     )
     .bind(library_id)
@@ -3195,7 +3241,9 @@ pub async fn rescan_music_library(
     .await
     .map_err(|e| e.to_string())?
     .into_iter()
-    .filter_map(|(rel, h, s, m)| Some((rel, (h?, s?, m?))))
+    .filter_map(|(rel, h, s, m, mode)| {
+        Some((rel, PriorStamp { hash: h?, size: s?, mtime: m?, bitrate_mode: mode }))
+    })
     .collect();
 
     let mut all_albums = Vec::new();
@@ -4081,11 +4129,12 @@ pub(crate) async fn loose_tracks_for(
             .push(credit_view(name, artist_id, &artist_titles));
     }
 
-    let track_rows: Vec<(i64, String, Option<i64>, Option<i64>, Option<i64>, Option<String>, String, i64, i64)> =
+    let track_rows: Vec<(i64, String, Option<i64>, Option<i64>, Option<i64>, Option<String>, String, i64, i64, Option<String>, Option<i64>, Option<String>)> =
         sqlx::query_as(
             "SELECT t.id, t.title, t.track_number, t.disc_number, t.runtime, tm.artist_name, t.file_path,
                     (SELECT COUNT(*) FROM music_play mp WHERE mp.track_id = t.id AND mp.scrobbled = 1),
-                    EXISTS(SELECT 1 FROM track_loved tl WHERE tl.track_id = t.id)
+                    EXISTS(SELECT 1 FROM track_loved tl WHERE tl.track_id = t.id),
+                    tm.codec, tm.bitrate_kbps, tm.bitrate_mode
              FROM track t
              JOIN media_entry me ON me.id = t.id
              LEFT JOIN track_meta tm ON tm.track_id = t.id
@@ -4097,7 +4146,7 @@ pub(crate) async fn loose_tracks_for(
         .await
         .map_err(|e| e.to_string())?;
     let mut tracks = Vec::new();
-    for (id, title, track_number, disc_number, runtime, artist_name, rel, play_count, loved) in track_rows {
+    for (id, title, track_number, disc_number, runtime, artist_name, rel, play_count, loved, codec, bitrate_kbps, bitrate_mode) in track_rows {
         tracks.push(TrackView {
             id,
             title,
@@ -4109,6 +4158,9 @@ pub(crate) async fn loose_tracks_for(
             play_count,
             loved: loved != 0,
             credits: credits_by_track.remove(&id).unwrap_or_default(),
+            codec,
+            bitrate_kbps,
+            bitrate_mode,
         });
     }
     Ok(tracks)
@@ -4311,6 +4363,12 @@ pub struct TrackView {
     pub loved: bool,
     /// Ordered credits (main first, then features), comma-joined by the UI.
     pub credits: Vec<CreditView>,
+    /// Codec badge facts: lofty's file type lowercased ("flac", "mpeg",
+    /// "aac"…), measured average bitrate, and for MP3 the frame-read
+    /// "cbr"/"vbr" verdict.
+    pub codec: Option<String>,
+    pub bitrate_kbps: Option<i64>,
+    pub bitrate_mode: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -4493,12 +4551,12 @@ pub async fn get_album_detail(
 
     let mut releases = Vec::new();
     for (rid, label, is_default, disc_count, rdate, folder_path, mb_release_id) in release_rows {
-        let track_rows: Vec<(i64, String, Option<i64>, Option<i64>, Option<i64>, Option<String>, String, i64, i64, Option<String>)> =
+        let track_rows: Vec<(i64, String, Option<i64>, Option<i64>, Option<i64>, Option<String>, String, i64, i64, Option<String>, Option<i64>, Option<String>)> =
             sqlx::query_as(
                 "SELECT t.id, t.title, t.track_number, t.disc_number, t.runtime, tm.artist_name, t.file_path,
                         (SELECT COUNT(*) FROM music_play mp WHERE mp.track_id = t.id AND mp.scrobbled = 1),
                         EXISTS(SELECT 1 FROM track_loved tl WHERE tl.track_id = t.id),
-                        tm.codec
+                        tm.codec, tm.bitrate_kbps, tm.bitrate_mode
                  FROM track t
                  JOIN track_release tr ON tr.track_id = t.id
                  LEFT JOIN track_meta tm ON tm.track_id = t.id
@@ -4511,8 +4569,8 @@ pub async fn get_album_detail(
             .map_err(|e| e.to_string())?;
         let mut tracks = Vec::new();
         let mut codecs: Vec<String> = Vec::new();
-        for (id, title, track_number, disc_number, runtime, artist_name, rel, play_count, loved, codec) in track_rows {
-            if let Some(c) = codec.filter(|c| !c.is_empty()) {
+        for (id, title, track_number, disc_number, runtime, artist_name, rel, play_count, loved, codec, bitrate_kbps, bitrate_mode) in track_rows {
+            if let Some(c) = codec.clone().filter(|c| !c.is_empty()) {
                 let c = c.to_uppercase();
                 if !codecs.contains(&c) {
                     codecs.push(c);
@@ -4529,6 +4587,9 @@ pub async fn get_album_detail(
                 play_count,
                 loved: loved != 0,
                 credits: credits_by_track.remove(&id).unwrap_or_default(),
+                codec,
+                bitrate_kbps,
+                bitrate_mode,
             });
         }
         releases.push(ReleaseView {
@@ -4662,6 +4723,10 @@ pub struct LibraryTrackRow {
     pub play_count: i64,
     pub loved: bool,
     pub credits: Vec<CreditView>,
+    /// Codec badge facts — see TrackView.
+    pub codec: Option<String>,
+    pub bitrate_kbps: Option<i64>,
+    pub bitrate_mode: Option<String>,
 }
 
 /// Every track in the library — the all-Tracks page. Loose tracks (no album,
@@ -4723,7 +4788,7 @@ pub async fn get_music_tracks(
     } else {
         "AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = me.parent_id)"
     };
-    let rows: Vec<(i64, String, String, Option<i64>, Option<String>, Option<i64>, Option<String>, i64, Option<i64>, i64, i64, Option<String>, Option<String>)> =
+    let rows: Vec<(i64, String, String, Option<i64>, Option<String>, Option<i64>, Option<String>, i64, Option<i64>, i64, i64, Option<String>, Option<String>, Option<String>, Option<i64>, Option<String>)> =
         sqlx::query_as(&format!(
             "SELECT t.id, t.title, t.file_path, t.runtime, tm.artist_name,
                     al.id, al.title, COALESCE((SELECT 1 FROM loose_album la WHERE la.album_id = al.id), 0),
@@ -4732,7 +4797,8 @@ pub async fn get_music_tracks(
                              alme.parent_id),
                     (SELECT COUNT(*) FROM music_play mp WHERE mp.track_id = t.id AND mp.scrobbled = 1),
                     EXISTS(SELECT 1 FROM track_loved tl WHERE tl.track_id = t.id),
-                    al.folder_path, al.selected_cover
+                    al.folder_path, al.selected_cover,
+                    tm.codec, tm.bitrate_kbps, tm.bitrate_mode
              FROM track t
              JOIN media_entry me ON me.id = t.id
              LEFT JOIN track_meta tm ON tm.track_id = t.id
@@ -4750,7 +4816,7 @@ pub async fn get_music_tracks(
 
     let single_base = if bases.len() == 1 { Some(bases[0].0.clone()) } else { None };
     let mut out = Vec::with_capacity(rows.len());
-    for (id, title, rel, runtime, artist_name, album_id, album_title, is_loose, album_parent, play_count, loved, album_folder, album_selected_cover) in rows {
+    for (id, title, rel, runtime, artist_name, album_id, album_title, is_loose, album_parent, play_count, loved, album_folder, album_selected_cover, codec, bitrate_kbps, bitrate_mode) in rows {
         let file_name = Path::new(&rel)
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -4791,6 +4857,9 @@ pub async fn get_music_tracks(
             play_count,
             loved: loved != 0,
             credits: credits_by_track.remove(&id).unwrap_or_default(),
+            codec,
+            bitrate_kbps,
+            bitrate_mode,
         });
     }
     Ok(out)
@@ -4814,6 +4883,10 @@ pub struct TrackQueueItem {
     pub file_path: String,
     pub duration_secs: Option<i64>,
     pub loved: bool,
+    /// Codec badge facts — see TrackView.
+    pub codec: Option<String>,
+    pub bitrate_kbps: Option<i64>,
+    pub bitrate_mode: Option<String>,
 }
 
 /// Resolve a list of track entry ids (one playlist's worth) into playable
@@ -4827,7 +4900,7 @@ pub async fn get_track_queue_items(
     let mut out = Vec::with_capacity(track_ids.len());
     let mut maps: Option<(String, HashMap<String, i64>, HashMap<i64, String>, HashMap<String, Vec<String>>)> = None;
     for id in track_ids {
-        let row: Option<(String, String, Option<i64>, Option<String>, String, Option<String>, Option<i64>, Option<i64>, i64, i64, Option<String>, Option<String>)> =
+        let row: Option<(String, String, Option<i64>, Option<String>, String, Option<String>, Option<i64>, Option<i64>, i64, i64, Option<String>, Option<String>, Option<String>, Option<i64>, Option<String>)> =
             sqlx::query_as(
                 "SELECT t.title, t.file_path, t.runtime, tm.artist_name, me.library_id,
                         al.title, al.id,
@@ -4836,7 +4909,8 @@ pub async fn get_track_queue_items(
                                  alme.parent_id),
                         COALESCE((SELECT 1 FROM loose_album la WHERE la.album_id = al.id), 0),
                         EXISTS(SELECT 1 FROM track_loved tl WHERE tl.track_id = t.id),
-                        al.folder_path, al.selected_cover
+                        al.folder_path, al.selected_cover,
+                        tm.codec, tm.bitrate_kbps, tm.bitrate_mode
                  FROM track t
                  JOIN media_entry me ON me.id = t.id
                  LEFT JOIN track_meta tm ON tm.track_id = t.id
@@ -4848,7 +4922,7 @@ pub async fn get_track_queue_items(
             .fetch_optional(pool)
             .await
             .map_err(|e| e.to_string())?;
-        let Some((title, rel, runtime, artist_name, library_id, album_title, album_id, album_artist_id, is_loose, loved, album_folder, album_selected_cover)) = row else {
+        let Some((title, rel, runtime, artist_name, library_id, album_title, album_id, album_artist_id, is_loose, loved, album_folder, album_selected_cover, codec, bitrate_kbps, bitrate_mode)) = row else {
             continue;
         };
         // Playlists are single-library, so the maps resolve once in practice.
@@ -4895,6 +4969,9 @@ pub async fn get_track_queue_items(
             file_path: resolve_music_path(pool, &library_id, &rel).await?,
             duration_secs: runtime,
             loved: loved != 0,
+            codec,
+            bitrate_kbps,
+            bitrate_mode,
         });
     }
     Ok(out)
@@ -5221,7 +5298,7 @@ mod tests {
             duration_secs: 180,
             codec: "flac".to_string(),
             bitrate_kbps: None,
-            sample_rate_hz: None,
+            sample_rate_hz: None, bitrate_mode: None,
             mb_recording_id: None,
             mb_release_id: None,
             mb_release_group_id: rg_mbid.map(|s| s.to_string()),
@@ -5318,7 +5395,7 @@ mod tests {
             duration_secs: 180,
             codec: "flac".to_string(),
             bitrate_kbps: None,
-            sample_rate_hz: None,
+            sample_rate_hz: None, bitrate_mode: None,
             mb_recording_id: None,
             mb_release_id: None,
             mb_release_group_id: None,
@@ -5700,7 +5777,7 @@ mod tests {
                 duration_secs: 180,
                 codec: "flac".to_string(),
                 bitrate_kbps: None,
-                sample_rate_hz: None,
+                sample_rate_hz: None, bitrate_mode: None,
                 mb_recording_id: None,
                 mb_release_id: None,
                 mb_release_group_id: None,

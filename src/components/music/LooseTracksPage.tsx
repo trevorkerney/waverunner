@@ -15,6 +15,7 @@ import { MoveToCollectionDialog } from "./MoveToCollectionDialog";
 import { PlayingIndicator } from "./PlayingIndicator";
 import { LoveButton, LoveMenuItem } from "./LoveButton";
 import { RevealMenuItem } from "./RevealMenuItem";
+import { CodecBadge } from "./CodecBadge";
 import { LibraryTrackRow, MusicQueueItem } from "../../types";
 import { fmtTrackTime, fmtAlbumRuntime, trackDisplayTitle } from "./musicQueue";
 
@@ -265,6 +266,7 @@ export function LooseTracksPage({
                   </span>
                 )}
                 <LoveButton trackId={t.id} loved={t.loved} reveal="group-hover:opacity-100" />
+                <CodecBadge codec={t.codec} bitrate={t.bitrate_kbps} mode={t.bitrate_mode} />
                 <span className="w-12 shrink-0 text-right font-mono text-xs text-muted-foreground">
                   {fmtTrackTime(t.runtime_secs)}
                 </span>

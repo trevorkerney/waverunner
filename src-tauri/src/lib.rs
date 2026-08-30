@@ -4,6 +4,7 @@ mod db;
 pub mod interactive;
 mod interactive_session;
 mod watch;
+mod mp3_frames;
 mod mpv;
 mod music;
 mod music_art;

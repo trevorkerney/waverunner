@@ -16,6 +16,7 @@ import { MatchDialog } from "./MatchDialog";
 import { PlayingIndicator } from "./PlayingIndicator";
 import { LoveButton, LoveMenuItem } from "./LoveButton";
 import { RevealMenuItem } from "./RevealMenuItem";
+import { CodecBadge } from "./CodecBadge";
 import { MediaEntry, MusicQueueItem, TrackQueueInfo } from "../../types";
 import { fmtTrackTime, trackDisplayTitle } from "./musicQueue";
 import { useDeselectOnBackgroundClick } from "./useTrackSelection";
@@ -332,6 +333,7 @@ export function PlaylistTrackList({
                 </span>
               )}
               <LoveButton trackId={e.id} loved={info?.loved ?? false} reveal="group-hover/track:opacity-100" />
+              <CodecBadge codec={info?.codec} bitrate={info?.bitrate_kbps} mode={info?.bitrate_mode} />
               <span className="w-10 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
                 {fmtTrackTime(info?.duration_secs ?? null)}
               </span>

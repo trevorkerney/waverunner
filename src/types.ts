@@ -241,6 +241,11 @@ export interface MusicTrack {
   loved: boolean;
   /** Main artist(s) first, then features — no "feat." framing. */
   credits: MusicCredit[];
+  /** Codec badge facts: lofty file type lowercased ("flac", "mpeg", "aac"…),
+   *  measured average kbps, and for MP3 the frame-read "cbr"/"vbr". */
+  codec: string | null;
+  bitrate_kbps: number | null;
+  bitrate_mode: string | null;
 }
 
 // One owned version of an album (our release = MusicBrainz "release";
@@ -311,6 +316,9 @@ export interface LibraryTrackRow {
   play_count: number;
   loved: boolean;
   credits: MusicCredit[];
+  codec: string | null;
+  bitrate_kbps: number | null;
+  bitrate_mode: string | null;
 }
 
 // Backend row from get_track_queue_items — everything needed to build a
@@ -328,6 +336,9 @@ export interface TrackQueueInfo {
   file_path: string;
   duration_secs: number | null;
   loved: boolean;
+  codec: string | null;
+  bitrate_kbps: number | null;
+  bitrate_mode: string | null;
 }
 
 // One card on the Home hub's continue-watching rail (get_continue_watching).

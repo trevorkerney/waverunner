@@ -369,7 +369,7 @@ export function CreateLibraryDialog({
       setLibraryName(mode.name);
       if (mode.kind === "match") {
         void (async () => {
-          await enterMatch(mode.libraryId);
+          await enterMatch(mode.libraryId, false);
           setMatchPhase("running");
           try {
             await invoke("music_match_begin", { libraryId: mode.libraryId });
@@ -439,7 +439,12 @@ export function CreateLibraryDialog({
     resetForm();
   }
 
-  async function enterMatch(libId: string) {
+  // skipIfIdle: with nothing for a pass to check, skip the elect screen and
+  // land on review. Off for the center-triggered "run a pass" route — that
+  // caller starts the pass the moment this returns (its work is the queued
+  // pending_pass rows, which the unchecked counts don't see), and the wizard
+  // must be sitting on the match step to show it.
+  async function enterMatch(libId: string, skipIfIdle = true) {
     // Per-library opt-out: with online metadata off there IS no match step —
     // the wizard is done once the scan is. Checked here (not at the callers)
     // so every route in — create, rescan, resume-at-match — honors it.
@@ -473,7 +478,7 @@ export function CreateLibraryDialog({
       // center-triggered pass may be live): show its progress instead.
       if (ms.running) {
         setMatchPhase("running");
-      } else if (ms.unchecked === 0 && ms.unchecked_artists === 0) {
+      } else if (skipIfIdle && ms.unchecked === 0 && ms.unchecked_artists === 0) {
         // Nothing for a pass to do — the elect screen would only offer a
         // disabled Start, so go straight to review.
         await enterReview(libId);

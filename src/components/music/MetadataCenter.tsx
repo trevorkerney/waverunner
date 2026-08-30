@@ -2143,16 +2143,31 @@ export function MetadataCenter({
                   : "matches"}{" "}
               waiting for a matching pass — it identifies the artists their credits prove
             </p>
+            {/* Locked while quick wins drain: the pass would walk the very
+                artists mid-merge, and a button that stays live beside a
+                busy list is a misclick waiting to happen. */}
             <Button
               size="sm"
               variant="outline"
               className="shrink-0 gap-1.5"
-              disabled={busy || running || pending.length > 0}
-              title={pending.length > 0 ? "Staged changes need a rescan first" : undefined}
+              disabled={busy || running || pending.length > 0 || quickDraining}
+              title={
+                pending.length > 0
+                  ? "Staged changes need a rescan first"
+                  : quickDraining
+                    ? "Queued quick wins are still applying"
+                    : undefined
+              }
               onClick={rerunMatching}
             >
               <RefreshCw size={13} />
-              {pending.length > 0 ? "Rescan first" : running ? "Pass running…" : "Run pass now"}
+              {pending.length > 0
+                ? "Rescan first"
+                : running
+                  ? "Pass running…"
+                  : quickDraining
+                    ? "Waiting for queue…"
+                    : "Run pass now"}
             </Button>
           </div>
           {/* Same height cap as the staged banner — the queue can hold every
@@ -2345,16 +2360,21 @@ export function MetadataCenter({
                   Quick wins ({quickWins.length}) — click to queue, then apply
                 </h4>
                 {(queuedQuickKeys.size > 0 || quickDraining) && (
+                  // The mirror lock: no draining while a pass walks the same
+                  // artists. Staging (clicking rows) stays open meanwhile.
                   <Button
                     size="sm"
                     className="ml-auto shrink-0 gap-1.5"
-                    disabled={quickDraining}
+                    disabled={quickDraining || running}
+                    title={running && !quickDraining ? "A matching pass is running" : undefined}
                     onClick={applyQueuedQuickWins}
                   >
                     {quickDraining && <Spinner className="size-3" />}
                     {quickDraining
                       ? `Applying ${Math.min(doneQuickKeys.size + 1, doneQuickKeys.size + queuedQuickKeys.size + 1)} of ${doneQuickKeys.size + queuedQuickKeys.size + 1}…`
-                      : `Apply ${queuedQuickKeys.size} queued`}
+                      : running
+                        ? `Wait for pass… (${queuedQuickKeys.size} queued)`
+                        : `Apply ${queuedQuickKeys.size} queued`}
                   </Button>
                 )}
               </div>
@@ -2511,12 +2531,24 @@ export function MetadataCenter({
                 size="sm"
                 variant="outline"
                 className="shrink-0 gap-1.5"
-                disabled={busy || running || pending.length > 0}
-                title={pending.length > 0 ? "Staged changes need a rescan first" : undefined}
+                disabled={busy || running || pending.length > 0 || quickDraining}
+                title={
+                  pending.length > 0
+                    ? "Staged changes need a rescan first"
+                    : quickDraining
+                      ? "Queued quick wins are still applying"
+                      : undefined
+                }
                 onClick={rerunMatching}
               >
                 <RefreshCw size={13} />
-                {pending.length > 0 ? "Rescan first" : running ? "Pass running…" : "Run pass now"}
+                {pending.length > 0
+                  ? "Rescan first"
+                  : running
+                    ? "Pass running…"
+                    : quickDraining
+                      ? "Waiting for queue…"
+                      : "Run pass now"}
               </Button>
             </div>
           )}

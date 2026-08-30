@@ -563,6 +563,15 @@ const MIGRATIONS: &[Migration] = &[
             )",
         ],
     },
+    Migration {
+        id: 31,
+        app_version: "1.0.0-alpha.12.5",
+        description: "track_meta.bitrate_mode — MP3 CBR/VBR verdict read from the frames",
+        requires_table: Some("track_meta"),
+        // 'cbr' | 'vbr' for MP3s (mp3_frames samples the frame headers), NULL
+        // for every other codec and until the next rescan stamps it.
+        statements: &["ALTER TABLE track_meta ADD COLUMN bitrate_mode TEXT"],
+    },
 ];
 
 /// Copy the database beside itself before the first migration of a run
@@ -1363,6 +1372,7 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             codec TEXT,
             bitrate_kbps INTEGER,
             sample_rate_hz INTEGER,
+            bitrate_mode TEXT,
             FOREIGN KEY (track_id) REFERENCES track(id) ON DELETE CASCADE
         )",
     )
