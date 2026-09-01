@@ -95,7 +95,7 @@ export function CombineSelectedDialog({
 
   return (
     <Dialog open={configuring} onOpenChange={(o) => !busy && onOpenChange(o)}>
-      <DialogContent className="sm:max-w-md">
+      <DialogContent className="sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>Combine {picked.length} albums</DialogTitle>
           <DialogDescription>
@@ -104,12 +104,15 @@ export function CombineSelectedDialog({
           </DialogDescription>
         </DialogHeader>
 
-        <div className="flex flex-col gap-3">
-          <div>
+        {/* min-w-0 everywhere down the chain: DialogContent is a grid, and a
+            grid item's default min-width:auto lets one unbreakable title
+            widen the whole dialog past its max-w instead of truncating. */}
+        <div className="flex min-w-0 flex-col gap-3">
+          <div className="min-w-0">
             <p className="mb-1 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
               Keep the info of
             </p>
-            <div className="flex max-h-56 flex-col gap-0.5 overflow-y-auto">
+            <div className="flex max-h-56 min-w-0 flex-col gap-0.5 overflow-y-auto">
               {picked.map((a) => {
                 const meta = byId(a.id);
                 // Everything the surviving card would take from this pick:

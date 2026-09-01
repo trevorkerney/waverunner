@@ -4435,6 +4435,36 @@ fn credit_view(name: String, artist_id: Option<i64>, titles: &HashMap<i64, Strin
 pub(crate) async fn resolve_credit_ids(pool: &SqlitePool, library_id: &str) -> Result<(), String> {
     let (by_lower, _) = artist_resolution_maps(pool, library_id).await?;
 
+    // Exact-name misses fall back to the punctuation-blind key — MusicBrainz
+    // harvests write typographic punctuation ("E‐40" with U+2010, curly
+    // apostrophes) that never string-equals the ASCII-tagged page, leaving
+    // the credit unlinked and the page starving toward the orphan sweep.
+    // UNIQUE key hits only (same rule as clusters and the split pre-fill):
+    // a key shared by two different artists proves nothing and links nothing.
+    let mut by_key: HashMap<String, Option<i64>> = HashMap::new();
+    for (name, id) in by_lower.iter() {
+        let key = credit_name_key(name);
+        if key.is_empty() {
+            continue;
+        }
+        match by_key.entry(key) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(Some(*id));
+            }
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                if *e.get() != Some(*id) {
+                    e.insert(None); // ambiguous — never link through this key
+                }
+            }
+        }
+    }
+    let resolve = |name: &str| -> Option<i64> {
+        by_lower
+            .get(&name.to_lowercase())
+            .copied()
+            .or_else(|| by_key.get(&credit_name_key(name)).copied().flatten())
+    };
+
     // ONE transaction for every write. On a fresh create this pass stamps
     // every credit row in the library (~thousands), and each autocommit
     // statement costs SQLite a journal sync — several thousand fsyncs made
@@ -4452,7 +4482,7 @@ pub(crate) async fn resolve_credit_ids(pool: &SqlitePool, library_id: &str) -> R
     .await
     .map_err(|e| e.to_string())?;
     for (track_id, position, name, stored) in track_rows {
-        let resolved = by_lower.get(&name.to_lowercase()).copied();
+        let resolved = resolve(&name);
         if resolved != stored {
             sqlx::query("UPDATE track_credit SET artist_id = ? WHERE track_id = ? AND position = ?")
                 .bind(resolved)
@@ -4473,7 +4503,7 @@ pub(crate) async fn resolve_credit_ids(pool: &SqlitePool, library_id: &str) -> R
     .await
     .map_err(|e| e.to_string())?;
     for (album_id, position, name, stored) in album_rows {
-        let resolved = by_lower.get(&name.to_lowercase()).copied();
+        let resolved = resolve(&name);
         if resolved != stored {
             sqlx::query(
                 "UPDATE album_artist_credit SET artist_id = ? WHERE album_id = ? AND position = ?",

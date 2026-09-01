@@ -9,6 +9,10 @@
 
 ## bugs / needs fixing
 
+tracks search needs improving. ALL MUSIC SEARCH NEEDS IMRPOVING
+
+give different releases under a release group unique album covers
+
 this may already be in here already but the settings menu is comically narrow for some reason
 
 when scrolling all the way down on people page then scrolling back up relatively quickly, the app fairly reliably freezes to the point where I have to close it in task manager. im assuming because theres so many or something, idk. theres 14.8K people in my library
@@ -112,6 +116,8 @@ display images (png, jpg, webp, gif, etc) in extras, alongside the video extras 
 
 
 ## new features
+
+EQUALIZER
 
 multi track player - play multiple audio tracks (and a video track if desired) at the same time. multi track player should have entire UI for controlling multiple playing tracks at once
 

@@ -114,6 +114,11 @@ interface MbAlbumRow {
   /** User declared the album deliberately partial — missing release tracks
    *  are expected and stop surfacing/counting. */
   partial: boolean;
+  /** Version counts: state 'release' now means EVERY version is resolved
+   *  (pinned or declared); the map shows resolved/releases on multi-version
+   *  cards so a half-pinned card can't read as done. */
+  releases: number;
+  resolved_releases: number;
 }
 
 interface MbChange {
@@ -1080,7 +1085,7 @@ function AlbumRow({
         ) : a.state === "album" ? (
           <>
             <TriangleAlert size={12} className="-translate-y-px" />
-            Pick release
+            {a.releases > 1 ? `Pick releases · ${a.resolved_releases}/${a.releases}` : "Pick release"}
           </>
         ) : (
           <>
@@ -2275,6 +2280,37 @@ export function MetadataCenter({
                   </li>
                 </ul>
               </div>
+              <div>
+                <p className="mb-1 font-medium text-foreground">
+                  Some things only a retag can fix — tags are the source of truth:
+                </p>
+                <ul className="list-disc space-y-0.5 pl-4">
+                  <li>
+                    <span className="text-foreground">Album membership</span> — which album a track
+                    belongs to IS its ALBUM tag. Moving a track between albums, or making it a
+                    loose track (clear the ALBUM tag), happens in the files.
+                  </li>
+                  <li>
+                    <span className="text-foreground">How albums group</span> — same artist + album
+                    tags = one album; different = separate. Two different works sharing one name,
+                    or one work split across mismatched tags, are tag edits.
+                  </li>
+                  <li>
+                    <span className="text-foreground">A wrong name on specific files</span> — a
+                    label or junk string in the artist tag of one rip. Alias is a permanent
+                    everywhere-rule for real spellings, not a per-file correction.
+                  </li>
+                  <li>
+                    <span className="text-foreground">Anything under File problems</span> —
+                    unreadable or stacked tags are rewritten at the source, then rescanned.
+                  </li>
+                </ul>
+                <p className="mt-1">
+                  Everything else — joint credits (Split), spellings (Alias), identities (Persona),
+                  one album in several editions (Combine), credits and dates (matching) — is
+                  handled here and survives every rescan.
+                </p>
+              </div>
               <p>
                 After a batch of decisions, run the pass — it cashes them in, harvesting credits
                 and identifying feature artists, and often clears more than you clicked.
@@ -2411,7 +2447,7 @@ export function MetadataCenter({
             </span>
             <span className="flex items-center gap-1.5">
               <span className="inline-block h-3 w-4 rounded-sm border border-amber-500/60 bg-amber-500/10" />
-              album matched, release unmatched
+              album matched, releases unresolved (· n/m on multi-version cards)
             </span>
             <span className="flex items-center gap-1.5">
               <span className="inline-block h-3 w-4 rounded-sm border border-red-500/60" />
@@ -2496,6 +2532,12 @@ export function MetadataCenter({
                         }
                       >
                         {al.title}
+                        {/* Multi-version cards say how much of the release
+                            stage is done — amber with 1/3 instead of a green
+                            that rounds up. */}
+                        {al.releases > 1 && !al.ignored && (
+                          <span className="opacity-75"> · {al.resolved_releases}/{al.releases}</span>
+                        )}
                       </ContextMenuTrigger>
                       <ContextMenuContent>
                         {stagedLockedIds.has(al.album_id) ? (
@@ -2550,6 +2592,12 @@ export function MetadataCenter({
                         }
                       >
                         {al.title}
+                        {/* Multi-version cards say how much of the release
+                            stage is done — amber with 1/3 instead of a green
+                            that rounds up. */}
+                        {al.releases > 1 && !al.ignored && (
+                          <span className="opacity-75"> · {al.resolved_releases}/{al.releases}</span>
+                        )}
                       </ContextMenuTrigger>
                       <ContextMenuContent>
                         {stagedLockedIds.has(al.album_id) ? (

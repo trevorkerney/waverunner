@@ -4119,6 +4119,11 @@ pub struct MbAlbumRow {
     /// (release tracks the library doesn't hold) are expected: they stop
     /// counting and stop surfacing in Track lists differ.
     pub partial: bool,
+    /// Version counts: `state == "release"` requires EVERY release resolved
+    /// (pinned or declared-none); the map renders resolved/releases on
+    /// multi-version cards so a half-pinned card can't read as done.
+    pub releases: i64,
+    pub resolved_releases: i64,
 }
 
 /// Artists and where they stand. An artist's MusicBrainz id only ever comes
@@ -4201,6 +4206,38 @@ pub async fn mb_get_review(state: State<'_, AppState>, library_id: String) -> Re
             payload: serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null),
         })
         .collect();
+    // A suggestion whose subject entity was deleted (keep-artist swept as an
+    // orphan, album dissolved by a combine) is unanswerable — purge it here
+    // rather than render a card pointing at a ghost. Read time is the one
+    // chokepoint every deletion path funnels through.
+    let mut dead: Vec<i64> = Vec::new();
+    for s in suggestions.iter() {
+        let subject = match s.kind.as_str() {
+            "artist_merge" => s.payload["keep_id"].as_i64(),
+            "artist_match" | "artist_split" => s.payload["artist_id"].as_i64(),
+            "album_match" => s.payload["album_id"].as_i64(),
+            _ => None,
+        };
+        let Some(id) = subject else { continue };
+        let alive: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM media_entry WHERE id = ?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        if alive.is_none() {
+            dead.push(s.id);
+        }
+    }
+    if !dead.is_empty() {
+        for id in &dead {
+            sqlx::query("DELETE FROM mb_suggestion WHERE id = ?")
+                .bind(id)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        suggestions.retain(|s| !dead.contains(&s.id));
+    }
     // "Which artist is this?" cards get an "In your library:" line — WHERE the
     // artist is credited, which is what jogs the memory for a feature-only
     // name nobody recognizes cold. Computed at read time, not stored: the
@@ -4313,11 +4350,22 @@ pub async fn mb_get_review(state: State<'_, AppState>, library_id: String) -> Re
         }
     }
 
-    let album_rows: Vec<(i64, String, String, i64, i64, i64, i64)> = sqlx::query_as(
+    let album_rows: Vec<(i64, String, String, i64, i64, i64, i64, i64, i64)> = sqlx::query_as(
         "SELECT al.id, al.title,
                 CASE
+                  -- 'release' means the WHOLE card is resolved: every version
+                  -- carries a release_match row (a pin, or the declared-none
+                  -- sentinel). A half-pinned multi-version card stays 'album'
+                  -- so the map can't round it up to green.
                   WHEN EXISTS (SELECT 1 FROM release_match rm
-                               WHERE rm.album_id = al.id) THEN 'release'
+                               WHERE rm.album_id = al.id)
+                       AND NOT EXISTS (SELECT 1 FROM album_release ar
+                                       WHERE ar.album_id = al.id
+                                         AND NOT EXISTS (SELECT 1 FROM release_match rm2
+                                                         WHERE rm2.album_id = al.id
+                                                           AND rm2.folder_path = ar.folder_path COLLATE NOCASE)) THEN 'release'
+                  WHEN EXISTS (SELECT 1 FROM release_match rm
+                               WHERE rm.album_id = al.id) THEN 'album'
                   WHEN EXISTS (SELECT 1 FROM field_override o
                                WHERE o.entity_id = al.id AND o.field = 'mb_release_group_id'
                                  AND o.value IS NOT NULL AND o.value <> '') THEN 'album'
@@ -4325,6 +4373,11 @@ pub async fn mb_get_review(state: State<'_, AppState>, library_id: String) -> Re
                                WHERE f.album_id = al.id) THEN 'notfound'
                   ELSE 'unchecked'
                 END,
+                (SELECT COUNT(*) FROM album_release ar WHERE ar.album_id = al.id),
+                (SELECT COUNT(*) FROM album_release ar WHERE ar.album_id = al.id
+                   AND EXISTS (SELECT 1 FROM release_match rm3
+                               WHERE rm3.album_id = al.id
+                                 AND rm3.folder_path = ar.folder_path COLLATE NOCASE)),
                 COALESCE((SELECT SUM(side = 'ours') FROM album_match_gap g WHERE g.album_id = al.id), 0),
                 -- A declared-partial album EXPECTS mb-side gaps (tracks the
                 -- release has, the library deliberately doesn't) — they stop
@@ -4351,20 +4404,26 @@ pub async fn mb_get_review(state: State<'_, AppState>, library_id: String) -> Re
     .map_err(|e| e.to_string())?;
     let albums = album_rows
         .into_iter()
-        .map(|(album_id, title, state, gap_ours, gap_mb, ignored, partial)| MbAlbumRow {
-            album_id,
-            title,
-            artist_title: credit_names
-                .remove(&album_id)
-                .map(|names| names.join(" · "))
-                .filter(|s| !s.is_empty()),
-            state,
-            gap_ours,
-            gap_mb,
-            artist_ids: credit_ids.remove(&album_id).unwrap_or_default(),
-            ignored: ignored != 0,
-            partial: partial != 0,
-        })
+        .map(
+            |(album_id, title, state, releases, resolved_releases, gap_ours, gap_mb, ignored, partial)| {
+                MbAlbumRow {
+                    album_id,
+                    title,
+                    artist_title: credit_names
+                        .remove(&album_id)
+                        .map(|names| names.join(" · "))
+                        .filter(|s| !s.is_empty()),
+                    state,
+                    gap_ours,
+                    gap_mb,
+                    artist_ids: credit_ids.remove(&album_id).unwrap_or_default(),
+                    ignored: ignored != 0,
+                    partial: partial != 0,
+                    releases,
+                    resolved_releases,
+                }
+            },
+        )
         .collect();
 
     // An artist identified before ids were stored durably still carries one on
