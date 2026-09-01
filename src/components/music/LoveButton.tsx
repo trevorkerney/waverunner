@@ -59,11 +59,14 @@ export function LoveButton({
   trackId,
   loved,
   reveal = "",
+  className = "",
 }: {
   trackId: number;
   loved: boolean;
   /** Host row's hover-reveal class for the unloved state, e.g. "group-hover/track:opacity-100". */
   reveal?: string;
+  /** Always-applied extras (spacing etc.) — unlike `reveal`, survives the loved state. */
+  className?: string;
 }) {
   const on = useLoved(trackId, loved);
   return (
@@ -76,7 +79,7 @@ export function LoveButton({
         setTrackLoved(trackId, !on);
       }}
       onDoubleClick={(e) => e.stopPropagation()}
-      className={`shrink-0 cursor-pointer transition-colors ${
+      className={`shrink-0 cursor-pointer transition-colors ${className} ${
         on
           ? "text-rose-500 hover:text-rose-400"
           : `text-muted-foreground/60 opacity-0 hover:text-rose-400 ${reveal}`

@@ -173,6 +173,26 @@ pub(crate) async fn reapply_album_overrides(
     pool: &SqlitePool,
     album_id: i64,
 ) -> Result<(), String> {
+    // MB's adopted ORIGINAL date lives at mb tier and re-stomps after every
+    // tag rebuild, exactly like user overrides — which are applied below and
+    // win when both exist. Empty value = "group has no date" marker: skip.
+    let mb_date: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT value FROM field_override WHERE entity_id = ? AND field = 'release_date' AND tier = 'mb'",
+    )
+    .bind(album_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    if let Some((Some(d),)) = mb_date {
+        if !d.is_empty() {
+            sqlx::query("UPDATE album SET release_date = ? WHERE id = ?")
+                .bind(&d)
+                .bind(album_id)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
     let overrides = user_overrides(pool, album_id).await?;
     if overrides.is_empty() {
         return Ok(());
@@ -626,9 +646,14 @@ pub async fn resolve_artist_choices(
             out.push(None);
             continue;
         }
-        // Exact match only — a split member is a specific artist, and a fuzzy
-        // hit here would silently attach albums to the wrong page.
-        let row: Option<(i64, String, Option<String>, String, i64)> = sqlx::query_as(
+        // Exact title first; else a punctuation-blind key match — the same
+        // identity rule the lookalike/cluster machinery uses, so a tag's
+        // straight-apostrophe "O'Donnell" finds the MB-canonical curly
+        // "O’Donnell" page instead of offering to create a duplicate. Key
+        // hits count only when UNIQUE: a split member is a specific artist,
+        // and an ambiguous fuzzy hit would silently attach albums to the
+        // wrong page.
+        let mut row: Option<(i64, String, Option<String>, String, i64)> = sqlx::query_as(
             "SELECT a.id, a.title, a.selected_cover, a.folder_path,
                     (SELECT COUNT(*) FROM album_artist_credit c WHERE c.artist_id = a.id)
              FROM artist a
@@ -642,6 +667,30 @@ pub async fn resolve_artist_choices(
         .fetch_optional(pool)
         .await
         .map_err(|e| e.to_string())?;
+        if row.is_none() {
+            let key = crate::music::credit_name_key(trimmed);
+            if !key.is_empty() {
+                let all: Vec<(i64, String, Option<String>, String, i64)> = sqlx::query_as(
+                    "SELECT a.id, a.title, a.selected_cover, a.folder_path,
+                            (SELECT COUNT(*) FROM album_artist_credit c WHERE c.artist_id = a.id)
+                     FROM artist a
+                     JOIN media_entry me ON me.id = a.id
+                     WHERE me.library_id = ?1 AND a.id != ?2",
+                )
+                .bind(&library_id)
+                .bind(artist_id)
+                .fetch_all(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+                let mut hits = all
+                    .into_iter()
+                    .filter(|(_, title, _, _, _)| crate::music::credit_name_key(title) == key);
+                let first = hits.next();
+                if hits.next().is_none() {
+                    row = first;
+                }
+            }
+        }
 
         match row {
             Some((id, title, selected, folder, release_count)) => {
@@ -805,6 +854,55 @@ pub async fn set_release_label(
         .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Name (or clear the name of) one disc of a release — "Disc 2 — Mars".
+/// Folder-keyed pref overlaying the tag-derived subtitle; empty clears back
+/// to whatever the tags say. Instant and unlogged, same contract as release
+/// labels.
+#[tauri::command]
+pub async fn set_disc_title(
+    state: State<'_, AppState>,
+    release_id: i64,
+    disc_no: i64,
+    title: String,
+) -> Result<(), String> {
+    let pool = &state.app_db;
+    let row: Option<(i64, String)> =
+        sqlx::query_as("SELECT album_id, folder_path FROM album_release WHERE id = ?")
+            .bind(release_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    let Some((album_id, folder)) = row else {
+        return Err("Release not found".to_string());
+    };
+    let title = title.trim().to_string();
+    if title.is_empty() {
+        sqlx::query(
+            "DELETE FROM disc_title_pref WHERE album_id = ? AND folder_path = ? AND disc_no = ?",
+        )
+        .bind(album_id)
+        .bind(&folder)
+        .bind(disc_no)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    } else {
+        sqlx::query(
+            "INSERT INTO disc_title_pref (album_id, folder_path, disc_no, title)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(album_id, folder_path, disc_no) DO UPDATE SET title = excluded.title",
+        )
+        .bind(album_id)
+        .bind(&folder)
+        .bind(disc_no)
+        .bind(&title)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -1485,6 +1583,12 @@ pub struct CombineAlbumInfo {
     /// Owning artist — two same-titled albums are otherwise indistinguishable.
     pub artist: Option<String>,
     pub track_count: i64,
+    /// What picking this album as keeper KEEPS: its year, genres, and cover
+    /// survive alongside the title — the dialog shows them per option.
+    pub year: Option<String>,
+    pub genres: Vec<String>,
+    /// Display cover (cached path), for the option row's thumbnail.
+    pub cover: Option<String>,
     pub editions: Vec<CombineEdition>,
 }
 
@@ -1496,20 +1600,49 @@ pub async fn get_combine_info(
     let pool = &state.app_db;
     let mut out = Vec::with_capacity(album_ids.len());
     for id in album_ids {
-        let Some((title, artist)) = sqlx::query_as::<_, (String, Option<String>)>(
-            "SELECT al.title,
-                    (SELECT ac.name FROM album_artist_credit ac
-                     WHERE ac.album_id = al.id ORDER BY ac.position LIMIT 1)
-             FROM album al
-             WHERE al.id = ?",
-        )
-        .bind(id)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| e.to_string())?
+        let Some((title, artist, library_id, folder_path, selected_cover, release_date)) =
+            sqlx::query_as::<_, (String, Option<String>, String, String, Option<String>, Option<String>)>(
+                "SELECT al.title,
+                        (SELECT GROUP_CONCAT(name, ' · ') FROM (
+                             SELECT ac.name FROM album_artist_credit ac
+                             WHERE ac.album_id = al.id ORDER BY ac.position)),
+                        me.library_id, al.folder_path, al.selected_cover, al.release_date
+                 FROM album al
+                 JOIN media_entry me ON me.id = al.id
+                 WHERE al.id = ?",
+            )
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?
         else {
             continue; // vanished mid-selection (rescan) — just drop it
         };
+        let genres: Vec<String> = sqlx::query_as::<_, (String,)>(
+            "SELECT g.name FROM genre g JOIN album_genre ag ON ag.genre_id = g.id
+             WHERE ag.album_id = ? ORDER BY g.name",
+        )
+        .bind(id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|(n,)| n)
+        .collect();
+        // Display cover: the selected one when still cached, else the first.
+        let covers: Vec<(String,)> = sqlx::query_as(
+            "SELECT cached_path FROM cached_images
+             WHERE library_id = ? AND entry_folder_path = ? AND image_type = 'cover'
+             ORDER BY source_filename",
+        )
+        .bind(&library_id)
+        .bind(&folder_path)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        let cover = selected_cover
+            .filter(|s| covers.iter().any(|(c,)| c == s))
+            .or_else(|| covers.first().map(|(c,)| c.clone()));
         let (track_count,): (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM media_entry WHERE parent_id = ?")
                 .bind(id)
@@ -1531,6 +1664,11 @@ pub async fn get_combine_info(
             title,
             artist,
             track_count,
+            year: release_date
+                .map(|d| d.chars().take(4).collect::<String>())
+                .filter(|s| !s.is_empty()),
+            genres,
+            cover,
             editions: rows
                 .into_iter()
                 .map(|(release_id, label, folder_path, is_default, track_count)| CombineEdition {
@@ -1730,17 +1868,31 @@ pub async fn combine_albums_multi(
                 "\"{tgt_name}\" is already combined into \"{src_name}\" — undo that first"
             ));
         }
-        // Chains don't resolve (every source is pulled out before any fold, so
-        // a middle album is never there to receive), so refuse them outright.
-        if existing.iter().any(|(sa, st, _, _)| *sa == tgt_artist && *st == tgt_title) {
-            return Err(format!(
-                "\"{tgt_name}\" is itself combined into another album — undo that first, or keep that album instead"
-            ));
-        }
-        if existing.iter().any(|(_, _, ta, tt)| *ta == src_artist && *tt == src_title) {
-            return Err(format!(
-                "\"{src_name}\" has other albums combined into it — undo those first"
-            ));
+        // Chains apply leaf-first at rescan (combine_apply_order): a source
+        // with albums combined INTO it, or a target combined into something
+        // else, is fine. Only a LOOP can never resolve — refuse the directive
+        // when the target already reaches the source through the directives
+        // on file.
+        {
+            let start = (tgt_artist.clone(), tgt_title.clone());
+            let mut seen: std::collections::HashSet<(String, String)> =
+                std::iter::once(start.clone()).collect();
+            let mut frontier = vec![start];
+            while let Some(node) = frontier.pop() {
+                if node.0 == src_artist && node.1 == src_title {
+                    return Err(format!(
+                        "Combining \"{src_name}\" into \"{tgt_name}\" would loop the combines on file — undo one of them first"
+                    ));
+                }
+                for (sa, st, ta, tt) in existing.iter() {
+                    if *sa == node.0 && *st == node.1 {
+                        let next = (ta.clone(), tt.clone());
+                        if seen.insert(next.clone()) {
+                            frontier.push(next);
+                        }
+                    }
+                }
+            }
         }
         directives.push((src_artist, src_title, src_name));
         staged_source_ids.push(*src);
@@ -1794,8 +1946,13 @@ pub async fn combine_albums_multi(
         "album_combine",
         "",
         // source_album_ids: the entries this staging DISSOLVES (they fold
-        // into the target on rescan) — the UI locks them.
-        &serde_json::json!({ "ids": directive_ids, "source_album_ids": staged_source_ids }),
+        // into the target on rescan); target_album_id: the keeper, equally
+        // frozen — one album, one pending fate. The UI locks both sides.
+        &serde_json::json!({
+            "ids": directive_ids,
+            "source_album_ids": staged_source_ids,
+            "target_album_id": target_id,
+        }),
         &format!(
             "Combine {} into \u{201c}{tgt_name}\u{201d}{}",
             combined.join(", "),
@@ -1812,6 +1969,8 @@ pub async fn combine_albums_multi(
 
 /// Is this entity frozen by a staged rescan action? True for split-source
 /// artists and combine-source albums (both DISSOLVE when the rescan applies),
+/// for combine TARGETS (the keeper's track list is about to be rewritten —
+/// letting it join a second combine would stage contradictory fates),
 /// and for albums CREDITED to a staged-split artist — those survive, but
 /// their credit spine is about to be rewritten, so edits wait too. The name
 /// checks cover legacy rows staged before payloads carried entity ids.
@@ -1853,13 +2012,18 @@ pub(crate) async fn is_staged_for_rescan(
                     split_targets.push(target);
                 }
             }
-            "album_combine" => combine_source_ids.extend(
-                p["source_album_ids"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|v| v.as_i64()),
-            ),
+            "album_combine" => {
+                combine_source_ids.extend(
+                    p["source_album_ids"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|v| v.as_i64()),
+                );
+                // The keeper is frozen too — combining it into (or under)
+                // anything else would stage a second, contradictory fate.
+                combine_source_ids.extend(p["target_album_id"].as_i64());
+            }
             _ => {}
         }
     }
@@ -1997,6 +2161,8 @@ pub async fn get_pending_changes(
                     .into_iter()
                     .flatten()
                     .filter_map(|v| v.as_i64())
+                    // The keeper locks alongside its sources.
+                    .chain(p["target_album_id"].as_i64())
                     .collect(),
                 _ => Vec::new(),
             };

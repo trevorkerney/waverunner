@@ -1670,21 +1670,22 @@ pub async fn get_entries(
                 counts_by_artist.entry(artist_id).or_default().push((album_type, n));
             }
             // Feature credits on other artists' albums ("appears on N") — the
-            // whole subtitle for feature-only artists.
+            // whole subtitle for feature-only artists. Credit rows carry
+            // stamped artist_ids (resolve_credit_ids), so this joins by id —
+            // the old LOWER(name)=LOWER(name) join couldn't use an index and
+            // cost ~3s on a 481-artist library for identical results.
             let appears_rows: Vec<(i64, i64)> = sqlx::query_as(
                 "SELECT a.id, COUNT(DISTINCT tme.parent_id) \
                  FROM artist a \
                  JOIN media_entry ame ON ame.id = a.id \
-                 JOIN artist_names an ON an.artist_id = a.id \
-                 JOIN track_credit tc ON LOWER(tc.name) = LOWER(an.name) \
+                 JOIN track_credit tc ON tc.artist_id = a.id \
                  JOIN media_entry tme ON tme.id = tc.track_id AND tme.library_id = ame.library_id \
                  JOIN media_entry alme ON alme.id = tme.parent_id \
                  WHERE ame.library_id = ? \
                    AND NOT EXISTS (SELECT 1 FROM album_artist_credit ac2 \
                                    WHERE ac2.album_id = alme.id \
                                      AND (ac2.artist_id = a.id \
-                                          OR ac2.artist_id IN (SELECT persona_id FROM artist_persona WHERE parent_id = a.id) \
-                                          OR LOWER(ac2.name) IN (SELECT LOWER(name) FROM artist_names WHERE artist_id = a.id))) \
+                                          OR ac2.artist_id IN (SELECT persona_id FROM artist_persona WHERE parent_id = a.id))) \
                    AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = alme.id) \
                    AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = alme.id) \
                  GROUP BY a.id",

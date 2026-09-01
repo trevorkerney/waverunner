@@ -572,6 +572,33 @@ const MIGRATIONS: &[Migration] = &[
         // for every other codec and until the next rescan stamps it.
         statements: &["ALTER TABLE track_meta ADD COLUMN bitrate_mode TEXT"],
     },
+    Migration {
+        id: 32,
+        app_version: "1.0.0-alpha.12.5",
+        description: "named discs — tag-truth disc subtitles + user disc-name prefs",
+        requires_table: Some("album_release"),
+        // Two stores, two lifetimes: release_disc_subtitle is TAG truth
+        // (DISCSUBTITLE/TSST), rebuilt with the release rows it hangs off;
+        // disc_title_pref is the user's rename, folder-keyed so it survives
+        // rescans and overlays the tag value at read time.
+        statements: &[
+            "CREATE TABLE IF NOT EXISTS release_disc_subtitle (
+                release_id INTEGER NOT NULL,
+                disc_no INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                PRIMARY KEY (release_id, disc_no),
+                FOREIGN KEY (release_id) REFERENCES album_release(id) ON DELETE CASCADE
+            )",
+            "CREATE TABLE IF NOT EXISTS disc_title_pref (
+                album_id INTEGER NOT NULL,
+                folder_path TEXT NOT NULL,
+                disc_no INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                PRIMARY KEY (album_id, folder_path, disc_no),
+                FOREIGN KEY (album_id) REFERENCES album(id) ON DELETE CASCADE
+            )",
+        ],
+    },
 ];
 
 /// Copy the database beside itself before the first migration of a run
@@ -1583,6 +1610,33 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             mb_release_id TEXT NOT NULL,
             tier TEXT NOT NULL DEFAULT 'mb',
             PRIMARY KEY (album_id, folder_path),
+            FOREIGN KEY (album_id) REFERENCES album(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // Tag-truth disc names (rebuilt with the release rows they hang off).
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS release_disc_subtitle (
+            release_id INTEGER NOT NULL,
+            disc_no INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            PRIMARY KEY (release_id, disc_no),
+            FOREIGN KEY (release_id) REFERENCES album_release(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // User disc renames — folder-keyed, overlaying the tag value at read.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS disc_title_pref (
+            album_id INTEGER NOT NULL,
+            folder_path TEXT NOT NULL,
+            disc_no INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            PRIMARY KEY (album_id, folder_path, disc_no),
             FOREIGN KEY (album_id) REFERENCES album(id) ON DELETE CASCADE
         )",
     )

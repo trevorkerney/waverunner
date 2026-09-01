@@ -815,6 +815,7 @@ export function CreateLibraryDialog({
                   ["albums", "Albums"],
                   ["artist-ids", "Identify"],
                   ["artist-credits", "Credits"],
+                  ["dates", "Dates"],
                   ["artist-search", "Artists"],
                   ["artist-images", "Images"],
                 ] as const
@@ -1172,7 +1173,9 @@ export function CreateLibraryDialog({
                       ? "Identifying artists from matched albums"
                       : matchProgress?.phase === "artist-credits"
                         ? "Reading album credits on MusicBrainz"
-                        : matchProgress?.phase === "artist-search"
+                        : matchProgress?.phase === "dates"
+                          ? "Fetching original release dates"
+                          : matchProgress?.phase === "artist-search"
                           ? "Searching artists on MusicBrainz"
                           : matchProgress?.phase === "artist-images"
                             ? "Fetching artist images"

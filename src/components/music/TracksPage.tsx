@@ -124,6 +124,12 @@ export const TrackRow = memo(function TrackRow({
             {trackDisplayTitle(t.title, t.file_path)}
           </span>
           {isCurrent && <PlayingIndicator paused={!playing} className="shrink-0" />}
+          <LoveButton
+            trackId={t.id}
+            loved={t.loved}
+            reveal="group-hover/track:opacity-100"
+            className="ml-1.5"
+          />
         </span>
         {(t.credits.length > 0 || t.artist_name) && (
           <span className="block truncate text-xs text-muted-foreground">
@@ -184,9 +190,8 @@ export const TrackRow = memo(function TrackRow({
           t.album_title ?? ""
         )}
       </span>
-      <LoveButton trackId={t.id} loved={t.loved} reveal="group-hover/track:opacity-100" />
       <CodecBadge codec={t.codec} bitrate={t.bitrate_kbps} mode={t.bitrate_mode} />
-      <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
+      <span className="w-12 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
         {fmtTrackTime(t.runtime_secs)}
       </span>
     </div>

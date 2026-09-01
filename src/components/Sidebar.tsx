@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
 import { PendingWorkBadge } from "@/components/music/PendingWork";
-import { Trash2, RefreshCw, FolderPlus, FolderCog, ChevronRight, Sparkles, Pencil, Home, CircleAlert, Music2, Settings2 } from "lucide-react";
+import { Trash2, RefreshCw, FolderPlus, FolderCog, ChevronRight, Sparkles, Pencil, Home, CircleAlert, Music2, Settings2, TriangleAlert } from "lucide-react";
 import { open as openFolderPicker } from "@tauri-apps/plugin-dialog";
 import { Spinner } from "@/components/ui/spinner";
 import {
@@ -440,7 +440,11 @@ export function Sidebar({
               // Unfinished import, nothing running: the wizard is waiting on
               // the user — amber alert in the chevron slot, stage-specific
               // line below. Clicking resumes the wizard where it left off.
-              if (lib.setup_stage || (wizard && wizard.kind !== "create" && wizard.libraryId === lib.id && wizardMinimized)) {
+              // (A minimized RESCAN/MATCH wizard with nothing running does NOT
+              // take this branch: the library's data is consistent again, so
+              // the row stays browsable — a triangle beside the name reopens
+              // the waiting wizard instead.)
+              if (lib.setup_stage) {
                 const stageLine =
                   lib.setup_stage === "review"
                     ? "Ready to review"
@@ -535,6 +539,18 @@ export function Sidebar({
                       <span className="flex min-w-0 flex-1 items-start gap-1">
                         <span className="min-w-0 break-words">{lib.name}</span>
                         {lib.format === "music" && <PendingWorkBadge libraryId={lib.id} />}
+                        {wizard && wizard.kind !== "create" && wizard.libraryId === lib.id && wizardMinimized && (
+                          <span
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setWizardMinimized(false);
+                            }}
+                            title="The rescan wizard is waiting — click to reopen"
+                            className="flex h-5 flex-shrink-0 cursor-pointer items-center"
+                          >
+                            <TriangleAlert size={12} className="text-amber-400 hover:text-amber-300" />
+                          </span>
+                        )}
                       </span>
                     </ContextMenuTrigger>
                     <ContextMenuContent>

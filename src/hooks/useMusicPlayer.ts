@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { MusicQueueItem } from "../types";
+import { MusicQueueItem, TrackQueueInfo } from "../types";
+import { trackDisplayTitle } from "../components/music/musicQueue";
 
 /**
  * Music playback — a second, audio-only mpv instance behind the persistent
@@ -717,6 +718,102 @@ export function useMusicPlayer(): [MusicPlayerState, MusicPlayerActions] {
       }
     })();
   }, [setPosition]);
+
+  // ── Rescan revalidation ────────────────────────────────────────────────────
+  // The queue is a snapshot from enqueue time; a rescan can retitle tracks,
+  // rewrite credits, or leave paths stale (files moved at the source). When a
+  // scan finishes, re-resolve every queued track id: survivors get fresh
+  // fields (title, credits, cover, path), dead rows drop out — except
+  // whatever is PLAYING, which mpv already holds open and keeps.
+  const revalidateQueue = useCallback(async () => {
+    if (!activeRef.current) return;
+    const ids = new Set<number>();
+    queueRef.current.forEach((i) => ids.add(i.trackId));
+    explicitQueueRef.current.forEach((i) => ids.add(i.trackId));
+    originalOrderRef.current?.forEach((i) => ids.add(i.trackId));
+    if (explicitCurrentRef.current) ids.add(explicitCurrentRef.current.trackId);
+    if (ids.size === 0) return;
+    let infos: TrackQueueInfo[];
+    try {
+      infos = await invoke<TrackQueueInfo[]>("get_track_queue_items", { trackIds: [...ids] });
+    } catch {
+      return; // lookup failed — the snapshots stand
+    }
+    if (!activeRef.current) return;
+    const byId = new Map(infos.map((r) => [r.track_id, r]));
+    // Memoized per OLD object so the same object (the pre-shuffle order
+    // shares references with the shuffled queue) maps to the same fresh one —
+    // identity-based bookkeeping keeps working across the swap.
+    const freshMap = new Map<MusicQueueItem, MusicQueueItem | null>();
+    const freshen = (item: MusicQueueItem): MusicQueueItem | null => {
+      if (freshMap.has(item)) return freshMap.get(item)!;
+      const info = byId.get(item.trackId);
+      const fresh: MusicQueueItem | null = info
+        ? {
+            trackId: info.track_id,
+            title: trackDisplayTitle(info.title, info.file_path),
+            artistName: info.artist_name,
+            artistId: info.artist_id,
+            artists: info.artists.map((c) => ({ name: c.name, artistId: c.artist_id })),
+            albumId: info.album_id,
+            albumTitle: info.album_title,
+            cover: info.cover,
+            path: info.file_path,
+            durationSecs: info.duration_secs,
+          }
+        : null;
+      freshMap.set(item, fresh);
+      return fresh;
+    };
+    // Context: dead rows drop; the current slot keeps its (stale) item so the
+    // playing file stays represented and the index stays meaningful.
+    const oldQueue = queueRef.current;
+    const nextQueue: MusicQueueItem[] = [];
+    let nextIndex = 0;
+    oldQueue.forEach((item, i) => {
+      const fresh = freshen(item) ?? (i === indexRef.current ? item : null);
+      if (!fresh) return;
+      if (i === indexRef.current) nextIndex = nextQueue.length;
+      nextQueue.push(fresh);
+    });
+    queueRef.current = nextQueue;
+    indexRef.current = nextQueue.length > 0 ? Math.min(nextIndex, nextQueue.length - 1) : 0;
+    explicitQueueRef.current = explicitQueueRef.current
+      .map((item) => freshen(item))
+      .filter((i): i is MusicQueueItem => i !== null);
+    if (explicitCurrentRef.current) {
+      explicitCurrentRef.current =
+        freshen(explicitCurrentRef.current) ?? explicitCurrentRef.current;
+    }
+    originalOrderRef.current =
+      originalOrderRef.current
+        ?.map((item) => freshen(item))
+        .filter((i): i is MusicQueueItem => i !== null) ?? null;
+    labelRef.current = labelForContext(queueRef.current);
+    setState((s) => ({
+      ...s,
+      queue: queueRef.current,
+      index: indexRef.current,
+      explicitCurrent: explicitCurrentRef.current,
+      explicitQueue: explicitQueueRef.current,
+      contextLabel: labelRef.current,
+    }));
+    persistSession();
+    // mpv may hold a prefetched entry at a now-stale path — re-arm with the
+    // refreshed one.
+    void rearmPrefetch();
+  }, [persistSession, rearmPrefetch]);
+  const revalidateQueueRef = useRef(revalidateQueue);
+  revalidateQueueRef.current = revalidateQueue;
+
+  useEffect(() => {
+    const unlisten = listen<{ libraryId: string; state: string }>("scan-state", (event) => {
+      if (event.payload.state === "finished") void revalidateQueueRef.current();
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
 
   return [
     state,

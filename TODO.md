@@ -9,6 +9,8 @@
 
 ## bugs / needs fixing
 
+this may already be in here already but the settings menu is comically narrow for some reason
+
 when scrolling all the way down on people page then scrolling back up relatively quickly, the app fairly reliably freezes to the point where I have to close it in task manager. im assuming because theres so many or something, idk. theres 14.8K people in my library
 
 consider volume equalization methods like how Apple/Spotify match all tracks -14DBFS volume. Consider making this equalization optional in settings and maybe allow user to choose level of equalization

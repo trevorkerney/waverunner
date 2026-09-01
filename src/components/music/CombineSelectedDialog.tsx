@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { Disc3 } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -36,10 +37,16 @@ interface AlbumInfo {
   title: string;
   artist: string | null;
   track_count: number;
+  /** What picking this keeper KEEPS — shown per option so the choice is
+   *  informed: its year, genres, and cover survive alongside the title. */
+  year: string | null;
+  genres: string[];
+  /** Display cover (cached path). */
+  cover: string | null;
   editions: Edition[];
 }
 
-const editionName = (e: Edition) => e.label ?? "Original";
+const editionName = (e: Edition) => e.label ?? "1";
 
 /** Configure step for combining the current selection: pick the keeper, pick
  *  the mode, confirm. A normal centered dialog — the grid keeps its full
@@ -105,9 +112,12 @@ export function CombineSelectedDialog({
             <div className="flex max-h-56 flex-col gap-0.5 overflow-y-auto">
               {picked.map((a) => {
                 const meta = byId(a.id);
+                // Everything the surviving card would take from this pick:
+                // title, artist, year, cover, genres — shown per option so
+                // "keep the info of" is a visible choice, not a guess.
                 const sub = [
                   meta?.artist,
-                  meta ? `${meta.track_count} track${meta.track_count === 1 ? "" : "s"}` : null,
+                  meta?.year,
                   meta && meta.editions.length > 1 ? `${meta.editions.length} editions` : null,
                 ]
                   .filter(Boolean)
@@ -131,10 +141,28 @@ export function CombineSelectedDialog({
                       tabIndex={-1}
                       className="pointer-events-none size-3.5 shrink-0 accent-primary"
                     />
+                    {meta?.cover ? (
+                      <img
+                        src={convertFileSrc(meta.cover)}
+                        alt=""
+                        className="size-9 shrink-0 rounded-[2px] object-cover"
+                        draggable={false}
+                      />
+                    ) : (
+                      // Coverless: the same disc placeholder the album grids use.
+                      <span className="flex size-9 shrink-0 items-center justify-center rounded-[2px] bg-muted">
+                        <Disc3 size={16} className="text-muted-foreground" />
+                      </span>
+                    )}
                     <span className="min-w-0 flex-1">
                       <span className="block truncate text-sm">{a.title}</span>
                       {sub && (
                         <span className="block truncate text-[11px] text-muted-foreground">{sub}</span>
+                      )}
+                      {(meta?.genres.length ?? 0) > 0 && (
+                        <span className="block truncate text-[11px] text-muted-foreground/70">
+                          {meta!.genres.join(", ")}
+                        </span>
                       )}
                     </span>
                   </button>
@@ -165,7 +193,7 @@ export function CombineSelectedDialog({
             </div>
             <p className="text-[11px] leading-snug text-muted-foreground">
               {mode === "merge"
-                ? "One track list. Refused if two albums claim the same disc & track number — retag them yourself first."
+                ? "One track list. Refused if two tracks contain the same disc & track number — retag them yourself first."
                 : "One album, several editions: the others become entries in the release picker (alternate cuts of the same album)."}
             </p>
           </div>

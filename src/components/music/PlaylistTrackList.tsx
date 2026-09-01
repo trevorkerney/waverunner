@@ -293,6 +293,12 @@ export function PlaylistTrackList({
                     </span>
                   )}
                   {isCurrent && <PlayingIndicator paused={!playing} className="shrink-0" />}
+                  <LoveButton
+                    trackId={e.id}
+                    loved={info?.loved ?? false}
+                    reveal="group-hover/track:opacity-100"
+                    className="ml-1.5"
+                  />
                 </span>
                 {creditChips.length > 0 && (
                   <span className="block truncate text-xs text-muted-foreground">
@@ -332,7 +338,6 @@ export function PlaylistTrackList({
                   {info?.album_title ?? ""}
                 </span>
               )}
-              <LoveButton trackId={e.id} loved={info?.loved ?? false} reveal="group-hover/track:opacity-100" />
               <CodecBadge codec={info?.codec} bitrate={info?.bitrate_kbps} mode={info?.bitrate_mode} />
               <span className="w-10 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
                 {fmtTrackTime(info?.duration_secs ?? null)}

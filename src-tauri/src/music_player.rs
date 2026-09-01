@@ -177,6 +177,32 @@ where
 
 /// Load and play one track, logging a play-history row for it. The frontend
 /// owns the queue and calls this per track.
+/// The track's CURRENT absolute path, if its row still exists and the file is
+/// where the row says. None → caller falls back to its snapshot path.
+async fn fresh_track_path(pool: &sqlx::SqlitePool, track_id: i64) -> Option<String> {
+    let (library_id, rel): (String, String) = sqlx::query_as(
+        "SELECT me.library_id, t.file_path FROM track t
+         JOIN media_entry me ON me.id = t.id WHERE t.id = ?",
+    )
+    .bind(track_id)
+    .fetch_optional(pool)
+    .await
+    .ok()??;
+    let bases: Vec<(String,)> = sqlx::query_as(
+        "SELECT path FROM library_path WHERE library_id = ? AND kind IN ('music', 'sounds')
+         ORDER BY sort_order, id",
+    )
+    .bind(library_id)
+    .fetch_all(pool)
+    .await
+    .ok()?;
+    bases
+        .iter()
+        .map(|(base,)| std::path::Path::new(base).join(&rel))
+        .find(|p| p.exists())
+        .map(|p| p.to_string_lossy().to_string())
+}
+
 #[tauri::command]
 pub async fn music_play_track(
     app: AppHandle,
@@ -185,6 +211,12 @@ pub async fn music_play_track(
     path: String,
 ) -> Result<(), String> {
     pause_video(&state);
+    // The queue's snapshot path can be stale after a rescan moved files — the
+    // track id is the identity, so prefer the row's current location and fall
+    // back to the snapshot when the row (or the file itself) is gone.
+    let path = fresh_track_path(&state.app_db, track_id)
+        .await
+        .unwrap_or(path);
     // Startup default from Settings → Audio Player (0–100, default 50).
     let initial_volume: f64 = sqlx::query_as::<_, (String,)>(
         "SELECT value FROM settings WHERE key = 'music_default_volume'",
@@ -197,19 +229,24 @@ pub async fn music_play_track(
     .unwrap_or(50.0);
     let inner = ensure_music_player(&app, &state, initial_volume)?;
 
-    // Play-event row first — every start counts, even a one-second one.
-    let res = sqlx::query("INSERT INTO music_play (track_id) VALUES (?)")
+    // Play-event row first — every start counts, even a one-second one. A
+    // track whose DB row died (deleted mid-rescan) still PLAYS from the
+    // snapshot path — the FK insert just can't land, so it logs nothing.
+    let log = match sqlx::query("INSERT INTO music_play (track_id) VALUES (?)")
         .bind(track_id)
         .execute(&state.app_db)
         .await
-        .map_err(|e| e.to_string())?;
-    *inner.log.lock().map_err(|e| e.to_string())? = Some(PlayLog {
-        row_id: res.last_insert_rowid(),
-        listened_secs: 0.0,
-        last_pos: None,
-        duration: 0.0,
-        scrobbled: false,
-    });
+    {
+        Ok(res) => Some(PlayLog {
+            row_id: res.last_insert_rowid(),
+            listened_secs: 0.0,
+            last_pos: None,
+            duration: 0.0,
+            scrobbled: false,
+        }),
+        Err(_) => None,
+    };
+    *inner.log.lock().map_err(|e| e.to_string())? = log;
 
     // Flag BEFORE the loadfile so the event thread can't see the new file's
     // FileLoaded first. The unpause itself happens there — never here, where
@@ -256,11 +293,20 @@ pub async fn music_track_started(
     track_id: i64,
 ) -> Result<(), String> {
     let inner = current_music(&state)?;
-    let res = sqlx::query("INSERT INTO music_play (track_id) VALUES (?)")
+    // A failed insert (track row deleted mid-rescan) must NOT leave the
+    // previous track's log in place — the event loop would keep crediting
+    // listened-seconds to a row the new track has nothing to do with.
+    let res = match sqlx::query("INSERT INTO music_play (track_id) VALUES (?)")
         .bind(track_id)
         .execute(&state.app_db)
         .await
-        .map_err(|e| e.to_string())?;
+    {
+        Ok(res) => res,
+        Err(err) => {
+            *inner.log.lock().map_err(|e| e.to_string())? = None;
+            return Err(err.to_string());
+        }
+    };
     *inner.log.lock().map_err(|e| e.to_string())? = Some(PlayLog {
         row_id: res.last_insert_rowid(),
         listened_secs: 0.0,

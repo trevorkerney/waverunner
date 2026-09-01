@@ -264,6 +264,9 @@ export interface MusicRelease {
   has_mb_tag: boolean;
   /** This release holds its own pinned MusicBrainz pressing. */
   mb_matched: boolean;
+  /** Disc names on multi-disc sets ("Jupiter"): DISCSUBTITLE tags, overlaid
+   *  by your renames. */
+  disc_titles: { disc: number; title: string }[];
   tracks: MusicTrack[];
 }
 

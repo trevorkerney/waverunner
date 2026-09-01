@@ -50,7 +50,8 @@ interface AlbumDetailPageProps {
 }
 
 function releaseLabel(r: MusicRelease): string {
-  const label = r.label ?? "Original";
+  // The default release stores no label — it's version "1" by convention.
+  const label = r.label ?? "1";
   return r.year ? `${label} (${r.year})` : label;
 }
 
@@ -86,6 +87,8 @@ export function AlbumDetailPage({
   const [mbKey, setMbKey] = useState(0);
   // Release whose label is being renamed in the versions menu.
   const [renameRelease, setRenameRelease] = useState<MusicRelease | null>(null);
+  /** Disc being named via the header pencil (multi-disc sets). */
+  const [renameDisc, setRenameDisc] = useState<number | null>(null);
 
   // Navigations clear the page (spinner); edit-triggered refetches are silent
   // and keep the selected release when it still exists.
@@ -468,8 +471,19 @@ export function AlbumDetailPage({
       {discs.map(([discNo, tracks]) => (
         <div key={discNo} className="mb-4">
           {(release?.disc_count ?? 1) > 1 && (
-            <p className="mb-1 flex items-center gap-1.5 px-2 pt-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+            <p className="group/disc mb-1 flex items-center gap-1.5 px-2 pt-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
               <Disc3 size={13} /> Disc {discNo}
+              {(release?.disc_titles.find((d) => d.disc === discNo)?.title ?? "") !== "" && (
+                <span>— {release!.disc_titles.find((d) => d.disc === discNo)!.title}</span>
+              )}
+              <button
+                type="button"
+                title="Name this disc"
+                onClick={() => setRenameDisc(discNo)}
+                className="opacity-0 transition-opacity hover:text-foreground group-hover/disc:opacity-100"
+              >
+                <Pencil size={11} />
+              </button>
             </p>
           )}
           <div>
@@ -512,6 +526,12 @@ export function AlbumDetailPage({
                         {trackDisplayTitle(t.title, t.file_path)}
                       </span>
                       {isCurrent && <PlayingIndicator paused={!playing} className="shrink-0" />}
+                      <LoveButton
+                        trackId={t.id}
+                        loved={t.loved}
+                        reveal="group-hover:opacity-100"
+                        className="ml-1.5"
+                      />
                     </span>
                     {/* Full credit list, comma-separated, no "feat." framing —
                         names the library knows as artists link to their pages. */}
@@ -545,7 +565,6 @@ export function AlbumDetailPage({
                       {t.play_count}×
                     </span>
                   )}
-                  <LoveButton trackId={t.id} loved={t.loved} reveal="group-hover:opacity-100" />
                   <CodecBadge codec={t.codec} bitrate={t.bitrate_kbps} mode={t.bitrate_mode} />
                   <span className="w-12 shrink-0 text-right font-mono text-xs text-muted-foreground">
                     {fmtTrackTime(t.runtime_secs)}
@@ -670,9 +689,27 @@ export function AlbumDetailPage({
             if (!o) setRenameRelease(null);
           }}
           title="Rename release label"
-          initialValue={renameRelease.label ?? "Original"}
+          initialValue={renameRelease.label ?? "1"}
           onSubmit={async (v) => {
             await invoke("set_release_label", { releaseId: renameRelease.id, label: v });
+            setReloadKey((k) => k + 1);
+          }}
+        />
+      )}
+      {renameDisc != null && release && (
+        <RenameDialog
+          open
+          onOpenChange={(o) => {
+            if (!o) setRenameDisc(null);
+          }}
+          title={`Name disc ${renameDisc}`}
+          initialValue={release.disc_titles.find((d) => d.disc === renameDisc)?.title ?? ""}
+          onSubmit={async (v) => {
+            await invoke("set_disc_title", {
+              releaseId: release.id,
+              discNo: renameDisc,
+              title: v,
+            });
             setReloadKey((k) => k + 1);
           }}
         />

@@ -33,20 +33,56 @@ static CANCEL: AtomicBool = AtomicBool::new(false);
 const MB_MIN_SCORE: i64 = 90;
 const REQUEST_GAP: std::time::Duration = std::time::Duration::from_millis(1100);
 
+/// One process-wide pacing gate. MusicBrainz's rate limit (1 req/s per IP)
+/// doesn't care whether a request came from the background pass or a dialog
+/// search — pacing each caller in isolation let a pass + a manual search
+/// combine to ~2 req/s and 503 everything. Every request now waits its turn
+/// here: REQUEST_GAP since the previous send, whoever sent it. The lock is
+/// held through the send, so requests are also strictly serial.
+static GATE: std::sync::OnceLock<tokio::sync::Mutex<Option<std::time::Instant>>> =
+    std::sync::OnceLock::new();
+
+/// App handle for the `mb-busy` beacon, set once at startup — lets open
+/// dialogs say a long spinner is MusicBrainz shedding load, not a hang.
+static MB_APP: std::sync::OnceLock<AppHandle> = std::sync::OnceLock::new();
+
+pub fn set_mb_app(app: AppHandle) {
+    let _ = MB_APP.set(app);
+}
+
 /// GET with 503 patience: MusicBrainz sheds load in waves of Service
 /// Unavailable, so wait it out (5s, then 15s) before giving the item up as a
-/// transient failure. Cancellation (skip-remaining) aborts the waits.
+/// transient failure — each backoff emits `mb-busy` so open dialogs can say
+/// why their spinner is slow. Cancellation (skip-remaining) aborts the waits.
+/// Pacing lives HERE (the gate above), pre-send — callers add no sleeps.
 async fn mb_get(
     client: &reqwest::Client,
     url: url::Url,
 ) -> Result<reqwest::Response, String> {
+    let gate = GATE.get_or_init(|| tokio::sync::Mutex::new(None));
     let mut delay = std::time::Duration::from_secs(5);
     for attempt in 0..3 {
-        let resp = client.get(url.clone()).send().await.map_err(|e| e.to_string())?;
+        let resp = {
+            let mut last = gate.lock().await;
+            if let Some(prev) = *last {
+                let elapsed = prev.elapsed();
+                if elapsed < REQUEST_GAP {
+                    tokio::time::sleep(REQUEST_GAP - elapsed).await;
+                }
+            }
+            *last = Some(std::time::Instant::now());
+            client.get(url.clone()).send().await.map_err(|e| e.to_string())?
+        };
         if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE
             && attempt < 2
             && !CANCEL.load(Ordering::SeqCst)
         {
+            if let Some(app) = MB_APP.get() {
+                let _ = app.emit(
+                    "mb-busy",
+                    serde_json::json!({ "retryInMs": delay.as_millis() as u64 }),
+                );
+            }
             tokio::time::sleep(delay).await;
             delay *= 3;
             continue;
@@ -132,6 +168,8 @@ pub fn spawn_enrich(app: AppHandle, library_id: String) {
         return; // a pass is already running
     }
     CANCEL.store(false, Ordering::SeqCst);
+    // Fresh pass, fresh cache — see the pass-wide fetch cache block.
+    clear_pass_caches();
     tauri::async_runtime::spawn(async move {
         // A pass ends only when re-running it immediately would do nothing.
         // One sweep's output is the next sweep's input — matches identify
@@ -395,6 +433,9 @@ async fn enrich(app: &AppHandle, library_id: &str) -> Result<EnrichOutcome, Stri
     let artists_updated = artists_updated + harvested;
     let fetch_failed: std::collections::HashSet<i64> =
         fetch_failed.union(&harvest_failed).copied().collect();
+    // Original-date backfill for albums matched before adoption existed —
+    // empties itself out after one full pass over old matches.
+    backfill_group_dates(app, &pool, &client, library_id).await?;
     merge_mbid_duplicates(&pool, library_id).await?;
     suggest_artist_matches(app, &pool, &client, library_id, &fetch_failed).await?;
     // Credit replacement above can orphan artists that only backed a
@@ -1164,7 +1205,6 @@ async fn search_releases(
     )
     .map_err(|e| e.to_string())?;
     let resp = mb_get(client, url).await?;
-    tokio::time::sleep(REQUEST_GAP).await;
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status()));
     }
@@ -1228,7 +1268,6 @@ async fn lookup_release(
     )
     .map_err(|e| e.to_string())?;
     let resp = mb_get(client, url).await?;
-    tokio::time::sleep(REQUEST_GAP).await;
     if resp.status() == reqwest::StatusCode::NOT_FOUND
         || resp.status() == reqwest::StatusCode::BAD_REQUEST
     {
@@ -1267,7 +1306,6 @@ async fn releases_in_group(
         )
         .map_err(|e| e.to_string())?;
         let resp = mb_get(client, url).await?;
-        tokio::time::sleep(REQUEST_GAP).await;
         if resp.status() == reqwest::StatusCode::NOT_FOUND
             || resp.status() == reqwest::StatusCode::BAD_REQUEST
         {
@@ -1295,6 +1333,7 @@ async fn releases_in_group(
 /// One MB track's credit list: (disc, position, title, [(credited name, artist mbid)]).
 type MbTrack = (i64, i64, String, Vec<(String, Option<String>)>);
 
+#[derive(Clone)]
 struct MbReleaseFull {
     release_id: String,
     release_group_id: Option<String>,
@@ -1309,7 +1348,7 @@ struct MbReleaseFull {
     tracks: Vec<MbTrack>,
 }
 
-async fn fetch_release(
+async fn fetch_release_uncached(
     client: &reqwest::Client,
     release_id: &str,
 ) -> Result<Option<MbReleaseFull>, String> {
@@ -1319,7 +1358,6 @@ async fn fetch_release(
     )
     .map_err(|e| e.to_string())?;
     let resp = mb_get(client, url).await?;
-    tokio::time::sleep(REQUEST_GAP).await;
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status()));
     }
@@ -1552,7 +1590,6 @@ async fn search_release_groups(
     )
     .map_err(|e| e.to_string())?;
     let resp = mb_get(client, url).await?;
-    tokio::time::sleep(REQUEST_GAP).await;
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status()));
     }
@@ -1565,8 +1602,87 @@ async fn search_release_groups(
         .collect())
 }
 
-/// One release group by id, for a pasted link or a tagged id.
+// ── Pass-wide fetch cache ──────────────────────────────────────────────
+// One pass reads the same MusicBrainz entity from several phases (a group as
+// match evidence, again for its date; a pressing across harvest sweeps), and
+// the sweep loop re-runs phases up to 3×. At MB's 1 req/s the pass's
+// duration IS its request count, so duplicates are pure wall-clock waste.
+// Successes only (a 503 must stay retryable), cleared when a pass starts,
+// and consulted only WHILE a pass runs — dialog-driven fetches between
+// passes always hit MB fresh.
+static GROUP_FETCH_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<String, Option<GroupCandidate>>>,
+> = std::sync::OnceLock::new();
+static RELEASE_FETCH_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<String, Option<MbReleaseFull>>>,
+> = std::sync::OnceLock::new();
+
+fn clear_pass_caches() {
+    if let Some(m) = GROUP_FETCH_CACHE.get() {
+        m.lock().unwrap().clear();
+    }
+    if let Some(m) = RELEASE_FETCH_CACHE.get() {
+        m.lock().unwrap().clear();
+    }
+}
+
+/// One release group by id — cached for the duration of a pass.
 async fn fetch_release_group(
+    client: &reqwest::Client,
+    group_id: &str,
+) -> Result<Option<GroupCandidate>, String> {
+    let in_pass = RUNNING.load(Ordering::SeqCst);
+    if in_pass {
+        if let Some(hit) = GROUP_FETCH_CACHE
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .get(group_id)
+        {
+            return Ok(hit.clone());
+        }
+    }
+    let got = fetch_release_group_uncached(client, group_id).await?;
+    if in_pass {
+        GROUP_FETCH_CACHE
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert(group_id.to_string(), got.clone());
+    }
+    Ok(got)
+}
+
+/// One release by id — cached for the duration of a pass (harvest and the
+/// tagged-pin walk revisit the same pressings across sweeps).
+async fn fetch_release(
+    client: &reqwest::Client,
+    release_id: &str,
+) -> Result<Option<MbReleaseFull>, String> {
+    let in_pass = RUNNING.load(Ordering::SeqCst);
+    if in_pass {
+        if let Some(hit) = RELEASE_FETCH_CACHE
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .get(release_id)
+        {
+            return Ok(hit.clone());
+        }
+    }
+    let got = fetch_release_uncached(client, release_id).await?;
+    if in_pass {
+        RELEASE_FETCH_CACHE
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert(release_id.to_string(), got.clone());
+    }
+    Ok(got)
+}
+
+/// One release group by id, for a pasted link or a tagged id.
+async fn fetch_release_group_uncached(
     client: &reqwest::Client,
     group_id: &str,
 ) -> Result<Option<GroupCandidate>, String> {
@@ -1576,7 +1692,6 @@ async fn fetch_release_group(
     )
     .map_err(|e| e.to_string())?;
     let resp = mb_get(client, url).await?;
-    tokio::time::sleep(REQUEST_GAP).await;
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
     }
@@ -1847,6 +1962,59 @@ async fn settle_artist_card_derived(
 /// Apply what a release group knows: album type, first release date, and the
 /// album-level artist credit. Never touches tracks — a group has no track
 /// list, and that is exactly why it is safe to conclude automatically.
+/// Adopt MusicBrainz's ORIGINAL release date (the group's first-release-date)
+/// as the album's displayed date — user ruling: a matched album shows the
+/// year the album came out, not the year of the owned reissue (tags keep
+/// saying 2016 for a 2016 remaster of a 1962 record). Written at mb tier in
+/// field_override so reconcile re-stomps it after every tag rebuild; a user
+/// edit (user tier) outranks it, and album_year suppression (an undone
+/// adoption) stands. Logged when it visibly changes something.
+async fn adopt_group_date(
+    pool: &SqlitePool,
+    library_id: &str,
+    album_id: i64,
+    album_title: &str,
+    date: &str,
+    batch: i64,
+) -> Result<(), String> {
+    if suppressed(pool, "album_year", album_id).await?
+        || crate::music_edit::has_override(pool, album_id, "release_date").await?
+    {
+        return Ok(());
+    }
+    // Durable across rescans — written even when the row already agrees.
+    set_mb_id(pool, album_id, "release_date", date, TIER_MB).await?;
+    let (current,): (Option<String>,) =
+        sqlx::query_as("SELECT release_date FROM album WHERE id = ?")
+            .bind(album_id)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    if current.as_deref() == Some(date) {
+        return Ok(());
+    }
+    sqlx::query("UPDATE album SET release_date = ? WHERE id = ?")
+        .bind(date)
+        .bind(album_id)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    log_change(
+        pool,
+        library_id,
+        "album_year",
+        album_id,
+        &format!(
+            "{album_title} — date {} → {date} (original release)",
+            current.as_deref().unwrap_or("(none)")
+        ),
+        &serde_json::json!({ "release_date": current }),
+        &serde_json::json!({ "release_date": date }),
+        batch,
+    )
+    .await
+}
+
 async fn apply_group(
     pool: &SqlitePool,
     library_id: &str,
@@ -1989,36 +2157,10 @@ async fn apply_group(
         }
     }
 
+    // Original release date: the group's first-release-date wins over the
+    // owned pressing's tag year on matched albums (user edits outrank).
     if let Some(date) = &group.first_release_date {
-        if !suppressed(pool, "album_year", album_id).await?
-            && !crate::music_edit::has_override(pool, album_id, "release_date").await?
-        {
-            let (current,): (Option<String>,) =
-                sqlx::query_as("SELECT release_date FROM album WHERE id = ?")
-                    .bind(album_id)
-                    .fetch_one(pool)
-                    .await
-                    .map_err(|e| e.to_string())?;
-            if current.is_none() {
-                sqlx::query("UPDATE album SET release_date = ? WHERE id = ?")
-                    .bind(date)
-                    .bind(album_id)
-                    .execute(pool)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                log_change(
-                    pool,
-                    library_id,
-                    "album_year",
-                    album_id,
-                    &format!("{album_title} — date filled: {date}"),
-                    &serde_json::json!({ "release_date": null }),
-                    &serde_json::json!({ "release_date": date }),
-                    batch,
-                )
-                .await?;
-            }
-        }
+        adopt_group_date(pool, library_id, album_id, album_title, date, batch).await?;
     }
 
     // A person's match is a decision even when every gap-fill above turned
@@ -2220,38 +2362,10 @@ async fn apply_release(
         }
     }
 
-    // Release date: pure gap fill — only when the tags supplied nothing and
-    // the user hasn't set (or cleared) the date themselves.
+    // Original release date (the group's first-release-date, pressing date
+    // as fallback) wins over the owned reissue's tag year.
     if let Some(mb_date) = &full.date {
-        if !suppressed(pool, "album_year", album_id).await?
-            && !crate::music_edit::has_override(pool, album_id, "release_date").await?
-        {
-            let (current,): (Option<String>,) =
-                sqlx::query_as("SELECT release_date FROM album WHERE id = ?")
-                    .bind(album_id)
-                    .fetch_one(pool)
-                    .await
-                    .map_err(|e| e.to_string())?;
-            if current.is_none() {
-                sqlx::query("UPDATE album SET release_date = ? WHERE id = ?")
-                    .bind(mb_date)
-                    .bind(album_id)
-                    .execute(pool)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                log_change(
-                    pool,
-                    library_id,
-                    "album_year",
-                    album_id,
-                    &format!("{album_title} — date filled: {mb_date}"),
-                    &serde_json::json!({ "release_date": null }),
-                    &serde_json::json!({ "release_date": mb_date }),
-                    batch,
-                )
-                .await?;
-            }
-        }
+        adopt_group_date(pool, library_id, album_id, album_title, mb_date, batch).await?;
     }
 
     // Remember WHICH pressing THIS release is, durably — folder-keyed so the
@@ -3072,6 +3186,63 @@ async fn suggest_artist_matches(
         .map_err(|e| e.to_string())?;
     }
     Ok(suggested)
+}
+
+/// Backfill: albums matched before original-date adoption existed hold a
+/// group id but no mb-tier release_date. Fetch each group once and adopt its
+/// first-release-date; groups WITHOUT a date get an empty mb-tier marker so
+/// they're never refetched. Transient failures skip silently and retry next
+/// pass. One-time cost, rate-limited like every phase.
+async fn backfill_group_dates(
+    app: &AppHandle,
+    pool: &SqlitePool,
+    client: &reqwest::Client,
+    library_id: &str,
+) -> Result<(), String> {
+    let rows: Vec<(i64, String, String)> = sqlx::query_as(
+        "SELECT DISTINCT al.id, al.title, f.value FROM album al
+         JOIN media_entry me ON me.id = al.id
+         JOIN field_override f ON f.entity_id = al.id
+              AND f.field = 'mb_release_group_id' AND f.value IS NOT NULL AND f.value <> ''
+         WHERE me.library_id = ?
+           AND NOT EXISTS (SELECT 1 FROM field_override d
+                           WHERE d.entity_id = al.id AND d.field = 'release_date')
+           AND NOT EXISTS (SELECT 1 FROM mb_suppression s
+                           WHERE s.kind = 'album_year' AND s.target_id = al.id)",
+    )
+    .bind(library_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let total = rows.len();
+    for (i, (album_id, title, group_id)) in rows.into_iter().enumerate() {
+        if CANCEL.load(Ordering::SeqCst) {
+            break;
+        }
+        let _ = app.emit(
+            "music-enrich-progress",
+            serde_json::json!({ "libraryId": library_id, "phase": "dates", "done": i, "total": total, "name": title }),
+        );
+        let group = match fetch_release_group(client, &group_id).await {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("group date backfill '{title}': {e}");
+                continue;
+            }
+        };
+        match group.and_then(|g| g.first_release_date) {
+            Some(date) => {
+                let batch = next_batch(pool).await?;
+                adopt_group_date(pool, library_id, album_id, &title, &date, batch).await?;
+            }
+            // Known dateless group: the empty marker stops refetching.
+            None => set_mb_id(pool, album_id, "release_date", "", TIER_MB).await?,
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -4034,6 +4205,28 @@ pub async fn mb_get_review(state: State<'_, AppState>, library_id: String) -> Re
     // artist is credited, which is what jogs the memory for a feature-only
     // name nobody recognizes cold. Computed at read time, not stored: the
     // stored payload froze at suggestion time, but the library moves.
+    // Uncertain album matches get the LIBRARY side of the question: how many
+    // tracks and versions the album actually holds. A fused album (two bodies
+    // of work sharing one tag pair — So Far Gone mixtape + EP) is exactly the
+    // case where the candidates can't be told apart without it. Computed at
+    // read time like the artist line below — the library moves.
+    for s in suggestions.iter_mut() {
+        if s.kind != "album_match" {
+            continue;
+        }
+        let Some(album_id) = s.payload["album_id"].as_i64() else { continue };
+        let (tracks, versions): (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM media_entry me
+                     JOIN track t ON t.id = me.id WHERE me.parent_id = ?1),
+                    (SELECT COUNT(*) FROM album_release WHERE album_id = ?1)",
+        )
+        .bind(album_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        s.payload["library_tracks"] = serde_json::json!(tracks);
+        s.payload["library_versions"] = serde_json::json!(versions);
+    }
     for s in suggestions.iter_mut() {
         if s.kind != "artist_match" {
             continue;
@@ -4737,6 +4930,10 @@ pub struct MbCandidateRow {
     /// duplicate answers by title).
     #[serde(skip_serializing)]
     pub name_match: bool,
+    /// Artists only: MB's primary English artist-name alias, when the
+    /// canonical name is something else ("近藤浩治" → "Koji Kondo"). The UI
+    /// offers adopting it instead of the canonical script.
+    pub en_name: Option<String>,
 }
 
 fn group_row(g: GroupCandidate) -> MbCandidateRow {
@@ -4755,6 +4952,7 @@ fn group_row(g: GroupCandidate) -> MbCandidateRow {
         .filter(|s| !s.is_empty()),
         score: g.score,
         name_match: false,
+        en_name: None,
     }
 }
 
@@ -4799,6 +4997,7 @@ fn release_row(c: ReleaseCandidate) -> MbCandidateRow {
         .filter(|s| !s.is_empty()),
         score: c.score,
         name_match: false,
+        en_name: None,
     }
 }
 
@@ -4881,7 +5080,6 @@ async fn search_artists(
         )
         .map_err(|e| e.to_string())?;
         let resp = mb_get(client, url).await?;
-        tokio::time::sleep(REQUEST_GAP).await;
         if !resp.status().is_success() {
             return Err(format!("HTTP {}", resp.status()));
         }
@@ -4907,7 +5105,6 @@ async fn search_artists(
         )
         .map_err(|e| e.to_string())?;
         let resp = mb_get(client, url).await?;
-        tokio::time::sleep(REQUEST_GAP).await;
         if !resp.status().is_success() {
             return Err(format!("HTTP {}", resp.status()));
         }
@@ -4944,6 +5141,25 @@ async fn search_artists(
                             .any(|al| al["name"].as_str().is_some_and(|n| normalize(n) == want))
                     })
                     .unwrap_or(false);
+            // MB's English artist name, when the canonical is another script:
+            // the locale-en "Artist name" alias (primary preferred). Search
+            // rows carry aliases, so this costs nothing extra.
+            let name = a["name"].as_str().unwrap_or_default();
+            let en_alias = |primary_only: bool| {
+                a["aliases"].as_array().into_iter().flatten().find_map(|al| {
+                    let is_name = al["type"].as_str() == Some("Artist name");
+                    let is_en = al["locale"].as_str() == Some("en");
+                    let is_primary = al["primary"].as_bool() == Some(true);
+                    if is_name && is_en && (is_primary || !primary_only) {
+                        al["name"].as_str().map(|n| n.to_string())
+                    } else {
+                        None
+                    }
+                })
+            };
+            let en_name = en_alias(true)
+                .or_else(|| en_alias(false))
+                .filter(|n| n != name);
             Some(MbCandidateRow {
                 kind: "artist".to_string(),
                 mbid: a["id"].as_str()?.to_string(),
@@ -4963,6 +5179,7 @@ async fn search_artists(
                     .map(|s| s.to_string()),
                 score: a["score"].as_i64().unwrap_or(100),
                 name_match,
+                en_name,
             })
         })
         // NO score floor. Scores are lucene relevance, and the OR alias:
@@ -4987,7 +5204,6 @@ async fn search_recordings(
         )
         .map_err(|e| e.to_string())?;
         let resp = mb_get(client, url).await?;
-        tokio::time::sleep(REQUEST_GAP).await;
         if !resp.status().is_success() {
             return Err(format!("HTTP {}", resp.status()));
         }
@@ -5008,7 +5224,6 @@ async fn search_recordings(
         )
         .map_err(|e| e.to_string())?;
         let resp = mb_get(client, url).await?;
-        tokio::time::sleep(REQUEST_GAP).await;
         if !resp.status().is_success() {
             return Err(format!("HTTP {}", resp.status()));
         }
@@ -5037,6 +5252,7 @@ async fn search_recordings(
                     })
                     .unwrap_or_default(),
                 name_match: false,
+                en_name: None,
                 detail: Some(
                     [
                         secs.map(|s| format!("{}:{:02}", s / 60, s % 60)),
@@ -5076,6 +5292,10 @@ pub async fn mb_apply_entity_match(
     // Release applies: WHICH release of the album (db row id) the pressing
     // pins — the version the dialog was opened on. None = default release.
     release_db_id: Option<i64>,
+    // Artists: adopt THIS display name instead of MB's canonical one (the
+    // user ticked "use the English name" on a candidate). The canonical
+    // name is recorded as an alias so MB-authored credits still resolve.
+    preferred_name: Option<String>,
 ) -> Result<(), String> {
     let pool = &state.app_db;
     // Staged = immutable: a match on an entity a staged rescan action will
@@ -5151,55 +5371,80 @@ pub async fn mb_apply_entity_match(
                 .execute(pool)
                 .await
                 .map_err(|e| e.to_string())?;
-            // Adopt MB's canonical name. The tag spelling lives on as an
-            // alias (identity survives rescans), the user's own rename wins,
-            // and the change is logged with an undo. One extra request; a
-            // fetch failure just keeps the current name.
+            // Adopt a display name. Default: MB's canonical name (the tag
+            // spelling lives on as an alias, identity survives rescans, the
+            // user's own rename wins). With preferred_name — the user ticked
+            // "use the English name" on a candidate — that spelling wins the
+            // title and the canonical name is recorded as an alias instead,
+            // so MB-authored credits ("近藤浩治" on harvested releases) still
+            // resolve to this page. Logged with an undo either way; a fetch
+            // failure keeps the current name (or still adopts the preferred
+            // one, which needs no fetch).
             if !crate::music_edit::has_override(pool, entity_id, "title").await? {
+                let mut canonical: Option<String> = None;
                 if let Ok(client) = mb_client() {
                     if let Ok(url) = url::Url::parse_with_params(
                         &format!("https://musicbrainz.org/ws/2/artist/{mbid}"),
                         &[("fmt", "json")],
                     ) {
                         if let Ok(resp) = mb_get(&client, url).await {
-                            tokio::time::sleep(REQUEST_GAP).await;
                             if resp.status().is_success() {
                                 if let Ok(body) = resp.json::<serde_json::Value>().await {
-                                    if let Some(mb_name) =
-                                        body["name"].as_str().filter(|n| !n.is_empty() && *n != title)
-                                    {
-                                        sqlx::query(
-                                            "INSERT OR IGNORE INTO artist_alias (artist_id, name, kind) VALUES (?, ?, 'variant')",
-                                        )
-                                        .bind(entity_id)
-                                        .bind(&title)
-                                        .execute(pool)
-                                        .await
-                                        .map_err(|e| e.to_string())?;
-                                        sqlx::query(
-                                            "UPDATE artist SET title = ?, sort_title = ? WHERE id = ?",
-                                        )
-                                        .bind(mb_name)
-                                        .bind(crate::commands::generate_sort_title(mb_name, "en"))
-                                        .bind(entity_id)
-                                        .execute(pool)
-                                        .await
-                                        .map_err(|e| e.to_string())?;
-                                        log_change(
-                                            pool,
-                                            &library_id,
-                                            "artist_rename",
-                                            entity_id,
-                                            &format!("{title} — renamed to {mb_name}"),
-                                            &serde_json::json!({ "title": title }),
-                                            &serde_json::json!({ "title": mb_name }),
-                                            batch,
-                                        )
-                                        .await?;
-                                    }
+                                    canonical = body["name"]
+                                        .as_str()
+                                        .filter(|n| !n.is_empty())
+                                        .map(|n| n.to_string());
                                 }
                             }
                         }
+                    }
+                }
+                let preferred = preferred_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                    .map(|n| n.to_string());
+                let target = preferred.clone().or_else(|| canonical.clone());
+                if let Some(target) = target.filter(|n| *n != title) {
+                    sqlx::query(
+                        "INSERT OR IGNORE INTO artist_alias (artist_id, name, kind) VALUES (?, ?, 'variant')",
+                    )
+                    .bind(entity_id)
+                    .bind(&title)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                    sqlx::query("UPDATE artist SET title = ?, sort_title = ? WHERE id = ?")
+                        .bind(&target)
+                        .bind(crate::commands::generate_sort_title(&target, "en"))
+                        .bind(entity_id)
+                        .execute(pool)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    log_change(
+                        pool,
+                        &library_id,
+                        "artist_rename",
+                        entity_id,
+                        &format!("{title} — renamed to {target}"),
+                        &serde_json::json!({ "title": title }),
+                        &serde_json::json!({ "title": target }),
+                        batch,
+                    )
+                    .await?;
+                }
+                // The canonical spelling must keep resolving to this page
+                // even when the preferred name won the title.
+                if let (Some(pref), Some(canon)) = (preferred.as_deref(), canonical.as_deref()) {
+                    if pref != canon {
+                        sqlx::query(
+                            "INSERT OR IGNORE INTO artist_alias (artist_id, name, kind) VALUES (?, ?, 'variant')",
+                        )
+                        .bind(entity_id)
+                        .bind(canon)
+                        .execute(pool)
+                        .await
+                        .map_err(|e| e.to_string())?;
                     }
                 }
             }
@@ -5378,7 +5623,6 @@ async fn recording_credits(
     )
     .map_err(|e| e.to_string())?;
     let resp = mb_get(client, url).await?;
-    tokio::time::sleep(REQUEST_GAP).await;
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status()));
     }
@@ -5709,7 +5953,6 @@ pub async fn mb_artist_release_groups(artist_mbid: String) -> Result<Vec<GroupCa
         )
         .map_err(|e| e.to_string())?;
         let resp = mb_get(&client, url).await?;
-        tokio::time::sleep(REQUEST_GAP).await;
         if !resp.status().is_success() {
             return Err(format!("HTTP {}", resp.status()));
         }
@@ -6526,6 +6769,15 @@ pub async fn mb_undo_change(
             }
         }
         "album_year" => {
+            // Drop the adopted mb-tier date too — reapply re-stomps it after
+            // every rescan otherwise, resurrecting what was just undone.
+            sqlx::query(
+                "DELETE FROM field_override WHERE entity_id = ? AND field = 'release_date' AND tier = 'mb'",
+            )
+            .bind(target_id)
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
             let date = before["release_date"].as_str();
             sqlx::query("UPDATE album SET release_date = ? WHERE id = ?")
                 .bind(date)

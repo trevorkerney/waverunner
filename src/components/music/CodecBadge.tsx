@@ -52,18 +52,28 @@ export function CodecBadge({
   mode: string | null | undefined;
 }) {
   const text = codecBadgeText(codec, bitrate, mode);
-  if (!text) return null;
-  const title = text.includes("~")
-    ? "Average bitrate of a variable stream (kbps)"
-    : text.includes("CBR")
-      ? "Constant bitrate (kbps)"
-      : "Audio format";
+  const title =
+    text == null
+      ? undefined
+      : text.includes("~")
+        ? "Average bitrate of a variable stream (kbps)"
+        : text.includes("CBR")
+          ? "Constant bitrate (kbps)"
+          : "Audio format";
+  // A fixed-width slot, rendered even when there's nothing to show: badges
+  // vary in width (FLAC vs MP3 VBR ~245) and some rows have no codec at all
+  // — without the reservation every column to the left drifts per row.
+  // Right-aligned so the pill sits flush against the duration column.
   return (
-    <span
-      className="shrink-0 rounded bg-foreground/15 px-1.5 py-0.5 font-mono text-[10px] font-medium leading-none text-foreground/80"
-      title={title}
-    >
-      {text}
+    <span className="flex w-[5.5rem] shrink-0 items-center justify-end">
+      {text && (
+        <span
+          className="rounded bg-foreground/15 px-1.5 py-0.5 font-mono text-[10px] font-medium leading-none text-foreground/80"
+          title={title}
+        >
+          {text}
+        </span>
+      )}
     </span>
   );
 }

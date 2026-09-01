@@ -1308,9 +1308,9 @@ function App() {
     (libraryId: string, entry: MediaEntry, focusTrackId?: number) => {
       const lib = libraries.find((l) => l.id === libraryId);
       if (!lib || lib.setup_stage) return;
-      if (scanningLibs.has(libraryId)) {
+      if (scanningLibs.has(libraryId) || passLibs.has(libraryId)) {
         // Say WHY the click did nothing — a silent no-op reads as broken.
-        toast.info(`“${lib.name}” is rescanning — available again when it finishes.`);
+        toast.info(`“${lib.name}” is being updated — available again when it finishes.`);
         return;
       }
       saveScrollPosition(); // Home's scroll, for the return trip
@@ -1337,7 +1337,7 @@ function App() {
         setMusicFocusRequest({ albumId: entry.id, trackId: focusTrackId, nonce: musicFocusNonceRef.current });
       }
     },
-    [libraries, saveScrollPosition, scanningLibs]
+    [libraries, saveScrollPosition, scanningLibs, passLibs]
   );
 
   // Album-less recently-played tiles land on the LOOSE TRACKS page (their
@@ -1347,9 +1347,9 @@ function App() {
     (libraryId: string, trackId: number) => {
       const lib = libraries.find((l) => l.id === libraryId);
       if (!lib || lib.setup_stage) return;
-      if (scanningLibs.has(libraryId)) {
+      if (scanningLibs.has(libraryId) || passLibs.has(libraryId)) {
         // Say WHY the click did nothing — a silent no-op reads as broken.
-        toast.info(`“${lib.name}” is rescanning — available again when it finishes.`);
+        toast.info(`“${lib.name}” is being updated — available again when it finishes.`);
         return;
       }
       saveScrollPosition(); // Home's scroll, for the return trip
@@ -1370,7 +1370,7 @@ function App() {
       musicFocusNonceRef.current += 1;
       setTracksFocusRequest({ trackId, nonce: musicFocusNonceRef.current });
     },
-    [libraries, saveScrollPosition, scanningLibs]
+    [libraries, saveScrollPosition, scanningLibs, passLibs]
   );
 
   // Open the default library on launch, once libraries AND settings have both
@@ -1861,6 +1861,15 @@ function App() {
         /* resolution is best-effort; fall through to the no-op below */
       }
       if (!libId) return; // entry vanished (rescan) — dead click beats a broken page
+      // The same gates the sidebar and Home enforce — a bar link must not
+      // walk into a library mid-scan or mid-pass (its data is being
+      // rewritten under the page it would open).
+      const barLib = libraries.find((l) => l.id === libId);
+      if (barLib?.setup_stage) return;
+      if (scanningLibs.has(libId) || passLibs.has(libId)) {
+        toast.info(`“${barLib?.name ?? "Library"}” is being updated — available again when it finishes.`);
+        return;
+      }
       if (selectedLibrary?.id === libId) {
         navigateTo(entry);
         return;
@@ -1879,7 +1888,7 @@ function App() {
       setSearch("");
       setBreadcrumbs([...canonicalPrefix(crumb, libId), crumb]);
     },
-    [selectedLibrary, navigateTo, canonicalPrefix, saveScrollPosition, pushHistory]
+    [selectedLibrary, navigateTo, canonicalPrefix, saveScrollPosition, pushHistory, libraries, scanningLibs, passLibs]
   );
 
   const openMusicAlbumFromBar = useCallback(
