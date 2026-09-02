@@ -100,6 +100,16 @@ pub async fn set_watch_target(
     if let Some(inner) = guard.as_ref() {
         *inner.watch.lock().map_err(|e| e.to_string())? = target;
     }
+    drop(guard);
+    // Rich presence follows the same declaration. Untracked files (extras,
+    // interactive sessions) clear rather than show a stale card.
+    match target {
+        Some(target) => {
+            let pool = state.app_db.clone();
+            tauri::async_runtime::spawn(crate::discord_presence::video_started(pool, target));
+        }
+        None => crate::discord_presence::stopped(crate::discord_presence::Kind::Video),
+    }
     Ok(())
 }
 

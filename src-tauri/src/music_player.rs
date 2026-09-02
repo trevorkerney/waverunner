@@ -249,6 +249,9 @@ pub async fn music_play_track(
     };
     *inner.log.lock().map_err(|e| e.to_string())? = log;
 
+    let presence_pool = state.app_db.clone();
+    tauri::async_runtime::spawn(crate::discord_presence::music_started(presence_pool, track_id));
+
     // Flag BEFORE the loadfile so the event thread can't see the new file's
     // FileLoaded first. The unpause itself happens there — never here, where
     // it would resume the outgoing (possibly paused) track for a moment.
@@ -315,6 +318,8 @@ pub async fn music_track_started(
         duration: 0.0,
         scrobbled: false,
     });
+    let presence_pool = state.app_db.clone();
+    tauri::async_runtime::spawn(crate::discord_presence::music_started(presence_pool, track_id));
     Ok(())
 }
 
@@ -391,6 +396,7 @@ pub async fn music_stop(state: State<'_, AppState>) -> Result<(), String> {
         None => return Ok(()),
     };
     *inner.log.lock().map_err(|e| e.to_string())? = None;
+    crate::discord_presence::stopped(crate::discord_presence::Kind::Music);
     run_music(inner, |mpv| mpv.command(&["stop"])).await
 }
 
@@ -431,8 +437,39 @@ fn event_loop(app: &AppHandle, inner: Arc<MusicInner>) {
                         continue;
                     }
                     last_emit = Some(now);
+                    // Rich presence rides the throttled stream (~5/s); the
+                    // worker only re-sends on real seeks.
+                    if let Some(pos) = property_value_to_f64(prop) {
+                        crate::discord_presence::tick(crate::discord_presence::Kind::Music, pos);
+                    }
                 }
                 let value = property_value_to_json(prop);
+                match name.as_str() {
+                    "pause" => {
+                        if let Some(paused) = value.as_bool() {
+                            crate::discord_presence::pause_changed(
+                                crate::discord_presence::Kind::Music,
+                                paused,
+                            );
+                        }
+                    }
+                    "duration" => {
+                        if let Some(dur) = value.as_f64() {
+                            crate::discord_presence::duration_changed(
+                                crate::discord_presence::Kind::Music,
+                                dur,
+                            );
+                        }
+                    }
+                    // keep-open hold at the end of the queue: nothing is
+                    // playing any more, so the presence card goes away.
+                    "eof-reached" => {
+                        if value.as_bool() == Some(true) {
+                            crate::discord_presence::soft_end(crate::discord_presence::Kind::Music);
+                        }
+                    }
+                    _ => {}
+                }
                 let _ = app.emit(
                     "music-property-change",
                     serde_json::json!({ "name": name, "value": value }),

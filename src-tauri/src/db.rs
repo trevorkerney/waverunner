@@ -626,6 +626,20 @@ const MIGRATIONS: &[Migration] = &[
         // DEFAULT demotes every pre-existing heart to liked, per user intent.
         statements: &["ALTER TABLE track_loved ADD COLUMN level TEXT NOT NULL DEFAULT 'liked'"],
     },
+    Migration {
+        id: 35,
+        app_version: "1.0.0-alpha.12.5",
+        description: "per-release presentation — release's own tag title + release cover pick",
+        requires_table: Some("album_release"),
+        // album_release.title: the release's OWN majority album tag, stamped
+        // by the scanner (table is rebuilt per rescan; NULL until one runs).
+        // album_release_pref.cover: the user's cover pick for one release,
+        // folder-keyed like labels so it survives rescans.
+        statements: &[
+            "ALTER TABLE album_release ADD COLUMN title TEXT",
+            "ALTER TABLE album_release_pref ADD COLUMN cover TEXT",
+        ],
+    },
 ];
 
 /// Copy the database beside itself before the first migration of a run
@@ -1371,6 +1385,9 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             mb_release_id TEXT,
             is_default INTEGER NOT NULL DEFAULT 0,
             disc_count INTEGER NOT NULL DEFAULT 1,
+            -- The release's OWN title: majority album tag of its tracks, so a
+            -- combined-in source keeps its original name. NULL pre-rescan.
+            title TEXT,
             FOREIGN KEY (album_id) REFERENCES album(id) ON DELETE CASCADE
         )",
     )
@@ -1387,6 +1404,9 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             folder_path TEXT NOT NULL,
             label TEXT,
             is_default INTEGER NOT NULL DEFAULT 0,
+            -- The user's cover pick for THIS release (cached path), folder-
+            -- keyed like label so it survives the release-row rebuild.
+            cover TEXT,
             PRIMARY KEY (album_id, folder_path),
             FOREIGN KEY (album_id) REFERENCES album(id) ON DELETE CASCADE
         )",

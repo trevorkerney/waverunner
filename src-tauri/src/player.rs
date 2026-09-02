@@ -168,6 +168,7 @@ pub fn destroy_player(state: State<'_, AppState>) -> Result<(), String> {
         let _ = inner.mpv.command(&["quit"]);
         // MpvHandle::drop calls mpv_terminate_destroy
     }
+    crate::discord_presence::stopped(crate::discord_presence::Kind::Video);
     Ok(())
 }
 
@@ -674,6 +675,42 @@ fn event_loop(app: &AppHandle, inner: Arc<PlayerInner>) {
                         last_timepos_emit = Some(now);
                     }
                     let value = property_value_to_json(prop);
+                    // Rich presence: seeks, pauses, and the real duration ride
+                    // the same property stream the UI already gets.
+                    match name.as_str() {
+                        "time-pos" => {
+                            if let Some(pos) = value.as_f64() {
+                                crate::discord_presence::tick(
+                                    crate::discord_presence::Kind::Video,
+                                    pos,
+                                );
+                            }
+                        }
+                        "pause" => {
+                            if let Some(paused) = value.as_bool() {
+                                crate::discord_presence::pause_changed(
+                                    crate::discord_presence::Kind::Video,
+                                    paused,
+                                );
+                            }
+                        }
+                        "duration" => {
+                            if let Some(dur) = value.as_f64() {
+                                crate::discord_presence::duration_changed(
+                                    crate::discord_presence::Kind::Video,
+                                    dur,
+                                );
+                            }
+                        }
+                        "eof-reached" => {
+                            if value.as_bool() == Some(true) {
+                                crate::discord_presence::soft_end(
+                                    crate::discord_presence::Kind::Video,
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
                     let _ = app.emit(
                         "mpv-property-change",
                         serde_json::json!({ "name": name, "value": value }),

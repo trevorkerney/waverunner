@@ -119,6 +119,7 @@ import { playDropIn } from "@/lib/dropIn";
 import { TmdbMatchDialog } from "@/components/TmdbMatchDialog";
 import { TmdbShowMatchDialog } from "@/components/TmdbShowMatchDialog";
 import { TmdbImageBrowserDialog } from "@/components/TmdbImageBrowserDialog";
+import { CoversDialog, CoversMenuItem, type CoversTarget } from "@/components/CoversDialog";
 import { TmdbEpisodeSourceDialog } from "@/components/TmdbEpisodeSourceDialog";
 import { BackdropSelectDialog } from "@/components/BackdropSelectDialog";
 import rtCriticsIcon from "@/assets/ratings/rt-critics.svg";
@@ -446,23 +447,28 @@ export function MainContent({
     setCoverDialogEntry(entry);
   }, []);
 
-  const [tmdbImagesEntry, setTmdbImagesEntry] = useState<{ entry: MediaEntry; tmdbId: string } | null>(null);
-
-  const openTmdbImages = useCallback(async (entry: MediaEntry) => {
+  // The unified covers menu. Music albums are release-scoped (grid = the
+  // default release); everything else manages the entry's covers.
+  const [coversTarget, setCoversTarget] = useState<CoversTarget | null>(null);
+  const openCoversMenu = useCallback((entry: MediaEntry) => {
     if (!selectedLibrary) return;
-    try {
-      // The two commands take differently-named id args (showId vs entryId).
-      const detail = entry.entry_type === "show"
-        ? await invoke<{ tmdb_id: string | null }>("get_show_detail", { showId: entry.id })
-        : await invoke<{ tmdb_id: string | null }>("get_movie_detail", { entryId: entry.id });
-      if (!detail.tmdb_id) {
-        toast.error("Match to TMDB first");
-        return;
-      }
-      setTmdbImagesEntry({ entry, tmdbId: detail.tmdb_id });
-    } catch (e) {
-      toast.error(String(e));
-    }
+    setCoversTarget(
+      selectedLibrary.format === "music" && entry.entry_type === "album"
+        ? {
+            kind: "release",
+            libraryId: selectedLibrary.id,
+            albumId: entry.id,
+            releaseId: null,
+            title: entry.title,
+          }
+        : {
+            kind: "entry",
+            libraryId: selectedLibrary.id,
+            entryId: entry.id,
+            entryType: entry.entry_type,
+            title: entry.title,
+          },
+    );
   }, [selectedLibrary]);
 
   const deletePlaylistCollection = useCallback(async (collectionId: number) => {
@@ -1543,7 +1549,7 @@ export function MainContent({
       <div ref={scrollContainerRef} className={`min-w-0 flex-1 overflow-y-auto overflow-x-hidden p-4 ${scrubberApplies ? "pr-10" : ""}`}>
       {selectedEntry ? (
         selectedEntry.entry_type === "show"
-          ? <ShowDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getCoverUrl={getCoverUrl} getFullCoverUrl={getFullCoverUrl} onEntryChanged={onEntryChanged} onTitleChanged={onTitleChanged} onChangeCover={() => openCoverDialog(selectedEntry, "select")} onAddCover={() => onAddCover(selectedEntry.id)} onDeleteCover={() => openCoverDialog(selectedEntry, "delete")} onPlayEpisode={onPlayEpisode} onPlayFile={onPlayFile} onNavigateToPerson={onNavigateToPerson} onSelectGenre={onSelectGenre} />
+          ? <ShowDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getCoverUrl={getCoverUrl} getFullCoverUrl={getFullCoverUrl} onEntryChanged={onEntryChanged} onTitleChanged={onTitleChanged} onPlayEpisode={onPlayEpisode} onPlayFile={onPlayFile} onNavigateToPerson={onNavigateToPerson} onSelectGenre={onSelectGenre} />
         : selectedEntry.entry_type === "artist"
           ? <ArtistDetailPage
               entryId={selectedEntry.id}
@@ -1638,7 +1644,7 @@ export function MainContent({
               onAddToPlaylist={(t) => setAddToPlaylistFor(t)}
               onEnqueue={onEnqueueMusic}
             />
-          : <EntryDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getCoverUrl={getCoverUrl} getFullCoverUrl={getFullCoverUrl} onEntryChanged={onEntryChanged} onTitleChanged={onTitleChanged} onChangeCover={() => openCoverDialog(selectedEntry, "select")} onAddCover={() => onAddCover(selectedEntry.id)} onDeleteCover={() => openCoverDialog(selectedEntry, "delete")} onPlayFile={onPlayFile} onPlayInteractive={onPlayInteractive} onNavigateToPerson={onNavigateToPerson} onSelectGenre={onSelectGenre} />
+          : <EntryDetailPage entry={selectedEntry} selectedLibrary={selectedLibrary!} getCoverUrl={getCoverUrl} getFullCoverUrl={getFullCoverUrl} onEntryChanged={onEntryChanged} onTitleChanged={onTitleChanged} onPlayFile={onPlayFile} onPlayInteractive={onPlayInteractive} onNavigateToPerson={onNavigateToPerson} onSelectGenre={onSelectGenre} />
       ) : selectedLibrary?.format === "music" && activeView?.kind === "library-root" && !searchResults ? (
         // Artists page — People-page styling (circles, centered names, works
         // subtitle) instead of the generic cover grid. Search results keep the
@@ -1804,7 +1810,7 @@ export function MainContent({
                     onAddCover={() => onAddCover(entry.id, {
                       playlistCollection: entry.entry_type === "playlist_collection",
                     })}
-                    onAddCoverFromTmdb={() => openTmdbImages(entry)}
+                    onOpenCovers={() => openCoversMenu(entry)}
                     onDeleteCover={() => openCoverDialog(entry, "delete")}
                     onDelete={async (entry) => {
                       // Empty collections delete immediately; non-empty ones confirm
@@ -2068,17 +2074,16 @@ export function MainContent({
         />
       )}
 
-      {tmdbImagesEntry && selectedLibrary && (
-        <TmdbImageBrowserDialog
-          open={!!tmdbImagesEntry}
-          onOpenChange={(open) => { if (!open) setTmdbImagesEntry(null); }}
-          libraryId={selectedLibrary.id}
-          entryId={tmdbImagesEntry.entry.id}
-          tmdbId={tmdbImagesEntry.tmdbId}
-          mediaType={tmdbImagesEntry.entry.entry_type === "show" ? "tv" : "movie"}
-          onDownloaded={() => { onEntryChanged(); }}
-        />
-      )}
+      {/* The unified covers menu (grid entry point). */}
+      <CoversDialog
+        open={coversTarget !== null}
+        onOpenChange={(o) => {
+          if (!o) setCoversTarget(null);
+        }}
+        target={coversTarget}
+        getCoverUrl={getFullCoverUrl}
+        onChanged={onEntryChanged}
+      />
 
       {/* Add-to-playlist dialog (applies anywhere a media entry is right-clicked) */}
       <AddToPlaylistDialog
@@ -2149,7 +2154,7 @@ function SortableCoverCard({
   onRename,
   onChangeCover,
   onAddCover,
-  onAddCoverFromTmdb,
+  onOpenCovers,
   onDeleteCover,
   onDelete,
   onAddToPlaylist,
@@ -2181,7 +2186,8 @@ function SortableCoverCard({
   onRename: (entryId: number, newTitle: string) => Promise<string | null>;
   onChangeCover: () => void;
   onAddCover: () => void;
-  onAddCoverFromTmdb: () => void;
+  /** The unified covers menu (add local/remote, set, delete in one place). */
+  onOpenCovers: () => void;
   onDeleteCover: () => void;
   onDelete: (entry: MediaEntry) => Promise<void>;
   onAddToPlaylist?: (entry: MediaEntry) => void;
@@ -2576,29 +2582,15 @@ function SortableCoverCard({
                 Rename
               </ContextMenuItem>
             )}
-            {/* Add/Delete cover mutate the target media_entry (shared with the library),
-                which we don't want from inside a playlist — only the per-link cover
-                override (Change cover) is offered there. */}
-            {entry.link_id == null && (
-              <>
-                <ContextMenuItem onClick={onAddCover}>
-                  <ImageIcon size={14} />
-                  Add local cover
-                </ContextMenuItem>
-                <ContextMenuItem onClick={onAddCoverFromTmdb} disabled={entry.entry_type === "collection" || !entry.tmdb_id}>
-                  <ImageIcon size={14} />
-                  Add cover from TMDB
-                </ContextMenuItem>
-              </>
-            )}
-            <ContextMenuItem onClick={onChangeCover} disabled={entry.covers.length <= 1}>
-              <ImageIcon size={14} />
-              Change cover
-            </ContextMenuItem>
-            {entry.link_id == null && (
-              <ContextMenuItem onClick={onDeleteCover} disabled={entry.covers.length < 1}>
-                <Trash2 size={14} />
-                Delete cover
+            {/* One covers menu — add (local/remote), set, and delete live in
+                the dialog. Playlist links keep the per-link override only:
+                mutating the shared target from inside a playlist stays out. */}
+            {entry.link_id == null ? (
+              <CoversMenuItem onOpen={onOpenCovers} />
+            ) : (
+              <ContextMenuItem onClick={onChangeCover} disabled={entry.covers.length <= 1}>
+                <ImageIcon size={14} />
+                Change cover
               </ContextMenuItem>
             )}
             {onAddToPlaylist && entry.link_id == null && (entry.entry_type === "movie" || entry.entry_type === "show") && (
@@ -3165,9 +3157,6 @@ function EntryDetailPage({
   getFullCoverUrl,
   onEntryChanged,
   onTitleChanged,
-  onChangeCover,
-  onAddCover,
-  onDeleteCover,
   onPlayFile,
   onPlayInteractive,
   onNavigateToPerson,
@@ -3179,9 +3168,6 @@ function EntryDetailPage({
   getFullCoverUrl: (filePath: string) => string;
   onEntryChanged: () => void;
   onTitleChanged: (entryId: number, newTitle: string) => void;
-  onChangeCover: () => void;
-  onAddCover: () => void;
-  onDeleteCover: () => void;
   onPlayFile?: (path: string, title: string, opts?: { watch?: { kind: "movie" | "episode"; id: number }; startSecs?: number }) => void;
   onPlayInteractive?: (args: { libraryId: string; entryId: number; title: string; fresh?: boolean }) => void;
   onNavigateToPerson?: (person: PersonInfo, role: PersonRole) => void;
@@ -3195,6 +3181,7 @@ function EntryDetailPage({
   // Which tab the TMDB image browser opens on, or null when closed — the cover
   // menu opens posters, the backdrop menu opens backdrops.
   const [tmdbImagesTab, setTmdbImagesTab] = useState<"posters" | "backdrops" | null>(null);
+  const [coversOpen, setCoversOpen] = useState(false);
   const [backdropDialogOpen, setBackdropDialogOpen] = useState(false);
   const [extrasOpen, setExtrasOpen] = useState(false);
   const [extrasCount, setExtrasCount] = useState(0);
@@ -3351,21 +3338,14 @@ function EntryDetailPage({
           <ContextMenuSeparator />
         </>
       )}
-      <ContextMenuItem onClick={onChangeCover} disabled={entry.covers.length <= 1}>
-        <ImageIcon size={14} />
-        Change cover
-      </ContextMenuItem>
+      <CoversMenuItem onOpen={() => setCoversOpen(true)} />
       <ContextMenuItem onClick={() => setBackdropDialogOpen(true)}>
         <ImageIcon size={14} />
         Change backdrop
       </ContextMenuItem>
       <ContextMenuItem onClick={() => setTmdbImagesTab(tmdbTab)} disabled={!detail?.tmdb_id}>
         <ImageIcon size={14} />
-        Add cover/backdrop from TMDB
-      </ContextMenuItem>
-      <ContextMenuItem onClick={onAddCover}>
-        <ImageIcon size={14} />
-        Add local cover
+        Add backdrop from TMDB
       </ContextMenuItem>
       <ContextMenuSeparator />
       <ContextMenuItem onClick={startEditing}>
@@ -3421,15 +3401,6 @@ function EntryDetailPage({
           Reset story
         </ContextMenuItem>
       )}
-      <ContextMenuSeparator />
-      <ContextMenuItem
-        onClick={onDeleteCover}
-        disabled={entry.covers.length < 1}
-        className="text-destructive focus:text-destructive"
-      >
-        <Trash2 size={14} />
-        Delete cover
-      </ContextMenuItem>
     </>
   );
 
@@ -3726,6 +3697,13 @@ function EntryDetailPage({
           onDownloaded={() => { loadDetail(); onEntryChanged(); }}
         />
       )}
+      <CoversDialog
+        open={coversOpen}
+        onOpenChange={setCoversOpen}
+        target={{ kind: "entry", libraryId: selectedLibrary.id, entryId: entry.id, entryType: entry.entry_type, title: entry.title }}
+        getCoverUrl={getFullCoverUrl}
+        onChanged={() => { loadDetail(); onEntryChanged(); }}
+      />
       <BackdropSelectDialog
         open={backdropDialogOpen}
         onOpenChange={setBackdropDialogOpen}
@@ -3754,9 +3732,6 @@ function ShowDetailPage({
   getFullCoverUrl,
   onEntryChanged,
   onTitleChanged: _onTitleChanged,
-  onChangeCover,
-  onAddCover,
-  onDeleteCover,
   onPlayEpisode,
   onPlayFile,
   onNavigateToPerson,
@@ -3768,9 +3743,6 @@ function ShowDetailPage({
   getFullCoverUrl: (filePath: string) => string;
   onEntryChanged: () => void;
   onTitleChanged: (entryId: number, newTitle: string) => void;
-  onChangeCover: () => void;
-  onAddCover: () => void;
-  onDeleteCover: () => void;
   onPlayEpisode?: (args: { libraryId: string; showId: number; showTitle: string; startEpisodeId: number; startSecs?: number }) => void;
   /** Plays a standalone file (used for extras — episodes go through onPlayEpisode). */
   onPlayFile?: (path: string, title: string) => void;
@@ -3785,6 +3757,7 @@ function ShowDetailPage({
   // Which tab the TMDB image browser opens on, or null when closed — the cover
   // menu opens posters, the backdrop menu opens backdrops.
   const [tmdbImagesTab, setTmdbImagesTab] = useState<"posters" | "backdrops" | null>(null);
+  const [coversOpen, setCoversOpen] = useState(false);
   const [backdropDialogOpen, setBackdropDialogOpen] = useState(false);
   const [ratings, setRatings] = useState<RatingInfo[]>([]);
   const [omdbEnabled, setOmdbEnabled] = useState(false);
@@ -4243,21 +4216,14 @@ function ShowDetailPage({
           <ContextMenuSeparator />
         </>
       )}
-      <ContextMenuItem onClick={onChangeCover} disabled={entry.covers.length <= 1}>
-        <ImageIcon size={14} />
-        Change cover
-      </ContextMenuItem>
+      <CoversMenuItem onOpen={() => setCoversOpen(true)} />
       <ContextMenuItem onClick={() => setBackdropDialogOpen(true)}>
         <ImageIcon size={14} />
         Change backdrop
       </ContextMenuItem>
       <ContextMenuItem onClick={() => setTmdbImagesTab(tmdbTab)} disabled={!detail?.tmdb_id}>
         <ImageIcon size={14} />
-        Add cover/backdrop from TMDB
-      </ContextMenuItem>
-      <ContextMenuItem onClick={onAddCover}>
-        <ImageIcon size={14} />
-        Add local cover
+        Add backdrop from TMDB
       </ContextMenuItem>
       <ContextMenuSeparator />
       <ContextMenuItem onClick={startEditShow} disabled={!detail}>
@@ -4308,15 +4274,6 @@ function ShowDetailPage({
           </ContextMenuItem>
         );
       })()}
-      <ContextMenuSeparator />
-      <ContextMenuItem
-        onClick={onDeleteCover}
-        disabled={entry.covers.length < 1}
-        className="text-destructive focus:text-destructive"
-      >
-        <Trash2 size={14} />
-        Delete cover
-      </ContextMenuItem>
     </>
   );
 
@@ -4909,6 +4866,13 @@ function ShowDetailPage({
           onDownloaded={() => { loadDetail(); onEntryChanged(); }}
         />
       )}
+      <CoversDialog
+        open={coversOpen}
+        onOpenChange={setCoversOpen}
+        target={{ kind: "entry", libraryId: selectedLibrary.id, entryId: entry.id, entryType: entry.entry_type, title: entry.title }}
+        getCoverUrl={getFullCoverUrl}
+        onChanged={() => { loadDetail(); onEntryChanged(); }}
+      />
       <BackdropSelectDialog
         open={backdropDialogOpen}
         onOpenChange={setBackdropDialogOpen}

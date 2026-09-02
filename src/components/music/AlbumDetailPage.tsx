@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { useDeselectOnBackgroundClick } from "./useTrackSelection";
 import { notifyPendingWorkChanged } from "./PendingWork";
 import { toast } from "sonner";
 import { Play, Disc3, Pencil, ListPlus, ListStart, ListEnd, Scissors, Star, ListChecks, FolderOpen } from "lucide-react";
@@ -25,7 +26,8 @@ import { PlayingIndicator } from "./PlayingIndicator";
 import { LoveButton, LoveMenuItem } from "./LoveButton";
 import { RevealMenuItem } from "./RevealMenuItem";
 import { CodecBadge } from "./CodecBadge";
-import { albumCover, queueFromRelease, defaultRelease, fmtTrackTime, fmtAlbumRuntime, trackDisplayTitle } from "./musicQueue";
+import { releaseCover, queueFromRelease, defaultRelease, fmtTrackTime, fmtAlbumRuntime, trackDisplayTitle } from "./musicQueue";
+import { CoversDialog, CoversMenuItem } from "../CoversDialog";
 import { useMbHidden } from "@/lib/mbVisibility";
 
 interface AlbumDetailPageProps {
@@ -76,6 +78,9 @@ export function AlbumDetailPage({
   const [releaseId, setReleaseId] = useState<number | null>(null);
   // Single click selects a row; double click (or the hover play button) plays.
   const [selectedTrackId, setSelectedTrackId] = useState<number | null>(null);
+  // Document-level so "background" includes the page space BELOW a short
+  // track list — a container-scoped handler ends where the content does.
+  useDeselectOnBackgroundClick(useCallback(() => setSelectedTrackId(null), []));
   const [editTrackId, setEditTrackId] = useState<number | null>(null);
   const [editAlbumOpen, setEditAlbumOpen] = useState(false);
   // Sound collections: track being moved to another collection (or to loose).
@@ -92,6 +97,8 @@ export function AlbumDetailPage({
   const [renameRelease, setRenameRelease] = useState<MusicRelease | null>(null);
   /** Disc being named via the header pencil (multi-disc sets). */
   const [renameDisc, setRenameDisc] = useState<number | null>(null);
+  /** The unified covers menu, scoped to the ACTIVE release. */
+  const [coversOpen, setCoversOpen] = useState(false);
 
   // Navigations clear the page (spinner); edit-triggered refetches are silent
   // and keep the selected release when it still exists.
@@ -196,48 +203,46 @@ export function AlbumDetailPage({
     );
   }
 
-  const cover = albumCover(detail);
+  // Everything a release owns swaps with the picker: cover, title, year,
+  // tracks, time. Album-level values are the fallback.
+  const cover = releaseCover(detail, release);
   const totalSecs = release?.tracks.reduce((acc, t) => acc + (t.runtime_secs ?? 0), 0) ?? 0;
   const playFrom = (index: number) => {
     if (!release) return;
     onPlayQueue(queueFromRelease(detail, release), index);
   };
-
   return (
-    <div
-      className="px-6 pb-8"
-      // Clicking empty page space deselects the selected track. Guarded so
-      // clicks on rows (buttons) and any other control never count as
-      // "background" — only genuinely inert space clears the selection.
-      onClick={(e) => {
-        if (
-          selectedTrackId !== null &&
-          !(e.target as HTMLElement).closest("button, [role='link'], [role='menu'], input, textarea, select, img")
-        ) {
-          setSelectedTrackId(null);
-        }
-      }}
-    >
+    <div className="px-6 pb-8">
       {/* Header */}
       <div className="flex items-end gap-5 py-6">
-        {cover ? (
-          <img
-            src={getFullCoverUrl(cover)}
-            alt=""
-            className="h-80 w-80 shrink-0 rounded-[3px] object-cover shadow-md"
-            draggable={false}
+        {/* Right-click the art: the covers menu for the ACTIVE release. */}
+        <ContextMenu>
+          <ContextMenuTrigger
+            render={
+              cover ? (
+                <img
+                  src={getFullCoverUrl(cover)}
+                  alt=""
+                  className="h-80 w-80 shrink-0 rounded-[3px] object-cover shadow-md"
+                  draggable={false}
+                />
+              ) : (
+                <div className="flex h-80 w-80 shrink-0 items-center justify-center rounded-[3px] bg-muted text-muted-foreground">
+                  <Disc3 size={56} />
+                </div>
+              )
+            }
           />
-        ) : (
-          <div className="flex h-80 w-80 shrink-0 items-center justify-center rounded-[3px] bg-muted text-muted-foreground">
-            <Disc3 size={56} />
-          </div>
-        )}
+          <ContextMenuContent>
+            <CoversMenuItem onOpen={() => setCoversOpen(true)} />
+          </ContextMenuContent>
+        </ContextMenu>
         <div className="min-w-0 pb-1">
           <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
             {detail.album_type || "album"}
           </p>
           <h1 className="group/title flex min-w-0 items-center gap-2 font-heading text-4xl font-bold">
-            <span className="truncate">{detail.title}</span>
+            <span className="truncate">{release?.title ?? detail.title}</span>
             <button
               onClick={() => setEditAlbumOpen(true)}
               className="shrink-0 rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/title:opacity-100"
@@ -313,7 +318,7 @@ export function AlbumDetailPage({
                 detail.artist_credits.length >= 2 ||
                 (detail.artist_id != null && detail.artist_title != null);
               const parts = [
-                detail.year,
+                release?.year ?? detail.year,
                 release ? `${release.tracks.length} tracks` : null,
                 fmtAlbumRuntime(totalSecs) || null,
               ].filter(Boolean);
@@ -370,6 +375,19 @@ export function AlbumDetailPage({
                           <span className="block size-2.5 rounded-full border border-muted-foreground/50" />
                         )}
                       </span>
+                      {/* Each release's own art in the picker. */}
+                      {(() => {
+                        const rc = releaseCover(detail, r);
+                        return rc ? (
+                          <img
+                            src={getFullCoverUrl(rc)}
+                            alt=""
+                            className="h-9 w-9 shrink-0 rounded-[2px] object-cover"
+                            loading="lazy"
+                            draggable={false}
+                          />
+                        ) : null;
+                      })()}
                       <span className="min-w-0 flex-1">
                         <span className="flex items-center gap-1.5">
                           <span className="truncate text-sm">{releaseLabel(r)}</span>
@@ -389,6 +407,8 @@ export function AlbumDetailPage({
                         </span>
                         <span className="block truncate text-[11px] text-muted-foreground">
                           {[
+                            r.title,
+                            r.year,
                             `${r.tracks.length} track${r.tracks.length === 1 ? "" : "s"}`,
                             r.folder,
                           ]
@@ -715,6 +735,21 @@ export function AlbumDetailPage({
             });
             setReloadKey((k) => k + 1);
           }}
+        />
+      )}
+      {release && (
+        <CoversDialog
+          open={coversOpen}
+          onOpenChange={setCoversOpen}
+          target={{
+            kind: "release",
+            libraryId: detail.library_id,
+            albumId: detail.id,
+            releaseId: release.id,
+            title: release.title ?? detail.title,
+          }}
+          getCoverUrl={getFullCoverUrl}
+          onChanged={handleSaved}
         />
       )}
     </div>

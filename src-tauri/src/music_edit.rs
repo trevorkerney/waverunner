@@ -945,6 +945,63 @@ pub async fn set_default_release(
         .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
+    // The album card's cover follows the default release: the new default's
+    // own pick, or NULL so the grid falls back to the pool's first cover.
+    sqlx::query(
+        "UPDATE album SET selected_cover = (
+            SELECT p.cover FROM album_release_pref p
+            WHERE p.album_id = ? AND p.folder_path = ? COLLATE NOCASE
+              AND p.cover IS NOT NULL AND p.cover <> '')
+         WHERE id = ?",
+    )
+    .bind(album_id)
+    .bind(&folder)
+    .bind(album_id)
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// The user's cover pick for ONE release of a multi-release album (the album
+/// page's picker while a release is active). Folder-keyed — survives the
+/// release-row rebuild. Picking on the DEFAULT release also moves the album
+/// card, which by rule shows the default release's cover.
+#[tauri::command]
+pub async fn set_release_cover(
+    state: State<'_, AppState>,
+    release_id: i64,
+    cover: Option<String>,
+) -> Result<(), String> {
+    let pool = &state.app_db;
+    let row: Option<(i64, String, i64)> =
+        sqlx::query_as("SELECT album_id, folder_path, is_default FROM album_release WHERE id = ?")
+            .bind(release_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    let Some((album_id, folder, is_default)) = row else {
+        return Err("Release not found".to_string());
+    };
+    sqlx::query(
+        "INSERT INTO album_release_pref (album_id, folder_path, cover)
+         VALUES (?, ?, ?)
+         ON CONFLICT(album_id, folder_path) DO UPDATE SET cover = excluded.cover",
+    )
+    .bind(album_id)
+    .bind(&folder)
+    .bind(&cover)
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    if is_default != 0 {
+        sqlx::query("UPDATE album SET selected_cover = ? WHERE id = ?")
+            .bind(&cover)
+            .bind(album_id)
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 

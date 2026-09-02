@@ -1143,6 +1143,22 @@ fn release_date_of(release: &ScannedRelease) -> Option<String> {
     release.tracks.iter().filter_map(|t| t.date.clone()).min()
 }
 
+/// This release's OWN title: the majority album tag of ITS tracks (the album
+/// row keeps the group title). Combined-in sources keep showing their
+/// original names — "So Far Gone" the EP vs the mixtape. None = untagged.
+fn release_title_of(release: &ScannedRelease) -> Option<String> {
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for t in &release.tracks {
+        if !t.album.is_empty() {
+            *counts.entry(t.album.as_str()).or_insert(0) += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .max_by_key(|(_, n)| *n)
+        .map(|(v, _)| v.to_string())
+}
+
 fn release_disc_count(release: &ScannedRelease) -> i64 {
     release.tracks.iter().map(|t| t.disc_number).max().unwrap_or(1)
 }
@@ -1404,8 +1420,8 @@ async fn insert_album(
 
     for (i, release) in album.releases.iter().enumerate() {
         let res = sqlx::query(
-            "INSERT INTO album_release (album_id, label, folder_path, release_date, mb_release_id, is_default, disc_count)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO album_release (album_id, label, folder_path, release_date, mb_release_id, is_default, disc_count, title)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(album_entry_id)
         .bind(&release.label)
@@ -1414,6 +1430,7 @@ async fn insert_album(
         .bind(release_mb_id(release))
         .bind((i == album.default_release) as i64)
         .bind(release_disc_count(release))
+        .bind(release_title_of(release))
         .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
@@ -1611,8 +1628,8 @@ async fn reconcile_album(
 
     for (i, release) in album.releases.iter().enumerate() {
         let res = sqlx::query(
-            "INSERT INTO album_release (album_id, label, folder_path, release_date, mb_release_id, is_default, disc_count)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO album_release (album_id, label, folder_path, release_date, mb_release_id, is_default, disc_count, title)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(album_entry_id)
         .bind(&release.label)
@@ -1621,6 +1638,7 @@ async fn reconcile_album(
         .bind(release_mb_id(release))
         .bind((i == album.default_release) as i64)
         .bind(release_disc_count(release))
+        .bind(release_title_of(release))
         .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
@@ -3164,6 +3182,28 @@ pub async fn ensure_credit_artists(pool: &SqlitePool, library_id: &str) -> Resul
     // pass, credit edits), which makes this the natural place to stamp: the
     // credit set is final and the artists it names now exist.
     resolve_credit_ids(pool, library_id).await?;
+    // Grid rule: an album card's cover IS its default release's pick. Re-sync
+    // here for the same reason — rescans and combines can move which release
+    // is default. Albums whose default release has no pick keep their own.
+    sqlx::query(
+        "UPDATE album SET selected_cover = (
+            SELECT p.cover FROM album_release_pref p
+            JOIN album_release ar ON ar.album_id = p.album_id
+                 AND ar.folder_path = p.folder_path COLLATE NOCASE
+            WHERE p.album_id = album.id AND ar.is_default = 1
+              AND p.cover IS NOT NULL AND p.cover <> '')
+         WHERE id IN (SELECT me.id FROM media_entry me WHERE me.library_id = ?)
+           AND EXISTS (
+            SELECT 1 FROM album_release_pref p
+            JOIN album_release ar ON ar.album_id = p.album_id
+                 AND ar.folder_path = p.folder_path COLLATE NOCASE
+            WHERE p.album_id = album.id AND ar.is_default = 1
+              AND p.cover IS NOT NULL AND p.cover <> '')",
+    )
+    .bind(library_id)
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
     Ok(created)
 }
 
@@ -4852,6 +4892,17 @@ pub struct ReleaseView {
     /// overlaid by the user's renames (disc_title_pref).
     pub disc_titles: Vec<DiscTitleView>,
     pub tracks: Vec<TrackView>,
+    /// The release's OWN title (its tracks' majority album tag) when it
+    /// differs is worth showing; None pre-rescan or untagged — fall back to
+    /// the album title.
+    pub title: Option<String>,
+    /// This release's art: the pooled album covers that live under ITS
+    /// folders (bare names belong to the default release). Never empty when
+    /// the album has any art — releases with none fall back to the full pool.
+    pub covers: Vec<String>,
+    /// The user's cover pick for this release (album_release_pref), when it
+    /// still exists in the pool.
+    pub selected_cover: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -4972,9 +5023,9 @@ pub async fn get_album_detail(
     .await
     .map_err(|e| e.to_string())?;
 
-    let release_rows: Vec<(i64, Option<String>, i64, i64, Option<String>, String, Option<String>)> =
+    let release_rows: Vec<(i64, Option<String>, i64, i64, Option<String>, String, Option<String>, Option<String>)> =
         sqlx::query_as(
-            "SELECT id, label, is_default, disc_count, release_date, folder_path, mb_release_id
+            "SELECT id, label, is_default, disc_count, release_date, folder_path, mb_release_id, title
          FROM album_release WHERE album_id = ?
          ORDER BY is_default DESC, label",
         )
@@ -4982,6 +5033,67 @@ pub async fn get_album_detail(
         .fetch_all(pool)
         .await
         .map_err(|e| e.to_string())?;
+
+    // Per-release art attribution. The scan pools every release's covers into
+    // one cached set for the album folder, prefixing non-default releases'
+    // files with their source folder's leaf ("{leaf}_{name}") while the album
+    // root and the default release keep bare names — so ownership is
+    // recoverable from the cached filename alone.
+    let cover_rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT source_filename, cached_path FROM cached_images
+         WHERE library_id = ? AND entry_folder_path = ? AND image_type = 'cover'
+         ORDER BY source_filename",
+    )
+    .bind(&library_id)
+    .bind(&folder_path)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    // The user's per-release cover picks, folder-keyed (case-folded).
+    let pref_covers: HashMap<String, String> = sqlx::query_as::<_, (String, String)>(
+        "SELECT folder_path, cover FROM album_release_pref
+         WHERE album_id = ? AND cover IS NOT NULL AND cover <> ''",
+    )
+    .bind(entry_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .into_iter()
+    .map(|(f, c)| (f.to_lowercase(), c))
+    .collect();
+    // Folder leaves each release owns: its own folder plus every folder its
+    // tracks live in (disc subfolders, combined-in sources).
+    let leaf = |p: &str| p.rsplit(['\\', '/']).next().unwrap_or(p).to_lowercase();
+    let mut leaves_by_release: HashMap<i64, std::collections::HashSet<String>> = HashMap::new();
+    for (rid, _, _, _, _, rfolder, _, _) in &release_rows {
+        leaves_by_release.entry(*rid).or_default().insert(leaf(rfolder));
+    }
+    let track_folder_rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT tr.release_id, t.file_path FROM track t
+         JOIN track_release tr ON tr.track_id = t.id
+         JOIN media_entry me ON me.id = t.id
+         WHERE me.parent_id = ?",
+    )
+    .bind(entry_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    for (rid, rel) in &track_folder_rows {
+        if let Some((parent, _)) = rel.rsplit_once(['\\', '/']) {
+            leaves_by_release.entry(*rid).or_default().insert(leaf(parent));
+        }
+    }
+    // A cached name with ANY release's prefix is owned; the rest are bare and
+    // belong to the default release (album root + default-folder art).
+    let all_leaves: std::collections::HashSet<&String> =
+        leaves_by_release.values().flatten().collect();
+    let is_prefixed = |name_lower: &str| {
+        all_leaves.iter().any(|l| {
+            name_lower.len() > l.len() + 1
+                && name_lower.starts_with(l.as_str())
+                && name_lower.as_bytes()[l.len()] == b'_'
+        })
+    };
 
     // Every name each library artist answers to (title + aliases), for
     // linking credits to their pages — displayed under current artist titles.
@@ -5020,7 +5132,7 @@ pub async fn get_album_detail(
     }
 
     let mut releases = Vec::new();
-    for (rid, label, is_default, disc_count, rdate, folder_path, mb_release_id) in release_rows {
+    for (rid, label, is_default, disc_count, rdate, folder_path, mb_release_id, rtitle) in release_rows {
         let track_rows: Vec<(i64, String, Option<i64>, Option<i64>, Option<i64>, Option<String>, String, i64, Option<String>, Option<String>, Option<i64>, Option<String>)> =
             sqlx::query_as(
                 "SELECT t.id, t.title, t.track_number, t.disc_number, t.runtime, tm.artist_name, t.file_path,
@@ -5087,6 +5199,30 @@ pub async fn get_album_detail(
         }
         disc_titles.sort_by_key(|(d, _)| *d);
 
+        // This release's OWN art and nothing else: covers under its folders,
+        // plus the bare-named ones when it's the default. Releases don't
+        // pool — one with no art of its own shows the placeholder.
+        let my_leaves = leaves_by_release.get(&rid);
+        let release_covers: Vec<String> = cover_rows
+            .iter()
+            .filter(|(name, _)| {
+                let lower = name.to_lowercase();
+                let owned = my_leaves.is_some_and(|ls| {
+                    ls.iter().any(|l| {
+                        lower.len() > l.len() + 1
+                            && lower.starts_with(l.as_str())
+                            && lower.as_bytes()[l.len()] == b'_'
+                    })
+                });
+                owned || (is_default != 0 && !is_prefixed(&lower))
+            })
+            .map(|(_, path)| path.clone())
+            .collect();
+        let release_selected = pref_covers
+            .get(&folder_path.to_lowercase())
+            .filter(|c| release_covers.iter().any(|rc| rc == *c))
+            .cloned();
+
         releases.push(ReleaseView {
             id: rid,
             label,
@@ -5108,6 +5244,9 @@ pub async fn get_album_detail(
                 .map(|(disc, title)| DiscTitleView { disc, title })
                 .collect(),
             tracks,
+            title: rtitle.filter(|t| !t.is_empty()),
+            covers: release_covers,
+            selected_cover: release_selected,
         });
     }
 
@@ -5445,8 +5584,54 @@ pub async fn get_track_queue_items(
             .map(|(name, aid)| credit_view(name, aid, titles))
             .collect();
         let loose = is_loose != 0;
+        // Bar art shows the PRESSING being played: the track's own release —
+        // its pick first, then art attributed to its folder by the pooled-name
+        // prefix, then the album-level fallback (selected = default release's
+        // pick by construction).
+        let release_row: Option<(String, Option<String>, i64)> = sqlx::query_as(
+            "SELECT ar.folder_path,
+                    (SELECT p.cover FROM album_release_pref p
+                     WHERE p.album_id = ar.album_id
+                       AND p.folder_path = ar.folder_path COLLATE NOCASE
+                       AND p.cover IS NOT NULL AND p.cover <> ''),
+                    ar.is_default
+             FROM track_release tr JOIN album_release ar ON ar.id = tr.release_id
+             WHERE tr.track_id = ?",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        // Strictly the PRESSING's art — releases don't pool. Default release:
+        // its pick or the shared map (which get_all_cached_covers already
+        // trims to default-release art). Non-default: its pick or its
+        // "{leaf}_"-prefixed slice of the album cache — queried raw here
+        // because the shared map strips those on purpose. No art → no cover.
         let cover = if loose {
             None
+        } else if let Some((_, Some(pref), _)) = &release_row {
+            Some(pref.clone())
+        } else if let (Some(folder), Some((rfolder, None, 0))) = (&album_folder, &release_row) {
+            let leaf = rfolder
+                .rsplit(['\\', '/'])
+                .next()
+                .unwrap_or(rfolder)
+                .to_lowercase();
+            sqlx::query_scalar::<_, String>(
+                "SELECT cached_path FROM cached_images
+                 WHERE library_id = ? AND entry_folder_path = ? AND image_type = 'cover'
+                   AND LOWER(source_filename) LIKE ? ESCAPE '^'
+                 ORDER BY source_filename LIMIT 1",
+            )
+            .bind(&library_id)
+            .bind(folder)
+            .bind(format!(
+                "{}^_%",
+                leaf.replace('^', "^^").replace('%', "^%").replace('_', "^_")
+            ))
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?
         } else {
             album_folder.and_then(|folder| {
                 let covers = covers_map.get(&folder)?;
@@ -5474,6 +5659,117 @@ pub async fn get_track_queue_items(
         });
     }
     Ok(out)
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReleaseCovers {
+    /// The concrete release resolved (callers may ask for the default).
+    pub release_id: i64,
+    pub covers: Vec<crate::commands::CoverInfo>,
+    pub selected: Option<String>,
+}
+
+/// The covers dialog's view of ONE release: strictly its own slice of the
+/// album's pooled art, by the same filename-prefix attribution
+/// get_album_detail uses (its folder + its tracks' folders own "{leaf}_"
+/// names; bare names belong to the default release). None → default release.
+#[tauri::command]
+pub async fn get_release_covers(
+    state: State<'_, AppState>,
+    album_id: i64,
+    release_id: Option<i64>,
+) -> Result<ReleaseCovers, String> {
+    let pool = &state.app_db;
+    let (library_id, album_folder): (String, String) = sqlx::query_as(
+        "SELECT me.library_id, al.folder_path FROM album al
+         JOIN media_entry me ON me.id = al.id WHERE al.id = ?",
+    )
+    .bind(album_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or("Album not found")?;
+
+    let release_rows: Vec<(i64, String, i64)> = sqlx::query_as(
+        "SELECT id, folder_path, is_default FROM album_release WHERE album_id = ?",
+    )
+    .bind(album_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let (rid, rfolder, is_default) = release_rows
+        .iter()
+        .find(|(id, _, d)| match release_id {
+            Some(want) => *id == want,
+            None => *d != 0,
+        })
+        .or(release_rows.first())
+        .cloned()
+        .ok_or("Release not found")?;
+
+    let leaf = |p: &str| p.rsplit(['\\', '/']).next().unwrap_or(p).to_lowercase();
+    let mut my_leaves: std::collections::HashSet<String> = std::collections::HashSet::new();
+    my_leaves.insert(leaf(&rfolder));
+    let mut all_leaves: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (orid, ofolder, _) in &release_rows {
+        all_leaves.insert(leaf(ofolder));
+        let track_rels: Vec<(String,)> = sqlx::query_as(
+            "SELECT t.file_path FROM track t
+             JOIN track_release tr ON tr.track_id = t.id WHERE tr.release_id = ?",
+        )
+        .bind(orid)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        for (rel,) in track_rels {
+            if let Some((parent, _)) = rel.rsplit_once(['\\', '/']) {
+                let l = leaf(parent);
+                if *orid == rid {
+                    my_leaves.insert(l.clone());
+                }
+                all_leaves.insert(l);
+            }
+        }
+    }
+    let owns = |leaves: &std::collections::HashSet<String>, name_lower: &str| {
+        leaves.iter().any(|l| {
+            name_lower.len() > l.len() + 1
+                && name_lower.starts_with(l.as_str())
+                && name_lower.as_bytes()[l.len()] == b'_'
+        })
+    };
+
+    let cover_rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT source_filename, cached_path, origin FROM cached_images
+         WHERE library_id = ? AND entry_folder_path = ? AND image_type = 'cover'
+         ORDER BY source_filename",
+    )
+    .bind(&library_id)
+    .bind(&album_folder)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let covers: Vec<crate::commands::CoverInfo> = cover_rows
+        .into_iter()
+        .filter(|(name, _, _)| {
+            let lower = name.to_lowercase();
+            owns(&my_leaves, &lower) || (is_default != 0 && !owns(&all_leaves, &lower))
+        })
+        .map(|(_, path, origin)| crate::commands::CoverInfo { path, origin })
+        .collect();
+
+    let selected: Option<String> = sqlx::query_scalar(
+        "SELECT cover FROM album_release_pref
+         WHERE album_id = ? AND folder_path = ? COLLATE NOCASE
+           AND cover IS NOT NULL AND cover <> ''",
+    )
+    .bind(album_id)
+    .bind(&rfolder)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let selected = selected.filter(|s| covers.iter().any(|c| &c.path == s));
+    Ok(ReleaseCovers { release_id: rid, covers, selected })
 }
 
 /// "Remove from Recently listened to": hides the track's plays up to now from

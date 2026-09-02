@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { useDeselectOnBackgroundClick } from "./useTrackSelection";
 import { Play, Music2, Pencil, ListPlus, ListStart, ListEnd, Disc3 } from "lucide-react";
 import { Spinner } from "../ui/spinner";
 import {
@@ -55,6 +56,9 @@ export function LooseTracksPage({
 }: LooseTracksPageProps) {
   const [rows, setRows] = useState<LibraryTrackRow[] | null>(null);
   const [selectedTrackId, setSelectedTrackId] = useState<number | null>(null);
+  // Document-level so "background" includes the page space BELOW a short
+  // track list — a container-scoped handler ends where the content does.
+  useDeselectOnBackgroundClick(useCallback(() => setSelectedTrackId(null), []));
   // Per-library "hide MusicBrainz outside the center" (center map toggle).
   const mbHidden = useMbHidden(libraryId);
   const [editTrackId, setEditTrackId] = useState<number | null>(null);
@@ -135,17 +139,7 @@ export function LooseTracksPage({
   };
 
   return (
-    <div
-      className="px-6 pb-8"
-      onClick={(e) => {
-        if (
-          selectedTrackId !== null &&
-          !(e.target as HTMLElement).closest("button, [role='link'], [role='menu'], input, textarea, select, img")
-        ) {
-          setSelectedTrackId(null);
-        }
-      }}
-    >
+    <div className="px-6 pb-8">
       {/* Header — album-page shape with a placeholder cover. */}
       <div className="flex items-end gap-5 py-6">
         <div className="flex h-80 w-80 shrink-0 items-center justify-center rounded-[3px] bg-muted text-muted-foreground">

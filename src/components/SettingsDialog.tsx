@@ -306,6 +306,22 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                   </div>
                 </div>
               </div>
+              <div>
+                <h3 className="mb-4 text-sm font-semibold">Integrations</h3>
+                <div className="flex items-center justify-between gap-4">
+                  <div>
+                    <p className="text-sm">Discord Rich Presence</p>
+                    <p className="text-xs text-muted-foreground">
+                      Show what you're listening to or watching on your Discord profile.
+                      Needs the Discord desktop app running.
+                    </p>
+                  </div>
+                  <Switch
+                    checked={view["discord_presence"] === "true"}
+                    onCheckedChange={(v) => stageSetting("discord_presence", v ? "true" : "false")}
+                  />
+                </div>
+              </div>
             </div>
           )}
           {activeCategory === "tmdb" && (

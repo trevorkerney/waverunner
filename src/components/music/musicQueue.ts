@@ -8,9 +8,23 @@ export function albumCover(detail: MusicAlbumDetail): string | null {
   return detail.covers[0] ?? null;
 }
 
+/** STRICTLY a release's own art: its pick, else the first cover attributed
+ *  to its folders, else nothing — releases don't pool, so an artless release
+ *  shows the placeholder. The album-level cover only stands in while no
+ *  release is resolved yet (loading). */
+export function releaseCover(detail: MusicAlbumDetail, release: MusicRelease | null): string | null {
+  if (release) {
+    if (release.selected_cover && release.covers.includes(release.selected_cover)) {
+      return release.selected_cover;
+    }
+    return release.covers[0] ?? null;
+  }
+  return albumCover(detail);
+}
+
 /** Build the play queue for one release of an album, in track order. */
 export function queueFromRelease(detail: MusicAlbumDetail, release: MusicRelease): MusicQueueItem[] {
-  const cover = albumCover(detail);
+  const cover = releaseCover(detail, release);
   return release.tracks.map((t) => ({
     trackId: t.id,
     title: trackDisplayTitle(t.title, t.file_path),

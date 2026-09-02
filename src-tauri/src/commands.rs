@@ -489,6 +489,10 @@ pub async fn set_setting(
         .execute(&state.app_db)
         .await
         .map_err(|e| e.to_string())?;
+    // Live side-effects for settings a backend worker watches.
+    if key == "discord_presence" {
+        crate::discord_presence::set_enabled(value == "true");
+    }
     Ok(())
 }
 
@@ -3023,6 +3027,7 @@ pub async fn add_cover(
     library_id: String,
     entry_id: i64,
     source_path: String,
+    release_id: Option<i64>,
 ) -> Result<String, String> {
     let entry_row: Option<(String,)> = sqlx::query_as(
         "SELECT folder_path FROM media_entry_full WHERE id = ?",
@@ -3034,11 +3039,31 @@ pub async fn add_cover(
 
     let (folder_path,) = entry_row.ok_or("Entry not found")?;
 
+    // Release-scoped add (music): a NON-default release's covers are the
+    // "{folder-leaf}_"-prefixed ones, so name the file to land there. The
+    // default release owns bare names — no prefix needed.
+    let mut name_prefix: Option<String> = None;
+    if let Some(rid) = release_id {
+        let rel: Option<(String, i64)> = sqlx::query_as(
+            "SELECT folder_path, is_default FROM album_release WHERE id = ? AND album_id = ?",
+        )
+        .bind(rid)
+        .bind(entry_id)
+        .fetch_optional(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+        let (rfolder, is_default) = rel.ok_or("Release not found")?;
+        if is_default == 0 {
+            let leaf = rfolder.rsplit(['\\', '/']).next().unwrap_or(&rfolder);
+            name_prefix = Some(format!("{leaf}_"));
+        }
+    }
+
     // App-added covers never touch the media folders — originals live in app-data.
     // This also covers virtual collections, whose synthetic folder_path has no disk home.
     let app_base = app_images_base(&state.app_data_dir, &library_id);
     let target_dir = app_base.join(&folder_path).join("covers");
-    let target_abs = copy_cover_into_dir(&source_path, &target_dir)?;
+    let target_abs = copy_cover_into_dir(&source_path, &target_dir, name_prefix.as_deref())?;
     let target_name = PathBuf::from(&target_abs)
         .file_name()
         .unwrap_or_default()
@@ -3065,6 +3090,138 @@ pub async fn add_cover(
     cached_path
         .map(|(p,)| p)
         .ok_or_else(|| "Cover added but cache path not found".into())
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct CoverInfo {
+    pub path: String,
+    /// 'library' = a file in the media folder (undeletable from the app),
+    /// 'app' = added through waverunner, 'fetched' = auto-fetched.
+    pub origin: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct EntryCovers {
+    pub covers: Vec<CoverInfo>,
+    pub selected: Option<String>,
+}
+
+/// The covers dialog's view of one entry (video movie/show/collection, music
+/// artist). Music ALBUMS are release-scoped — get_release_covers instead.
+#[tauri::command]
+pub async fn get_entry_covers(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    entry_id: i64,
+) -> Result<EntryCovers, String> {
+    let entry_row: Option<(String,)> =
+        sqlx::query_as("SELECT folder_path FROM media_entry_full WHERE id = ?")
+            .bind(entry_id)
+            .fetch_optional(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+    let (folder_path,) = entry_row.ok_or("Entry not found")?;
+
+    let mut rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT cached_path, origin FROM cached_images
+         WHERE library_id = ? AND entry_folder_path = ? AND image_type = 'cover'
+         ORDER BY source_filename",
+    )
+    .bind(&library_id)
+    .bind(&folder_path)
+    .fetch_all(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    // Artists also carry auto-fetched portraits under their synthetic key.
+    let is_artist: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM artist WHERE id = ?")
+        .bind(entry_id)
+        .fetch_optional(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+    if is_artist.is_some() {
+        let fetched: Vec<(String, String)> = sqlx::query_as(
+            "SELECT cached_path, origin FROM cached_images
+             WHERE library_id = ? AND entry_folder_path = ? AND image_type = 'cover'
+             ORDER BY source_filename",
+        )
+        .bind(&library_id)
+        .bind(crate::music_art::artist_fetch_rel(entry_id))
+        .fetch_all(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+        rows.extend(fetched);
+    }
+
+    // Selected: blind reads — only the owning table bites.
+    let mut selected: Option<String> = None;
+    for table in ["movie", "show", "media_collection", "artist", "album"] {
+        let q = format!("SELECT selected_cover FROM {table} WHERE id = ?");
+        let r: Option<(Option<String>,)> = sqlx::query_as(&q)
+            .bind(entry_id)
+            .fetch_optional(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Some((v,)) = r {
+            selected = v;
+            break;
+        }
+    }
+    Ok(EntryCovers {
+        covers: rows.into_iter().map(|(path, origin)| CoverInfo { path, origin }).collect(),
+        selected: selected.filter(|s| !s.is_empty()),
+    })
+}
+
+/// Download a remote image (Cover Art Archive picks) and add it exactly like
+/// a local add — app-origin, so it's deletable, and release-scoped the same
+/// way. `filename` names the stored file ("caa-front.jpg").
+#[tauri::command]
+pub async fn add_cover_from_url(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    entry_id: i64,
+    url: String,
+    filename: String,
+    release_id: Option<i64>,
+) -> Result<String, String> {
+    if !url.starts_with("https://") {
+        return Err("Only https image URLs are supported".into());
+    }
+    let client = crate::music_art::art_client()?;
+    let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("Image download failed: HTTP {}", resp.status()));
+    }
+    let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+    if bytes.len() < 1024 {
+        return Err("Downloaded file is not an image".into());
+    }
+    // Stage in app-data temp, then reuse the local-add path end to end.
+    let tmp_dir = state.app_data_dir.join("tmp");
+    std::fs::create_dir_all(&tmp_dir).map_err(|e| e.to_string())?;
+    let mut safe: String = filename
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
+        .collect();
+    if safe.is_empty() {
+        safe = "cover.jpg".to_string();
+    }
+    let lower = safe.to_lowercase();
+    if !["jpg", "jpeg", "png", "webp", "bmp", "gif"].iter().any(|e| lower.ends_with(&format!(".{e}"))) {
+        safe.push_str(".jpg");
+    }
+    let tmp = tmp_dir.join(safe);
+    std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
+    let result = add_cover(
+        state,
+        library_id,
+        entry_id,
+        tmp.to_string_lossy().to_string(),
+        release_id,
+    )
+    .await;
+    let _ = std::fs::remove_file(&tmp);
+    result
 }
 
 #[tauri::command]
@@ -5414,7 +5571,7 @@ pub async fn add_playlist_cover(
     source_path: String,
 ) -> Result<String, String> {
     let dir = playlist_covers_dir(&state.app_data_dir, "playlist", playlist_id);
-    let added = copy_cover_into_dir(&source_path, &dir)?;
+    let added = copy_cover_into_dir(&source_path, &dir, None)?;
     // Auto-select the first cover added so the UI updates immediately.
     let current: Option<(Option<String>,)> = sqlx::query_as(
         "SELECT selected_cover FROM media_playlist WHERE id = ?",
@@ -5438,7 +5595,7 @@ pub async fn add_playlist_collection_cover(
     source_path: String,
 ) -> Result<String, String> {
     let dir = playlist_covers_dir(&state.app_data_dir, "collection", collection_id);
-    let added = copy_cover_into_dir(&source_path, &dir)?;
+    let added = copy_cover_into_dir(&source_path, &dir, None)?;
     let current: Option<(Option<String>,)> = sqlx::query_as(
         "SELECT selected_cover FROM media_playlist_collection WHERE id = ?",
     )
@@ -7303,6 +7460,16 @@ pub async fn set_cover(
                 .bind(&cover_path).bind(entry_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
             sqlx::query("UPDATE album SET selected_cover = ? WHERE id = ?")
                 .bind(&cover_path).bind(entry_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
+            // The album card's cover IS the default release's pick, so the
+            // grid picker writes that release's pref too (folder-keyed —
+            // survives the release-row rebuild). No-op for artists.
+            sqlx::query(
+                "INSERT INTO album_release_pref (album_id, folder_path, cover)
+                 SELECT ar.album_id, ar.folder_path, ? FROM album_release ar
+                 WHERE ar.album_id = ? AND ar.is_default = 1
+                 ON CONFLICT(album_id, folder_path) DO UPDATE SET cover = excluded.cover",
+            )
+            .bind(&cover_path).bind(entry_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
         }
         _ => {
             return Err(format!("Unsupported library format: {}", format));
@@ -8408,12 +8575,19 @@ fn list_playlist_covers(dir: &Path) -> Vec<String> {
 
 /// Copy a user-picked image into `target_dir`, deduplicating the filename. Returns the
 /// absolute path of the new file.
-fn copy_cover_into_dir(source_path: &str, target_dir: &Path) -> Result<String, String> {
+/// `name_prefix` scopes an added cover to one release of a music album: the
+/// scan's cover attribution keys off "{release-folder-leaf}_" filename
+/// prefixes, so an app-added file named the same way lands on that release.
+fn copy_cover_into_dir(source_path: &str, target_dir: &Path, name_prefix: Option<&str>) -> Result<String, String> {
     let src = PathBuf::from(source_path);
     if !src.exists() { return Err("Source file does not exist".into()); }
     if !is_image_file(&src) { return Err("File is not a supported image".into()); }
     std::fs::create_dir_all(target_dir).map_err(|e| format!("Failed to create covers dir: {e}"))?;
     let stem = src.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "cover".into());
+    let stem = match name_prefix {
+        Some(p) => format!("{p}{stem}"),
+        None => stem,
+    };
     let ext = src.extension().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "jpg".into());
     let mut name = format!("{stem}.{ext}");
     let mut target = target_dir.join(&name);
@@ -8504,15 +8678,46 @@ async fn insert_cached_images(
 }
 
 pub(crate) async fn get_all_cached_covers(pool: &sqlx::SqlitePool, library_id: &str) -> Result<HashMap<String, Vec<String>>, sqlx::Error> {
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT entry_folder_path, cached_path FROM cached_images WHERE library_id = ? AND image_type = 'cover' ORDER BY entry_folder_path, source_filename",
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT entry_folder_path, cached_path, source_filename FROM cached_images WHERE library_id = ? AND image_type = 'cover' ORDER BY entry_folder_path, source_filename",
     )
     .bind(library_id)
     .fetch_all(pool)
     .await?;
 
+    // Releases don't pool: an album card (and every list/rail fed by this
+    // map) shows only its DEFAULT release's art. The scan-time pool prefixes
+    // non-default releases' files with their folder leaf ("{leaf}_{name}"),
+    // so stripping those here leaves the default release's own covers.
+    // (The album page attributes the full set per release itself.)
+    // No-op for video libraries — they have no album_release rows.
+    let nd_rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT al.folder_path, ar.folder_path FROM album_release ar
+         JOIN album al ON al.id = ar.album_id
+         JOIN media_entry me ON me.id = al.id
+         WHERE me.library_id = ? AND ar.is_default = 0",
+    )
+    .bind(library_id)
+    .fetch_all(pool)
+    .await?;
+    let mut excluded: HashMap<String, Vec<String>> = HashMap::new();
+    for (album_folder, release_folder) in nd_rows {
+        let leaf = release_folder
+            .rsplit(['\\', '/'])
+            .next()
+            .unwrap_or(&release_folder)
+            .to_lowercase();
+        excluded.entry(album_folder.to_lowercase()).or_default().push(format!("{leaf}_"));
+    }
+
     let mut map: HashMap<String, Vec<String>> = HashMap::new();
-    for (folder_path, cached_path) in rows {
+    for (folder_path, cached_path, source_filename) in rows {
+        if let Some(prefixes) = excluded.get(&folder_path.to_lowercase()) {
+            let name = source_filename.to_lowercase();
+            if prefixes.iter().any(|p| name.starts_with(p.as_str())) {
+                continue;
+            }
+        }
         map.entry(folder_path).or_default().push(cached_path);
     }
     Ok(map)

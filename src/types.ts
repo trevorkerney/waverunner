@@ -272,6 +272,14 @@ export interface MusicRelease {
    *  by your renames. */
   disc_titles: { disc: number; title: string }[];
   tracks: MusicTrack[];
+  /** The release's OWN title (its tracks' album tag) — null pre-rescan or
+   *  untagged; fall back to the album title. */
+  title: string | null;
+  /** This release's slice of the pooled art (never empty when the album has
+   *  any: unattributable releases fall back to the full pool). */
+  covers: string[];
+  /** Your cover pick for this release, when it still exists in the pool. */
+  selected_cover: string | null;
 }
 
 export interface MusicAlbumDetail {

@@ -715,6 +715,23 @@ function App() {
     const key = `${libraryId}:${kind}:${parentId}`;
     const saved = scrollCacheRef.current.get(key);
     if (!scrollContainerRef.current) return;
+    // Veil: the container inevitably paints a frame or two at scrollTop 0
+    // before the settle loop below can re-anchor — visible as an ugly
+    // top-then-jump. Hide it until the first scroll write lands (typically
+    // <50ms), with a cap so a slow-loading page shows content (and accepts
+    // the jump) rather than sitting blank.
+    let veiled = false;
+    if (saved) {
+      scrollContainerRef.current.style.visibility = "hidden";
+      veiled = true;
+    }
+    const unveil = () => {
+      if (!veiled) return;
+      veiled = false;
+      const c = scrollContainerRef.current;
+      if (c) c.style.visibility = "";
+    };
+    if (saved) window.setTimeout(unveil, 250);
     // Two restore strategies, both patient about content that isn't there yet:
     //  - Anchored (grids): re-align the card that sat at the top of the
     //    viewport. content-visibility cards above it settle over a few frames
@@ -738,6 +755,9 @@ function App() {
           const before = c.scrollTop;
           const cTop = c.getBoundingClientRect().top;
           c.scrollTop += (el.getBoundingClientRect().top - cTop) - saved.anchorDelta;
+          // First write puts the anchor in place — safe to show. Later
+          // frames only nudge by the content-visibility drift.
+          unveil();
           alignFrames++;
           if (alignFrames < 8 && Math.abs(c.scrollTop - before) > 1) requestAnimationFrame(settle);
           return;
@@ -749,6 +769,7 @@ function App() {
       const reachable = c.scrollHeight - c.clientHeight >= saved.scrollTop - 1;
       if (reachable || attempts >= MAX_FRAMES) {
         c.scrollTop = saved.scrollTop;
+        unveil();
         return;
       }
       requestAnimationFrame(settle);

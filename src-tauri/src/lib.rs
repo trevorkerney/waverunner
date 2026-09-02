@@ -1,6 +1,7 @@
 mod content_hash;
 mod commands;
 mod db;
+mod discord_presence;
 pub mod interactive;
 mod interactive_session;
 mod watch;
@@ -73,6 +74,18 @@ pub fn run() {
             // MusicBrainz "busy" beacon target (mb-busy events from retries).
             music_mb::set_mb_app(app.handle().clone());
 
+            // Discord Rich Presence worker (transmits only while the Settings
+            // toggle is on; set_setting flips it live).
+            {
+                let pool = &app.state::<AppState>().app_db;
+                let enabled: Option<String> = tauri::async_runtime::block_on(
+                    sqlx::query_scalar("SELECT value FROM settings WHERE key = 'discord_presence'")
+                        .fetch_optional(pool),
+                )
+                .unwrap_or(None);
+                discord_presence::init(enabled.as_deref() == Some("true"));
+            }
+
             if cfg!(debug_assertions) {
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.set_title("waverunner_dev");
@@ -116,6 +129,10 @@ pub fn run() {
             commands::get_file_size,
             commands::add_cover,
             commands::delete_cover,
+            commands::get_entry_covers,
+            commands::add_cover_from_url,
+            music::get_release_covers,
+            music_art::caa_release_images,
             commands::check_for_update,
             commands::download_and_install_update,
             commands::create_library,
@@ -309,6 +326,7 @@ pub fn run() {
             music_mb::mb_set_partial,
             music_edit::set_release_label,
             music_edit::set_default_release,
+            music_edit::set_release_cover,
             music_edit::set_disc_title,
             music_mb::mb_set_release_no_mb,
             music_edit::reveal_track_file,

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Play, Music2, Pencil, Scissors, LayoutGrid, List, ArrowUpDown, Disc3, ListPlus, ListStart, ListEnd, VenetianMask } from "lucide-react";
+import { CoversDialog, CoversMenuItem } from "../CoversDialog";
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -24,7 +25,7 @@ import { useMbHidden } from "@/lib/mbVisibility";
 import type { LoveLevel } from "../../types";
 import { CodecBadge } from "./CodecBadge";
 import { MusicArtistDetail, MusicAlbumCard, MusicAlbumDetail, MusicQueueItem, MusicTrack } from "../../types";
-import { queueFromRelease, defaultRelease, trackDisplayTitle, fmtTrackTime, fmtAlbumRuntime } from "./musicQueue";
+import { queueFromRelease, defaultRelease, releaseCover, trackDisplayTitle, fmtTrackTime, fmtAlbumRuntime } from "./musicQueue";
 import { useDeselectOnBackgroundClick } from "./useTrackSelection";
 
 // Artist-page view + sort preferences — implicit in-app prefs (instant apply,
@@ -92,6 +93,8 @@ export function ArtistDetailPage({
   const [matchTrack, setMatchTrack] = useState<number | null>(null);
   const [mbKey, setMbKey] = useState(0);
   const [reloadKey, setReloadKey] = useState(0);
+  /** Covers menu target — an album card's DEFAULT release. */
+  const [coversFor, setCoversFor] = useState<{ id: number; title: string } | null>(null);
   // Persona links, both directions: "Persona of J. Cole" on the mask's page,
   // "Also performs as kiLL edward" on the human's.
   const [personaLinks, setPersonaLinks] = useState<{
@@ -298,7 +301,10 @@ export function ArtistDetailPage({
   const renderReleaseBlock = (album: MusicAlbumCard, onlyCredited: boolean) => {
               const d = releaseDetails?.get(album.id) ?? null;
               const release = d ? defaultRelease(d) : null;
-              const albumCoverPath = displayCover(album.covers, album.selected_cover);
+              // Detail view pins the DEFAULT release — show ITS cover/title/
+              // year once loaded; the card's album-level look until then.
+              const albumCoverPath =
+                d && release ? releaseCover(d, release) : displayCover(album.covers, album.selected_cover);
               const queue = d && release ? queueFromRelease(d, release) : [];
               const totalSecs = release
                 ? release.tracks.reduce((s, t) => s + (t.runtime_secs ?? 0), 0)
@@ -314,10 +320,17 @@ export function ArtistDetailPage({
               return (
                 <section key={album.id}>
                   <div className="flex items-center gap-5">
-                    <div
-                      className="group/cover relative h-56 w-56 shrink-0 cursor-pointer overflow-hidden rounded-[3px] bg-muted shadow-sm"
-                      onClick={() => onOpenAlbum(album)}
-                    >
+                    {/* Right-click the art: the covers menu for the album's
+                        DEFAULT release (this view pins the default). */}
+                    <ContextMenu>
+                      <ContextMenuTrigger
+                        render={
+                          <div
+                            className="group/cover relative h-56 w-56 shrink-0 cursor-pointer overflow-hidden rounded-[3px] bg-muted shadow-sm"
+                            onClick={() => onOpenAlbum(album)}
+                          />
+                        }
+                      >
                       {albumCoverPath ? (
                         <img
                           src={getCoverUrl(albumCoverPath)}
@@ -342,7 +355,11 @@ export function ArtistDetailPage({
                       >
                         <Play size={16} className="translate-x-px" />
                       </button>
-                    </div>
+                      </ContextMenuTrigger>
+                      <ContextMenuContent>
+                        <CoversMenuItem onOpen={() => setCoversFor({ id: album.id, title: album.title })} />
+                      </ContextMenuContent>
+                    </ContextMenu>
                     <div className="min-w-0">
                       <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
                         {d?.album_type || "album"}
@@ -350,9 +367,9 @@ export function ArtistDetailPage({
                       <button
                         onClick={() => onOpenAlbum(album)}
                         className="block max-w-full truncate text-left font-heading text-xl font-bold hover:underline"
-                        title={album.title}
+                        title={release?.title ?? album.title}
                       >
-                        {album.title}
+                        {release?.title ?? album.title}
                       </button>
                       <p className="mt-0.5 text-sm text-muted-foreground">
                         {/* Album-page parity: every credited owner, linked —
@@ -379,7 +396,7 @@ export function ArtistDetailPage({
                           </>
                         )}
                         {[
-                          album.year,
+                          release?.year ?? album.year,
                           release
                             ? `${release.tracks.length} ${release.tracks.length === 1 ? "track" : "tracks"}`
                             : null,
@@ -692,10 +709,15 @@ export function ArtistDetailPage({
           const albumCoverPath = displayCover(album.covers, album.selected_cover);
           return (
             <div key={album.id} className="group min-w-0">
-              <div
-                className="relative aspect-square cursor-pointer overflow-hidden rounded-[3px] bg-muted shadow-sm"
-                onClick={() => onOpenAlbum(album)}
-              >
+              <ContextMenu>
+                <ContextMenuTrigger
+                  render={
+                    <div
+                      className="relative aspect-square cursor-pointer overflow-hidden rounded-[3px] bg-muted shadow-sm"
+                      onClick={() => onOpenAlbum(album)}
+                    />
+                  }
+                >
                 {albumCoverPath ? (
                   <img
                     src={getCoverUrl(albumCoverPath)}
@@ -719,7 +741,12 @@ export function ArtistDetailPage({
                 >
                   <Play size={16} className="translate-x-px" />
                 </button>
-              </div>
+                </ContextMenuTrigger>
+                <ContextMenuContent>
+                  {/* Grid cards manage the DEFAULT release's covers. */}
+                  <CoversMenuItem onOpen={() => setCoversFor({ id: album.id, title: album.title })} />
+                </ContextMenuContent>
+              </ContextMenu>
               <button
                 onClick={() => onOpenAlbum(album)}
                 className="mt-1.5 block w-full truncate text-left text-sm font-medium hover:underline"
@@ -1114,6 +1141,23 @@ export function ArtistDetailPage({
           }}
         />
       )}
+      <CoversDialog
+        open={coversFor !== null}
+        onOpenChange={(o) => {
+          if (!o) setCoversFor(null);
+        }}
+        target={
+          coversFor && {
+            kind: "release",
+            libraryId,
+            albumId: coversFor.id,
+            releaseId: null,
+            title: coversFor.title,
+          }
+        }
+        getCoverUrl={getFullCoverUrl}
+        onChanged={handleSaved}
+      />
     </div>
   );
 }

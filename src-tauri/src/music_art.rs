@@ -23,7 +23,7 @@ pub(crate) fn artist_fetch_rel(artist_id: i64) -> String {
     format!("_fetched/artists/{artist_id}")
 }
 
-fn art_client() -> Result<reqwest::Client, String> {
+pub(crate) fn art_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .user_agent(format!(
             "waverunner/{} (https://github.com/trevorkerney/waverunner)",
@@ -310,6 +310,92 @@ pub async fn music_fetch_artist_image(
     let found = fetch_one(pool, &library_id, &cache_base, &client, artist_id, &title, mbid.as_deref()).await?;
     stamp(pool, artist_id, found.unwrap_or("notfound")).await?;
     Ok(found.is_some())
+}
+
+#[derive(serde::Serialize)]
+pub struct CaaImage {
+    /// 250px thumbnail for the picker grid.
+    pub thumb: String,
+    /// Full image, downloaded on pick.
+    pub url: String,
+    pub front: bool,
+    pub comment: String,
+}
+
+/// Cover Art Archive images for one release of an album — the covers
+/// dialog's "Add from MusicBrainz" source. Uses the release's own pin when it
+/// has one, else the album's release group. No MB API call (CAA is a separate
+/// service with no rate gate), keyless.
+#[tauri::command]
+pub async fn caa_release_images(
+    state: State<'_, AppState>,
+    album_id: i64,
+    release_id: Option<i64>,
+) -> Result<Vec<CaaImage>, String> {
+    let pool = &state.app_db;
+    // The release's pinned pressing, when the caller names one that has it.
+    let mut path: Option<String> = None;
+    if let Some(rid) = release_id {
+        let folder: Option<(String,)> =
+            sqlx::query_as("SELECT folder_path FROM album_release WHERE id = ? AND album_id = ?")
+                .bind(rid)
+                .bind(album_id)
+                .fetch_optional(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        if let Some((folder,)) = folder {
+            if let Some((mbid, _)) =
+                crate::music_mb::release_match_of(pool, album_id, &folder).await?
+            {
+                if !mbid.is_empty() {
+                    path = Some(format!("release/{mbid}"));
+                }
+            }
+        }
+    }
+    if path.is_none() {
+        if let Some((group_id, _)) =
+            crate::music_mb::mb_id(pool, album_id, crate::music_mb::MB_RELEASE_GROUP).await?
+        {
+            path = Some(format!("release-group/{group_id}"));
+        }
+    }
+    let Some(path) = path else {
+        return Err("Match this album to MusicBrainz first".into());
+    };
+
+    let client = art_client()?;
+    let resp = client
+        .get(format!("https://coverartarchive.org/{path}"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if resp.status().as_u16() == 404 {
+        return Ok(Vec::new()); // no art on CAA — a state, not an error
+    }
+    if !resp.status().is_success() {
+        return Err(format!("Cover Art Archive: HTTP {}", resp.status()));
+    }
+    let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let https = |s: &str| s.replacen("http://", "https://", 1);
+    Ok(body["images"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|img| {
+            let url = img["image"].as_str()?;
+            let thumb = img["thumbnails"]["250"]
+                .as_str()
+                .or_else(|| img["thumbnails"]["small"].as_str())
+                .unwrap_or(url);
+            Some(CaaImage {
+                thumb: https(thumb),
+                url: https(url),
+                front: img["front"].as_bool().unwrap_or(false),
+                comment: img["comment"].as_str().unwrap_or("").to_string(),
+            })
+        })
+        .collect())
 }
 
 /// Remove an artist's fetched images (rows + files). Called when the artist
