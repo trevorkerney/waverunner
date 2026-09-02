@@ -319,52 +319,26 @@ pub struct CaaImage {
     /// Full image, downloaded on pick.
     pub url: String,
     pub front: bool,
+    /// CAA image types ("Front", "Back", "Booklet", "Medium", …).
+    pub types: Vec<String>,
     pub comment: String,
 }
 
-/// Cover Art Archive images for one release of an album — the covers
-/// dialog's "Add from MusicBrainz" source. Uses the release's own pin when it
-/// has one, else the album's release group. No MB API call (CAA is a separate
-/// service with no rate gate), keyless.
-#[tauri::command]
-pub async fn caa_release_images(
-    state: State<'_, AppState>,
-    album_id: i64,
-    release_id: Option<i64>,
-) -> Result<Vec<CaaImage>, String> {
-    let pool = &state.app_db;
-    // The release's pinned pressing, when the caller names one that has it.
-    let mut path: Option<String> = None;
-    if let Some(rid) = release_id {
-        let folder: Option<(String,)> =
-            sqlx::query_as("SELECT folder_path FROM album_release WHERE id = ? AND album_id = ?")
-                .bind(rid)
-                .bind(album_id)
-                .fetch_optional(pool)
-                .await
-                .map_err(|e| e.to_string())?;
-        if let Some((folder,)) = folder {
-            if let Some((mbid, _)) =
-                crate::music_mb::release_match_of(pool, album_id, &folder).await?
-            {
-                if !mbid.is_empty() {
-                    path = Some(format!("release/{mbid}"));
-                }
-            }
-        }
-    }
-    if path.is_none() {
-        if let Some((group_id, _)) =
-            crate::music_mb::mb_id(pool, album_id, crate::music_mb::MB_RELEASE_GROUP).await?
-        {
-            path = Some(format!("release-group/{group_id}"));
-        }
-    }
-    let Some(path) = path else {
-        return Err("Match this album to MusicBrainz first".into());
-    };
+#[derive(serde::Serialize)]
+pub struct CaaBrowse {
+    /// The album has a MusicBrainz release group id.
+    pub group_matched: bool,
+    /// The release being browsed has its own pinned MB release.
+    pub release_pinned: bool,
+    /// The group's canonical front cover — CAA serves exactly ONE image for
+    /// a release group (the designated release's front).
+    pub group: Vec<CaaImage>,
+    /// The pinned release's full scan set (front/back/booklet/…); empty when
+    /// unpinned or CAA holds nothing for that release.
+    pub release: Vec<CaaImage>,
+}
 
-    let client = art_client()?;
+async fn caa_fetch(client: &reqwest::Client, path: &str) -> Result<Vec<CaaImage>, String> {
     let resp = client
         .get(format!("https://coverartarchive.org/{path}"))
         .send()
@@ -392,10 +366,82 @@ pub async fn caa_release_images(
                 thumb: https(thumb),
                 url: https(url),
                 front: img["front"].as_bool().unwrap_or(false),
+                types: img["types"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|t| t.as_str().map(|s| s.to_string()))
+                    .collect(),
                 comment: img["comment"].as_str().unwrap_or("").to_string(),
             })
         })
         .collect())
+}
+
+/// Full scan set for one MB release by mbid — the CAA browser's per-row
+/// "all N images" expander for OTHER releases in the group.
+#[tauri::command]
+pub async fn caa_release_scans(release_mbid: String) -> Result<Vec<CaaImage>, String> {
+    if !release_mbid.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        return Err("Invalid release id".into());
+    }
+    let client = art_client()?;
+    caa_fetch(&client, &format!("release/{release_mbid}")).await
+}
+
+/// Cover Art Archive images for one release of an album — the CAA browser
+/// modal's data. Group cover always (when group-matched); the release's own
+/// full scan set too when its pressing is pinned. No MB API call (CAA is a
+/// separate service with no rate gate), keyless.
+#[tauri::command]
+pub async fn caa_release_images(
+    state: State<'_, AppState>,
+    album_id: i64,
+    release_id: Option<i64>,
+) -> Result<CaaBrowse, String> {
+    let pool = &state.app_db;
+    let group_id = crate::music_mb::mb_id(pool, album_id, crate::music_mb::MB_RELEASE_GROUP)
+        .await?
+        .map(|(id, _)| id);
+    let mut release_mbid: Option<String> = None;
+    if let Some(rid) = release_id {
+        let folder: Option<(String,)> =
+            sqlx::query_as("SELECT folder_path FROM album_release WHERE id = ? AND album_id = ?")
+                .bind(rid)
+                .bind(album_id)
+                .fetch_optional(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        if let Some((folder,)) = folder {
+            release_mbid = crate::music_mb::release_match_of(pool, album_id, &folder)
+                .await?
+                .map(|(v, _)| v)
+                .filter(|v| !v.is_empty());
+        }
+    }
+    if group_id.is_none() && release_mbid.is_none() {
+        return Err("Match this album to MusicBrainz first".into());
+    }
+
+    let client = art_client()?;
+    let release = match &release_mbid {
+        Some(mbid) => caa_fetch(&client, &format!("release/{mbid}")).await?,
+        None => Vec::new(),
+    };
+    let mut group = match &group_id {
+        Some(id) => caa_fetch(&client, &format!("release-group/{id}")).await?,
+        None => Vec::new(),
+    };
+    // The group's chosen front is often literally one of the pinned
+    // release's scans — don't show the same file twice.
+    group.retain(|g| !release.iter().any(|r| r.url == g.url));
+
+    Ok(CaaBrowse {
+        group_matched: group_id.is_some(),
+        release_pinned: release_mbid.is_some(),
+        group,
+        release,
+    })
 }
 
 /// Remove an artist's fetched images (rows + files). Called when the artist

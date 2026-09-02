@@ -133,6 +133,8 @@ pub fn run() {
             commands::add_cover_from_url,
             music::get_release_covers,
             music_art::caa_release_images,
+            music_art::caa_release_scans,
+            music_mb::mb_group_release_art,
             commands::check_for_update,
             commands::download_and_install_update,
             commands::create_library,

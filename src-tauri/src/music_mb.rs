@@ -1336,6 +1336,128 @@ async fn releases_in_group(
     Ok(out)
 }
 
+#[derive(Debug, Serialize)]
+pub struct GroupArtRelease {
+    pub release_id: String,
+    pub date: Option<String>,
+    pub countries: Vec<String>,
+    pub format: Option<String>,
+    /// "Label CATNO" merged, candidate_of's convention.
+    pub label: Option<String>,
+    pub status: Option<String>,
+    pub disambiguation: Option<String>,
+    /// Cover Art Archive piece count for this release.
+    pub art_count: i64,
+    /// CAA has a designated FRONT image (a release can carry only
+    /// back/booklet scans — its /front URL would 404).
+    pub has_front: bool,
+}
+
+/// Releases in the album's group that HAVE Cover Art Archive artwork — the
+/// CAA browser's "other releases" roster. One gated MB browse (paged like
+/// releases_in_group); the currently pinned release is excluded (its art is
+/// the browser's main view). Front thumbnails then cost NO further API calls
+/// (/release/<id>/front-250 is a direct redirect URL); only expanding a
+/// row's full scan set does one CAA fetch.
+#[tauri::command]
+pub async fn mb_group_release_art(
+    state: State<'_, AppState>,
+    album_id: i64,
+    release_id: Option<i64>,
+) -> Result<Vec<GroupArtRelease>, String> {
+    let pool = &state.app_db;
+    let group_id = mb_id(pool, album_id, MB_RELEASE_GROUP)
+        .await?
+        .map(|(v, _)| v)
+        .ok_or("Match this album to MusicBrainz first")?;
+    let mut pinned: Option<String> = None;
+    if let Some(rid) = release_id {
+        let folder: Option<(String,)> =
+            sqlx::query_as("SELECT folder_path FROM album_release WHERE id = ? AND album_id = ?")
+                .bind(rid)
+                .bind(album_id)
+                .fetch_optional(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        if let Some((folder,)) = folder {
+            pinned = release_match_of(pool, album_id, &folder)
+                .await?
+                .map(|(v, _)| v)
+                .filter(|v| !v.is_empty());
+        }
+    }
+
+    let client = mb_client()?;
+    let mut out: Vec<GroupArtRelease> = Vec::new();
+    let mut seen = 0i64;
+    for page in 0..4 {
+        let offset = (page * 100).to_string();
+        let url = url::Url::parse_with_params(
+            "https://musicbrainz.org/ws/2/release",
+            &[
+                ("release-group", group_id.as_str()),
+                ("inc", "labels+media"),
+                ("fmt", "json"),
+                ("limit", "100"),
+                ("offset", offset.as_str()),
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        let resp = mb_get(&client, url).await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND
+            || resp.status() == reqwest::StatusCode::BAD_REQUEST
+        {
+            break;
+        }
+        if !resp.status().is_success() {
+            return Err(format!("HTTP {}", resp.status()));
+        }
+        let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+        let total = body["release-count"].as_i64().unwrap_or(0);
+        let page_rows = body["releases"].as_array().map(|a| a.len()).unwrap_or(0);
+        seen += page_rows as i64;
+        for r in body["releases"].as_array().into_iter().flatten() {
+            let caa = &r["cover-art-archive"];
+            let count = caa["count"].as_i64().unwrap_or(0);
+            if !caa["artwork"].as_bool().unwrap_or(false) || count == 0 {
+                continue;
+            }
+            let Some(c) = candidate_of(r, 0) else { continue };
+            if pinned.as_deref() == Some(c.release_id.as_str()) {
+                continue;
+            }
+            out.push(GroupArtRelease {
+                release_id: c.release_id,
+                date: c.date,
+                countries: c.countries,
+                format: c.format,
+                label: c.label,
+                status: c.status,
+                disambiguation: c.disambiguation,
+                art_count: count,
+                has_front: caa["front"].as_bool().unwrap_or(false),
+            });
+        }
+        if seen >= total || page_rows == 0 {
+            break;
+        }
+    }
+    // Official pressings first, then oldest → newest (mirror of the release
+    // picker's ordering).
+    out.sort_by(|a, b| {
+        let official = |r: &GroupArtRelease| r.status.as_deref() != Some("Official");
+        official(a)
+            .cmp(&official(b))
+            .then_with(|| match (&a.date, &b.date) {
+                (Some(x), Some(y)) => x.cmp(y),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            })
+    });
+    Ok(out)
+}
+
 /// One MB track's credit list: (disc, position, title, [(credited name, artist mbid)]).
 type MbTrack = (i64, i64, String, Vec<(String, Option<String>)>);
 

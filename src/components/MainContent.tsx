@@ -1534,7 +1534,7 @@ export function MainContent({
                   }
                   min={100}
                   max={400}
-                  step={10}
+                  step={6}
                   className="w-full"
                 />
               </div>
@@ -5470,7 +5470,7 @@ function PlaylistsView({
             )}
           </div>
           <div className="flex w-32 items-center gap-2">
-            <Slider value={[coverSize]} onValueChange={(v) => onCoverSizeChange(Array.isArray(v) ? v[0] : v)} min={100} max={400} step={10} className="w-full" />
+            <Slider value={[coverSize]} onValueChange={(v) => onCoverSizeChange(Array.isArray(v) ? v[0] : v)} min={100} max={400} step={6} className="w-full" />
           </div>
         </div>
       )}

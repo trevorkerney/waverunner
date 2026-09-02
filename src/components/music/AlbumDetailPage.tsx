@@ -368,7 +368,7 @@ export function AlbumDetailPage({
                       onClick={() => setReleaseId(r.id)}
                       className="items-start gap-2 py-2"
                     >
-                      <span className="mt-1 flex size-3.5 shrink-0 items-center justify-center">
+                      <span className="flex size-3.5 shrink-0 items-center justify-center self-center">
                         {r.id === releaseId ? (
                           <Disc3 size={14} />
                         ) : (
