@@ -194,7 +194,9 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
       }}
     >
       {/* Rows: sidebar+content, then a full-width Save/Cancel footer. */}
-      <DialogContent className="grid h-[576px] w-[1024px] grid-cols-[11rem_1fr] grid-rows-[minmax(0,1fr)_auto] gap-0 overflow-hidden p-0">
+      {/* max-w override is load-bearing: the base DialogContent pins max-w-md
+          (384px), which silently clamped the w-[1024px] below it. */}
+      <DialogContent className="grid h-[576px] w-[1024px] max-w-[min(1024px,calc(100vw-3rem))] grid-cols-[11rem_1fr] grid-rows-[minmax(0,1fr)_auto] gap-0 overflow-hidden p-0">
         {/* Sidebar */}
         <div className="flex w-44 shrink-0 flex-col border-r bg-muted/30 p-2">
           <p className="mb-2 px-2 pt-1 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
@@ -436,6 +438,20 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
                       {musicDefaultVolume}%
                     </span>
                   </div>
+                </div>
+                <div className="mt-6 flex items-center justify-between gap-4">
+                  <div>
+                    <p className="text-sm">Waveform seek bar</p>
+                    <p className="text-xs text-muted-foreground">
+                      Draw the playing track's waveform in the now-playing bar. Computed the first
+                      time a track plays, then cached — tracks in formats that can't be decoded
+                      keep the plain bar.
+                    </p>
+                  </div>
+                  <Switch
+                    checked={view["music_waveform_seekbar"] === "true"}
+                    onCheckedChange={(v) => stageSetting("music_waveform_seekbar", v ? "true" : "false")}
+                  />
                 </div>
               </div>
             </div>

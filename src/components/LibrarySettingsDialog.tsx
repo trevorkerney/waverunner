@@ -100,6 +100,35 @@ export function LibrarySettingsDialog({
             <Switch checked={online} onCheckedChange={setOnline} />
           </div>
         )}
+        {/* Instant action, not a staged setting — Save/Cancel don't apply.
+            Progress appears under the library's name in the sidebar and in
+            the reattachable progress window. */}
+        {loaded && library?.format === "music" && (
+          <div className="flex items-center gap-3 rounded-md border px-3 py-2.5">
+            <div className="min-w-0 flex-1">
+              <p className="text-sm font-medium">Preload waveforms</p>
+              <p className="text-xs text-muted-foreground">
+                Compute and cache every track's waveform now instead of on first play. Runs in
+                the background.
+              </p>
+            </div>
+            <Button
+              size="sm"
+              variant="outline"
+              className="shrink-0"
+              onClick={() => {
+                window.dispatchEvent(
+                  new CustomEvent("waverunner:waveform-preload", {
+                    detail: { libraryId: library.id },
+                  }),
+                );
+                onOpenChange(false);
+              }}
+            >
+              Preload now
+            </Button>
+          </div>
+        )}
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)}>
             Cancel

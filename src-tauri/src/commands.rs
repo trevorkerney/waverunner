@@ -1621,7 +1621,7 @@ pub async fn get_entries(
             .await
             .map_err(|e| e.to_string())?
             .map(|(v,)| v)
-            .filter(|v| v == "credits" || v == "loved")
+            .filter(|v| v == "credits" || v == "loved" || v == "liked")
             .unwrap_or_else(|| "alpha".to_string());
 
             // Artists whose only presence is sound-marked containers hide
@@ -1765,11 +1765,13 @@ pub async fn get_entries(
                     + loose_by_artist.get(&id).copied().unwrap_or(0)
             };
 
-            // Loved-track counts feed the "loved" sort AND two subtitle variants.
-            let loved_by_artist: std::collections::HashMap<i64, i64> =
+            // Heart counts (liked, loved) feed the "loved" sort AND two
+            // subtitle variants — both tiers shown, loved outranks liked.
+            let loved_by_artist: std::collections::HashMap<i64, (i64, i64)> =
                 crate::music::artist_loved_counts(&state.app_db, &library_id)
                     .await?
                     .into_iter()
+                    .map(|(id, liked, loved)| (id, (liked, loved)))
                     .collect();
 
             // Alphabetical-mode subtitle: "2 releases · 4 appearances · 7 loved"
@@ -1781,7 +1783,7 @@ pub async fn get_entries(
                     .map(|v| v.iter().map(|(_, n)| *n).sum::<i64>())
                     .unwrap_or(0);
                 let appears = appears_by_artist.get(&id).copied().unwrap_or(0);
-                let loved = loved_by_artist.get(&id).copied().unwrap_or(0);
+                let (liked, loved) = loved_by_artist.get(&id).copied().unwrap_or((0, 0));
                 let mut parts: Vec<String> = Vec::new();
                 if releases > 0 {
                     parts.push(format!("{releases} release{}", if releases == 1 { "" } else { "s" }));
@@ -1792,6 +1794,9 @@ pub async fn get_entries(
                 let loose = loose_by_artist.get(&id).copied().unwrap_or(0);
                 if loose > 0 {
                     parts.push(format!("{loose} loose track{}", if loose == 1 { "" } else { "s" }));
+                }
+                if liked > 0 {
+                    parts.push(format!("{liked} liked"));
                 }
                 if loved > 0 {
                     parts.push(format!("{loved} loved"));
@@ -1819,10 +1824,15 @@ pub async fn get_entries(
                     let role_display = alpha_display(id);
                     // Always present, "0 loved" included — an all-blank grid in
                     // loved mode reads as broken rather than as "nothing loved".
-                    let season_display = Some(format!(
-                        "{} loved",
-                        loved_by_artist.get(&id).copied().unwrap_or(0)
-                    ));
+                    // Liked rides along when nonzero (the sort's tiebreaker).
+                    let season_display = {
+                        let (liked, loved) = loved_by_artist.get(&id).copied().unwrap_or((0, 0));
+                        Some(if liked > 0 {
+                            format!("{loved} loved · {liked} liked")
+                        } else {
+                            format!("{loved} loved")
+                        })
+                    };
                     MediaEntry {
                         id,
                         title,
@@ -1854,9 +1864,18 @@ pub async fn get_entries(
                 // alphabetical, so a stable sort keeps ties.
                 entries.sort_by_key(|e| std::cmp::Reverse(e.child_count));
             } else if artists_sort_mode == "loved" {
-                // Most loved tracks first, ties A–Z (stable sort again).
+                // Most LOVED first, likes as the tiebreaker (user ruling: 1–2
+                // loves outrank 10+ bare likes), ties A–Z (stable sort again).
                 entries.sort_by_key(|e| {
-                    std::cmp::Reverse(loved_by_artist.get(&e.id).copied().unwrap_or(0))
+                    let (liked, loved) = loved_by_artist.get(&e.id).copied().unwrap_or((0, 0));
+                    std::cmp::Reverse((loved, liked))
+                });
+            } else if artists_sort_mode == "liked" {
+                // Most HEARTS first — liked and loved count together — loved
+                // breaking ties, then A–Z (stable sort again).
+                entries.sort_by_key(|e| {
+                    let (liked, loved) = loved_by_artist.get(&e.id).copied().unwrap_or((0, 0));
+                    std::cmp::Reverse((liked + loved, loved))
                 });
             }
 

@@ -599,6 +599,33 @@ const MIGRATIONS: &[Migration] = &[
             )",
         ],
     },
+    Migration {
+        id: 33,
+        app_version: "1.0.0-alpha.12.5",
+        description: "track_waveform — cached seekbar peaks, computed lazily on first play",
+        requires_table: Some("track"),
+        // Normalized peak bytes for the waveform seekbar, stamped with
+        // (size, mtime) so a changed file recomputes. Filled lazily by
+        // get_track_waveform — scans never touch it.
+        statements: &[
+            "CREATE TABLE IF NOT EXISTS track_waveform (
+                track_id INTEGER PRIMARY KEY,
+                peaks BLOB NOT NULL,
+                content_size INTEGER,
+                content_mtime INTEGER,
+                FOREIGN KEY (track_id) REFERENCES track(id) ON DELETE CASCADE
+            )",
+        ],
+    },
+    Migration {
+        id: 34,
+        app_version: "1.0.0-alpha.12.5",
+        description: "liked AND loved — track_loved.level, existing hearts demote to liked",
+        requires_table: Some("track_loved"),
+        // Two tiers now: 'liked' (rose outline) and 'loved' (filled). The
+        // DEFAULT demotes every pre-existing heart to liked, per user intent.
+        statements: &["ALTER TABLE track_loved ADD COLUMN level TEXT NOT NULL DEFAULT 'liked'"],
+    },
 ];
 
 /// Copy the database beside itself before the first migration of a run
@@ -1406,6 +1433,22 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .execute(&pool)
     .await?;
 
+    // ── Track waveform peaks ──────────────────────────────────────────
+    // Seekbar waveform cache: normalized peak bytes per track, computed
+    // lazily by the first get_track_waveform call and stamped with
+    // (size, mtime) so a changed file recomputes. Scans never touch it.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS track_waveform (
+            track_id INTEGER PRIMARY KEY,
+            peaks BLOB NOT NULL,
+            content_size INTEGER,
+            content_mtime INTEGER,
+            FOREIGN KEY (track_id) REFERENCES track(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     // ── Track artist credits ──────────────────────────────────────────
     // Ordered credit list per track, parsed from tags at scan time: main
     // artist(s) first, then features (from the artist tag's "feat." clause,
@@ -1818,6 +1861,7 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
         "CREATE TABLE IF NOT EXISTS track_loved (
             track_id INTEGER PRIMARY KEY,
             loved_at TEXT NOT NULL DEFAULT (datetime('now')),
+            level TEXT NOT NULL DEFAULT 'liked',
             FOREIGN KEY (track_id) REFERENCES track(id) ON DELETE CASCADE
         )",
     )

@@ -20,6 +20,8 @@ import { PersonaDialog } from "./PersonaDialog";
 import { PlayingIndicator } from "./PlayingIndicator";
 import { LoveButton, LoveMenuItem } from "./LoveButton";
 import { RevealMenuItem } from "./RevealMenuItem";
+import { useMbHidden } from "@/lib/mbVisibility";
+import type { LoveLevel } from "../../types";
 import { CodecBadge } from "./CodecBadge";
 import { MusicArtistDetail, MusicAlbumCard, MusicAlbumDetail, MusicQueueItem, MusicTrack } from "../../types";
 import { queueFromRelease, defaultRelease, trackDisplayTitle, fmtTrackTime, fmtAlbumRuntime } from "./musicQueue";
@@ -78,6 +80,8 @@ export function ArtistDetailPage({
   onEnqueue,
 }: ArtistDetailPageProps) {
   const [detail, setDetail] = useState<MusicArtistDetail | null>(null);
+  // Per-library "hide MusicBrainz outside the center" (center map toggle).
+  const mbHidden = useMbHidden(libraryId);
   const [loading, setLoading] = useState(true);
   const [editTrackId, setEditTrackId] = useState<number | null>(null);
   const [editArtistOpen, setEditArtistOpen] = useState(false);
@@ -117,7 +121,7 @@ export function ArtistDetailPage({
   const menuTrackRef = useRef<{
     id: number;
     title: string;
-    loved: boolean;
+    loved: LoveLevel;
     /** Ready-to-queue shape of this row, for Play next / Add to queue. */
     queueItem: MusicQueueItem;
   } | null>(null);
@@ -212,15 +216,21 @@ export function ArtistDetailPage({
 
   // Any detail refresh (navigation or silent post-edit refetch) invalidates the
   // per-release details so the list view reflects edits.
+  //
+  // Stale-while-revalidate: only a NAVIGATION clears the rows (a fresh page
+  // earns its spinner). Silent detail refetches — scrobble count ticks,
+  // edits — keep the old rows on screen and swap when the fresh per-album
+  // fetches land. Nulling on every `detail` identity change collapsed the
+  // list to a spinner once per scrobbled track, clamping the scroll to the
+  // top mid-browse (the "jumps while music is playing" bug).
   useEffect(() => {
     setReleaseDetails(null);
-  }, [detail]);
+  }, [entryId]);
 
   useEffect(() => {
     if (
       viewMode !== "list" ||
       !detail ||
-      releaseDetails !== null ||
       detail.albums.length + detail.appears_on.length === 0
     ) {
       return;
@@ -244,7 +254,7 @@ export function ArtistDetailPage({
     return () => {
       cancelled = true;
     };
-  }, [viewMode, detail, releaseDetails]);
+  }, [viewMode, detail]);
 
   const playAlbum = async (albumId: number) => {
     try {
@@ -563,14 +573,16 @@ export function ArtistDetailPage({
               .filter(Boolean)
               .join(" · ")}
           </p>
-          <div className="mt-1.5">
-            <MbStatusChip
-              kind="artist"
-              entityId={detail.id}
-              reloadKey={mbKey}
-              onClick={() => setMatchOpen(true)}
-            />
-          </div>
+          {!mbHidden && (
+            <div className="mt-1.5">
+              <MbStatusChip
+                kind="artist"
+                entityId={detail.id}
+                reloadKey={mbKey}
+                onClick={() => setMatchOpen(true)}
+              />
+            </div>
+          )}
           {/* Persona links, whichever direction this page sits on. The names
               are the links — one human, several masks, all reachable. */}
           {personaLinks && (personaLinks.parent || personaLinks.personas.length > 0) && (
@@ -773,10 +785,12 @@ export function ArtistDetailPage({
               <Pencil size={14} />
               Edit metadata
             </ContextMenuItem>
-            <ContextMenuItem onClick={() => setMatchTrack(menuTrackRef.current?.id ?? null)}>
-              <Disc3 size={14} />
-              Match to MusicBrainz…
-            </ContextMenuItem>
+            {!mbHidden && (
+              <ContextMenuItem onClick={() => setMatchTrack(menuTrackRef.current?.id ?? null)}>
+                <Disc3 size={14} />
+                Match to MusicBrainz…
+              </ContextMenuItem>
+            )}
             <LoveMenuItem
               resolve={() =>
                 menuTrackRef.current
@@ -890,10 +904,12 @@ export function ArtistDetailPage({
                       <Pencil size={14} />
                       Edit metadata
                     </ContextMenuItem>
-                    <ContextMenuItem onClick={() => setMatchTrack(t.id)}>
-                      <Disc3 size={14} />
-                      Match to MusicBrainz…
-                    </ContextMenuItem>
+                    {!mbHidden && (
+                      <ContextMenuItem onClick={() => setMatchTrack(t.id)}>
+                        <Disc3 size={14} />
+                        Match to MusicBrainz…
+                      </ContextMenuItem>
+                    )}
                     <LoveMenuItem resolve={() => ({ id: t.id, loved: t.loved })} />
                     {onAddToPlaylist && (
                       <ContextMenuItem

@@ -12,6 +12,8 @@ import { NowPlayingBar } from "@/components/player/NowPlayingBar";
 import { MetadataCenterDialog } from "@/components/music/MetadataCenter";
 import { VideoMetadataCenterDialog } from "@/components/VideoMetadataCenter";
 import { Toaster } from "@/components/ui/sonner";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -114,6 +116,68 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [playerState, playerActions] = usePlayer();
   const [musicState, musicActions] = useMusicPlayer();
+
+  // Waveform preload (Settings → Audio → "Preload now"): a background walk
+  // the user can minimize and reattach to, wizard-style — modal when open,
+  // a small pill above the bar while minimized and running.
+  type WavePreloadStatus = {
+    running: boolean;
+    done: number;
+    total: number;
+    track?: string | null;
+    library_id?: string | null;
+  };
+  const [wavePreload, setWavePreload] = useState<{
+    open: boolean;
+    running: boolean;
+    done: number;
+    total: number;
+    track?: string | null;
+    libraryId?: string | null;
+  }>({ open: false, running: false, done: 0, total: 0 });
+  useEffect(() => {
+    const onStart = (e: Event) => {
+      const libraryId = (e as CustomEvent<{ libraryId: string }>).detail?.libraryId;
+      if (!libraryId) return;
+      setWavePreload((p) => ({ ...p, open: true }));
+      void (async () => {
+        try {
+          const s = await invoke<WavePreloadStatus>("waveform_preload_status");
+          // A run in flight (this library's or another's) just reattaches.
+          if (!s.running) await invoke("waveform_preload_start", { libraryId });
+          setWavePreload((p) => ({
+            ...p,
+            ...s,
+            libraryId: s.library_id ?? libraryId,
+            running: true,
+            open: true,
+          }));
+        } catch (e2) {
+          toast.error(String(e2));
+        }
+      })();
+    };
+    window.addEventListener("waverunner:waveform-preload", onStart);
+    const un = listen<WavePreloadStatus>("waveform-preload", (e) => {
+      setWavePreload((p) => ({
+        ...p,
+        ...e.payload,
+        libraryId: e.payload.library_id ?? p.libraryId,
+        // A finished run closes its own modal; a minimized one just ends.
+        open: p.open && e.payload.running,
+      }));
+    });
+    // App start while a preload runs (webview refresh): reattach silently.
+    void invoke<WavePreloadStatus>("waveform_preload_status")
+      .then((s) => {
+        if (s.running) setWavePreload((p) => ({ ...p, ...s, libraryId: s.library_id }));
+      })
+      .catch(() => {});
+    return () => {
+      window.removeEventListener("waverunner:waveform-preload", onStart);
+      un.then((fn) => fn());
+    };
+  }, []);
   // Match-to-MusicBrainz review modal: opened from the sidebar context menu
   // or automatically when an enrichment pass leaves items needing review.
   const [mbReviewLibraryId, setMbReviewLibraryId] = useState<string | null>(null);
@@ -2139,18 +2203,22 @@ function App() {
       // fetch — so the switch is as instant as the People pages; the setting
       // persists in the background and the backend applies it on fresh loads.
       if (activeView?.kind === "library-root" && selectedLibrary.format === "music") {
-        const next = mode === "credits" ? "credits" : mode === "loved" ? "loved" : "alpha";
+        const next =
+          mode === "credits" ? "credits"
+          : mode === "loved" ? "loved"
+          : mode === "liked" ? "liked"
+          : "alpha";
         setSortMode(next);
         invoke("set_setting", { key: `music_artists_sort_mode:${selectedLibrary.id}`, value: next }).catch(() => {});
         const byTitle = (a: MediaEntry, b: MediaEntry) =>
           sortTitleKey(a.title).localeCompare(sortTitleKey(b.title));
-        let lovedByArtist: Map<number, number> | null = null;
-        if (next === "loved") {
+        let lovedByArtist: Map<number, [number, number]> | null = null;
+        if (next === "loved" || next === "liked") {
           try {
-            const rows = await invoke<[number, number][]>("get_artist_loved_counts", {
+            const rows = await invoke<[number, number, number][]>("get_artist_loved_counts", {
               libraryId: selectedLibrary.id,
             });
-            lovedByArtist = new Map(rows);
+            lovedByArtist = new Map(rows.map(([id, liked, loved]) => [id, [liked, loved]]));
           } catch (e) {
             console.error("Failed to load loved counts:", e);
             lovedByArtist = new Map();
@@ -2161,8 +2229,20 @@ function App() {
             next === "credits"
               ? b.child_count - a.child_count || byTitle(a, b)
               : next === "loved"
-                ? (lovedByArtist!.get(b.id) ?? 0) - (lovedByArtist!.get(a.id) ?? 0) || byTitle(a, b)
-                : byTitle(a, b),
+                ? (() => {
+                    // Loved desc, likes as tiebreaker (matches the backend).
+                    const [al, av] = lovedByArtist!.get(a.id) ?? [0, 0];
+                    const [bl, bv] = lovedByArtist!.get(b.id) ?? [0, 0];
+                    return bv - av || bl - al || byTitle(a, b);
+                  })()
+                : next === "liked"
+                  ? (() => {
+                      // All hearts together, loved as tiebreaker (matches backend).
+                      const [al, av] = lovedByArtist!.get(a.id) ?? [0, 0];
+                      const [bl, bv] = lovedByArtist!.get(b.id) ?? [0, 0];
+                      return bl + bv - (al + av) || bv - av || byTitle(a, b);
+                    })()
+                  : byTitle(a, b),
           );
           updateCache(selectedLibrary.id, null, sorted, next);
           return sorted;
@@ -2999,6 +3079,12 @@ function App() {
           homeActive={activeView?.kind === "home"}
           scanningLibs={scanningLibs}
           passLibs={passLibs}
+          wavePreload={
+            wavePreload.running
+              ? { done: wavePreload.done, total: wavePreload.total, libraryId: wavePreload.libraryId }
+              : null
+          }
+          onOpenWavePreload={() => setWavePreload((p) => ({ ...p, open: true }))}
           dockedMusic={
             musicCoverDocked && musicState.isActive
               ? (() => {
@@ -3123,6 +3209,49 @@ function App() {
         onToggleCoverDock={() => setMusicCoverDocked((v) => !v)}
         hidden={playerState.isActive && !playerState.isMinimized}
       />
+      {/* Waveform preload progress — the house dialog when open, pill when
+          minimized. Dismissing (esc/backdrop) minimizes; the walk keeps going. */}
+      <Dialog
+        open={wavePreload.open}
+        onOpenChange={(o) => {
+          if (!o) setWavePreload((p) => ({ ...p, open: false }));
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Preloading waveforms</DialogTitle>
+            <DialogDescription>
+              {wavePreload.running
+                ? `${wavePreload.done} of ${wavePreload.total} tracks — already-cached tracks fly by.`
+                : "Done — every track's waveform is cached."}
+            </DialogDescription>
+          </DialogHeader>
+          {wavePreload.running && wavePreload.track && (
+            <p className="-mt-2 truncate text-xs text-muted-foreground/80">{wavePreload.track}</p>
+          )}
+          <div className="h-2 overflow-hidden rounded bg-muted">
+            <div
+              className="h-full bg-primary transition-[width]"
+              style={{
+                width: `${wavePreload.total > 0 ? Math.round((wavePreload.done / wavePreload.total) * 100) : 0}%`,
+              }}
+            />
+          </div>
+          {/* X / esc / backdrop minimize (the walk keeps going) — no button
+              needed for that. Cancel is the only real action. */}
+          {wavePreload.running && (
+            <DialogFooter>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => void invoke("waveform_preload_cancel").catch(() => {})}
+              >
+                Cancel
+              </Button>
+            </DialogFooter>
+          )}
+        </DialogContent>
+      </Dialog>
       <MetadataCenterDialog
         libraryId={mbReviewLibraryId}
         open={mbReviewLibraryId !== null}

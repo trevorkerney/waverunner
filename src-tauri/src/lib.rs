@@ -14,6 +14,7 @@ mod music_player;
 mod player;
 mod rt;
 mod tmdb;
+mod waveform;
 #[cfg(windows)]
 mod win_maximize_fix;
 
@@ -320,6 +321,10 @@ pub fn run() {
             music_player::music_stop,
             music_player::music_prefetch_next,
             music_player::music_track_started,
+            waveform::get_track_waveform,
+            waveform::waveform_preload_start,
+            waveform::waveform_preload_cancel,
+            waveform::waveform_preload_status,
             player::init_player,
             player::get_player_stats,
             player::set_player_region,

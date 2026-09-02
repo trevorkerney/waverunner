@@ -4,11 +4,94 @@ import { Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, X, Music2, Chevro
 import { Slider } from "../ui/slider";
 import { MusicPlayerState, MusicPlayerActions, currentMusicItem } from "../../hooks/useMusicPlayer";
 import { useLoved } from "../music/LoveButton";
+import type { LoveLevel } from "../../types";
 import { UpNextPanel } from "./UpNextPanel";
 
 const MARQUEE_PX_PER_SEC = 40;
 const MARQUEE_PAUSE_MS = 2000;
 const MARQUEE_GAP_PX = 40;
+
+/** SoundCloud-style waveform seekbar: mirrored peak bars on a canvas, played
+ *  portion at full alpha. Pointer drag/click seeks; the parent owns the
+ *  drag-value plumbing so the time readout stays glued to the cursor exactly
+ *  like the plain slider. */
+function WaveformSeekbar({
+  peaks,
+  position,
+  duration,
+  onSeek,
+  onCommit,
+}: {
+  peaks: number[];
+  position: number;
+  duration: number;
+  onSeek: (v: number) => void;
+  onCommit: (v: number) => void;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const dragRef = useRef(false);
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const el = canvasRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => setTick((t) => t + 1));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  // Redraw every render — position updates arrive throttled (~5/s), and 480
+  // rects is nothing. Canvas is sized to the device pixel ratio each pass.
+  useEffect(() => {
+    const el = canvasRef.current;
+    if (!el) return;
+    const dpr = window.devicePixelRatio || 1;
+    const w = el.clientWidth;
+    const h = el.clientHeight;
+    if (w === 0 || h === 0) return;
+    el.width = Math.round(w * dpr);
+    el.height = Math.round(h * dpr);
+    const ctx = el.getContext("2d");
+    if (!ctx) return;
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, w, h);
+    const color = getComputedStyle(el).color; // text-primary — theme-aware
+    const n = peaks.length;
+    const frac = duration > 0 ? Math.min(position / duration, 1) : 0;
+    const barW = w / n;
+    const gap = barW > 2 ? 1 : 0;
+    ctx.fillStyle = color;
+    for (let i = 0; i < n; i++) {
+      const amp = Math.max(peaks[i] / 255, 0.04); // silence still draws a hairline
+      const bh = amp * (h - 2);
+      ctx.globalAlpha = (i + 0.5) / n <= frac ? 1 : 0.3;
+      ctx.fillRect(i * barW, (h - bh) / 2, Math.max(barW - gap, 1), bh);
+    }
+  });
+  const valueAt = (e: React.PointerEvent) => {
+    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const f = Math.min(Math.max((e.clientX - r.left) / r.width, 0), 1);
+    return f * duration;
+  };
+  return (
+    <canvas
+      ref={canvasRef}
+      className="h-6 w-full cursor-pointer text-primary"
+      onPointerDown={(e) => {
+        dragRef.current = true;
+        e.currentTarget.setPointerCapture(e.pointerId);
+        onSeek(valueAt(e));
+      }}
+      onPointerMove={(e) => {
+        if (dragRef.current) onSeek(valueAt(e));
+      }}
+      onPointerUp={(e) => {
+        if (dragRef.current) {
+          dragRef.current = false;
+          onCommit(valueAt(e));
+        }
+      }}
+    />
+  );
+}
 
 /** Single-line text that marquee-scrolls when it overflows instead of
  *  truncating (same treatment as the minimized video dock's title). Hovering
@@ -132,12 +215,12 @@ export function NowPlayingBar({ state, actions, hidden, onOpenAlbum, onOpenArtis
   // loved state, so a per-track snapshot is fetched; the session override
   // store keeps it live when the track is (un)loved anywhere in the app.
   const currentTrackId = currentMusicItem(state)?.trackId ?? null;
-  const [lovedSnapshot, setLovedSnapshot] = useState(false);
+  const [lovedSnapshot, setLovedSnapshot] = useState<LoveLevel>(null);
   useEffect(() => {
     let cancelled = false;
-    setLovedSnapshot(false);
+    setLovedSnapshot(null);
     if (currentTrackId != null) {
-      invoke<boolean>("get_track_loved", { trackId: currentTrackId })
+      invoke<LoveLevel>("get_track_loved", { trackId: currentTrackId })
         .then((v) => {
           if (!cancelled) setLovedSnapshot(v);
         })
@@ -150,6 +233,32 @@ export function NowPlayingBar({ state, actions, hidden, onOpenAlbum, onOpenArtis
     };
   }, [currentTrackId]);
   const loved = useLoved(currentTrackId ?? -1, lovedSnapshot);
+
+  // Waveform seekbar (Settings → Audio, default off): peaks fetched lazily
+  // per track — the backend decodes once and caches, so the first play of a
+  // track fades the shape in a moment late and every later play is instant.
+  // null = plain slider (setting off, undecodable codec, or still loading).
+  const [waveform, setWaveform] = useState<number[] | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    setWaveform(null);
+    if (currentTrackId == null) return;
+    (async () => {
+      try {
+        const settings = await invoke<Record<string, string>>("get_settings");
+        if (cancelled || settings["music_waveform_seekbar"] !== "true") return;
+        const peaks = await invoke<number[] | null>("get_track_waveform", {
+          trackId: currentTrackId,
+        });
+        if (!cancelled && peaks && peaks.length > 0) setWaveform(peaks);
+      } catch {
+        /* the plain bar is always a fine answer */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [currentTrackId]);
 
   if (!state.isActive || hidden) return null;
 
@@ -244,11 +353,16 @@ export function NowPlayingBar({ state, actions, hidden, onOpenAlbum, onOpenArtis
                 current.title
               )}
             </MarqueeText>
-            {loved && (
+            {loved !== null && (
               // Nudged up 1px: flex centering aligns to the full line box
               // (descenders included), which reads visually low — this centers
               // the heart on the letterforms' cap/x-height band instead.
-              <Heart size={10} fill="currentColor" className="shrink-0 -translate-y-px text-rose-500" />
+              // Filled = loved, outline = liked (same tiers as the row hearts).
+              <Heart
+                size={10}
+                fill={loved === "loved" ? "currentColor" : "none"}
+                className="shrink-0 -translate-y-px text-rose-500"
+              />
             )}
           </div>
           {subtitle && (
@@ -352,14 +466,27 @@ export function NowPlayingBar({ state, actions, hidden, onOpenAlbum, onOpenArtis
             {fmtTime(shownPosition)}
           </span>
           <div className="flex-1">
-            <Slider
-              value={[Math.min(shownPosition, duration || shownPosition)]}
-              min={0}
-              max={Math.max(duration, 1)}
-              step={0.1}
-              onValueChange={handleSeek}
-              onValueCommitted={commitSeek}
-            />
+            {waveform ? (
+              <WaveformSeekbar
+                peaks={waveform}
+                position={Math.min(shownPosition, duration || shownPosition)}
+                duration={duration}
+                onSeek={(v) => setSeekDragValue(v)}
+                onCommit={(v) => {
+                  actions.seekAbsolute(v);
+                  setSeekDragValue(null);
+                }}
+              />
+            ) : (
+              <Slider
+                value={[Math.min(shownPosition, duration || shownPosition)]}
+                min={0}
+                max={Math.max(duration, 1)}
+                step={0.1}
+                onValueChange={handleSeek}
+                onValueCommitted={commitSeek}
+              />
+            )}
           </div>
           <span className="w-10 shrink-0 font-mono text-[10px] text-muted-foreground">
             {fmtTime(duration)}

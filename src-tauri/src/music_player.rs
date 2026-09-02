@@ -179,7 +179,8 @@ where
 /// owns the queue and calls this per track.
 /// The track's CURRENT absolute path, if its row still exists and the file is
 /// where the row says. None → caller falls back to its snapshot path.
-async fn fresh_track_path(pool: &sqlx::SqlitePool, track_id: i64) -> Option<String> {
+/// (Also the waveform module's path resolver — same identity rules.)
+pub(crate) async fn fresh_track_path(pool: &sqlx::SqlitePool, track_id: i64) -> Option<String> {
     let (library_id, rel): (String, String) = sqlx::query_as(
         "SELECT me.library_id, t.file_path FROM track t
          JOIN media_entry me ON me.id = t.id WHERE t.id = ?",

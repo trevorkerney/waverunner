@@ -38,7 +38,7 @@ export function ArtistsGrid({ entries, getCoverUrl, onNavigate, gridRef, sortMod
   //   season_display     — loved mode ("N loved")
   const subtitleFor = (artist: MediaEntry) =>
     sortMode === "credits" ? artist.collection_display
-    : sortMode === "loved" ? artist.season_display
+    : sortMode === "loved" || sortMode === "liked" ? artist.season_display
     : artist.role_display;
 
   const grid = (items: MediaEntry[]) => (

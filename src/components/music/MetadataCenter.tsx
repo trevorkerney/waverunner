@@ -15,7 +15,9 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ClearableInput } from "@/components/ui/clearable-input";
 import { Spinner } from "@/components/ui/spinner";
+import { Switch } from "@/components/ui/switch";
 import { useMbBusy } from "./MbBusy";
+import { setMbHiddenLocal } from "@/lib/mbVisibility";
 import { Search, Undo2, GitMerge, Equal, CircleAlert, CircleCheck, CircleSlash, Combine, RefreshCw, FileWarning, TriangleAlert, ChevronRight, Scissors, Music2, VenetianMask } from "lucide-react";
 import {
   ContextMenu,
@@ -1203,6 +1205,8 @@ export function MetadataCenter({
   // Per-library opt-out: false hides every MusicBrainz-backed pane, leaving
   // the local ones (unlinked credits, file problems, history).
   const [onlineEnabled, setOnlineEnabled] = useState(true);
+  // Per-library: hide MB chips/menu items everywhere OUTSIDE this center.
+  const [hideOutside, setHideOutside] = useState(false);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -1233,6 +1237,7 @@ export function MetadataCenter({
       setClusters(clus);
       setTagFixes(tf);
       setOnlineEnabled(ls["online_metadata"] !== "off");
+      setHideOutside(ls["hide_mb_outside_center"] === "on");
       // Outside surfaces (sidebar badge, library-page strip) mirror both
       // queues — tell them whenever the center's view of them refreshes.
       notifyPendingWorkChanged();
@@ -2458,6 +2463,37 @@ export function MetadataCenter({
               ignored
             </span>
             <span className="ml-auto">click a node to match · right-click to ignore</span>
+          </div>
+
+          {/* Presentation, per library: the grind can live entirely in here —
+              flipping this clears MB chips and Match menu items from album
+              and artist pages and track lists, without touching matching
+              itself. The sidebar's pending-work triangle stays (cheap to
+              clear, and it marks real queued work). */}
+          <div className="flex items-center justify-between gap-4 rounded-md border px-3 py-2">
+            <div>
+              <p className="text-sm">Hide MusicBrainz outside this center</p>
+              <p className="text-xs text-muted-foreground">
+                Match status chips, track-list check, and “Match to MusicBrainz” menu items stay
+                in here; the rest of the app shows none of it. Matching keeps working.
+              </p>
+            </div>
+            <Switch
+              checked={hideOutside}
+              onCheckedChange={async (v) => {
+                setHideOutside(v);
+                setMbHiddenLocal(libraryId, v); // outside pages flip instantly
+                try {
+                  await invoke("set_library_setting", {
+                    libraryId,
+                    key: "hide_mb_outside_center",
+                    value: v ? "on" : "off",
+                  });
+                } catch (e) {
+                  toast.error(String(e));
+                }
+              }}
+            />
           </div>
 
           {/* Artist rows: the tree with containment instead of edges. Rows

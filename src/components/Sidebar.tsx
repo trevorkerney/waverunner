@@ -81,6 +81,10 @@ interface SidebarProps {
   scanningLibs: Set<string>;
   /** Libraries with a matching pass in flight — locked like a scanning one. */
   passLibs: Set<string>;
+  /** Waveform preload in flight — a progress line under the library being
+   *  walked (null = not running). Clicking it reopens the progress window. */
+  wavePreload?: { done: number; total: number; libraryId?: string | null } | null;
+  onOpenWavePreload?: () => void;
 }
 
 export function Sidebar({
@@ -108,6 +112,8 @@ export function Sidebar({
   homeActive,
   scanningLibs,
   passLibs,
+  wavePreload,
+  onOpenWavePreload,
 }: SidebarProps) {
   const [width, setWidth] = useState(DEFAULT_WIDTH);
   const [dragging, setDragging] = useState(false);
@@ -609,6 +615,24 @@ export function Sidebar({
                       </ContextMenuItem>
                     </ContextMenuContent>
                   </ContextMenu>
+                  {/* Waveform preload progress — background work lives in the
+                      sidebar; this line sits under the library name, above the
+                      tree, and reopens the progress window. */}
+                  {wavePreload && wavePreload.libraryId === lib.id && (
+                    <button
+                      onClick={onOpenWavePreload}
+                      className="flex items-start gap-1.5 pb-1 pl-6 pr-2 pt-1 text-left text-xs italic text-muted-foreground hover:text-foreground"
+                    >
+                      {/* mt-1 centers the 8px spinner on the first 16px text
+                          line (items-start, so wrapped lines don't drag it). */}
+                      <Spinner className="mt-1 size-2 shrink-0" />
+                      {/* Wraps rather than truncating — a narrow sidebar gets
+                          two lines, never an ellipsis. */}
+                      <span className="min-w-0 break-words">
+                        preloading waveforms · {wavePreload.done}/{wavePreload.total}
+                      </span>
+                    </button>
+                  )}
                   {expanded && (
                     <SidebarTree
                       nodes={getComplicationsForLibrary(lib, sidebarPlaylists[lib.id] ?? [], sidebarCounts[lib.id], sidebarGenres[lib.id])}

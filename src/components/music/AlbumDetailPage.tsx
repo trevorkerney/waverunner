@@ -26,6 +26,7 @@ import { LoveButton, LoveMenuItem } from "./LoveButton";
 import { RevealMenuItem } from "./RevealMenuItem";
 import { CodecBadge } from "./CodecBadge";
 import { albumCover, queueFromRelease, defaultRelease, fmtTrackTime, fmtAlbumRuntime, trackDisplayTitle } from "./musicQueue";
+import { useMbHidden } from "@/lib/mbVisibility";
 
 interface AlbumDetailPageProps {
   entryId: number;
@@ -69,6 +70,8 @@ export function AlbumDetailPage({
   onEnqueue,
 }: AlbumDetailPageProps) {
   const [detail, setDetail] = useState<MusicAlbumDetail | null>(null);
+  // Per-library "hide MusicBrainz outside the center" (center map toggle).
+  const mbHidden = useMbHidden(detail?.library_id);
   const [loading, setLoading] = useState(true);
   const [releaseId, setReleaseId] = useState<number | null>(null);
   // Single click selects a row; double click (or the hover play button) plays.
@@ -246,7 +249,7 @@ export function AlbumDetailPage({
                 A track whose title disagrees with MusicBrainz never received
                 MB's credits — this is how that surfaces (and how it clears
                 once the tags are fixed and rescanned). */}
-            {detail.mb_matched && !detail.is_sound && (
+            {detail.mb_matched && !detail.is_sound && !mbHidden && (
               <button
                 onClick={async () => {
                   setChecking(true);
@@ -323,7 +326,7 @@ export function AlbumDetailPage({
           {detail.genres.length > 0 && (
             <p className="mt-0.5 truncate text-xs text-muted-foreground">{detail.genres.join(", ")}</p>
           )}
-          {!detail.is_sound && (
+          {!detail.is_sound && !mbHidden && (
             <div className="mt-1.5">
               <MbStatusChip
                 kind="album"
@@ -375,7 +378,7 @@ export function AlbumDetailPage({
                               default
                             </span>
                           )}
-                          {!r.mb_matched && r.has_mb_tag ? (
+                          {!r.mb_matched && r.has_mb_tag && !mbHidden ? (
                             <span
                               className="shrink-0 rounded border border-muted-foreground/30 px-1 py-px text-[10px] text-muted-foreground"
                               title="Files carry a MusicBrainz release id — the next matching pass pins it automatically"
@@ -601,7 +604,7 @@ export function AlbumDetailPage({
                       <Pencil size={14} />
                       Edit metadata
                     </ContextMenuItem>
-                    {!detail.is_sound && (
+                    {!detail.is_sound && !mbHidden && (
                       <ContextMenuItem
                         onClick={() =>
                           setMatchTrack({ id: t.id, title: trackDisplayTitle(t.title, t.file_path) })

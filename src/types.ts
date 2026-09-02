@@ -221,6 +221,10 @@ export interface MusicArtistDetail {
   biography: string | null;
 }
 
+// A track's heart, two tiers: 'liked' (rose outline) or 'loved' (filled).
+// null = no heart. Existing hearts demoted to liked at migration 34.
+export type LoveLevel = "liked" | "loved" | null;
+
 // One name in a track's ordered credit list; artist_id set when the library
 // has them as an artist (linkable to their page).
 export interface MusicCredit {
@@ -238,7 +242,7 @@ export interface MusicTrack {
   /** Absolute path, ready to play. */
   file_path: string;
   play_count: number;
-  loved: boolean;
+  loved: LoveLevel;
   /** Main artist(s) first, then features — no "feat." framing. */
   credits: MusicCredit[];
   /** Codec badge facts: lofty file type lowercased ("flac", "mpeg", "aac"…),
@@ -317,7 +321,7 @@ export interface LibraryTrackRow {
   /** Album display cover (cached path) — the now-playing bar's art. */
   cover: string | null;
   play_count: number;
-  loved: boolean;
+  loved: LoveLevel;
   credits: MusicCredit[];
   codec: string | null;
   bitrate_kbps: number | null;
@@ -338,7 +342,7 @@ export interface TrackQueueInfo {
   cover: string | null;
   file_path: string;
   duration_secs: number | null;
-  loved: boolean;
+  loved: LoveLevel;
   codec: string | null;
   bitrate_kbps: number | null;
   bitrate_mode: string | null;

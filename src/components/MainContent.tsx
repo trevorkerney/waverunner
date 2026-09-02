@@ -1395,6 +1395,7 @@ export function MainContent({
                   if (isArtistsView) {
                     return sortMode === "credits" ? "Most credited"
                       : sortMode === "loved" ? "Most loved"
+                      : sortMode === "liked" ? "Most liked"
                       : "Alphabetical";
                   }
                   if (activeView?.kind === "albums" || activeView?.kind === "sounds") {
@@ -1426,6 +1427,9 @@ export function MainContent({
                   <>
                     <DropdownMenuItem onClick={() => onSortModeChange("credits")}>
                       Most credited
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onClick={() => onSortModeChange("liked")}>
+                      Most liked
                     </DropdownMenuItem>
                     <DropdownMenuItem onClick={() => onSortModeChange("loved")}>
                       Most loved
@@ -1721,6 +1725,7 @@ export function MainContent({
                 <div ref={gridRef}>
                   <PlaylistTrackList
                     entries={filteredEntries}
+                    libraryId={selectedLibrary?.id}
                     getCoverUrl={getCoverUrl}
                     onPlayQueue={(items, startIndex) => onPlayMusicQueue?.(items, startIndex)}
                     currentTrackId={musicCurrentTrackId ?? null}

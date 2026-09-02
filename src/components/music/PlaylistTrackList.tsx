@@ -20,6 +20,7 @@ import { CodecBadge } from "./CodecBadge";
 import { MediaEntry, MusicQueueItem, TrackQueueInfo } from "../../types";
 import { fmtTrackTime, trackDisplayTitle } from "./musicQueue";
 import { useDeselectOnBackgroundClick } from "./useTrackSelection";
+import { useMbHidden } from "@/lib/mbVisibility";
 
 // Must mirror MainContent's sortableIdFor so the shared DndContext machinery
 // (reorder, drop-into-collection, move-up zone) works on rows unchanged.
@@ -50,6 +51,8 @@ interface PlaylistTrackListProps {
    *  exact navigation recipe. */
   onOpenArtist?: (artistId: number, artistName: string) => void;
   onOpenAlbum?: (albumId: number, albumTitle: string, trackId?: number) => void;
+  /** Owning library — gates the per-library hide-MB-outside-the-center flag. */
+  libraryId?: string;
 }
 
 function displayCover(covers: string[], selected: string | null): string | null {
@@ -124,10 +127,13 @@ export function PlaylistTrackList({
   onDeleteCollection,
   onOpenArtist,
   onOpenAlbum,
+  libraryId,
 }: PlaylistTrackListProps) {
   // Row facts the hydrated entries lack (artists, album, duration, loved,
   // file paths for playback) — one batch fetch per view.
   const [infos, setInfos] = useState<Map<number, TrackQueueInfo> | null>(null);
+  // Per-library "hide MusicBrainz outside the center" (center map toggle).
+  const mbHidden = useMbHidden(libraryId);
   const [editTrackId, setEditTrackId] = useState<number | null>(null);
   // Track being matched to MusicBrainz (its own dialog).
   const [matchTrack, setMatchTrack] = useState<number | null>(null);
@@ -295,7 +301,7 @@ export function PlaylistTrackList({
                   {isCurrent && <PlayingIndicator paused={!playing} className="shrink-0" />}
                   <LoveButton
                     trackId={e.id}
-                    loved={info?.loved ?? false}
+                    loved={info?.loved ?? null}
                     reveal="group-hover/track:opacity-100"
                     className="ml-1.5"
                   />
@@ -375,14 +381,16 @@ export function PlaylistTrackList({
               <Pencil size={14} />
               Edit metadata
             </ContextMenuItem>
-            <ContextMenuItem onClick={() => menuEntry && setMatchTrack(menuEntry.id)}>
-              <Disc3 size={14} />
-              Match to MusicBrainz…
-            </ContextMenuItem>
+            {!mbHidden && (
+              <ContextMenuItem onClick={() => menuEntry && setMatchTrack(menuEntry.id)}>
+                <Disc3 size={14} />
+                Match to MusicBrainz…
+              </ContextMenuItem>
+            )}
             <LoveMenuItem
               resolve={() =>
                 menuEntry
-                  ? { id: menuEntry.id, loved: infos?.get(menuEntry.id)?.loved ?? false }
+                  ? { id: menuEntry.id, loved: infos?.get(menuEntry.id)?.loved ?? null }
                   : null
               }
             />

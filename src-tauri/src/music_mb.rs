@@ -30,6 +30,12 @@ static RUNNING: AtomicBool = AtomicBool::new(false);
 /// in the metadata center), finishes its local passes, and reports normally.
 static CANCEL: AtomicBool = AtomicBool::new(false);
 
+/// Is a matching pass running right now? Heavy background work that shares
+/// the DB and CPU (waveform preload) polls this and yields.
+pub(crate) fn pass_running() -> bool {
+    RUNNING.load(Ordering::SeqCst)
+}
+
 const MB_MIN_SCORE: i64 = 90;
 const REQUEST_GAP: std::time::Duration = std::time::Duration::from_millis(1100);
 

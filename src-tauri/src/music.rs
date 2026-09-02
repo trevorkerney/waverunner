@@ -4072,8 +4072,8 @@ pub async fn rescan_music_library(
             .await
             .map_err(|e| e.to_string())?;
         sqlx::query(
-            "INSERT OR IGNORE INTO track_loved (track_id, loved_at)
-             SELECT ?, loved_at FROM track_loved WHERE track_id = ?",
+            "INSERT OR IGNORE INTO track_loved (track_id, loved_at, level)
+             SELECT ?, loved_at, level FROM track_loved WHERE track_id = ?",
         )
         .bind(new_id)
         .bind(old_id)
@@ -4590,11 +4590,11 @@ pub(crate) async fn loose_tracks_for(
             .push(credit_view(name, artist_id, &artist_titles));
     }
 
-    let track_rows: Vec<(i64, String, Option<i64>, Option<i64>, Option<i64>, Option<String>, String, i64, i64, Option<String>, Option<i64>, Option<String>)> =
+    let track_rows: Vec<(i64, String, Option<i64>, Option<i64>, Option<i64>, Option<String>, String, i64, Option<String>, Option<String>, Option<i64>, Option<String>)> =
         sqlx::query_as(
             "SELECT t.id, t.title, t.track_number, t.disc_number, t.runtime, tm.artist_name, t.file_path,
                     (SELECT COUNT(*) FROM music_play mp WHERE mp.track_id = t.id AND mp.scrobbled = 1),
-                    EXISTS(SELECT 1 FROM track_loved tl WHERE tl.track_id = t.id),
+                    (SELECT tl.level FROM track_loved tl WHERE tl.track_id = t.id),
                     tm.codec, tm.bitrate_kbps, tm.bitrate_mode
              FROM track t
              JOIN media_entry me ON me.id = t.id
@@ -4617,7 +4617,7 @@ pub(crate) async fn loose_tracks_for(
             artist_name: canonical_artist_name(artist_name, &artist_by_lower, &artist_titles),
             file_path: resolve_music_path(pool, library_id, &rel).await?,
             play_count,
-            loved: loved != 0,
+            loved,
             credits: credits_by_track.remove(&id).unwrap_or_default(),
             codec,
             bitrate_kbps,
@@ -4821,7 +4821,7 @@ pub struct TrackView {
     pub artist_name: Option<String>,
     pub file_path: String,
     pub play_count: i64,
-    pub loved: bool,
+    pub loved: Option<String>,
     /// Ordered credits (main first, then features), comma-joined by the UI.
     pub credits: Vec<CreditView>,
     /// Codec badge facts: lofty's file type lowercased ("flac", "mpeg",
@@ -5021,11 +5021,11 @@ pub async fn get_album_detail(
 
     let mut releases = Vec::new();
     for (rid, label, is_default, disc_count, rdate, folder_path, mb_release_id) in release_rows {
-        let track_rows: Vec<(i64, String, Option<i64>, Option<i64>, Option<i64>, Option<String>, String, i64, i64, Option<String>, Option<i64>, Option<String>)> =
+        let track_rows: Vec<(i64, String, Option<i64>, Option<i64>, Option<i64>, Option<String>, String, i64, Option<String>, Option<String>, Option<i64>, Option<String>)> =
             sqlx::query_as(
                 "SELECT t.id, t.title, t.track_number, t.disc_number, t.runtime, tm.artist_name, t.file_path,
                         (SELECT COUNT(*) FROM music_play mp WHERE mp.track_id = t.id AND mp.scrobbled = 1),
-                        EXISTS(SELECT 1 FROM track_loved tl WHERE tl.track_id = t.id),
+                        (SELECT tl.level FROM track_loved tl WHERE tl.track_id = t.id),
                         tm.codec, tm.bitrate_kbps, tm.bitrate_mode
                  FROM track t
                  JOIN track_release tr ON tr.track_id = t.id
@@ -5055,7 +5055,7 @@ pub async fn get_album_detail(
                 artist_name: canonical_artist_name(artist_name, &artist_by_lower, &artist_titles),
                 file_path: resolve_music_path(pool, &library_id, &rel).await?,
                 play_count,
-                loved: loved != 0,
+                loved,
                 credits: credits_by_track.remove(&id).unwrap_or_default(),
                 codec,
                 bitrate_kbps,
@@ -5220,7 +5220,7 @@ pub struct LibraryTrackRow {
     /// The album's display cover (cached path) — the now-playing bar's art.
     pub cover: Option<String>,
     pub play_count: i64,
-    pub loved: bool,
+    pub loved: Option<String>,
     pub credits: Vec<CreditView>,
     /// Codec badge facts — see TrackView.
     pub codec: Option<String>,
@@ -5287,7 +5287,7 @@ pub async fn get_music_tracks(
     } else {
         "AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = me.parent_id)"
     };
-    let rows: Vec<(i64, String, String, Option<i64>, Option<String>, Option<i64>, Option<String>, i64, Option<i64>, i64, i64, Option<String>, Option<String>, Option<String>, Option<i64>, Option<String>)> =
+    let rows: Vec<(i64, String, String, Option<i64>, Option<String>, Option<i64>, Option<String>, i64, Option<i64>, i64, Option<String>, Option<String>, Option<String>, Option<String>, Option<i64>, Option<String>)> =
         sqlx::query_as(&format!(
             "SELECT t.id, t.title, t.file_path, t.runtime, tm.artist_name,
                     al.id, al.title, COALESCE((SELECT 1 FROM loose_album la WHERE la.album_id = al.id), 0),
@@ -5295,7 +5295,7 @@ pub async fn get_music_tracks(
                               WHERE ac0.album_id = alme.id ORDER BY ac0.position LIMIT 1),
                              alme.parent_id),
                     (SELECT COUNT(*) FROM music_play mp WHERE mp.track_id = t.id AND mp.scrobbled = 1),
-                    EXISTS(SELECT 1 FROM track_loved tl WHERE tl.track_id = t.id),
+                    (SELECT tl.level FROM track_loved tl WHERE tl.track_id = t.id),
                     al.folder_path, al.selected_cover,
                     tm.codec, tm.bitrate_kbps, tm.bitrate_mode
              FROM track t
@@ -5354,7 +5354,7 @@ pub async fn get_music_tracks(
             album_title: if loose { None } else { album_title },
             cover,
             play_count,
-            loved: loved != 0,
+            loved,
             credits: credits_by_track.remove(&id).unwrap_or_default(),
             codec,
             bitrate_kbps,
@@ -5381,7 +5381,7 @@ pub struct TrackQueueItem {
     pub cover: Option<String>,
     pub file_path: String,
     pub duration_secs: Option<i64>,
-    pub loved: bool,
+    pub loved: Option<String>,
     /// Codec badge facts — see TrackView.
     pub codec: Option<String>,
     pub bitrate_kbps: Option<i64>,
@@ -5399,7 +5399,7 @@ pub async fn get_track_queue_items(
     let mut out = Vec::with_capacity(track_ids.len());
     let mut maps: Option<(String, HashMap<String, i64>, HashMap<i64, String>, HashMap<String, Vec<String>>)> = None;
     for id in track_ids {
-        let row: Option<(String, String, Option<i64>, Option<String>, String, Option<String>, Option<i64>, Option<i64>, i64, i64, Option<String>, Option<String>, Option<String>, Option<i64>, Option<String>)> =
+        let row: Option<(String, String, Option<i64>, Option<String>, String, Option<String>, Option<i64>, Option<i64>, i64, Option<String>, Option<String>, Option<String>, Option<String>, Option<i64>, Option<String>)> =
             sqlx::query_as(
                 "SELECT t.title, t.file_path, t.runtime, tm.artist_name, me.library_id,
                         al.title, al.id,
@@ -5407,7 +5407,7 @@ pub async fn get_track_queue_items(
                                   WHERE ac0.album_id = alme.id ORDER BY ac0.position LIMIT 1),
                                  alme.parent_id),
                         COALESCE((SELECT 1 FROM loose_album la WHERE la.album_id = al.id), 0),
-                        EXISTS(SELECT 1 FROM track_loved tl WHERE tl.track_id = t.id),
+                        (SELECT tl.level FROM track_loved tl WHERE tl.track_id = t.id),
                         al.folder_path, al.selected_cover,
                         tm.codec, tm.bitrate_kbps, tm.bitrate_mode
                  FROM track t
@@ -5467,7 +5467,7 @@ pub async fn get_track_queue_items(
             cover,
             file_path: resolve_music_path(pool, &library_id, &rel).await?,
             duration_secs: runtime,
-            loved: loved != 0,
+            loved,
             codec,
             bitrate_kbps,
             bitrate_mode,
@@ -5495,26 +5495,35 @@ pub async fn dismiss_recent_listen(
     Ok(())
 }
 
-/// Love/unlove a track. Idempotent in both directions.
+/// Set a track's heart: 'liked' | 'loved' | None (clear). Idempotent; a level
+/// change keeps the original loved_at (the first-hearted moment).
 #[tauri::command]
 pub async fn set_track_loved(
     state: State<'_, AppState>,
     track_id: i64,
-    loved: bool,
+    level: Option<String>,
 ) -> Result<(), String> {
     let pool = &state.app_db;
-    if loved {
-        sqlx::query("INSERT OR IGNORE INTO track_loved (track_id) VALUES (?)")
+    match level.as_deref() {
+        Some(l @ ("liked" | "loved")) => {
+            sqlx::query(
+                "INSERT INTO track_loved (track_id, level) VALUES (?, ?)
+                 ON CONFLICT(track_id) DO UPDATE SET level = excluded.level",
+            )
             .bind(track_id)
+            .bind(l)
             .execute(pool)
             .await
             .map_err(|e| e.to_string())?;
-    } else {
-        sqlx::query("DELETE FROM track_loved WHERE track_id = ?")
-            .bind(track_id)
-            .execute(pool)
-            .await
-            .map_err(|e| e.to_string())?;
+        }
+        None => {
+            sqlx::query("DELETE FROM track_loved WHERE track_id = ?")
+                .bind(track_id)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        Some(other) => return Err(format!("Invalid heart level: {other}")),
     }
     Ok(())
 }
@@ -5526,8 +5535,9 @@ pub async fn set_track_loved(
 pub(crate) async fn artist_loved_counts(
     pool: &SqlitePool,
     library_id: &str,
-) -> Result<Vec<(i64, i64)>, String> {
-    // An album has ARTISTS, not one main artist. A loved track counts for
+) -> Result<Vec<(i64, i64, i64)>, String> {
+    // Rows are (artist_id, liked_count, loved_count) — two tiers since
+    // migration 34. An album has ARTISTS, not one main artist. A loved track counts for
     // everyone credited on the ALBUM it belongs to — What a Time to Be Alive
     // is Drake's and Future's, so its ten loved tracks are ten for each of
     // them; Sneakin' credits Drake and 21 Savage, so both get it.
@@ -5551,7 +5561,7 @@ pub(crate) async fn artist_loved_counts(
     // Explanations live out here for that reason.
     sqlx::query_as(
         "WITH loved AS ( \
-             SELECT tl.track_id, ar.album_id, \
+             SELECT tl.track_id, tl.level, ar.album_id, \
                     EXISTS(SELECT 1 FROM loose_album la WHERE la.album_id = ar.album_id) AS loose \
              FROM track_loved tl \
              JOIN media_entry tme ON tme.id = tl.track_id AND tme.library_id = ? \
@@ -5559,20 +5569,23 @@ pub(crate) async fn artist_loved_counts(
              JOIN album_release ar ON ar.id = tr.release_id \
              WHERE NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = ar.album_id) \
          ), attributed AS ( \
-             SELECT aac.artist_id AS artist_id, l.track_id \
+             SELECT aac.artist_id AS artist_id, l.track_id, l.level \
              FROM loved l \
              JOIN album_artist_credit aac ON aac.album_id = l.album_id \
              WHERE NOT l.loose AND aac.artist_id IS NOT NULL \
              UNION \
-             SELECT tc.artist_id, l.track_id \
+             SELECT tc.artist_id, l.track_id, l.level \
              FROM loved l \
              JOIN track_credit tc ON tc.track_id = l.track_id \
              WHERE l.loose AND tc.artist_id IS NOT NULL \
          ) \
-         SELECT artist_id, COUNT(DISTINCT track_id) FROM ( \
-             SELECT artist_id, track_id FROM attributed \
+         SELECT artist_id, \
+                COALESCE(SUM(level = 'liked'), 0), \
+                COALESCE(SUM(level = 'loved'), 0) \
+         FROM ( \
+             SELECT artist_id, track_id, level FROM attributed \
              UNION \
-             SELECT p.parent_id, a.track_id FROM attributed a \
+             SELECT p.parent_id, a.track_id, a.level FROM attributed a \
              JOIN artist_persona p ON p.persona_id = a.artist_id \
          ) GROUP BY artist_id",
     )
@@ -5582,19 +5595,19 @@ pub(crate) async fn artist_loved_counts(
     .map_err(|e| e.to_string())
 }
 
-/// Loved snapshot for one track — the now-playing bar's heart indicator
-/// (queue items don't carry loved state; toggles stay live via the frontend
-/// override store on top of this).
+/// Heart snapshot for one track ('liked' | 'loved' | None) — the now-playing
+/// bar's indicator (queue items don't carry heart state; toggles stay live
+/// via the frontend override store on top of this).
 #[tauri::command]
 pub async fn get_track_loved(
     state: State<'_, AppState>,
     track_id: i64,
-) -> Result<bool, String> {
-    sqlx::query_as::<_, (i64,)>("SELECT EXISTS(SELECT 1 FROM track_loved WHERE track_id = ?)")
+) -> Result<Option<String>, String> {
+    sqlx::query_as::<_, (String,)>("SELECT level FROM track_loved WHERE track_id = ?")
         .bind(track_id)
-        .fetch_one(&state.app_db)
+        .fetch_optional(&state.app_db)
         .await
-        .map(|(v,)| v != 0)
+        .map(|r| r.map(|(l,)| l))
         .map_err(|e| e.to_string())
 }
 
@@ -5602,7 +5615,7 @@ pub async fn get_track_loved(
 pub async fn get_artist_loved_counts(
     state: State<'_, AppState>,
     library_id: String,
-) -> Result<Vec<(i64, i64)>, String> {
+) -> Result<Vec<(i64, i64, i64)>, String> {
     artist_loved_counts(&state.app_db, &library_id).await
 }
 

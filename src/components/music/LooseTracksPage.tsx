@@ -18,6 +18,7 @@ import { RevealMenuItem } from "./RevealMenuItem";
 import { CodecBadge } from "./CodecBadge";
 import { LibraryTrackRow, MusicQueueItem } from "../../types";
 import { fmtTrackTime, fmtAlbumRuntime, trackDisplayTitle } from "./musicQueue";
+import { useMbHidden } from "@/lib/mbVisibility";
 
 interface LooseTracksPageProps {
   libraryId: string;
@@ -54,6 +55,8 @@ export function LooseTracksPage({
 }: LooseTracksPageProps) {
   const [rows, setRows] = useState<LibraryTrackRow[] | null>(null);
   const [selectedTrackId, setSelectedTrackId] = useState<number | null>(null);
+  // Per-library "hide MusicBrainz outside the center" (center map toggle).
+  const mbHidden = useMbHidden(libraryId);
   const [editTrackId, setEditTrackId] = useState<number | null>(null);
   // Track being matched to MusicBrainz (its own dialog).
   const [matchTrack, setMatchTrack] = useState<number | null>(null);
@@ -303,10 +306,12 @@ export function LooseTracksPage({
                   <Pencil size={14} />
                   Edit metadata
                 </ContextMenuItem>
-                <ContextMenuItem onClick={() => setMatchTrack(t.id)}>
-                  <Disc3 size={14} />
-                  Match to MusicBrainz…
-                </ContextMenuItem>
+                {!mbHidden && (
+                  <ContextMenuItem onClick={() => setMatchTrack(t.id)}>
+                    <Disc3 size={14} />
+                    Match to MusicBrainz…
+                  </ContextMenuItem>
+                )}
                 <LoveMenuItem resolve={() => ({ id: t.id, loved: t.loved })} />
                 <ContextMenuItem
                   onClick={() =>
