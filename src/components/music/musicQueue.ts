@@ -51,6 +51,16 @@ export function defaultRelease(detail: MusicAlbumDetail): MusicRelease | null {
   return detail.releases.find((r) => r.is_default) ?? detail.releases[0] ?? null;
 }
 
+/** Header title for one release of an album. A release's own tag title
+ *  ("So Far Gone" the EP inside the mixtape) shows only while the album's
+ *  title is itself tag-derived; a user rename or a MusicBrainz-matched
+ *  title outranks it — tags are the lowest tier and must never mask either.
+ *  The tag title still appears in the versions menu. */
+export function releaseTitle(detail: MusicAlbumDetail, release: MusicRelease | null): string {
+  if (detail.title_overridden) return detail.title;
+  return release?.title ?? detail.title;
+}
+
 /** Display titles drop "(feat. …)" / "[ft. …]" parentheticals — the credit
  *  line carries the features, so the suffix is redundant. Tags are untouched;
  *  this is presentation only. */

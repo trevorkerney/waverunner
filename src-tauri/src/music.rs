@@ -1143,20 +1143,39 @@ fn release_date_of(release: &ScannedRelease) -> Option<String> {
     release.tracks.iter().filter_map(|t| t.date.clone()).min()
 }
 
+/// Album tag that names a release: the FIRST disc alone decides (user rule —
+/// a bonus disc's own tag, like Death Magnetic's "Demo Magnetic" demos, must
+/// never outvote or tie the main disc). Within that disc it's a majority
+/// vote, ties broken by track order — never HashMap iteration order. "First
+/// disc" is the lowest disc number present, so a split-off disc-2 release
+/// still votes with its own tracks. An untagged first disc falls back to a
+/// vote over every track.
+fn majority_album_tag(tracks: &[ScannedTrack]) -> Option<String> {
+    fn vote(ordered: &[&ScannedTrack]) -> Option<String> {
+        let mut counts: HashMap<&str, (usize, usize)> = HashMap::new(); // tag → (votes, first index)
+        for (i, t) in ordered.iter().enumerate() {
+            if !t.album.is_empty() {
+                counts.entry(t.album.as_str()).or_insert((0, i)).0 += 1;
+            }
+        }
+        counts
+            .into_iter()
+            .max_by(|(_, (an, ai)), (_, (bn, bi))| an.cmp(bn).then(bi.cmp(ai)))
+            .map(|(v, _)| v.to_string())
+    }
+    let mut ordered: Vec<&ScannedTrack> = tracks.iter().collect();
+    ordered.sort_by_key(|t| (t.disc_number, t.track_number.unwrap_or(i64::MAX)));
+    let first_disc = ordered.first().map(|t| t.disc_number)?;
+    let disc_one: Vec<&ScannedTrack> =
+        ordered.iter().copied().filter(|t| t.disc_number == first_disc).collect();
+    vote(&disc_one).or_else(|| vote(&ordered))
+}
+
 /// This release's OWN title: the majority album tag of ITS tracks (the album
 /// row keeps the group title). Combined-in sources keep showing their
 /// original names — "So Far Gone" the EP vs the mixtape. None = untagged.
 fn release_title_of(release: &ScannedRelease) -> Option<String> {
-    let mut counts: HashMap<&str, usize> = HashMap::new();
-    for t in &release.tracks {
-        if !t.album.is_empty() {
-            *counts.entry(t.album.as_str()).or_insert(0) += 1;
-        }
-    }
-    counts
-        .into_iter()
-        .max_by_key(|(_, n)| *n)
-        .map(|(v, _)| v.to_string())
+    majority_album_tag(&release.tracks)
 }
 
 fn release_disc_count(release: &ScannedRelease) -> i64 {
@@ -1185,27 +1204,20 @@ fn album_type_of(album: &ScannedAlbum) -> &'static str {
     }
 }
 
-/// Album (release-group) title: the default release's album tag by majority.
+/// Album (release-group) title: the default release's album tag by majority
+/// (same deterministic vote as release titles — ties go to disc/track order).
 fn album_title_of(album: &ScannedAlbum) -> String {
     if let Some((_, title)) = &album.identity_override {
         return title.clone();
     }
     let def = &album.releases[album.default_release];
-    let mut counts: HashMap<&str, usize> = HashMap::new();
-    for t in &def.tracks {
-        *counts.entry(t.album.as_str()).or_insert(0) += 1;
-    }
-    counts
-        .into_iter()
-        .max_by_key(|(_, n)| *n)
-        .map(|(v, _)| v.to_string())
-        .unwrap_or_else(|| {
-            album
-                .folder_abs
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default()
-        })
+    majority_album_tag(&def.tracks).unwrap_or_else(|| {
+        album
+            .folder_abs
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default()
+    })
 }
 
 /// Ordering key within a release/container: numbered tracks by disc+number,
@@ -1324,6 +1336,45 @@ pub(crate) async fn write_track_side_tables(
         }
     }
     crate::music_edit::reapply_track_overrides(pool, track_id).await?;
+    Ok(())
+}
+
+/// The TAG tier of the album's editable fields — what the files say, stored
+/// so "Clear overrides" (and the coming per-tier view) can read the tags
+/// back without a rescan. Same derivations the column writes use; an
+/// absent date is stored as '' (a real "none", unlike the MB marker).
+async fn write_album_tag_tier(
+    pool: &SqlitePool,
+    album_id: i64,
+    album: &ScannedAlbum,
+) -> Result<(), String> {
+    let mut names = album_credit_names(album);
+    if names.is_empty() {
+        let solo = album_artist_of(album);
+        if !solo.is_empty() {
+            names.push(solo);
+        }
+    }
+    let mut genres: Vec<String> = album
+        .releases
+        .iter()
+        .flat_map(|r| r.tracks.iter())
+        .flat_map(|t| t.genres.iter().cloned())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    genres.sort();
+    let pairs = [
+        ("title", album_title_of(album)),
+        ("release_date", album_release_date(album).unwrap_or_default()),
+        ("album_type", album_type_of(album).to_string()),
+        ("genres", serde_json::to_string(&genres).map_err(|e| e.to_string())?),
+        ("artist_credits", serde_json::to_string(&names).map_err(|e| e.to_string())?),
+    ];
+    for (field, value) in pairs {
+        crate::music_mb::set_mb_id(pool, album_id, field, &value, crate::music_edit::TIER_TAG)
+            .await?;
+    }
     Ok(())
 }
 
@@ -1452,6 +1503,7 @@ async fn insert_album(
 
     write_album_credits(pool, album_entry_id, album, true).await?;
     link_album_genres(pool, album_entry_id, album).await?;
+    write_album_tag_tier(pool, album_entry_id, album).await?;
     sync_music_covers(
         pool,
         library_id,
@@ -1707,6 +1759,7 @@ async fn reconcile_album(
 
     write_album_credits(pool, album_entry_id, album, write_credits).await?;
     link_album_genres(pool, album_entry_id, album).await?;
+    write_album_tag_tier(pool, album_entry_id, album).await?;
     sync_music_covers(
         pool,
         library_id,
@@ -3017,6 +3070,15 @@ pub(crate) async fn insert_artist_row(
     .execute(pool)
     .await
     .map_err(|e| e.to_string())?;
+    // The tag tier of the name — what a reset falls back to when unmatched.
+    crate::music_mb::set_mb_id(
+        pool,
+        artist_entry_id,
+        "title",
+        &artist.title,
+        crate::music_edit::TIER_TAG,
+    )
+    .await?;
 
     if let Some((rel, abs)) = &parent {
         sync_music_covers(pool, library_id, cache_base, rel, &desired_covers(abs, None)).await?;
@@ -3415,6 +3477,13 @@ pub(crate) async fn apply_album_combines(
     // the release whose track list actually changed; the card's other
     // releases keep their own pinned pressings.
     let mut merge_targets: Vec<(String, String)> = Vec::new();
+    // Versions-mode carry-overs, resolved after the folds: (source album row
+    // id, keeper album folder, the source's release folders). The source's
+    // release-scoped rows are keyed to ITS album id, which the reconcile
+    // deletes — re-keying them to the keeper first is what lets the incoming
+    // release arrive with its cover pick, disc names and (same group only)
+    // its pinned pressing intact.
+    let mut version_carries: Vec<(i64, String, Vec<String>)> = Vec::new();
     // Leaf-first order, and each directive extracts its sources AT ITS TURN
     // rather than all up front — a chain's middle album (Bonus → Bad 25 →
     // Bad) must RECEIVE its folds before it is itself pulled out as a
@@ -3461,30 +3530,30 @@ pub(crate) async fn apply_album_combines(
                 }
             }
         }
-        // A merge invalidates the poured-into release's pin ONLY on its FIRST
-        // application — the one that actually changes the track list, proven
-        // by the source still existing as its own album row. The directive is
-        // permanent and re-folds on every rescan; wiping the pin each time
-        // unmatched the release on every rescan (it did exactly that).
-        let first_application = if d.4 == "merge" {
-            sqlx::query_as::<_, (i64,)>(
-                "SELECT al.id FROM album al JOIN media_entry me ON me.id = al.id
-                 WHERE me.library_id = ? AND al.folder_path = ? AND LOWER(al.title) = ?",
-            )
-            .bind(library_id)
-            .bind(&src.folder_rel)
-            .bind(&d.1)
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| e.to_string())?
-            .is_some()
-        } else {
-            false
-        };
+        // The FIRST application of a directive is the one that changes
+        // anything, proven by the source still existing as its own album
+        // row. The directive is permanent and re-folds on every rescan; a
+        // merge wiping the poured-into pin each time unmatched the release on
+        // every rescan (it did exactly that), and a versions carry-over has
+        // nothing left to carry once the source row is gone.
+        let source_row: Option<i64> = sqlx::query_as::<_, (i64,)>(
+            "SELECT al.id FROM album al JOIN media_entry me ON me.id = al.id
+             WHERE me.library_id = ? AND al.folder_path = ? AND LOWER(al.title) = ?",
+        )
+        .bind(library_id)
+        .bind(&src.folder_rel)
+        .bind(&d.1)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?
+        .map(|(id,)| id);
+        let first_application = source_row.is_some();
+        let src_release_folders: Vec<String> =
+            src.releases.iter().map(|r| r.folder_rel.clone()).collect();
         match found {
             Some((Some(ai), bi)) => {
+                let t = &artists[ai].albums[bi];
                 if d.4 == "merge" && first_application {
-                    let t = &artists[ai].albums[bi];
                     let rf = d
                         .5
                         .clone()
@@ -3493,12 +3562,14 @@ pub(crate) async fn apply_album_combines(
                     if !merge_targets.contains(&key) {
                         merge_targets.push(key);
                     }
+                } else if let (false, Some(sid)) = (d.4 == "merge", source_row) {
+                    version_carries.push((sid, t.folder_rel.clone(), src_release_folders));
                 }
                 fold_album(&mut artists[ai].albums[bi], src, &d.4, d.5.as_deref())
             }
             Some((None, bi)) => {
+                let t = &orphans.albums[bi];
                 if d.4 == "merge" && first_application {
-                    let t = &orphans.albums[bi];
                     let rf = d
                         .5
                         .clone()
@@ -3507,6 +3578,8 @@ pub(crate) async fn apply_album_combines(
                     if !merge_targets.contains(&key) {
                         merge_targets.push(key);
                     }
+                } else if let (false, Some(sid)) = (d.4 == "merge", source_row) {
+                    version_carries.push((sid, t.folder_rel.clone(), src_release_folders));
                 }
                 fold_album(&mut orphans.albums[bi], src, &d.4, d.5.as_deref())
             }
@@ -3550,6 +3623,76 @@ pub(crate) async fn apply_album_combines(
             .execute(pool)
             .await
             .map_err(|e| e.to_string())?;
+    }
+
+    // Versions mode changes no track list, so the incoming release's state
+    // is still true — it just needs to belong to the keeper before the
+    // reconcile deletes the source row (and, by cascade, everything keyed to
+    // it). User edits (cover pick, disc names) always carry. The pressing
+    // pin and its gap rows carry only when both albums were matched to the
+    // SAME release group: a pin is a claim about one group's release, and
+    // the combined album's identity is the keeper's. A keeper with no group
+    // keeps nothing — adopting the source's would be the app guessing what
+    // the keeper is.
+    for (source_id, keeper_folder, release_folders) in version_carries {
+        let keeper: Option<(i64,)> = sqlx::query_as(
+            "SELECT al.id FROM album al JOIN media_entry me ON me.id = al.id
+             WHERE me.library_id = ? AND al.folder_path = ?",
+        )
+        .bind(library_id)
+        .bind(&keeper_folder)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        let Some((keeper_id,)) = keeper else { continue };
+        if keeper_id == source_id {
+            continue;
+        }
+        let group_of = |id: i64| async move {
+            sqlx::query_as::<_, (String,)>(
+                "SELECT value FROM field_override
+                 WHERE entity_id = ? AND field = 'mb_release_group_id' AND value <> ''
+                 LIMIT 1",
+            )
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .map(|r| r.map(|(v,)| v))
+            .map_err(|e| e.to_string())
+        };
+        let same_group = match (group_of(keeper_id).await?, group_of(source_id).await?) {
+            (Some(k), Some(s)) => k == s,
+            _ => false,
+        };
+        let mut tables: Vec<&str> = vec!["album_release_pref", "disc_title_pref"];
+        if same_group {
+            tables.extend(["release_match", "album_match_gap"]);
+        }
+        for folder in &release_folders {
+            for table in &tables {
+                // OR IGNORE: a keeper row for the same folder (impossible
+                // unless folders collide) keeps the keeper's value.
+                sqlx::query(&format!(
+                    "UPDATE OR IGNORE {table} SET album_id = ? WHERE album_id = ? AND folder_path = ?"
+                ))
+                .bind(keeper_id)
+                .bind(source_id)
+                .bind(folder)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            }
+            // The keeper's default stays the default — an incoming solo
+            // release was its own album's default, not this one's.
+            sqlx::query(
+                "UPDATE album_release_pref SET is_default = 0 WHERE album_id = ? AND folder_path = ?",
+            )
+            .bind(keeper_id)
+            .bind(folder)
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        }
     }
     Ok(())
 }
@@ -3913,6 +4056,16 @@ pub async fn rescan_music_library(
                         .execute(pool)
                         .await
                         .map_err(|e| e.to_string())?;
+                    // Tag tier follows the tags; the alias branch below leaves
+                    // it alone so a variant spelling never becomes the fallback.
+                    crate::music_mb::set_mb_id(
+                        pool,
+                        *id,
+                        "title",
+                        &artist.title,
+                        crate::music_edit::TIER_TAG,
+                    )
+                    .await?;
                     crate::music_edit::reapply_artist_overrides(pool, *id).await?;
                 } else {
                     // Alias-matched: keep the name; still refresh the art
@@ -4915,6 +5068,11 @@ pub struct DiscTitleView {
 pub struct AlbumDetail {
     pub id: i64,
     pub title: String,
+    /// The album's title comes from an override — the user's rename or the
+    /// MusicBrainz match — rather than from tags. Either outranks every
+    /// release's own tag title in headers (tags are the lowest tier); the
+    /// tag titles stay visible only as the versions menu's differentiator.
+    pub title_overridden: bool,
     /// "album" | "single" | "ep" | "compilation" | … — drives the page eyebrow.
     pub album_type: String,
     pub year: Option<String>,
@@ -5270,9 +5428,28 @@ pub async fn get_album_detail(
     .map_err(|e| e.to_string())?
     .0 != 0;
 
+    // A user rename or an MB-matched title wins over the releases' tag
+    // titles. The MB apply writes the group's title straight onto the album
+    // row (no 'title' override row), so "group-matched" is the MB-side
+    // signal — a matched album's title is MusicBrainz's, not the tags'.
+    let title_overridden: bool = sqlx::query_as::<_, (i64,)>(
+        "SELECT EXISTS(
+            SELECT 1 FROM field_override
+            WHERE entity_id = ?
+              AND ((field = 'title' AND tier = 'user')
+                OR (field = 'mb_release_group_id' AND value <> ''))
+        )",
+    )
+    .bind(entry_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .0 != 0;
+
     Ok(AlbumDetail {
         id: entry_id,
         title,
+        title_overridden,
         album_type,
         year: release_date.map(|d| d.chars().take(4).collect()),
         artist_id: parent_id,
@@ -6162,6 +6339,34 @@ mod tests {
         ]);
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(|a| a.releases.len() == 1));
+    }
+
+    #[test]
+    fn majority_album_tag_first_disc_alone_decides() {
+        // Death Magnetic shape: disc 1 = 10× "Death Magnetic", disc 2 = 11×
+        // "Demo Magnetic". The bonus disc holds MORE tracks — and still
+        // doesn't get a vote: the first disc alone names the release.
+        let mut tracks = Vec::new();
+        for n in 1..=10 {
+            let mut t = fixture_track(&format!("A\\B\\1-{n:02}.flac"), "S", &["M"], n);
+            t.album = "Death Magnetic".to_string();
+            t.disc_number = 1;
+            tracks.push(t);
+        }
+        for n in 1..=11 {
+            let mut t = fixture_track(&format!("A\\B\\2-{n:02}.flac"), "S", &["M"], n);
+            t.album = "Demo Magnetic".to_string();
+            t.disc_number = 2;
+            tracks.push(t);
+        }
+        assert_eq!(majority_album_tag(&tracks).as_deref(), Some("Death Magnetic"));
+
+        // A tie WITHIN the first disc goes to track order, deterministically.
+        let mut a = fixture_track("A\\C\\01.flac", "S", &["M"], 1);
+        a.album = "First".to_string();
+        let mut b = fixture_track("A\\C\\02.flac", "S", &["M"], 2);
+        b.album = "Second".to_string();
+        assert_eq!(majority_album_tag(&[a, b]).as_deref(), Some("First"));
     }
 
     fn fixture_track(rel: &str, title: &str, credits: &[&str], track_number: i64) -> ScannedTrack {

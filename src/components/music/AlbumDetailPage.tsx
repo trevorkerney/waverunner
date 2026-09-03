@@ -26,7 +26,7 @@ import { PlayingIndicator } from "./PlayingIndicator";
 import { LoveButton, LoveMenuItem } from "./LoveButton";
 import { RevealMenuItem } from "./RevealMenuItem";
 import { CodecBadge } from "./CodecBadge";
-import { releaseCover, queueFromRelease, defaultRelease, fmtTrackTime, fmtAlbumRuntime, trackDisplayTitle } from "./musicQueue";
+import { releaseCover, releaseTitle, queueFromRelease, defaultRelease, fmtTrackTime, fmtAlbumRuntime, trackDisplayTitle } from "./musicQueue";
 import { CoversDialog, CoversMenuItem } from "../CoversDialog";
 import { useMbHidden } from "@/lib/mbVisibility";
 
@@ -242,7 +242,7 @@ export function AlbumDetailPage({
             {detail.album_type || "album"}
           </p>
           <h1 className="group/title flex min-w-0 items-center gap-2 font-heading text-4xl font-bold">
-            <span className="truncate">{release?.title ?? detail.title}</span>
+            <span className="truncate">{releaseTitle(detail, release)}</span>
             <button
               onClick={() => setEditAlbumOpen(true)}
               className="shrink-0 rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/title:opacity-100"
@@ -746,7 +746,7 @@ export function AlbumDetailPage({
             libraryId: detail.library_id,
             albumId: detail.id,
             releaseId: release.id,
-            title: release.title ?? detail.title,
+            title: releaseTitle(detail, release),
           }}
           getCoverUrl={getFullCoverUrl}
           onChanged={handleSaved}

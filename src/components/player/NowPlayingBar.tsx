@@ -239,6 +239,20 @@ export function NowPlayingBar({ state, actions, hidden, onOpenAlbum, onOpenArtis
   // track fades the shape in a moment late and every later play is instant.
   // null = plain slider (setting off, undecodable codec, or still loading).
   const [waveform, setWaveform] = useState<number[] | null>(null);
+  // Saving Settings re-runs the fetch below, so flipping the waveform toggle
+  // takes effect on the CURRENT track — no waiting for the next one. Keyed:
+  // unrelated saves (volume, keybinds) must not blank and refetch the bar.
+  const [settingsNonce, setSettingsNonce] = useState(0);
+  useEffect(() => {
+    const bump = (e: Event) => {
+      const keys = (e as CustomEvent<{ keys?: string[] }>).detail?.keys;
+      if (!keys || keys.includes("music_waveform_seekbar")) {
+        setSettingsNonce((n) => n + 1);
+      }
+    };
+    window.addEventListener("waverunner:settings-saved", bump);
+    return () => window.removeEventListener("waverunner:settings-saved", bump);
+  }, []);
   useEffect(() => {
     let cancelled = false;
     setWaveform(null);
@@ -258,7 +272,7 @@ export function NowPlayingBar({ state, actions, hidden, onOpenAlbum, onOpenArtis
     return () => {
       cancelled = true;
     };
-  }, [currentTrackId]);
+  }, [currentTrackId, settingsNonce]);
 
   if (!state.isActive || hidden) return null;
 

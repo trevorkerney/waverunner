@@ -285,6 +285,10 @@ export interface MusicRelease {
 export interface MusicAlbumDetail {
   id: number;
   title: string;
+  /** The title comes from an override (user rename or MusicBrainz match),
+   *  not tags — it outranks every release's own tag title in headers (see
+   *  releaseTitle in musicQueue). */
+  title_overridden: boolean;
   /** "album" | "single" | "ep" | "compilation" | … — drives the page eyebrow. */
   album_type: string;
   year: string | null;

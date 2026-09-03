@@ -428,7 +428,7 @@ export function AlbumEditDialog({ albumId, open, onOpenChange, onSaved }: AlbumE
     setBusy(true);
     try {
       await invoke("reset_album_fields", { albumId });
-      toast("Overrides cleared — tag values return on the next rescan");
+      toast("Edits cleared — back to what MusicBrainz or the tags say");
       onSaved();
       onOpenChange(false);
     } catch (e) {
@@ -658,7 +658,7 @@ export function ArtistEditDialog({ artistId, open, onOpenChange, onSaved }: Arti
     setBusy(true);
     try {
       await invoke("reset_artist_fields", { artistId });
-      toast("Rename cleared — the tag name returns on the next rescan");
+      toast("Rename cleared — back to what MusicBrainz or the tags say");
       onSaved();
       onOpenChange(false);
     } catch (e) {

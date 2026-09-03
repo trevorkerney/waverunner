@@ -25,7 +25,7 @@ import { useMbHidden } from "@/lib/mbVisibility";
 import type { LoveLevel } from "../../types";
 import { CodecBadge } from "./CodecBadge";
 import { MusicArtistDetail, MusicAlbumCard, MusicAlbumDetail, MusicQueueItem, MusicTrack } from "../../types";
-import { queueFromRelease, defaultRelease, releaseCover, trackDisplayTitle, fmtTrackTime, fmtAlbumRuntime } from "./musicQueue";
+import { queueFromRelease, defaultRelease, releaseCover, releaseTitle, trackDisplayTitle, fmtTrackTime, fmtAlbumRuntime } from "./musicQueue";
 import { useDeselectOnBackgroundClick } from "./useTrackSelection";
 
 // Artist-page view + sort preferences — implicit in-app prefs (instant apply,
@@ -367,9 +367,9 @@ export function ArtistDetailPage({
                       <button
                         onClick={() => onOpenAlbum(album)}
                         className="block max-w-full truncate text-left font-heading text-xl font-bold hover:underline"
-                        title={release?.title ?? album.title}
+                        title={d && release ? releaseTitle(d, release) : album.title}
                       >
-                        {release?.title ?? album.title}
+                        {d && release ? releaseTitle(d, release) : album.title}
                       </button>
                       <p className="mt-0.5 text-sm text-muted-foreground">
                         {/* Album-page parity: every credited owner, linked —

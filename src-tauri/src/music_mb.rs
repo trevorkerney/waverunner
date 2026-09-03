@@ -796,6 +796,31 @@ pub const MB_IGNORED: &str = "mb_ignored";
 /// them back in), this survives re-checks, re-applies, and rescans.
 pub const MB_PARTIAL: &str = "mb_partial";
 
+/// Drop one field's MB-tier value (an undo retracting what a match adopted).
+/// Field-and-tier precise: the user tier of the same field must survive.
+pub(crate) async fn clear_mb_tier(pool: &SqlitePool, entity_id: i64, field: &str) -> Result<(), String> {
+    sqlx::query("DELETE FROM field_override WHERE entity_id = ? AND field = ? AND tier = 'mb'")
+        .bind(entity_id)
+        .bind(field)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Releases of an album holding a REAL pinned pressing — the declared-none
+/// sentinel (mb_release_id = '') is a resolution, not a pin.
+pub(crate) async fn pinned_release_count(pool: &SqlitePool, album_id: i64) -> Result<i64, String> {
+    sqlx::query_as::<_, (i64,)>(
+        "SELECT COUNT(*) FROM release_match WHERE album_id = ? AND mb_release_id <> ''",
+    )
+    .bind(album_id)
+    .fetch_one(pool)
+    .await
+    .map(|(n,)| n)
+    .map_err(|e| e.to_string())
+}
+
 pub const TIER_USER: &str = "user";
 pub const TIER_MB: &str = "mb";
 /// release_match sentinel tier: the row declares "no MB counterpart exists"
@@ -1465,6 +1490,9 @@ type MbTrack = (i64, i64, String, Vec<(String, Option<String>)>);
 struct MbReleaseFull {
     release_id: String,
     release_group_id: Option<String>,
+    /// The release GROUP's title — the album's MB-tier title even when a
+    /// pressing is what got matched (release titles carry edition junk).
+    group_title: Option<String>,
     /// 'album' | 'ep' | 'single' | 'compilation' — from the release group.
     album_type: Option<String>,
     /// Release-group first release date (falls back to the release date).
@@ -1493,6 +1521,7 @@ async fn fetch_release_uncached(
 
     let rg = &body["release-group"];
     let album_type = mb_album_type(rg);
+    let group_title = rg["title"].as_str().filter(|s| !s.is_empty()).map(|s| s.to_string());
     let date = rg["first-release-date"]
         .as_str()
         .filter(|s| !s.is_empty())
@@ -1550,6 +1579,7 @@ async fn fetch_release_uncached(
         Some(MbReleaseFull {
             release_id: release_id.to_string(),
             release_group_id: rg["id"].as_str().map(|s| s.to_string()),
+            group_title,
             album_type,
             date,
             album_artists,
@@ -2143,6 +2173,49 @@ async fn adopt_group_date(
     .await
 }
 
+/// Store the release GROUP's official title at the MB tier and adopt it as
+/// the album's title (never a release's — those carry edition junk). Shared
+/// by the group and release applies, so a pressing-only match still records
+/// what MusicBrainz calls the album. Same guards as every adoption: the
+/// user's own title edit wins the column, an undo suppression stands (and
+/// blocks the store too), and the change is logged.
+async fn adopt_group_title(
+    pool: &SqlitePool,
+    library_id: &str,
+    album_id: i64,
+    album_title: &str,
+    group_title: &str,
+    batch: i64,
+) -> Result<(), String> {
+    if group_title.is_empty() || suppressed(pool, "album_title", album_id).await? {
+        return Ok(());
+    }
+    set_mb_id(pool, album_id, "title", group_title, TIER_MB).await?;
+    if group_title != album_title
+        && !crate::music_edit::has_override(pool, album_id, "title").await?
+    {
+        sqlx::query("UPDATE album SET title = ?, sort_title = ? WHERE id = ?")
+            .bind(group_title)
+            .bind(crate::commands::generate_sort_title(group_title, "en"))
+            .bind(album_id)
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        log_change(
+            pool,
+            library_id,
+            "album_title",
+            album_id,
+            &format!("{album_title} — renamed to {group_title}"),
+            &serde_json::json!({ "title": album_title }),
+            &serde_json::json!({ "title": group_title }),
+            batch,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 async fn apply_group(
     pool: &SqlitePool,
     library_id: &str,
@@ -2178,9 +2251,23 @@ async fn apply_group(
     // joint-credits fix), single-name credits rewrite only when a PERSON
     // applied this match — the mismatch warning was their consent. Machine
     // matches never recredit a single name (V/A compilation protection).
-    if (group.artists.len() >= 2 || tier == TIER_USER)
+    // The MB tier stores what MusicBrainz says whenever the credit rule
+    // admits it — even under a user edit, so Clear overrides can fall back
+    // to it without a fetch. The column write below stays user-guarded.
+    let credits_eligible = (group.artists.len() >= 2 || tier == TIER_USER)
         && !group.artists.is_empty()
-        && !suppressed(pool, "album_artists", album_id).await?
+        && !suppressed(pool, "album_artists", album_id).await?;
+    if credits_eligible {
+        set_mb_id(
+            pool,
+            album_id,
+            "artist_credits",
+            &serde_json::to_string(&group.artists).map_err(|e| e.to_string())?,
+            TIER_MB,
+        )
+        .await?;
+    }
+    if credits_eligible
         && !crate::music_edit::has_override(pool, album_id, "artist_credits").await?
     {
         let current: Vec<String> = sqlx::query_as::<_, (String,)>(
@@ -2226,35 +2313,12 @@ async fn apply_group(
         }
     }
 
-    // Adopt the release GROUP's official title (never a release's — those
-    // carry edition junk). Same guards as every adoption: the user's own
-    // title edit wins, an undo suppression stands, and the change is logged.
-    if !group.title.is_empty()
-        && group.title != album_title
-        && !suppressed(pool, "album_title", album_id).await?
-        && !crate::music_edit::has_override(pool, album_id, "title").await?
-    {
-        sqlx::query("UPDATE album SET title = ?, sort_title = ? WHERE id = ?")
-            .bind(&group.title)
-            .bind(crate::commands::generate_sort_title(&group.title, "en"))
-            .bind(album_id)
-            .execute(pool)
-            .await
-            .map_err(|e| e.to_string())?;
-        log_change(
-            pool,
-            library_id,
-            "album_title",
-            album_id,
-            &format!("{album_title} — renamed to {}", group.title),
-            &serde_json::json!({ "title": album_title }),
-            &serde_json::json!({ "title": group.title }),
-            batch,
-        )
-        .await?;
-    }
+    adopt_group_title(pool, library_id, album_id, album_title, &group.title, batch).await?;
 
     if let Some(mb_type) = &group.album_type {
+        if !suppressed(pool, "album_type", album_id).await? {
+            set_mb_id(pool, album_id, "album_type", mb_type, TIER_MB).await?;
+        }
         if !suppressed(pool, "album_type", album_id).await?
             && !crate::music_edit::has_override(pool, album_id, "album_type").await?
         {
@@ -2387,9 +2451,22 @@ async fn apply_release(
     // Miller). The MACHINE keeps the old protection — an auto-match must
     // never silently move an album out of an artist's discography (V/A
     // compilations filed under one artist).
-    if (album_artist_names.len() >= 2 || tier == TIER_USER)
+    // MB tier first (stored even under a user edit — the reset's fallback),
+    // then the user-guarded column write.
+    let credits_eligible = (album_artist_names.len() >= 2 || tier == TIER_USER)
         && !album_artist_names.is_empty()
-        && !suppressed(pool, "album_artists", album_id).await?
+        && !suppressed(pool, "album_artists", album_id).await?;
+    if credits_eligible {
+        set_mb_id(
+            pool,
+            album_id,
+            "artist_credits",
+            &serde_json::to_string(&album_artist_names).map_err(|e| e.to_string())?,
+            TIER_MB,
+        )
+        .await?;
+    }
+    if credits_eligible
         && !crate::music_edit::has_override(pool, album_id, "artist_credits").await?
     {
         let current: Vec<String> = sqlx::query_as::<_, (String,)>(
@@ -2460,6 +2537,9 @@ async fn apply_release(
     // Album type: MB's release-group type replaces the track-count guess —
     // unless the user set the type themselves (user tier outranks external).
     if let Some(mb_type) = &full.album_type {
+        if !suppressed(pool, "album_type", album_id).await? {
+            set_mb_id(pool, album_id, "album_type", mb_type, TIER_MB).await?;
+        }
         if !suppressed(pool, "album_type", album_id).await?
             && !crate::music_edit::has_override(pool, album_id, "album_type").await?
         {
@@ -2509,6 +2589,11 @@ async fn apply_release(
             .execute(pool)
             .await
             .map_err(|e| e.to_string())?;
+    }
+    // The group's title is the album's MB-tier title whichever way the
+    // group got pinned — a pressing-only match stores and adopts it too.
+    if let Some(gt) = &full.group_title {
+        adopt_group_title(pool, library_id, album_id, album_title, gt, batch).await?;
     }
 
     // Same rule as apply_group: a person's match logs even when every
@@ -2566,10 +2651,6 @@ async fn apply_release_credits(
 
     let mut changes = Vec::new();
     for (track_id, our_title, disc, number) in ours {
-        // User-edited credits outrank MB's — skip the track entirely.
-        if crate::music_edit::has_override(pool, track_id, "credits").await? {
-            continue;
-        }
         let (disc, number) = (disc.unwrap_or(1), number.unwrap_or(0));
         let Some((_, _, mb_title, credits)) = mb_tracks
             .iter()
@@ -2579,6 +2660,21 @@ async fn apply_release_credits(
         };
         if !raw_titles_match(&our_title, mb_title) {
             continue; // positions collide but songs differ — keep tag credits
+        }
+        let after: Vec<String> = credits.iter().map(|(n, _)| n.clone()).collect();
+        // MB tier: what the release says, stored even when a user edit
+        // outranks it (that's what Clear overrides falls back to).
+        set_mb_id(
+            pool,
+            track_id,
+            "credits",
+            &serde_json::to_string(&after).map_err(|e| e.to_string())?,
+            TIER_MB,
+        )
+        .await?;
+        // User-edited credits outrank MB's — stored above, not applied.
+        if crate::music_edit::has_override(pool, track_id, "credits").await? {
+            continue;
         }
         let before: Vec<String> = sqlx::query_as::<_, (String,)>(
             "SELECT name FROM track_credit WHERE track_id = ? ORDER BY position",
@@ -2590,7 +2686,6 @@ async fn apply_release_credits(
         .into_iter()
         .map(|(n,)| n)
         .collect();
-        let after: Vec<String> = credits.iter().map(|(n, _)| n.clone()).collect();
 
         if before != after {
             sqlx::query("DELETE FROM track_credit WHERE track_id = ?")
@@ -3361,6 +3456,19 @@ async fn backfill_group_dates(
                 continue;
             }
         };
+        // Matches made before the MB tier existed get their group title and
+        // type stored here, so Clear overrides has a fallback without a
+        // re-match (the group is fetched for the date anyway).
+        if let Some(g) = &group {
+            if !g.title.is_empty() && !suppressed(pool, "album_title", album_id).await? {
+                set_mb_id(pool, album_id, "title", &g.title, TIER_MB).await?;
+            }
+            if let Some(t) = &g.album_type {
+                if !suppressed(pool, "album_type", album_id).await? {
+                    set_mb_id(pool, album_id, "album_type", t, TIER_MB).await?;
+                }
+            }
+        }
         match group.and_then(|g| g.first_release_date) {
             Some(date) => {
                 let batch = next_batch(pool).await?;
@@ -4793,6 +4901,10 @@ pub struct MbStatus {
     /// Declared-no-MB releases count as resolved.
     pub matched_releases: i64,
     pub total_releases: i64,
+    /// Albums only: releases holding a REAL pinned pressing (declared-none
+    /// sentinels excluded). While any exist, the group can't be unmatched —
+    /// a pin is a claim inside the group, so the pins go first.
+    pub pinned_releases: i64,
     /// Albums only: user declared the album deliberately partial — mb-side
     /// gaps are expected and shouldn't warn.
     pub partial: bool,
@@ -4962,6 +5074,7 @@ pub async fn mb_status(
 
     let mut matched_releases = 0i64;
     let mut total_releases = 0i64;
+    let mut pinned_releases = 0i64;
     let (release_group_id, gap_count, gap_ours, gap_mb, searched_not_found) = if kind == "album" {
         let rg = mb_id(pool, entity_id, MB_RELEASE_GROUP).await?.map(|(v, _)| v);
         // Diff counts scope to the release this status views — each version
@@ -5001,6 +5114,7 @@ pub async fn mb_status(
         .map_err(|e| e.to_string())?;
         matched_releases = m;
         total_releases = t;
+        pinned_releases = pinned_release_count(pool, entity_id).await?;
         (rg, gaps.0, ours, theirs, nf.0 != 0)
     } else if kind == "artist" {
         // The pass's name lookup — same signal the artists list reads, so the
@@ -5034,6 +5148,7 @@ pub async fn mb_status(
         searched_not_found,
         matched_releases,
         total_releases,
+        pinned_releases,
         ignored,
         staged,
         partial,
@@ -5592,6 +5707,11 @@ pub async fn mb_apply_entity_match(
                     .filter(|n| !n.is_empty())
                     .map(|n| n.to_string());
                 let target = preferred.clone().or_else(|| canonical.clone());
+                // MB tier of the name (canonical, or the English alias the
+                // user preferred) — the fallback when a later rename is cleared.
+                if let Some(t) = &target {
+                    set_mb_id(pool, entity_id, "title", t, TIER_MB).await?;
+                }
                 if let Some(target) = target.filter(|n| *n != title) {
                     sqlx::query(
                         "INSERT OR IGNORE INTO artist_alias (artist_id, name, kind) VALUES (?, ?, 'variant')",
@@ -5840,6 +5960,20 @@ pub async fn mb_unmatch_entity(
     let pool = &state.app_db;
     let library_id = library_of(pool, entity_id).await?;
     let field = mb_field_for(&kind)?;
+    // A pinned pressing is a claim inside the group; the group can't be
+    // forgotten out from under it. Unmatch the release(s) first — the
+    // dialog disables the button for the same reason, this guards every
+    // other caller (the pending-pass list's Unmatch).
+    if kind == "album" {
+        let pinned = pinned_release_count(pool, entity_id).await?;
+        if pinned > 0 {
+            return Err(if pinned == 1 {
+                "A release is still matched — unmatch it first, then the album".to_string()
+            } else {
+                format!("{pinned} releases are still matched — unmatch them first, then the album")
+            });
+        }
+    }
 
     let changes: Vec<(i64,)> = sqlx::query_as(
         "SELECT id FROM mb_change_log
@@ -6228,9 +6362,9 @@ pub async fn mb_group_releases(
 /// replaces its row (latest reason shown) instead of stacking duplicates.
 /// Targets: a bare album id for album matches (the only kind whose row offers
 /// an Unmatch button); prefixed forms — "artist:<id>", "artist:<id>:match",
-/// "artist:<id>:renamed", "album:<id>:credits", "album:<id>:renamed" — for
-/// everything else, distinct per cause so each undo path can remove exactly
-/// the row its action created.
+/// "album:<id>:credits" — for everything else, distinct per cause so each
+/// undo path can remove exactly the row its action created. Renames never
+/// enqueue: matching after a rename is the user's call.
 async fn enqueue_pass_row(
     pool: &SqlitePool,
     library_id: &str,
@@ -6468,88 +6602,29 @@ pub(crate) async fn enqueue_album_credit_recheck(
 
 /// The user renamed a NOTFOUND album. Retries only re-run the arid tier —
 /// "the name tier is exactly what already failed" — but that reasoning died
-/// with the old title, so the notfound stamp is cleared (the album reads
-/// unchecked and gets the full search next pass) and the queue says so.
-/// Matched albums gain nothing from a rename (the user title is an override
-/// the matcher already respects), so they enqueue nothing.
-pub(crate) async fn requeue_renamed_album(
-    pool: &SqlitePool,
-    library_id: &str,
-    album_id: i64,
-) -> Result<(), String> {
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT al.title FROM album al
-         WHERE al.id = ?
-           AND EXISTS (SELECT 1 FROM mb_credit_fetch f
-                       WHERE f.album_id = al.id AND f.status = 'notfound')
-           AND NOT EXISTS (SELECT 1 FROM mb_suppression s
-                           WHERE s.kind = 'album_match' AND s.target_id = al.id)
-           AND NOT EXISTS (SELECT 1 FROM field_override ig
-                           WHERE ig.entity_id = al.id AND ig.field = 'mb_ignored')
-           AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = al.id)
-           AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = al.id)",
-    )
-    .bind(album_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| e.to_string())?;
-    let Some((title,)) = row else { return Ok(()) };
+/// with the old title, so the notfound stamp is cleared and the album reads
+/// unchecked again. Nothing is enqueued: whether to search under the new
+/// name is the user's call (a pass they run, or the match dialog).
+pub(crate) async fn forget_album_notfound(pool: &SqlitePool, album_id: i64) -> Result<(), String> {
     sqlx::query("DELETE FROM mb_credit_fetch WHERE album_id = ? AND status = 'notfound'")
         .bind(album_id)
         .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
-    enqueue_pass_row(
-        pool,
-        library_id,
-        &format!("album:{album_id}:renamed"),
-        &format!("Search \u{201c}{title}\u{201d} \u{2014} renamed"),
-    )
-    .await
+    Ok(())
 }
 
 /// The user renamed an artist. The derive and harvest walks compare NAMES, so
 /// a corrected spelling can flip a fruitless walk to fruitful — the same
 /// reasoning that has merges clear exhaustion. Clears this artist's exhaustion
-/// rows, then enqueues a re-check if the artist is still MBID-less and has any
-/// matched-album evidence to walk. An already-identified artist gains nothing
-/// from a rename (derivation is done; harvest only stamps the MBID-less).
-pub(crate) async fn requeue_renamed_artist(
-    pool: &SqlitePool,
-    library_id: &str,
-    artist_id: i64,
-) -> Result<(), String> {
+/// rows so the next pass the user runs walks again; enqueues nothing.
+pub(crate) async fn forget_artist_exhaustion(pool: &SqlitePool, artist_id: i64) -> Result<(), String> {
     sqlx::query("DELETE FROM mb_derive_exhausted WHERE entity_id = ?")
         .bind(artist_id)
         .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT a.title FROM artist a
-         WHERE a.id = ?1
-           AND (a.musicbrainz_id IS NULL OR a.musicbrainz_id = '')
-           AND (EXISTS (SELECT 1 FROM album_artist_credit ac
-                        JOIN field_override f ON f.entity_id = ac.album_id
-                           AND f.field = 'mb_release_group_id'
-                        WHERE ac.artist_id = a.id)
-             OR EXISTS (SELECT 1 FROM track_credit tc
-                        JOIN media_entry tme ON tme.id = tc.track_id
-                        JOIN release_match rm ON rm.album_id = tme.parent_id
-                                             AND rm.mb_release_id <> ''
-                        WHERE tc.artist_id = a.id))",
-    )
-    .bind(artist_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| e.to_string())?;
-    let Some((title,)) = row else { return Ok(()) };
-    enqueue_pass_row(
-        pool,
-        library_id,
-        &format!("artist:{artist_id}:renamed"),
-        &format!("Re-check \u{201c}{title}\u{201d} \u{2014} renamed"),
-    )
-    .await
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -6831,6 +6906,9 @@ pub async fn mb_undo_change(
             if let Some(map) = before.as_object() {
                 for (track_id, names) in map {
                     let Ok(track_id) = track_id.parse::<i64>() else { continue };
+                    // The retracted value leaves the MB tier too — reapply
+                    // would resurrect it after the next rescan otherwise.
+                    clear_mb_tier(pool, track_id, "credits").await?;
                     // User-edited credits stay put through an MB undo too.
                     if crate::music_edit::has_override(pool, track_id, "credits").await? {
                         continue;
@@ -6869,6 +6947,7 @@ pub async fn mb_undo_change(
             }
         }
         "album_artists" => {
+            clear_mb_tier(pool, target_id, "artist_credits").await?;
             // User-set credits stay put through an MB undo too.
             if !crate::music_edit::has_override(pool, target_id, "artist_credits").await? {
                 sqlx::query("DELETE FROM album_artist_credit WHERE album_id = ?")
@@ -6901,6 +6980,7 @@ pub async fn mb_undo_change(
             }
         }
         "album_title" => {
+            clear_mb_tier(pool, target_id, "title").await?;
             if let Some(t) = before["title"].as_str() {
                 sqlx::query("UPDATE album SET title = ?, sort_title = ? WHERE id = ?")
                     .bind(t)
@@ -6934,7 +7014,8 @@ pub async fn mb_undo_change(
         }
         "artist_rename" => {
             // The alias row stays (harmless, keeps references resolving) —
-            // only the display name goes back.
+            // only the display name goes back, and the MB tier with it.
+            clear_mb_tier(pool, target_id, "title").await?;
             if let Some(t) = before["title"].as_str() {
                 sqlx::query("UPDATE artist SET title = ?, sort_title = ? WHERE id = ?")
                     .bind(t)
@@ -6946,6 +7027,7 @@ pub async fn mb_undo_change(
             }
         }
         "album_type" => {
+            clear_mb_tier(pool, target_id, "album_type").await?;
             if let Some(t) = before["album_type"].as_str() {
                 sqlx::query("UPDATE album SET album_type = ? WHERE id = ?")
                     .bind(t)

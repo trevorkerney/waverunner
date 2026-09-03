@@ -31,16 +31,51 @@ const TRACK_FIELDS: &[&str] = &["title", "credits", "track_number", "disc_number
 const ALBUM_FIELDS: &[&str] = &["title", "release_date", "album_type", "genres", "artist_credits"];
 const ARTIST_FIELDS: &[&str] = &["title"];
 
+/// The value tiers. field_override is a TIERED VALUE STORE, not just an
+/// override list: the scanner writes what the files say at 'tag', matching
+/// writes what MusicBrainz says at 'mb', edits write 'user'. A column always
+/// shows the highest tier that has a value, so "Clear overrides" is nothing
+/// more than "delete the user tier and re-resolve" — no fetch, no rescan.
+/// (Tracks keep their tag tier IN the file: a reset re-reads it.)
+pub(crate) const TIER_TAG: &str = "tag";
+
+/// "Clear overrides" deletes ONLY the fields its edit dialog owns. The same
+/// table, at the same 'user' tier, also holds hand-picked MusicBrainz ids
+/// and flags (release group, recording, artist MBID, ignored, partial) —
+/// a blanket tier delete silently unmatched hand-matched albums. Field
+/// names are compile-time constants, so inlining them is safe.
+/// The edit dialog's "overridden" list — only ITS fields, for the same reason
+/// as the reset: hand-picked MB ids share the tier, and a freshly matched
+/// album must not show a Clear overrides button it has no edits behind.
+fn edited_fields(overrides: &HashMap<String, String>, fields: &[&str]) -> Vec<String> {
+    overrides.keys().filter(|f| fields.contains(&f.as_str())).cloned().collect()
+}
+
+fn clear_user_edits_sql(fields: &[&str]) -> String {
+    let list = fields.iter().map(|f| format!("'{f}'")).collect::<Vec<_>>().join(", ");
+    format!("DELETE FROM field_override WHERE entity_id = ? AND tier = 'user' AND field IN ({list})")
+}
+
 /// User-tier override values for an entity, keyed by field. Values are stored
 /// as raw text; "credits" holds a JSON array of names.
 pub(crate) async fn user_overrides(
     pool: &SqlitePool,
     entity_id: i64,
 ) -> Result<HashMap<String, String>, String> {
+    tier_values(pool, entity_id, crate::music_mb::TIER_USER).await
+}
+
+/// One tier's stored values for an entity, keyed by field.
+pub(crate) async fn tier_values(
+    pool: &SqlitePool,
+    entity_id: i64,
+    tier: &str,
+) -> Result<HashMap<String, String>, String> {
     let rows: Vec<(String, Option<String>)> = sqlx::query_as(
-        "SELECT field, value FROM field_override WHERE entity_id = ? AND tier = 'user'",
+        "SELECT field, value FROM field_override WHERE entity_id = ? AND tier = ?",
     )
     .bind(entity_id)
+    .bind(tier)
     .fetch_all(pool)
     .await
     .map_err(|e| e.to_string())?;
@@ -90,14 +125,43 @@ async fn upsert_override(
 // used by edits AND by the scan/reconcile reapply hooks)
 // ---------------------------------------------------------------------------
 
-/// Re-stomp a track's user overrides over whatever the columns currently hold
-/// (fresh tag parse, MB credits, …). Called after every bulk track write, so
-/// rescans/matches can never clobber an edit. No-op without overrides.
+/// Per field, the highest tier holding a usable value: user > mb > tag. An
+/// EMPTY mb value is MusicBrainz's "has none" marker (a dateless group) and
+/// yields to the tag tier; an empty user or tag value is a real "none" (a
+/// cleared date). The tag tier is consulted only on request — after a scan
+/// the columns already hold it, so the reapply hooks skip the read.
+async fn resolved_values(
+    pool: &SqlitePool,
+    entity_id: i64,
+    fields: &[&str],
+    from_tag: bool,
+) -> Result<HashMap<String, String>, String> {
+    let user = tier_values(pool, entity_id, crate::music_mb::TIER_USER).await?;
+    let mb = tier_values(pool, entity_id, crate::music_mb::TIER_MB).await?;
+    let tag = if from_tag { tier_values(pool, entity_id, TIER_TAG).await? } else { HashMap::new() };
+    let mut out = HashMap::new();
+    for field in fields {
+        let v = user
+            .get(*field)
+            .cloned()
+            .or_else(|| mb.get(*field).filter(|v| !v.is_empty()).cloned())
+            .or_else(|| tag.get(*field).cloned());
+        if let Some(v) = v {
+            out.insert(field.to_string(), v);
+        }
+    }
+    Ok(out)
+}
+
+/// Re-stomp a track's resolved values (user, else MB credits) over whatever
+/// the columns currently hold (fresh tag parse, …). Called after every bulk
+/// track write, so rescans can never clobber an edit or a match. No-op when
+/// no tier above the tags holds anything.
 pub(crate) async fn reapply_track_overrides(
     pool: &SqlitePool,
     track_id: i64,
 ) -> Result<(), String> {
-    let overrides = user_overrides(pool, track_id).await?;
+    let overrides = resolved_values(pool, track_id, TRACK_FIELDS, false).await?;
     if overrides.is_empty() {
         return Ok(());
     }
@@ -168,32 +232,25 @@ pub(crate) async fn reapply_track_overrides(
     Ok(())
 }
 
-/// Album counterpart of reapply_track_overrides.
+/// Album counterpart of reapply_track_overrides: user, else MB, over the
+/// freshly scanned columns.
 pub(crate) async fn reapply_album_overrides(
     pool: &SqlitePool,
     album_id: i64,
 ) -> Result<(), String> {
-    // MB's adopted ORIGINAL date lives at mb tier and re-stomps after every
-    // tag rebuild, exactly like user overrides — which are applied below and
-    // win when both exist. Empty value = "group has no date" marker: skip.
-    let mb_date: Option<(Option<String>,)> = sqlx::query_as(
-        "SELECT value FROM field_override WHERE entity_id = ? AND field = 'release_date' AND tier = 'mb'",
-    )
-    .bind(album_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| e.to_string())?;
-    if let Some((Some(d),)) = mb_date {
-        if !d.is_empty() {
-            sqlx::query("UPDATE album SET release_date = ? WHERE id = ?")
-                .bind(&d)
-                .bind(album_id)
-                .execute(pool)
-                .await
-                .map_err(|e| e.to_string())?;
-        }
-    }
-    let overrides = user_overrides(pool, album_id).await?;
+    resolve_album_fields(pool, album_id, false).await
+}
+
+/// Write the album's resolved values to its columns and side tables.
+/// `from_tag` = also read the stored tag tier — the reset path, where the
+/// columns may hold a just-deleted edit and nothing else is going to
+/// rewrite them. A field with no value at any consulted tier is left alone.
+pub(crate) async fn resolve_album_fields(
+    pool: &SqlitePool,
+    album_id: i64,
+    from_tag: bool,
+) -> Result<(), String> {
+    let overrides = resolved_values(pool, album_id, ALBUM_FIELDS, from_tag).await?;
     if overrides.is_empty() {
         return Ok(());
     }
@@ -238,9 +295,18 @@ pub(crate) async fn reapply_album_overrides(
         // reconcile, tag grouping can never drag the album back onto a
         // phantom credit ("Soundtrack", "Halo 2"). The first name's page is
         // created if missing (alias-aware) so the album lands somewhere real.
+        // artist_id is stamped here like the scanner's own credit write, so
+        // a resolve never drops an album off its artists' pages until the
+        // next scan-end re-stamp.
         for (i, name) in names.iter().enumerate() {
             sqlx::query(
-                "INSERT INTO album_artist_credit (album_id, position, name) VALUES (?, ?, ?)",
+                "INSERT INTO album_artist_credit (album_id, position, name, artist_id)
+                 VALUES (?1, ?2, ?3,
+                         (SELECT an.artist_id FROM artist_names an
+                          JOIN media_entry ame ON ame.id = an.artist_id
+                          JOIN media_entry alme ON alme.id = ?1
+                          WHERE ame.library_id = alme.library_id
+                            AND LOWER(an.name) = LOWER(?3) LIMIT 1))",
             )
             .bind(album_id)
             .bind(i as i64)
@@ -288,13 +354,22 @@ pub(crate) async fn reapply_album_overrides(
     Ok(())
 }
 
-/// Artist counterpart — a renamed artist keeps their user-chosen name through
-/// rescans (the scan's casing-refresh would otherwise restore the tag name).
+/// Artist counterpart — a renamed (or MB-named) artist keeps that name
+/// through rescans (the scan's casing-refresh would otherwise restore the
+/// tag spelling).
 pub(crate) async fn reapply_artist_overrides(
     pool: &SqlitePool,
     artist_id: i64,
 ) -> Result<(), String> {
-    let overrides = user_overrides(pool, artist_id).await?;
+    resolve_artist_fields(pool, artist_id, false).await
+}
+
+pub(crate) async fn resolve_artist_fields(
+    pool: &SqlitePool,
+    artist_id: i64,
+    from_tag: bool,
+) -> Result<(), String> {
+    let overrides = resolved_values(pool, artist_id, ARTIST_FIELDS, from_tag).await?;
     if let Some(title) = overrides.get("title") {
         if !title.is_empty() {
             sqlx::query("UPDATE artist SET title = ?, sort_title = ? WHERE id = ?")
@@ -1099,7 +1174,7 @@ pub async fn get_track_edit(
         credits: credit_rows.into_iter().map(|(n,)| n).collect(),
         track_number,
         disc_number,
-        overridden: overrides.into_keys().collect(),
+        overridden: edited_fields(&overrides, TRACK_FIELDS),
         file_name,
         file_tags,
     })
@@ -1218,7 +1293,7 @@ pub async fn reset_track_fields(
     let pool = &state.app_db;
     let (library_id, rel) = track_context(pool, track_id).await?;
     let credits_before = track_credit_names(pool, track_id).await?;
-    sqlx::query("DELETE FROM field_override WHERE entity_id = ? AND tier = 'user'")
+    sqlx::query(&clear_user_edits_sql(TRACK_FIELDS))
         .bind(track_id)
         .execute(pool)
         .await
@@ -1331,7 +1406,7 @@ pub async fn get_album_edit(
         album_type,
         genres: genres.into_iter().map(|(g,)| g).collect(),
         artist_credits,
-        overridden: overrides.into_keys().collect(),
+        overridden: edited_fields(&overrides, ALBUM_FIELDS),
     })
 }
 
@@ -1345,8 +1420,9 @@ pub async fn set_album_fields(
 ) -> Result<(), String> {
     let pool = &state.app_db;
     ensure_not_staged(pool, album_id).await?;
-    // Before-images for the two fields that arm pass work when they actually
-    // change — a save with them untouched must enqueue nothing.
+    // Before-images so a save that leaves these untouched changes nothing
+    // matching-side. Only a credits change enqueues pass work; a rename
+    // never does — matching after a rename is the user's call.
     let (title_before,): (String,) = sqlx::query_as("SELECT title FROM album WHERE id = ?")
         .bind(album_id)
         .fetch_one(pool)
@@ -1403,7 +1479,7 @@ pub async fn set_album_fields(
                 .await
                 .map_err(|e| e.to_string())?;
             if title_after != title_before {
-                crate::music_mb::requeue_renamed_album(pool, &lib, album_id).await?;
+                crate::music_mb::forget_album_notfound(pool, album_id).await?;
             }
         }
     }
@@ -1449,7 +1525,7 @@ pub async fn get_artist_edit(
         id: artist_id,
         title,
         biography,
-        overridden: overrides.into_keys().collect(),
+        overridden: edited_fields(&overrides, ARTIST_FIELDS),
     })
 }
 
@@ -1508,51 +1584,61 @@ pub async fn set_artist_fields(
     reapply_artist_overrides(pool, artist_id).await?;
     if renamed {
         // The walks compare names — a corrected spelling deserves the fresh
-        // walk a merge gets, and the queue should say a pass has work.
-        let library_id: Option<(String,)> =
-            sqlx::query_as("SELECT library_id FROM media_entry WHERE id = ?")
-                .bind(artist_id)
-                .fetch_optional(pool)
-                .await
-                .map_err(|e| e.to_string())?;
-        if let Some((lib,)) = library_id {
-            crate::music_mb::requeue_renamed_artist(pool, &lib, artist_id).await?;
-        }
+        // walk a merge gets. Nothing is enqueued: the user runs a pass when
+        // they want one.
+        crate::music_mb::forget_artist_exhaustion(pool, artist_id).await?;
     }
     Ok(())
 }
 
-/// Drop an artist's rename override. The tag-cased name returns on the next
-/// rescan (the alias rows are left in place — they're harmless and keep old
+/// Drop an artist's rename. The name falls back to MusicBrainz's when the
+/// artist is matched, else the tag spelling — immediately, from the stored
+/// tiers (the alias rows are left in place — they're harmless and keep old
 /// references resolving).
 #[tauri::command]
 pub async fn reset_artist_fields(
     state: State<'_, AppState>,
     artist_id: i64,
 ) -> Result<(), String> {
-    ensure_not_staged(&state.app_db, artist_id).await?;
-    sqlx::query("DELETE FROM field_override WHERE entity_id = ? AND tier = 'user'")
+    let pool = &state.app_db;
+    ensure_not_staged(pool, artist_id).await?;
+    sqlx::query(&clear_user_edits_sql(ARTIST_FIELDS))
         .bind(artist_id)
-        .execute(&state.app_db)
+        .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
-    Ok(())
+    resolve_artist_fields(pool, artist_id, true).await
 }
 
-/// Drop an album's user overrides. Columns keep their current values until the
-/// next rescan/matching pass re-derives them (album fields aren't stored in
-/// any single file, so there is nothing to re-read on the spot).
+/// Drop an album's user edits. Every field falls back to the tier below —
+/// what the match adopted when the album is matched, else what the files
+/// say — immediately, from the stored tiers. A field with nothing stored
+/// beneath it (pre-tier data: scanned before the tag tier existed, matched
+/// before the MB tier) keeps its current value until a rescan or re-match
+/// fills that tier in.
 #[tauri::command]
 pub async fn reset_album_fields(
     state: State<'_, AppState>,
     album_id: i64,
 ) -> Result<(), String> {
-    ensure_not_staged(&state.app_db, album_id).await?;
-    sqlx::query("DELETE FROM field_override WHERE entity_id = ? AND tier = 'user'")
+    let pool = &state.app_db;
+    ensure_not_staged(pool, album_id).await?;
+    sqlx::query(&clear_user_edits_sql(ALBUM_FIELDS))
         .bind(album_id)
-        .execute(&state.app_db)
+        .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
+    resolve_album_fields(pool, album_id, true).await?;
+    // Restored credits may name artists whose pages the edit had orphaned.
+    let library_id: Option<(String,)> =
+        sqlx::query_as("SELECT library_id FROM media_entry WHERE id = ?")
+            .bind(album_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    if let Some((lib,)) = library_id {
+        crate::music::ensure_credit_artists(pool, &lib).await?;
+    }
     Ok(())
 }
 

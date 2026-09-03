@@ -14,7 +14,18 @@ import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { Spinner } from "../ui/spinner";
 import { useMbBusy, MbLoadingNote } from "./MbBusy";
-import { Search, Link2Off, CircleCheck, CircleSlash, TriangleAlert, CircleOff, PackageOpen } from "lucide-react";
+import { fmtTrackTime, fmtAlbumRuntime } from "./musicQueue";
+import type { MusicAlbumDetail, MusicRelease } from "../../types";
+import {
+  Search,
+  Link2Off,
+  CircleCheck,
+  CircleSlash,
+  TriangleAlert,
+  CircleOff,
+  PackageOpen,
+  ChevronRight,
+} from "lucide-react";
 
 /** Match one album, artist, or track to MusicBrainz — the same dialog for all
  *  three, since the shape of the job is identical: see what it's matched to
@@ -51,6 +62,9 @@ export interface MbStatus {
    *  count as resolved. */
   matched_releases: number;
   total_releases: number;
+  /** Albums: releases holding a real pinned pressing. While any exist the
+   *  group can't be unmatched — the pins go first. */
+  pinned_releases: number;
   /** User declared the album deliberately partial — mb-side gaps are
    *  expected, not a problem. */
   partial: boolean;
@@ -279,6 +293,38 @@ export function MatchDialog({
   // matching pass, not instantly (new credit pages are created after the
   // stamping walk, so the pass is what cashes matches in).
   const [justApplied, setJustApplied] = useState(false);
+  // "Your tracks": the files being matched, numbered, for comparing against
+  // a release's tracklist on MusicBrainz — the modal hides the album page
+  // behind it. Collapsed by default (box sets run to 50+ rows) and fetched
+  // only on first expand. undefined = not loaded yet, null = nothing to show.
+  const [tracksOpen, setTracksOpen] = useState(false);
+  const [ourTracks, setOurTracks] = useState<MusicRelease | null | undefined>(undefined);
+  const [loadingTracks, setLoadingTracks] = useState(false);
+
+  useEffect(() => {
+    if (!open || !tracksOpen || kind !== "album" || ourTracks !== undefined) return;
+    let stale = false;
+    setLoadingTracks(true);
+    invoke<MusicAlbumDetail>("get_album_detail", { entryId: entityId })
+      .then((d) => {
+        if (stale) return;
+        setOurTracks(
+          d.releases.find((r) => r.id === releaseId) ??
+            d.releases.find((r) => r.is_default) ??
+            d.releases[0] ??
+            null,
+        );
+      })
+      .catch(() => {
+        if (!stale) setOurTracks(null);
+      })
+      .finally(() => {
+        if (!stale) setLoadingTracks(false);
+      });
+    return () => {
+      stale = true;
+    };
+  }, [open, tracksOpen, kind, entityId, releaseId, ourTracks]);
 
   const load = useCallback(async () => {
     const s = await invoke<MbStatus>("mb_status", {
@@ -301,6 +347,8 @@ export function MatchDialog({
     setSearchAll(false);
     setConfirmApply(null);
     setReleaseRef("");
+    setTracksOpen(false);
+    setOurTracks(undefined);
     setAlbumLeads(null);
     setLeadAlbum(null);
     setJustApplied(false);
@@ -848,7 +896,20 @@ export function MatchDialog({
                   size="sm"
                   variant="ghost"
                   className="gap-1.5"
-                  disabled={busy !== null}
+                  // The group can't be forgotten while any release is still
+                  // pinned inside it — unmatch the release(s) first. The
+                  // backend refuses too; this just says so up front.
+                  disabled={
+                    busy !== null ||
+                    (kind === "album" && !releaseStage && (status?.pinned_releases ?? 0) > 0)
+                  }
+                  title={
+                    kind === "album" && !releaseStage && (status?.pinned_releases ?? 0) > 0
+                      ? status!.pinned_releases === 1
+                        ? "A release is still matched — unmatch it first"
+                        : `${status!.pinned_releases} releases are still matched — unmatch them first`
+                      : undefined
+                  }
                   onClick={unmatch}
                 >
                   {busy === "unmatch" ? <Spinner className="size-3" /> : <Link2Off size={13} />}
@@ -861,6 +922,91 @@ export function MatchDialog({
               )}
             </span>
           </div>
+
+          {/* Your tracks, numbered — what the picker's "view" links are
+              compared against. Disc headers mirror MusicBrainz's tracklist
+              so a 5-disc box set lines up disc by disc. */}
+          {kind === "album" && (
+            <div className="rounded-md border">
+              <button
+                type="button"
+                onClick={() => setTracksOpen((o) => !o)}
+                className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-muted-foreground hover:text-foreground"
+              >
+                <ChevronRight
+                  size={14}
+                  className={`shrink-0 transition-transform ${tracksOpen ? "rotate-90" : ""}`}
+                />
+                <span className="min-w-0 flex-1 truncate">
+                  Your tracks
+                  {ourTracks
+                    ? [
+                        `${ourTracks.tracks.length} track${ourTracks.tracks.length === 1 ? "" : "s"}`,
+                        fmtAlbumRuntime(ourTracks.tracks.reduce((s, t) => s + (t.runtime_secs ?? 0), 0)),
+                      ]
+                        .filter(Boolean)
+                        .map((p) => ` · ${p}`)
+                        .join("")
+                    : ""}
+                  {releaseLabel ? ` · ${releaseLabel}` : ""}
+                </span>
+              </button>
+              {tracksOpen &&
+                (loadingTracks ? (
+                  <div className="flex justify-center border-t py-3">
+                    <Spinner className="size-4" />
+                  </div>
+                ) : ourTracks && ourTracks.tracks.length > 0 ? (
+                  <div className="max-h-56 overflow-y-auto border-t py-1.5">
+                    {(() => {
+                      const rows = [...ourTracks.tracks].sort(
+                        (a, b) =>
+                          (a.disc_number ?? 1) - (b.disc_number ?? 1) ||
+                          (a.track_number ?? Number.MAX_SAFE_INTEGER) -
+                            (b.track_number ?? Number.MAX_SAFE_INTEGER),
+                      );
+                      const multiDisc = new Set(rows.map((t) => t.disc_number ?? 1)).size > 1;
+                      let lastDisc: number | null = null;
+                      return rows.map((t) => {
+                        const disc = t.disc_number ?? 1;
+                        const header = multiDisc && disc !== lastDisc;
+                        lastDisc = disc;
+                        const discTitle = ourTracks.disc_titles.find((d) => d.disc === disc)?.title;
+                        const fileName = t.file_path.replace(/\\/g, "/").split("/").pop() ?? "";
+                        return (
+                          <div key={t.id}>
+                            {header && (
+                              <p className="bg-muted/40 px-3 py-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                                Disc {disc}
+                                {discTitle ? ` — ${discTitle}` : ""}
+                              </p>
+                            )}
+                            <div className="flex items-center gap-2 px-3 py-0.5">
+                              <span className="w-6 shrink-0 text-right font-mono text-[11px] text-muted-foreground">
+                                {t.track_number ?? "–"}
+                              </span>
+                              <span
+                                className="min-w-0 flex-1 truncate text-xs"
+                                title={t.title.trim() ? fileName : undefined}
+                              >
+                                {t.title.trim() || fileName}
+                              </span>
+                              <span className="shrink-0 font-mono text-[11px] text-muted-foreground">
+                                {fmtTrackTime(t.runtime_secs)}
+                              </span>
+                            </div>
+                          </div>
+                        );
+                      });
+                    })()}
+                  </div>
+                ) : (
+                  <p className="border-t px-3 py-2 text-xs text-muted-foreground">
+                    No tracks to show.
+                  </p>
+                ))}
+            </div>
+          )}
 
           {/* Two-step, same shape as the credit-consistency warning below. */}
           {confirmIgnore && (

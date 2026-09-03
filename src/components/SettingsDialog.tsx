@@ -87,7 +87,17 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
       setSettings((prev) => ({ ...prev, ...draft }));
       setDraft({});
       onOpenChange(false);
-      if (changed.length > 0) toast.success("Settings saved");
+      if (changed.length > 0) {
+        toast.success("Settings saved");
+        // Live surfaces (the now-playing bar's waveform toggle) re-read
+        // settings on this instead of waiting for their next natural refresh.
+        // detail.keys lets listeners ignore saves that don't concern them.
+        window.dispatchEvent(
+          new CustomEvent("waverunner:settings-saved", {
+            detail: { keys: changed.map(([k]) => k) },
+          }),
+        );
+      }
     } catch (e) {
       toast.error(String(e));
     }
