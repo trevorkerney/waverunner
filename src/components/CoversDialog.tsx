@@ -200,18 +200,23 @@ function CaaImageBrowserDialog({
     }
   };
 
-  const tileGrid = (images: CaaImage[]) => (
+  // `frontKey`: a release row's own thumb is the same file as the "Front"
+  // tile in its expanded scan set (the /front URL redirects to that image),
+  // so both select under ONE key — picking either lights both, and the
+  // download fetches it once.
+  const tileGrid = (images: CaaImage[], frontKey?: string) => (
     <div
       className="grid items-start gap-3"
       style={{ gridTemplateColumns: "repeat(auto-fill, minmax(140px, 1fr))" }}
     >
       {images.map((img) => {
-        const isPicked = picked.has(img.url);
+        const key = img.front && frontKey ? frontKey : img.url;
+        const isPicked = picked.has(key);
         return (
           <div key={img.url}>
             <button
               disabled={progress != null}
-              onClick={() => toggle(img.url)}
+              onClick={() => toggle(key)}
               title={[img.types.join(", ") || null, img.comment || null]
                 .filter(Boolean)
                 .join(" · ") || "Select this image"}
@@ -384,7 +389,9 @@ function CaaImageBrowserDialog({
                               </div>
                             </div>
                             {Array.isArray(expanded) && (
-                              <div className="mt-2">{tileGrid(expanded)}</div>
+                              <div className="mt-2">
+                                {tileGrid(expanded, r.has_front ? frontFull : undefined)}
+                              </div>
                             )}
                           </div>
                         );
@@ -747,7 +754,7 @@ export function CoversDialog({
                     )}
                     {c.origin !== "app" ? (
                       <span
-                        className="absolute right-1.5 top-1.5 rounded-full bg-black/60 p-1 text-white/80 opacity-0 transition-all duration-200 group-hover:-translate-y-1.5 group-hover:scale-110 group-hover:opacity-100"
+                        className="absolute right-1.5 top-1.5 rounded-md border border-border bg-popover p-1 text-popover-foreground shadow-md opacity-0 transition-all duration-200 group-hover:-translate-y-1.5 group-hover:scale-110 group-hover:opacity-100"
                         title={
                           c.origin === "fetched"
                             ? "Auto-fetched image — replaced by re-fetching, never deleted here"
@@ -757,11 +764,12 @@ export function CoversDialog({
                         <Lock size={11} />
                       </span>
                     ) : confirmDelete === c.path ? (
-                      <span className="absolute inset-x-1.5 top-1.5 flex justify-end gap-1">
+                      // Same lift/growth as the icons, anchored top-right so
+                      // the pair rides up and out with the tile.
+                      <span className="absolute right-1.5 top-1.5 flex origin-top-right gap-1 transition-all duration-200 group-hover:-translate-y-1.5 group-hover:scale-110">
                         <Button
                           size="sm"
-                          variant="destructive"
-                          className="h-6 px-2 text-[11px]"
+                          className="h-6 rounded-md bg-destructive px-2 text-[11px] font-semibold text-white shadow-md hover:bg-destructive/90"
                           disabled={busy}
                           onClick={() => deleteCover(c.path)}
                         >
@@ -769,8 +777,7 @@ export function CoversDialog({
                         </Button>
                         <Button
                           size="sm"
-                          variant="secondary"
-                          className="h-6 px-2 text-[11px]"
+                          className="h-6 rounded-md border-border bg-popover px-2 text-[11px] font-semibold text-popover-foreground shadow-md hover:bg-muted"
                           onClick={() => setConfirmDelete(null)}
                         >
                           Keep
@@ -780,7 +787,7 @@ export function CoversDialog({
                       <button
                         title="Delete this cover"
                         onClick={() => setConfirmDelete(c.path)}
-                        className="absolute right-1.5 top-1.5 rounded-full bg-black/60 p-1 text-white opacity-0 transition-all duration-200 hover:bg-black/80 group-hover:-translate-y-1.5 group-hover:scale-110 group-hover:opacity-100"
+                        className="absolute right-1.5 top-1.5 rounded-md border border-border bg-popover p-1 text-popover-foreground shadow-md opacity-0 transition-all duration-200 hover:bg-muted group-hover:-translate-y-1.5 group-hover:scale-110 group-hover:opacity-100"
                       >
                         <Trash2 size={11} />
                       </button>

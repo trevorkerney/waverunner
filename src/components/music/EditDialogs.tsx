@@ -279,7 +279,8 @@ export function TrackEditDialog({ trackId, open, onOpenChange, onSaved }: TrackE
               </div>
             </div>
             <p className="text-xs text-muted-foreground">
-              Edits are saved in waverunner and survive rescans; your files stay untouched.
+              Edits are saved in waverunner, not your files. Retagging a field at the source
+              replaces the edit on it.
             </p>
           </div>
         )}
@@ -554,8 +555,8 @@ export function AlbumEditDialog({ albumId, open, onOpenChange, onSaved }: AlbumE
               />
             </div>
             <p className="text-xs text-muted-foreground">
-              Edits are saved in waverunner and survive rescans and MusicBrainz matching; your
-              files stay untouched.
+              Edits are saved in waverunner, not your files, and outrank MusicBrainz. Retagging
+              a field at the source replaces the edit on it.
             </p>
           </div>
         )}

@@ -9,6 +9,8 @@
 
 ## bugs / needs fixing
 
+when playing a song in an album, then changing the album cover, then letting that song end and go to the next plays the next song with the old album cover. explicitly double clicking or clicking the play button plays it with the new cover. both situations should use the new cover. the current song continuing to use the old is fine unless its a simple easy fix.
+
 tracks search needs improving. ALL MUSIC SEARCH NEEDS IMRPOVING
 
 give different releases under a release group unique album covers

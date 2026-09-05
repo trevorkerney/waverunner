@@ -146,7 +146,9 @@ export type ViewSpec =
   | { kind: "sounds";             libraryId: string }
   | { kind: "tracks";             libraryId: string }
   | { kind: "loose-tracks";       libraryId: string; sounds: boolean }
-  | { kind: "music-issues";       libraryId: string };
+  | { kind: "music-issues";       libraryId: string }
+  /** Per-tier view: every album and loose track by artist × tags / MusicBrainz / edits. */
+  | { kind: "sources";            libraryId: string };
 
 // One node in the static complication tree shown for a library.
 export interface ComplicationNode {

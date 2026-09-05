@@ -39,9 +39,11 @@ interface AlbumDetailPageProps {
   currentTrackId: number | null;
   /** Whether that track is actively playing — freezes the equalizer when false. */
   playing?: boolean;
-  /** One-shot request to scroll a track's row into view and select it (the
-   *  now-playing bar's title link). A fresh nonce re-fires on repeat clicks. */
-  focusRequest?: { trackId: number; nonce: number } | null;
+  /** One-shot request: scroll a track's row into view and select it (the
+   *  now-playing bar's title link), and/or switch the page onto a release
+   *  (the metadata center's album links). A fresh nonce re-fires on repeat
+   *  clicks. */
+  focusRequest?: { trackId?: number; releaseId?: number; nonce: number } | null;
   /** Metadata was edited — the host invalidates its grid caches. */
   onMetadataChanged?: () => void;
   /** Title changed via an edit — the host patches breadcrumbs/nav state. */
@@ -171,12 +173,20 @@ export function AlbumDetailPage({
   useEffect(() => {
     if (!focusRequest || !detail || focusConsumedRef.current === focusRequest.nonce) return;
     focusConsumedRef.current = focusRequest.nonce;
-    setSelectedTrackId(focusRequest.trackId);
-    requestAnimationFrame(() => {
-      document
-        .querySelector(`[data-music-track-id="${focusRequest.trackId}"]`)
-        ?.scrollIntoView({ block: "center", behavior: "smooth" });
-    });
+    // A release the page still holds — switch onto it (the versions menu
+    // does the same thing by hand).
+    if (focusRequest.releaseId != null && detail.releases.some((r) => r.id === focusRequest.releaseId)) {
+      setReleaseId(focusRequest.releaseId);
+    }
+    if (focusRequest.trackId != null) {
+      const trackId = focusRequest.trackId;
+      setSelectedTrackId(trackId);
+      requestAnimationFrame(() => {
+        document
+          .querySelector(`[data-music-track-id="${trackId}"]`)
+          ?.scrollIntoView({ block: "center", behavior: "smooth" });
+      });
+    }
   }, [focusRequest, detail]);
 
   const release = useMemo(

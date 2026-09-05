@@ -256,6 +256,7 @@ pub fn run() {
             music::get_artist_detail,
             music::get_album_detail,
             music::get_music_scan_issues,
+            music_edit::get_tier_matrix,
             music::get_music_counts,
             music::get_recent_music_plays,
             music::get_music_tracks,

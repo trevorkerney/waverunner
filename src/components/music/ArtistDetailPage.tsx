@@ -603,11 +603,14 @@ export function ArtistDetailPage({
           {/* Persona links, whichever direction this page sits on. The names
               are the links — one human, several masks, all reachable. */}
           {personaLinks && (personaLinks.parent || personaLinks.personas.length > 0) && (
-            <p className="mt-1.5 flex flex-wrap items-center gap-x-1.5 text-sm text-muted-foreground">
-              <VenetianMask size={14} className="shrink-0" />
+            <p className="mt-1.5 flex items-start gap-x-1.5 text-sm text-muted-foreground">
+              <VenetianMask size={14} className="mt-0.5 shrink-0" />
+              {/* Inline text, not flex items: the words and names are a
+                  sentence, so real spaces separate them — a flex gap next
+                  to a word space read as a double space. */}
               {personaLinks.parent ? (
-                <>
-                  <span>Persona of</span>
+                <span>
+                  Persona of{" "}
                   {onNavigateToArtist ? (
                     <button
                       onClick={() =>
@@ -623,13 +626,13 @@ export function ArtistDetailPage({
                   ) : (
                     <span className="text-foreground">{personaLinks.parent.title}</span>
                   )}
-                </>
+                </span>
               ) : (
-                <>
-                  <span>Also performs as</span>
+                <span>
+                  Also performs as{" "}
                   {personaLinks.personas.map((p, i) => (
-                    <span key={p.artist_id} className="flex items-center gap-x-1.5">
-                      {i > 0 && <span>·</span>}
+                    <span key={p.artist_id}>
+                      {i > 0 && " · "}
                       {onNavigateToArtist ? (
                         <button
                           onClick={() => onNavigateToArtist(p.artist_id, p.title)}
@@ -642,7 +645,7 @@ export function ArtistDetailPage({
                       )}
                     </span>
                   ))}
-                </>
+                </span>
               )}
             </p>
           )}

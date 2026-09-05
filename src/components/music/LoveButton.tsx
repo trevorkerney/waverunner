@@ -96,7 +96,13 @@ export function LoveButton({
           : `text-muted-foreground/60 opacity-0 hover:text-foreground ${reveal}`
       }`}
     >
-      <Heart size={10} fill={level === "loved" ? "currentColor" : "none"} />
+      {/* Liked = outline only; a hair thicker than lucide's default 2 so the
+          tiny hollow heart doesn't read as faint next to the filled one. */}
+      <Heart
+        size={10}
+        fill={level === "loved" ? "currentColor" : "none"}
+        strokeWidth={level === "liked" ? 2.5 : 2}
+      />
     </span>
   );
 }

@@ -640,6 +640,16 @@ const MIGRATIONS: &[Migration] = &[
             "ALTER TABLE album_release_pref ADD COLUMN cover TEXT",
         ],
     },
+    Migration {
+        id: 36,
+        app_version: "1.0.0-alpha.12.5",
+        description: "release_match.title — the pinned pressing's own MusicBrainz title",
+        requires_table: Some("release_match"),
+        // Stored at pin time for the per-tier Sources view (the album's
+        // title always comes from the GROUP; this is the version's own).
+        // NULL for pins made before this column existed until re-pinned.
+        statements: &["ALTER TABLE release_match ADD COLUMN title TEXT"],
+    },
 ];
 
 /// Copy the database beside itself before the first migration of a run
@@ -1666,12 +1676,15 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     // is. The group id stays album-level (the card IS the group); every
     // release can pin its own pressing. Folder-keyed because album_release
     // rows are rebuilt with fresh ids on every rescan. Migration 30.
+    // title: the pinned pressing's own MB title (migration 36) — for the
+    // per-tier view; the album's title always comes from the group.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS release_match (
             album_id INTEGER NOT NULL,
             folder_path TEXT NOT NULL,
             mb_release_id TEXT NOT NULL,
             tier TEXT NOT NULL DEFAULT 'mb',
+            title TEXT,
             PRIMARY KEY (album_id, folder_path),
             FOREIGN KEY (album_id) REFERENCES album(id) ON DELETE CASCADE
         )",

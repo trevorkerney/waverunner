@@ -796,6 +796,114 @@ pub const MB_IGNORED: &str = "mb_ignored";
 /// them back in), this survives re-checks, re-applies, and rescans.
 pub const MB_PARTIAL: &str = "mb_partial";
 
+/// Forget an album's MusicBrainz match wholesale, from inside the scanner:
+/// the album's tag identity (title / artist credits) changed at the source,
+/// so the group, every release pin, the gaps, the fetch stamp, the queue
+/// rows, and every MB-tier value — the album's own and the per-track credits
+/// the pins wrote — were claims about a different album. No History replay
+/// (the user didn't act; the files did) and no suppression: a re-match is
+/// a fresh start.
+pub(crate) async fn forget_album_match(
+    pool: &SqlitePool,
+    library_id: &str,
+    album_id: i64,
+) -> Result<(), String> {
+    clear_mb_id(pool, album_id, MB_RELEASE_GROUP).await?;
+    sqlx::query("UPDATE album SET mb_release_group_id = NULL WHERE id = ?")
+        .bind(album_id)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    for table in ["release_match", "album_match_gap", "mb_credit_fetch"] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE album_id = ?"))
+            .bind(album_id)
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    sqlx::query("DELETE FROM pending_pass WHERE library_id = ? AND target IN (?, ?)")
+        .bind(library_id)
+        .bind(album_id.to_string())
+        .bind(format!("album:{album_id}:credits"))
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    for field in ["title", "album_type", "artist_credits", "release_date"] {
+        clear_mb_tier(pool, album_id, field).await?;
+    }
+    sqlx::query(
+        "DELETE FROM field_override WHERE tier = 'mb' AND field = 'credits'
+           AND entity_id IN (SELECT id FROM media_entry WHERE parent_id = ?)",
+    )
+    .bind(album_id)
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// End-of-rescan sweep of match-side rows that outlive their entity: the
+/// tables keyed by entity id WITHOUT a foreign key (suppressions, queue
+/// rows, id-keyed suggestion cards). Inert on their own — ids are never
+/// reused — but stray data all the same.
+pub(crate) async fn sweep_dead_match_rows(pool: &SqlitePool, library_id: &str) -> Result<(), String> {
+    sqlx::query("DELETE FROM mb_suppression WHERE target_id NOT IN (SELECT id FROM media_entry)")
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    let live = |id: i64| async move {
+        sqlx::query_as::<_, (i64,)>("SELECT EXISTS(SELECT 1 FROM media_entry WHERE id = ?)")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .map(|(n,)| n != 0)
+            .map_err(|e| e.to_string())
+    };
+    // Queue targets: a bare id, or "<kind>:<id>[:cause]".
+    let targets: Vec<(i64, String)> =
+        sqlx::query_as("SELECT id, target FROM pending_pass WHERE library_id = ?")
+            .bind(library_id)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    for (row_id, target) in targets {
+        let id_part = if target.contains(':') {
+            target.split(':').nth(1).unwrap_or("")
+        } else {
+            target.as_str()
+        };
+        let Ok(id) = id_part.parse::<i64>() else { continue };
+        if !live(id).await? {
+            sqlx::query("DELETE FROM pending_pass WHERE id = ?")
+                .bind(row_id)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    // Id-keyed suggestion cards (album/artist matches); name-keyed kinds
+    // (merges) are left alone.
+    let cards: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT id, target_key FROM mb_suggestion
+         WHERE library_id = ? AND kind IN ('album_match', 'artist_match')",
+    )
+    .bind(library_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    for (row_id, key) in cards {
+        let Ok(id) = key.parse::<i64>() else { continue };
+        if !live(id).await? {
+            sqlx::query("DELETE FROM mb_suggestion WHERE id = ?")
+                .bind(row_id)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
 /// Drop one field's MB-tier value (an undo retracting what a match adopted).
 /// Field-and-tier precise: the user tier of the same field must survive.
 pub(crate) async fn clear_mb_tier(pool: &SqlitePool, entity_id: i64, field: &str) -> Result<(), String> {
@@ -1489,6 +1597,9 @@ type MbTrack = (i64, i64, String, Vec<(String, Option<String>)>);
 #[derive(Clone)]
 struct MbReleaseFull {
     release_id: String,
+    /// The pressing's own title ("… (Deluxe Edition)") — stored on the pin
+    /// for the per-tier view; never the album's title.
+    title: Option<String>,
     release_group_id: Option<String>,
     /// The release GROUP's title — the album's MB-tier title even when a
     /// pressing is what got matched (release titles carry edition junk).
@@ -1578,6 +1689,7 @@ async fn fetch_release_uncached(
     } else {
         Some(MbReleaseFull {
             release_id: release_id.to_string(),
+            title: body["title"].as_str().filter(|s| !s.is_empty()).map(|s| s.to_string()),
             release_group_id: rg["id"].as_str().map(|s| s.to_string()),
             group_title,
             album_type,
@@ -2581,6 +2693,15 @@ async fn apply_release(
     // mb_release_id column stays purely tag-derived: it reports what the
     // FILES say, this table records what was matched.)
     set_release_match(pool, album_id, folder, &full.release_id, tier).await?;
+    if let Some(t) = &full.title {
+        sqlx::query("UPDATE release_match SET title = ? WHERE album_id = ? AND folder_path = ?")
+            .bind(t)
+            .bind(album_id)
+            .bind(folder)
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     if let Some(rg) = &full.release_group_id {
         set_mb_id(pool, album_id, MB_RELEASE_GROUP, rg, tier).await?;
         sqlx::query("UPDATE album SET mb_release_group_id = ? WHERE id = ?")
@@ -4360,6 +4481,11 @@ pub struct MbAlbumRow {
     /// multi-version cards so a half-pinned card can't read as done.
     pub releases: i64,
     pub resolved_releases: i64,
+    /// The first release still lacking a pin or a declared-none row (default
+    /// first) — where the row's link into the album page should land so
+    /// "pick a release" opens on the release that needs picking. None when
+    /// every release is resolved.
+    pub focus_release_id: Option<i64>,
 }
 
 /// Artists and where they stand. An artist's MusicBrainz id only ever comes
@@ -4586,7 +4712,7 @@ pub async fn mb_get_review(state: State<'_, AppState>, library_id: String) -> Re
         }
     }
 
-    let album_rows: Vec<(i64, String, String, i64, i64, i64, i64, i64, i64)> = sqlx::query_as(
+    let album_rows: Vec<(i64, String, String, i64, i64, i64, i64, i64, i64, Option<i64>)> = sqlx::query_as(
         "SELECT al.id, al.title,
                 CASE
                   -- 'release' means the WHOLE card is resolved: every version
@@ -4626,7 +4752,12 @@ pub async fn mb_get_review(state: State<'_, AppState>, library_id: String) -> Re
                 EXISTS (SELECT 1 FROM field_override ig
                         WHERE ig.entity_id = al.id AND ig.field = 'mb_ignored'),
                 EXISTS (SELECT 1 FROM field_override pt
-                        WHERE pt.entity_id = al.id AND pt.field = 'mb_partial')
+                        WHERE pt.entity_id = al.id AND pt.field = 'mb_partial'),
+                (SELECT ar.id FROM album_release ar WHERE ar.album_id = al.id
+                   AND NOT EXISTS (SELECT 1 FROM release_match rm4
+                                   WHERE rm4.album_id = al.id
+                                     AND rm4.folder_path = ar.folder_path COLLATE NOCASE)
+                 ORDER BY ar.is_default DESC, ar.id LIMIT 1)
          FROM album al
          JOIN media_entry me ON me.id = al.id
          WHERE me.library_id = ?
@@ -4641,7 +4772,7 @@ pub async fn mb_get_review(state: State<'_, AppState>, library_id: String) -> Re
     let albums = album_rows
         .into_iter()
         .map(
-            |(album_id, title, state, releases, resolved_releases, gap_ours, gap_mb, ignored, partial)| {
+            |(album_id, title, state, releases, resolved_releases, gap_ours, gap_mb, ignored, partial, focus_release_id)| {
                 MbAlbumRow {
                     album_id,
                     title,
@@ -4657,6 +4788,7 @@ pub async fn mb_get_review(state: State<'_, AppState>, library_id: String) -> Re
                     partial: partial != 0,
                     releases,
                     resolved_releases,
+                    focus_release_id,
                 }
             },
         )

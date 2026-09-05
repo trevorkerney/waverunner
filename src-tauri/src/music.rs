@@ -480,14 +480,25 @@ fn read_track(
 // Folder classification
 // ---------------------------------------------------------------------------
 
-/// "CD1" / "Disc 2" / "disk_03" → Some(n). Anything else → None (= a version).
-fn disc_folder_number(name: &str) -> Option<i64> {
+/// "CD1" / "Disc 2" / "disk_03" / "CD2 - Truly Yours 3" / "Disc 1 (Jupiter)"
+/// → Some(n). Anything else → None (= a version). A disc subtitle may follow
+/// the number after a separator; digits running straight into letters
+/// ("cd2x") or a number too big to be a disc ("CD 2013") do not qualify.
+pub(crate) fn disc_folder_number(name: &str) -> Option<i64> {
     let lower = name.trim().to_lowercase();
     for prefix in ["cd", "disc", "disk"] {
         if let Some(rest) = lower.strip_prefix(prefix) {
-            let digits = rest.trim_start_matches([' ', '.', '-', '_']);
-            if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
-                return Some(digits.parse().unwrap_or(1));
+            let rest = rest.trim_start_matches([' ', '.', '-', '_']);
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if digits.is_empty() {
+                continue;
+            }
+            let after = &rest[digits.len()..];
+            let subtitle_ok = after.is_empty()
+                || after.starts_with([' ', '.', '-', '_', ':', '(', '[']);
+            let n: i64 = digits.parse().unwrap_or(0);
+            if subtitle_ok && (1..=99).contains(&n) {
+                return Some(n);
             }
         }
     }
@@ -1335,16 +1346,46 @@ pub(crate) async fn write_track_side_tables(
                 .map_err(|e| e.to_string())?;
         }
     }
+    // The track's TAG tier — stored (not just in the file) so the per-tier
+    // view can show what the tags say next to MB and edits without reading
+    // files. Written regardless of write_credits: this records the tags,
+    // the column guard above is about what the columns show.
+    // A field whose tag changed sheds its MB value and edit. A changed TITLE
+    // is the track's identity moving: the recording match and every upper
+    // tier go with it (the title is what it was matched and edited as).
+    let changed = crate::music_edit::store_tag_tier(
+        pool,
+        track_id,
+        &[
+            ("title", t.title.clone()),
+            ("credits", serde_json::to_string(&t.credits).map_err(|e| e.to_string())?),
+            ("track_number", t.track_number.map(|n| n.to_string()).unwrap_or_default()),
+            ("disc_number", t.disc_number.to_string()),
+        ],
+    )
+    .await?;
+    if changed.iter().any(|f| f == "title") {
+        crate::music_mb::clear_mb_id(pool, track_id, crate::music_mb::MB_RECORDING).await?;
+        for field in crate::music_edit::track_fields() {
+            crate::music_edit::invalidate_field(pool, track_id, field).await?;
+        }
+    }
     crate::music_edit::reapply_track_overrides(pool, track_id).await?;
     Ok(())
 }
 
 /// The TAG tier of the album's editable fields — what the files say, stored
-/// so "Clear overrides" (and the coming per-tier view) can read the tags
-/// back without a rescan. Same derivations the column writes use; an
-/// absent date is stored as '' (a real "none", unlike the MB marker).
+/// so "Clear overrides" and the Sources view can read the tags back without
+/// a rescan. Same derivations the column writes use; an absent date is
+/// stored as '' (a real "none", unlike the MB marker).
+///
+/// A field whose tag value changed since the last scan sheds its MB value
+/// and user edit (store_tag_tier). A change to the album's IDENTITY — its
+/// title or artist credits — also forgets its MusicBrainz match outright:
+/// the group and pins were claims about what this album was.
 async fn write_album_tag_tier(
     pool: &SqlitePool,
+    library_id: &str,
     album_id: i64,
     album: &ScannedAlbum,
 ) -> Result<(), String> {
@@ -1371,9 +1412,9 @@ async fn write_album_tag_tier(
         ("genres", serde_json::to_string(&genres).map_err(|e| e.to_string())?),
         ("artist_credits", serde_json::to_string(&names).map_err(|e| e.to_string())?),
     ];
-    for (field, value) in pairs {
-        crate::music_mb::set_mb_id(pool, album_id, field, &value, crate::music_edit::TIER_TAG)
-            .await?;
+    let changed = crate::music_edit::store_tag_tier(pool, album_id, &pairs).await?;
+    if changed.iter().any(|f| f == "title" || f == "artist_credits") {
+        crate::music_mb::forget_album_match(pool, library_id, album_id).await?;
     }
     Ok(())
 }
@@ -1503,7 +1544,7 @@ async fn insert_album(
 
     write_album_credits(pool, album_entry_id, album, true).await?;
     link_album_genres(pool, album_entry_id, album).await?;
-    write_album_tag_tier(pool, album_entry_id, album).await?;
+    write_album_tag_tier(pool, library_id, album_entry_id, album).await?;
     sync_music_covers(
         pool,
         library_id,
@@ -1611,6 +1652,11 @@ async fn reconcile_album(
     existing_tracks: &mut HashMap<String, i64>,
 ) -> Result<(), String> {
     let track_type = entry_type_id(pool, "track").await?;
+
+    // Tag tier FIRST: a changed identity tag forgets the album's match here,
+    // so the credit guards below read the album as unmatched on this same
+    // rescan and rebuild everything from tags — not one cycle late.
+    write_album_tag_tier(pool, library_id, album_entry_id, album).await?;
 
     // Credits for MB-matched albums are authoritative — a rescan's tag re-parse
     // must not clobber them (the stamp keeps the fetch from re-running).
@@ -1759,7 +1805,6 @@ async fn reconcile_album(
 
     write_album_credits(pool, album_entry_id, album, write_credits).await?;
     link_album_genres(pool, album_entry_id, album).await?;
-    write_album_tag_tier(pool, album_entry_id, album).await?;
     sync_music_covers(
         pool,
         library_id,
@@ -4362,6 +4407,10 @@ pub async fn rescan_music_library(
     // Ending on a sweep makes the end state self-consistent every time.
     sweep_orphan_artists(pool, library_id, cache_base).await?;
 
+    // Match-side rows keyed to entities this scan deleted (no FK to cascade
+    // them): suppressions, queue rows, id-keyed suggestion cards.
+    crate::music_mb::sweep_dead_match_rows(pool, library_id).await?;
+
     Ok(())
 }
 
@@ -6838,6 +6887,14 @@ mod tests {
         assert_eq!(disc_folder_number("Deluxe Edition"), None);
         // "CDs and rarities" must not read as disc folders.
         assert_eq!(disc_folder_number("CDs and rarities"), None);
+        // A subtitle after the number is still a disc folder (Born Sinner's
+        // "CD2 - Truly Yours 3", Stadium Arcadium's "Disc 1 (Jupiter)").
+        assert_eq!(disc_folder_number("CD2 - Truly Yours 3"), Some(2));
+        assert_eq!(disc_folder_number("Disc 1 (Jupiter)"), Some(1));
+        assert_eq!(disc_folder_number("disc 2: Mars"), Some(2));
+        // Digits running into letters, or a year, are not disc numbers.
+        assert_eq!(disc_folder_number("cd2x"), None);
+        assert_eq!(disc_folder_number("CD 2013"), None);
     }
 
     /// Pure tag grouping: same album tag across two folders = one album with

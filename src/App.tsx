@@ -847,7 +847,7 @@ function App() {
       // (HomePage / MusicIssuesPage / TracksPage) — just clear grid state.
       // Scroll restores like any grid (the restore waits out the self-fetch);
       // Home is libraryless and keys under a fixed "home" prefix.
-      if (view.kind === "home" || view.kind === "music-issues" || view.kind === "tracks" || view.kind === "loose-tracks") {
+      if (view.kind === "home" || view.kind === "music-issues" || view.kind === "tracks" || view.kind === "loose-tracks" || view.kind === "sources") {
         setEntries([]);
         setPeople(null);
         setPlaylists(null);
@@ -1505,6 +1505,7 @@ function App() {
           : kind === "sounds" ? "Sounds"
           : kind === "tracks" ? "Tracks"
           : kind === "music-issues" ? "Needs attention"
+          : kind === "sources" ? "Sources"
           : "";
         return section ? `${libLabel} - ${section}` : libLabel;
       };
@@ -1877,7 +1878,7 @@ function App() {
         // at the library root so the detail page actually renders.
         if (
           activeView &&
-          ["people-list", "people-all", "genres", "playlists", "tracks", "loose-tracks", "music-issues"].includes(
+          ["people-list", "people-all", "genres", "playlists", "tracks", "loose-tracks", "music-issues", "sources"].includes(
             activeView.kind,
           )
         ) {
@@ -1922,7 +1923,10 @@ function App() {
   const musicFocusNonceRef = useRef(0);
   const [musicFocusRequest, setMusicFocusRequest] = useState<{
     albumId: number;
-    trackId: number;
+    /** Row to select and scroll to (bar title link). */
+    trackId?: number;
+    /** Release to switch the page onto (metadata center's "pick release"). */
+    releaseId?: number;
     nonce: number;
   } | null>(null);
 
@@ -1990,6 +1994,21 @@ function App() {
   const openMusicArtistFromBar = useCallback(
     (artistId: number, artistName: string) => {
       void openMusicEntryFromBar(fakeMusicEntry("artist", artistId, artistName));
+    },
+    [openMusicEntryFromBar]
+  );
+
+  // Metadata center album links: close the center and land on the album
+  // page, switched onto the release that still needs picking when the row
+  // names one.
+  const openMusicAlbumFromCenter = useCallback(
+    (albumId: number, albumTitle: string, releaseId: number | null) => {
+      setMbReviewLibraryId(null);
+      if (releaseId != null) {
+        musicFocusNonceRef.current += 1;
+        setMusicFocusRequest({ albumId, releaseId, nonce: musicFocusNonceRef.current });
+      }
+      void openMusicEntryFromBar(fakeMusicEntry("album", albumId, albumTitle));
     },
     [openMusicEntryFromBar]
   );
@@ -3279,6 +3298,7 @@ function App() {
         onOpenChange={(o) => {
           if (!o) setMbReviewLibraryId(null);
         }}
+        onOpenAlbum={openMusicAlbumFromCenter}
         onChanged={() => {
           // A match/undo landed behind the dialog — same recipe as a rescan:
           // drop caches, silently refresh the grid, and let self-fetching

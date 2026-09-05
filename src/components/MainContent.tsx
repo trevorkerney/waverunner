@@ -144,6 +144,7 @@ import { TmdbPersonSearchDialog } from "@/components/TmdbPersonSearchDialog";
 import { ArtistsGrid } from "@/components/music/ArtistsGrid";
 import { AlbumDetailPage } from "@/components/music/AlbumDetailPage";
 import { MusicIssuesPage } from "@/components/music/MusicIssuesPage";
+import { SourcesPage } from "@/components/music/SourcesPage";
 import { TracksPage } from "@/components/music/TracksPage";
 import { LooseTracksSection } from "@/components/music/LooseTracksSection";
 import { LooseTracksPage } from "@/components/music/LooseTracksPage";
@@ -291,9 +292,10 @@ interface MainContentProps {
   /** Whether that track is actively playing (false = paused) — freezes the
    *  row equalizer bars. */
   musicPlaying?: boolean;
-  /** One-shot scroll-to-track request for the album page (now-playing bar
-   *  title link). The nonce distinguishes repeat clicks. */
-  musicFocusRequest?: { albumId: number; trackId: number; nonce: number } | null;
+  /** One-shot request for the album page: scroll to a track (now-playing bar
+   *  title link) and/or switch onto a release (metadata center link). The
+   *  nonce distinguishes repeat clicks. */
+  musicFocusRequest?: { albumId: number; trackId?: number; releaseId?: number; nonce: number } | null;
 }
 
 export function MainContent({
@@ -1140,6 +1142,17 @@ export function MainContent({
         {/* relative: the page's loading spinner centers absolutely over this box */}
         <div ref={scrollContainerRef} className="relative flex min-h-0 flex-1 flex-col overflow-y-auto">
           <MusicIssuesPage libraryId={activeView.libraryId} />
+        </div>
+      </main>
+    );
+  }
+
+  if (activeView?.kind === "sources") {
+    return (
+      <main className="flex flex-1 flex-col overflow-hidden bg-background">
+        {breadcrumbBar}
+        <div ref={scrollContainerRef} className="relative flex min-h-0 flex-1 flex-col overflow-y-auto">
+          <SourcesPage libraryId={activeView.libraryId} />
         </div>
       </main>
     );

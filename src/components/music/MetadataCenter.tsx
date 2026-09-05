@@ -121,6 +121,9 @@ interface MbAlbumRow {
    *  cards so a half-pinned card can't read as done. */
   releases: number;
   resolved_releases: number;
+  /** First release still lacking a pin or a declared-none row — where the
+   *  title link lands. null when every release is resolved. */
+  focus_release_id: number | null;
 }
 
 interface MbChange {
@@ -213,6 +216,10 @@ interface MetadataCenterProps {
    *  back to the match step; without this the request opens the match-only
    *  wizard through the sidebar window event. */
   onRunPass?: () => void;
+  /** An album title was clicked: open its page, switched onto `releaseId`
+   *  when the row names a release still needing a pick. Hosts that can't
+   *  navigate (the wizard) leave this unset and titles stay plain text. */
+  onOpenAlbum?: (albumId: number, title: string, releaseId: number | null) => void;
 }
 
 type PaneId = "map" | "albums" | "artists" | "credits" | "gaps" | "files" | "history";
@@ -1041,6 +1048,7 @@ function AlbumRow({
   onMatch,
   onIgnore,
   onCombine,
+  onOpen,
 }: {
   a: MbAlbumRow;
   first: boolean;
@@ -1049,12 +1057,25 @@ function AlbumRow({
   onIgnore?: (a: MbAlbumRow) => void;
   /** Fold this album together with another (duplicates spotted in the list). */
   onCombine?: (a: MbAlbumRow) => void;
+  /** Title click → the album page (on the release still needing a pick). */
+  onOpen?: (a: MbAlbumRow) => void;
 }) {
   const identified = a.state === "release" || a.state === "album";
   return (
     <div className={`flex items-center gap-1.5 px-3 py-1.5 text-sm ${first ? "" : "border-t"}`}>
       <span className="min-w-0 flex-1 truncate">
-        {a.title}
+        {onOpen ? (
+          <button
+            type="button"
+            onClick={() => onOpen(a)}
+            className="truncate text-left underline-offset-2 hover:underline"
+            title={a.focus_release_id != null ? "Open this album on the release to pick" : "Open this album"}
+          >
+            {a.title}
+          </button>
+        ) : (
+          a.title
+        )}
         {a.artist_title && <span className="text-muted-foreground"> — {a.artist_title}</span>}
         {(a.gap_ours > 0 || a.gap_mb > 0) && (
           <span className="ml-1.5 text-[11px] text-amber-300">
@@ -1150,7 +1171,13 @@ export function MetadataCenter({
   onRescanNeeded,
   onDecisionsChange,
   onRunPass,
+  onOpenAlbum,
 }: MetadataCenterProps) {
+  // Album-row title links. undefined (not a no-op) when the host can't
+  // navigate, so rows render plain text instead of dead buttons.
+  const openAlbumRow = onOpenAlbum
+    ? (a: MbAlbumRow) => onOpenAlbum(a.album_id, a.title, a.focus_release_id)
+    : undefined;
   const [review, setReview] = useState<MbReview | null>(null);
   const [matchState, setMatchState] = useState<MusicMatchState | null>(null);
   const [fallbacks, setFallbacks] = useState<TagFallbackRow[]>([]);
@@ -2784,6 +2811,7 @@ export function MetadataCenter({
                     setPartnerFilter("");
                     setCombinePartnerFor(row);
                   }}
+                  onOpen={openAlbumRow}
                 />
               ))}
             </div>
@@ -2814,6 +2842,7 @@ export function MetadataCenter({
                     setPartnerFilter("");
                     setCombinePartnerFor(row);
                   }}
+                  onOpen={openAlbumRow}
                 />
               ))}
             </div>
@@ -2837,6 +2866,7 @@ export function MetadataCenter({
                     setPartnerFilter("");
                     setCombinePartnerFor(row);
                   }}
+                  onOpen={openAlbumRow}
                 />
               ))}
               {albumsFullyIdentified.length > albumLimit && (
@@ -3563,6 +3593,8 @@ interface MetadataCenterDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onChanged?: () => void;
+  /** Album title links — the host closes this dialog and navigates. */
+  onOpenAlbum?: (albumId: number, title: string, releaseId: number | null) => void;
 }
 
 /** Standalone host — the sidebar's always-available entrance to the center. */
@@ -3571,6 +3603,7 @@ export function MetadataCenterDialog({
   open,
   onOpenChange,
   onChanged,
+  onOpenAlbum,
 }: MetadataCenterDialogProps) {
   const [reloadKey, setReloadKey] = useState(0);
   useEffect(() => {
@@ -3585,7 +3618,12 @@ export function MetadataCenterDialog({
           <DialogTitle>Metadata center</DialogTitle>
         </DialogHeader>
         {libraryId && open && (
-          <MetadataCenter libraryId={libraryId} reloadKey={reloadKey} onChanged={onChanged} />
+          <MetadataCenter
+            libraryId={libraryId}
+            reloadKey={reloadKey}
+            onChanged={onChanged}
+            onOpenAlbum={onOpenAlbum}
+          />
         )}
       </DialogContent>
     </Dialog>

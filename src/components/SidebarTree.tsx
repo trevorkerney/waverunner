@@ -6,6 +6,7 @@ import {
   Disc3,
   Drama,
   Film,
+  Layers,
   Library,
   ListMusic,
   Music2,
@@ -28,6 +29,7 @@ import { viewCacheKey } from "@/lib/complications";
 const ICON_MAP: Record<string, LucideIcon> = {
   Clapperboard,
   Disc3,
+  Layers,
   Drama,
   Film,
   Library,

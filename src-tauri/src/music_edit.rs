@@ -51,6 +51,53 @@ fn edited_fields(overrides: &HashMap<String, String>, fields: &[&str]) -> Vec<St
     overrides.keys().filter(|f| fields.contains(&f.as_str())).cloned().collect()
 }
 
+/// Store an entity's TAG tier and invalidate what sat above any field whose
+/// tag value CHANGED since the last scan. A retag at the source is the base
+/// moving: the MB value and the user edit for that field were answers about
+/// the old base, so they go, and the column falls to the new tag value when
+/// the reapply hook runs after this. Per field — a changed date tag never
+/// touches a title edit. Returns the changed fields. The first write (nothing
+/// stored yet) changes nothing: there is no old base to compare against.
+pub(crate) async fn store_tag_tier(
+    pool: &SqlitePool,
+    entity_id: i64,
+    values: &[(&str, String)],
+) -> Result<Vec<String>, String> {
+    let prev = tier_values(pool, entity_id, TIER_TAG).await?;
+    let mut changed = Vec::new();
+    for (field, value) in values {
+        if let Some(old) = prev.get(*field) {
+            if old != value {
+                invalidate_field(pool, entity_id, field).await?;
+                changed.push(field.to_string());
+            }
+        }
+        crate::music_mb::set_mb_id(pool, entity_id, field, value, TIER_TAG).await?;
+    }
+    Ok(changed)
+}
+
+/// Drop one field's MB and user tiers — the base beneath them moved.
+pub(crate) async fn invalidate_field(
+    pool: &SqlitePool,
+    entity_id: i64,
+    field: &str,
+) -> Result<(), String> {
+    sqlx::query(
+        "DELETE FROM field_override WHERE entity_id = ? AND field = ? AND tier IN ('mb', 'user')",
+    )
+    .bind(entity_id)
+    .bind(field)
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub(crate) fn track_fields() -> &'static [&'static str] {
+    TRACK_FIELDS
+}
+
 fn clear_user_edits_sql(fields: &[&str]) -> String {
     let list = fields.iter().map(|f| format!("'{f}'")).collect::<Vec<_>>().join(", ");
     format!("DELETE FROM field_override WHERE entity_id = ? AND tier = 'user' AND field IN ({list})")
@@ -1341,6 +1388,313 @@ pub async fn reset_track_fields(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Per-tier view (the Sources page): every album and loose track, grouped by
+// artist, with what each tier holds — a straight read of the tiered store.
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Default, Clone)]
+pub struct TierValue {
+    pub tag: Option<String>,
+    pub mb: Option<String>,
+    pub user: Option<String>,
+}
+
+/// One release (version) of an album on the view: its own tag title and
+/// date, the release id the files carry vs. the pressing pinned, and the
+/// user's label rename.
+#[derive(Serialize)]
+pub struct TierRelease {
+    pub id: i64,
+    /// Effective label ("1", "2", or the user's rename).
+    pub label: Option<String>,
+    /// Folder leaf — the differentiator when labels collide.
+    pub folder: String,
+    pub is_default: bool,
+    /// The user declared this release has no MusicBrainz counterpart.
+    pub declared_none: bool,
+    pub fields: HashMap<String, TierValue>,
+}
+
+#[derive(Serialize)]
+pub struct TierRow {
+    pub id: i64,
+    /// "album" | "track"
+    pub kind: String,
+    /// The resolved title — what the library shows right now.
+    pub title: String,
+    /// Albums: matched to a release group. Tracks: matched to a recording.
+    pub matched: bool,
+    /// Albums: releases holding a pinned pressing.
+    pub pinned_releases: i64,
+    /// field → what each tier holds. JSON arrays for credits and genres.
+    pub fields: HashMap<String, TierValue>,
+    /// Albums: every release, default first. Tracks: empty.
+    pub releases: Vec<TierRelease>,
+}
+
+#[derive(Serialize)]
+pub struct TierGroup {
+    /// None = the leading group: loose tracks (and credit-less albums)
+    /// that belong to no artist page.
+    pub artist_id: Option<i64>,
+    pub artist_title: Option<String>,
+    /// The artist's own name across the tiers ("title" only).
+    pub artist_fields: HashMap<String, TierValue>,
+    pub albums: Vec<TierRow>,
+    pub loose_tracks: Vec<TierRow>,
+}
+
+#[derive(Serialize)]
+pub struct TierMatrix {
+    /// Online metadata is on for this library — the MusicBrainz column exists.
+    pub mb_enabled: bool,
+    pub groups: Vec<TierGroup>,
+}
+
+/// The fields the view shows, across every entity kind.
+const TIER_FIELDS: &[&str] = &[
+    "title",
+    "release_date",
+    "album_type",
+    "genres",
+    "artist_credits",
+    "credits",
+    "track_number",
+    "disc_number",
+];
+
+#[tauri::command]
+pub async fn get_tier_matrix(
+    state: State<'_, AppState>,
+    library_id: String,
+) -> Result<TierMatrix, String> {
+    let pool = &state.app_db;
+    let mb_enabled = crate::commands::library_online_metadata(pool, &library_id).await?;
+
+    // Every stored value in the library, bucketed per entity. The MB id
+    // fields ride along as the "matched" flags.
+    let rows: Vec<(i64, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT f.entity_id, f.field, f.tier, f.value FROM field_override f
+         JOIN media_entry me ON me.id = f.entity_id
+         WHERE me.library_id = ? AND f.tier IN ('tag', 'mb', 'user')",
+    )
+    .bind(&library_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let mut by_entity: HashMap<i64, HashMap<String, TierValue>> = HashMap::new();
+    let mut group_matched: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut recording_matched: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    for (id, field, tier, value) in rows {
+        let present = value.as_deref().is_some_and(|v| !v.is_empty());
+        if field == crate::music_mb::MB_RELEASE_GROUP {
+            if present {
+                group_matched.insert(id);
+            }
+            continue;
+        }
+        if field == crate::music_mb::MB_RECORDING {
+            if present {
+                recording_matched.insert(id);
+            }
+            continue;
+        }
+        if !TIER_FIELDS.contains(&field.as_str()) {
+            continue;
+        }
+        let slot = by_entity.entry(id).or_default().entry(field).or_default();
+        let v = value.unwrap_or_default();
+        match tier.as_str() {
+            "tag" => slot.tag = Some(v),
+            "mb" => slot.mb = Some(v),
+            "user" => slot.user = Some(v),
+            _ => {}
+        }
+    }
+
+    let pins: Vec<(i64, i64)> = sqlx::query_as(
+        "SELECT rm.album_id, COUNT(*) FROM release_match rm
+         JOIN media_entry me ON me.id = rm.album_id
+         WHERE me.library_id = ? AND rm.mb_release_id <> ''
+         GROUP BY rm.album_id",
+    )
+    .bind(&library_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let pinned: HashMap<i64, i64> = pins.into_iter().collect();
+
+    // Every release in the library with its pin and label pref, bucketed
+    // per album. Tag tier = what the scanner stamped on the release row;
+    // MB tier = the pinned pressing; user tier = the label rename.
+    type ReleaseRow = (
+        i64,
+        i64,
+        Option<String>,
+        String,
+        i64,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let release_rows: Vec<ReleaseRow> = sqlx::query_as(
+        "SELECT ar.album_id, ar.id, ar.label, ar.folder_path, ar.is_default, ar.release_date,
+                ar.title, ar.mb_release_id, rm.mb_release_id, rm.tier, rm.title, p.label
+         FROM album_release ar
+         JOIN media_entry me ON me.id = ar.album_id
+         LEFT JOIN release_match rm ON rm.album_id = ar.album_id AND rm.folder_path = ar.folder_path
+         LEFT JOIN album_release_pref p ON p.album_id = ar.album_id AND p.folder_path = ar.folder_path
+         WHERE me.library_id = ?
+         ORDER BY ar.is_default DESC, ar.label",
+    )
+    .bind(&library_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let mut releases_by_album: HashMap<i64, Vec<TierRelease>> = HashMap::new();
+    for (album_id, id, label, folder, is_default, date, tag_title, tag_mbid, pin_mbid, pin_tier, pin_title, pref_label) in
+        release_rows
+    {
+        let mut fields: HashMap<String, TierValue> = HashMap::new();
+        let non_empty = |s: Option<String>| s.filter(|v| !v.is_empty());
+        let declared_none = pin_tier.as_deref() == Some(crate::music_mb::TIER_NONE);
+        fields.insert(
+            "title".into(),
+            TierValue { tag: non_empty(tag_title), mb: non_empty(pin_title), user: None },
+        );
+        fields.insert(
+            "release_date".into(),
+            TierValue { tag: non_empty(date), mb: None, user: None },
+        );
+        fields.insert(
+            "mb_release_id".into(),
+            TierValue {
+                tag: non_empty(tag_mbid),
+                mb: if declared_none { None } else { non_empty(pin_mbid) },
+                user: None,
+            },
+        );
+        fields.insert(
+            "label".into(),
+            TierValue { tag: None, mb: None, user: non_empty(pref_label) },
+        );
+        fields.retain(|_, v| v.tag.is_some() || v.mb.is_some() || v.user.is_some());
+        let leaf = folder.rsplit(['\\', '/']).next().unwrap_or(&folder).to_string();
+        releases_by_album.entry(album_id).or_default().push(TierRelease {
+            id,
+            label,
+            folder: leaf,
+            is_default: is_default != 0,
+            declared_none,
+            fields,
+        });
+    }
+
+    let artists: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT a.id, a.title FROM artist a JOIN media_entry me ON me.id = a.id
+         WHERE me.library_id = ? ORDER BY a.sort_title COLLATE NOCASE",
+    )
+    .bind(&library_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let index: HashMap<i64, usize> =
+        artists.iter().enumerate().map(|(i, (id, _))| (*id, i)).collect();
+    let mut groups: Vec<TierGroup> = artists
+        .iter()
+        .map(|(id, title)| TierGroup {
+            artist_id: Some(*id),
+            artist_title: Some(title.clone()),
+            artist_fields: by_entity.remove(id).unwrap_or_default(),
+            albums: Vec::new(),
+            loose_tracks: Vec::new(),
+        })
+        .collect();
+    let mut orphan = TierGroup {
+        artist_id: None,
+        artist_title: None,
+        artist_fields: HashMap::new(),
+        albums: Vec::new(),
+        loose_tracks: Vec::new(),
+    };
+
+    // Real albums (not loose containers, not sound collections), filed under
+    // their first credit's artist — the same rule the artist pages use.
+    let albums: Vec<(i64, String, Option<i64>)> = sqlx::query_as(
+        "SELECT al.id, al.title,
+                (SELECT ac.artist_id FROM album_artist_credit ac
+                 WHERE ac.album_id = al.id ORDER BY ac.position LIMIT 1)
+         FROM album al JOIN media_entry me ON me.id = al.id
+         WHERE me.library_id = ?
+           AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = al.id)
+           AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = al.id)
+         ORDER BY al.sort_title COLLATE NOCASE",
+    )
+    .bind(&library_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    for (id, title, artist_id) in albums {
+        let row = TierRow {
+            id,
+            kind: "album".to_string(),
+            title,
+            matched: group_matched.contains(&id),
+            pinned_releases: *pinned.get(&id).unwrap_or(&0),
+            fields: by_entity.remove(&id).unwrap_or_default(),
+            releases: releases_by_album.remove(&id).unwrap_or_default(),
+        };
+        match artist_id.and_then(|a| index.get(&a)) {
+            Some(&i) => groups[i].albums.push(row),
+            None => orphan.albums.push(row),
+        }
+    }
+
+    // Loose tracks: a loose container's parent is its artist (NULL at the
+    // library root). Sound containers are the sounds domain's, not here.
+    let loose: Vec<(i64, String, Option<i64>)> = sqlx::query_as(
+        "SELECT t.id, t.title, cme.parent_id
+         FROM track t JOIN media_entry me ON me.id = t.id
+         JOIN loose_album la ON la.album_id = me.parent_id
+         JOIN media_entry cme ON cme.id = la.album_id
+         WHERE me.library_id = ?
+           AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = la.album_id)
+         ORDER BY t.sort_title COLLATE NOCASE",
+    )
+    .bind(&library_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    for (id, title, artist_id) in loose {
+        let row = TierRow {
+            id,
+            kind: "track".to_string(),
+            title,
+            matched: recording_matched.contains(&id),
+            pinned_releases: 0,
+            fields: by_entity.remove(&id).unwrap_or_default(),
+            releases: Vec::new(),
+        };
+        match artist_id.and_then(|a| index.get(&a)) {
+            Some(&i) => groups[i].loose_tracks.push(row),
+            None => orphan.loose_tracks.push(row),
+        }
+    }
+
+    groups.retain(|g| !g.albums.is_empty() || !g.loose_tracks.is_empty());
+    // The artist-less group leads the page: loose tracks sit at the top,
+    // above the artists (his call), not trailing after them.
+    if !orphan.albums.is_empty() || !orphan.loose_tracks.is_empty() {
+        groups.insert(0, orphan);
+    }
+    Ok(TierMatrix { mb_enabled, groups })
+}
+
 #[derive(Serialize)]
 pub struct AlbumEditView {
     pub id: i64,
@@ -1772,26 +2126,6 @@ pub async fn get_combine_info(
         .into_iter()
         .map(|(n,)| n)
         .collect();
-        // Display cover: the selected one when still cached, else the first.
-        let covers: Vec<(String,)> = sqlx::query_as(
-            "SELECT cached_path FROM cached_images
-             WHERE library_id = ? AND entry_folder_path = ? AND image_type = 'cover'
-             ORDER BY source_filename",
-        )
-        .bind(&library_id)
-        .bind(&folder_path)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| e.to_string())?;
-        let cover = selected_cover
-            .filter(|s| covers.iter().any(|(c,)| c == s))
-            .or_else(|| covers.first().map(|(c,)| c.clone()));
-        let (track_count,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM media_entry WHERE parent_id = ?")
-                .bind(id)
-                .fetch_one(pool)
-                .await
-                .map_err(|e| e.to_string())?;
         let rows: Vec<(i64, Option<String>, String, i64, i64)> = sqlx::query_as(
             "SELECT r.id, r.label, r.folder_path, r.is_default,
                     (SELECT COUNT(*) FROM track_release tr WHERE tr.release_id = r.id)
@@ -1802,6 +2136,53 @@ pub async fn get_combine_info(
         .fetch_all(pool)
         .await
         .map_err(|e| e.to_string())?;
+        // Display cover = what the grid card shows: the DEFAULT release's
+        // art. Its pick first, then the album's selected cover, then the
+        // first BARE-named cached file — non-default releases' art is pooled
+        // under a "{leaf}_" prefix and belongs to them, so a prefixed file
+        // sorting first by name (the bug this fixes) must not win.
+        let covers: Vec<(String, String)> = sqlx::query_as(
+            "SELECT source_filename, cached_path FROM cached_images
+             WHERE library_id = ? AND entry_folder_path = ? AND image_type = 'cover'
+             ORDER BY source_filename",
+        )
+        .bind(&library_id)
+        .bind(&folder_path)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        let default_pick: Option<String> = sqlx::query_scalar(
+            "SELECT p.cover FROM album_release_pref p
+             JOIN album_release ar ON ar.album_id = p.album_id
+                  AND ar.folder_path = p.folder_path COLLATE NOCASE
+             WHERE p.album_id = ? AND ar.is_default = 1
+               AND p.cover IS NOT NULL AND p.cover <> ''",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        let leaf = |p: &str| p.rsplit(['\\', '/']).next().unwrap_or(p).to_lowercase();
+        let other_leaves: Vec<String> =
+            rows.iter().filter(|r| r.3 == 0).map(|r| leaf(&r.2)).collect();
+        let is_prefixed = |name: &str| {
+            let n = name.to_lowercase();
+            other_leaves
+                .iter()
+                .any(|l| n.len() > l.len() + 1 && n.starts_with(l.as_str()) && n.as_bytes()[l.len()] == b'_')
+        };
+        let in_pool = |s: &str| covers.iter().any(|(_, c)| c == s);
+        let cover = default_pick
+            .filter(|s| in_pool(s))
+            .or_else(|| selected_cover.filter(|s| in_pool(s)))
+            .or_else(|| covers.iter().find(|(n, _)| !is_prefixed(n)).map(|(_, c)| c.clone()))
+            .or_else(|| covers.first().map(|(_, c)| c.clone()));
+        let (track_count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM media_entry WHERE parent_id = ?")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .map_err(|e| e.to_string())?;
         out.push(CombineAlbumInfo {
             id,
             title,
@@ -1991,11 +2372,41 @@ pub async fn combine_albums_multi(
 
     let mut directives: Vec<(String, String, String)> = Vec::new();
     let mut staged_source_ids: Vec<i64> = Vec::new();
+    // Same-identity pairs the scanner would already group, held apart only
+    // by a standing release split: "combine" here means "undo the split".
+    // (folder, disc-named?) per split row to drop, plus the albums involved.
+    let mut unsplit: Vec<(String, bool)> = Vec::new();
+    let mut unsplit_source_ids: Vec<i64> = Vec::new();
     for src in &sources {
         let (src_artist, src_title) = album_tag_identity(pool, &library_id, *src).await?;
         let src_name = title_of(*src).await?;
         if src_artist == tgt_artist && src_title == tgt_title {
-            continue; // same tag identity — already one album at scan time
+            // Already one album at scan time — unless a release split is
+            // what's keeping them apart, in which case dropping it is the
+            // combine. Splits can sit on either side's folders.
+            let folders: Vec<(String,)> = sqlx::query_as(
+                "SELECT ar.folder_path FROM album_release ar
+                 JOIN album_release_split s ON s.library_id = ? AND s.folder_path = ar.folder_path COLLATE NOCASE
+                 WHERE ar.album_id IN (?, ?)",
+            )
+            .bind(&library_id)
+            .bind(*src)
+            .bind(target_id)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            for (folder,) in folders {
+                if unsplit.iter().any(|(f, _)| f.eq_ignore_ascii_case(&folder)) {
+                    continue;
+                }
+                let leaf = folder.rsplit(['\\', '/']).next().unwrap_or(&folder);
+                let disc_named = crate::music::disc_folder_number(leaf).is_some();
+                unsplit.push((folder, disc_named));
+            }
+            if !unsplit.is_empty() {
+                unsplit_source_ids.push(*src);
+            }
+            continue;
         }
         if existing
             .iter()
@@ -2040,8 +2451,56 @@ pub async fn combine_albums_multi(
         directives.push((src_artist, src_title, src_name));
         staged_source_ids.push(*src);
     }
-    if directives.is_empty() {
+    if directives.is_empty() && unsplit.is_empty() {
         return Err("These albums are already combined".to_string());
+    }
+
+    if !unsplit.is_empty() {
+        let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+        for (folder, _) in &unsplit {
+            sqlx::query("DELETE FROM album_release_split WHERE library_id = ? AND folder_path = ? COLLATE NOCASE")
+                .bind(&library_id)
+                .bind(folder)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        tx.commit().await.map_err(|e| e.to_string())?;
+        // What the rescan yields is the scanner's call: a disc-named folder
+        // ("CD2 - …") rejoins as a disc of the same release; anything else
+        // comes back as a separate release, whatever mode was clicked.
+        let non_disc = unsplit.iter().any(|(_, disc)| !disc);
+        let names: Vec<String> = {
+            let mut v = Vec::new();
+            for id in &unsplit_source_ids {
+                v.push(format!("\u{201c}{}\u{201d}", title_of(*id).await?));
+            }
+            v
+        };
+        stage_pending_change(
+            pool,
+            &library_id,
+            "release_split_removed",
+            "",
+            &serde_json::json!({
+                "folder_paths": unsplit.iter().map(|(f, _)| f.clone()).collect::<Vec<_>>(),
+                "source_album_ids": unsplit_source_ids,
+                "target_album_id": target_id,
+            }),
+            &format!(
+                "Rejoin {} with \u{201c}{tgt_name}\u{201d}{}",
+                names.join(", "),
+                if mode == "merge" && non_disc {
+                    " — its folder isn't named as a disc, so it returns as a separate release"
+                } else {
+                    ""
+                }
+            ),
+        )
+        .await?;
+    }
+    if directives.is_empty() {
+        return Ok(());
     }
 
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
@@ -2155,7 +2614,9 @@ pub(crate) async fn is_staged_for_rescan(
                     split_targets.push(target);
                 }
             }
-            "album_combine" => {
+            // A rejoin (dropped release split) freezes both sides the same
+            // way a combine does — the rescan rewrites both albums.
+            "album_combine" | "release_split_removed" => {
                 combine_source_ids.extend(
                     p["source_album_ids"]
                         .as_array()
@@ -2299,7 +2760,7 @@ pub async fn get_pending_changes(
                 serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null);
             let locked_ids: Vec<i64> = match kind.as_str() {
                 "artist_split" => p["artist_id"].as_i64().into_iter().collect(),
-                "album_combine" => p["source_album_ids"]
+                "album_combine" | "release_split_removed" => p["source_album_ids"]
                     .as_array()
                     .into_iter()
                     .flatten()
@@ -2389,6 +2850,21 @@ pub async fn unstage_pending_change(state: State<'_, AppState>, id: i64) -> Resu
                 .execute(pool)
                 .await
                 .map_err(|e| e.to_string())?;
+            }
+        }
+        "release_split_removed" => {
+            // Un-staging a rejoin puts the split rows back.
+            for folder in p["folder_paths"].as_array().into_iter().flatten() {
+                if let Some(folder) = folder.as_str() {
+                    sqlx::query(
+                        "INSERT OR IGNORE INTO album_release_split (library_id, folder_path) VALUES (?, ?)",
+                    )
+                    .bind(&library_id)
+                    .bind(folder)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                }
             }
         }
         // Legacy rows (pre-undo staging) carry no revert data — removing the
