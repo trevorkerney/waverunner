@@ -7,6 +7,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::Emitter;
 use tauri_plugin_updater::UpdaterExt;
 
+/// Fold a title to its sort form: lowercase, typographic punctuation mapped
+/// to the ASCII it stands for, accented Latin letters to their base, and a
+/// leading article dropped. Lists ORDER BY this with a byte collation, so
+/// the folding is what decides where symbols and accents land: an ASCII
+/// ellipsis or quote sorts BEFORE digits and letters (the "#" bucket at the
+/// top of the grid), while the typographic "…" and “ ” MusicBrainz titles
+/// carry are non-ASCII and would sort after "z" — which is exactly where
+/// "…And Justice for All" vanished to once its group title was adopted.
 pub(crate) fn generate_sort_title(title: &str, language: &str) -> String {
     let articles: &[&str] = match language {
         "en" => &["the ", "a ", "an "],
@@ -15,13 +23,47 @@ pub(crate) fn generate_sort_title(title: &str, language: &str) -> String {
         "es" => &["el ", "la ", "los ", "las ", "un ", "una "],
         _ => &[],
     };
-    let lower = title.to_lowercase();
+    let lower = fold_for_sort(title);
     for article in articles {
         if lower.starts_with(article) {
             return lower[article.len()..].to_string();
         }
     }
     lower
+}
+
+/// Lowercase + fold typographic punctuation and accented Latin letters to
+/// ASCII. Shared by sort titles and text search, so "..." finds "…" and
+/// "aenima" finds "Ænima".
+pub(crate) fn fold_for_sort(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.to_lowercase().chars() {
+        match c {
+            '…' => out.push_str("..."),
+            '‘' | '’' | '‚' | '‛' | '′' => out.push('\''),
+            '“' | '”' | '„' | '‟' | '″' => out.push('"'),
+            '–' | '—' | '‐' | '‑' | '−' => out.push('-'),
+            '\u{a0}' => out.push(' '),
+            'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' => out.push('a'),
+            'æ' => out.push_str("ae"),
+            'ç' | 'č' => out.push('c'),
+            'è' | 'é' | 'ê' | 'ë' | 'ē' | 'ě' => out.push('e'),
+            'ì' | 'í' | 'î' | 'ï' | 'ī' => out.push('i'),
+            'ñ' | 'ń' => out.push('n'),
+            'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' | 'ō' => out.push('o'),
+            'œ' => out.push_str("oe"),
+            'š' => out.push('s'),
+            'ß' => out.push_str("ss"),
+            'ù' | 'ú' | 'û' | 'ü' | 'ū' => out.push('u'),
+            'ý' | 'ÿ' => out.push('y'),
+            'ž' => out.push('z'),
+            'ð' => out.push('d'),
+            'þ' => out.push_str("th"),
+            'ł' => out.push('l'),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1227,7 +1269,7 @@ pub async fn get_entries(
 
     let (format, _paths, default_sort_mode) = get_library_meta(&state.app_db, &library_id).await?;
 
-    let mut covers_map = get_all_cached_covers(&state.app_db, &library_id)
+    let covers_map = get_all_cached_covers(&state.app_db, &library_id)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -1407,7 +1449,7 @@ pub async fn get_entries(
             let entries: Vec<MediaEntry> = rows
                 .into_iter()
                 .map(|(id, title, year, end_year, folder_path, parent_id, entry_type, selected_cover, tmdb_id, child_count, season_display)| {
-                    let covers = covers_map.remove(&folder_path).unwrap_or_default();
+                    let covers = covers_map.get(&folder_path).cloned().unwrap_or_default();
                     MediaEntry {
                         id,
                         title,
@@ -1516,9 +1558,11 @@ pub async fn get_entries(
                 .unwrap_or_else(|| "alpha".to_string());
                 let order_clause = match sort_mode.as_str() {
                     // App-wide date vocabulary: "date" = oldest first, "date-desc"
-                    // = newest first. Undated albums sink in both directions.
-                    "date" => "ORDER BY al.release_date IS NULL, al.release_date ASC, al.sort_title COLLATE NOCASE ASC",
-                    "date-desc" => "ORDER BY al.release_date IS NULL, al.release_date DESC, al.sort_title COLLATE NOCASE ASC",
+                    // = newest first. Undated albums LEAD in both directions
+                    // (user rule 2026-09-09): they're the ones needing a look,
+                    // and the bottom of a 300-album grid is where nobody scrolls.
+                    "date" => "ORDER BY (al.release_date IS NULL OR al.release_date = '') DESC, al.release_date ASC, al.sort_title COLLATE NOCASE ASC",
+                    "date-desc" => "ORDER BY (al.release_date IS NULL OR al.release_date = '') DESC, al.release_date DESC, al.sort_title COLLATE NOCASE ASC",
                     _ => "ORDER BY al.sort_title COLLATE NOCASE ASC",
                 };
                 let marker = if sounds {
@@ -1557,7 +1601,10 @@ pub async fn get_entries(
                 let entries: Vec<MediaEntry> = rows
                     .into_iter()
                     .map(|(id, title, release_date, folder_path, selected_cover)| {
-                        let covers = covers_map.remove(&folder_path).unwrap_or_default();
+                        // Looked up, not removed: two tag-albums can share
+                        // one folder (Halo 2 Vol. 1 + Vol. 2), and the pool
+                        // is folder-keyed — a remove starved the second card.
+                        let covers = covers_map.get(&folder_path).cloned().unwrap_or_default();
                         let credit_display = credits_by_album
                             .remove(&id)
                             .filter(|names| !names.is_empty())
@@ -1812,10 +1859,11 @@ pub async fn get_entries(
                 .into_iter()
                 .map(|(id, title, folder_path, selected_cover)| {
                     // Folder art first, fetched images appended after.
-                    let mut covers = covers_map.remove(&folder_path).unwrap_or_default();
+                    let mut covers = covers_map.get(&folder_path).cloned().unwrap_or_default();
                     covers.extend(
                         covers_map
-                            .remove(&crate::music_art::artist_fetch_rel(id))
+                            .get(&crate::music_art::artist_fetch_rel(id))
+                            .cloned()
                             .unwrap_or_default(),
                     );
                     // The card subtitle depends on the ACTIVE SORT, and sort
@@ -1909,11 +1957,14 @@ pub async fn search_entries(
 ) -> Result<Vec<MediaEntry>, String> {
     let (format, _paths, _default_sort_mode) = get_library_meta(&state.app_db, &library_id).await?;
 
-    let mut covers_map = get_all_cached_covers(&state.app_db, &library_id)
+    let covers_map = get_all_cached_covers(&state.app_db, &library_id)
         .await
         .map_err(|e| e.to_string())?;
 
     let like_pattern = format!("%{}%", query);
+    // Music also matches against the folded sort title, so "..." finds an
+    // "…" title and "aenima" finds Ænima (same folding as the sort key).
+    let folded_pattern = format!("%{}%", fold_for_sort(&query));
 
     let entries = match format.as_str() {
         "video" => {
@@ -1998,7 +2049,7 @@ pub async fn search_entries(
 
             let mut entries: Vec<MediaEntry> = rows.into_iter()
                 .map(|(id, title, year, end_year, folder_path, parent_id, entry_type, selected_cover, tmdb_id, season_display)| {
-                    let covers = covers_map.remove(&folder_path).unwrap_or_default();
+                    let covers = covers_map.get(&folder_path).cloned().unwrap_or_default();
                     MediaEntry { id, title, year, end_year, folder_path, parent_id, entry_type, covers, selected_cover, child_count: 0, season_display, collection_display: None, role_display: None, tmdb_id, link_id: None, interactive: false, watched: false, watch_progress: None, unwatched: false, has_progress: false, sort_date: None }
                 })
                 .collect();
@@ -2046,7 +2097,8 @@ pub async fn search_entries(
                 sqlx::query_as(
                     "SELECT mef.id, mef.title, mef.folder_path, mef.selected_cover \
                      FROM media_entry_full mef \
-                     WHERE mef.library_id = ? AND mef.entry_type = 'artist' AND mef.title LIKE ? \
+                     WHERE mef.library_id = ? AND mef.entry_type = 'artist' \
+                       AND (mef.title LIKE ? OR mef.sort_title LIKE ?) \
                        AND (NOT EXISTS (SELECT 1 FROM media_entry ch WHERE ch.parent_id = mef.id) \
                             OR EXISTS (SELECT 1 FROM media_entry ch WHERE ch.parent_id = mef.id \
                                        AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = ch.id)) \
@@ -2055,6 +2107,7 @@ pub async fn search_entries(
                 )
                 .bind(&library_id)
                 .bind(&like_pattern)
+                .bind(&folded_pattern)
                 .fetch_all(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -2063,13 +2116,14 @@ pub async fn search_entries(
                     "SELECT al.id, al.title, al.release_date, al.folder_path, al.selected_cover \
                      FROM album al \
                      JOIN media_entry me ON me.id = al.id \
-                     WHERE me.library_id = ? AND al.title LIKE ? \
+                     WHERE me.library_id = ? AND (al.title LIKE ? OR al.sort_title LIKE ?) \
                        AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = al.id) \
                        AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = al.id) \
                      ORDER BY al.sort_title COLLATE NOCASE ASC",
                 )
                 .bind(&library_id)
                 .bind(&like_pattern)
+                .bind(&folded_pattern)
                 .fetch_all(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -2094,10 +2148,11 @@ pub async fn search_entries(
             let mut results: Vec<MediaEntry> = artist_rows
                 .into_iter()
                 .map(|(id, title, folder_path, selected_cover)| {
-                    let mut covers = covers_map.remove(&folder_path).unwrap_or_default();
+                    let mut covers = covers_map.get(&folder_path).cloned().unwrap_or_default();
                     covers.extend(
                         covers_map
-                            .remove(&crate::music_art::artist_fetch_rel(id))
+                            .get(&crate::music_art::artist_fetch_rel(id))
+                            .cloned()
                             .unwrap_or_default(),
                     );
                     MediaEntry { id, title, year: None, end_year: None, folder_path, parent_id: None, entry_type: "artist".to_string(), covers, selected_cover, child_count: 0, season_display: None, collection_display: None, role_display: None, tmdb_id: None, link_id: None, interactive: false, watched: false, watch_progress: None, unwatched: false, has_progress: false, sort_date: None }
@@ -2105,7 +2160,7 @@ pub async fn search_entries(
                 .collect();
             results.extend(album_rows.into_iter().map(
                     |(id, title, release_date, folder_path, selected_cover)| {
-                        let covers = covers_map.remove(&folder_path).unwrap_or_default();
+                        let covers = covers_map.get(&folder_path).cloned().unwrap_or_default();
                         let artist_title = search_credits
                             .remove(&id)
                             .filter(|names| !names.is_empty())
@@ -3610,7 +3665,7 @@ pub async fn get_entries_for_genre(
     library_id: String,
     genre: String,
 ) -> Result<Vec<MediaEntry>, String> {
-    let mut covers_map = get_all_cached_covers(&state.app_db, &library_id)
+    let covers_map = get_all_cached_covers(&state.app_db, &library_id)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -3653,7 +3708,7 @@ pub async fn get_entries_for_genre(
         return Ok(rows
             .into_iter()
             .map(|(id, title, release_date, folder_path, selected_cover)| {
-                let covers = covers_map.remove(&folder_path).unwrap_or_default();
+                let covers = covers_map.get(&folder_path).cloned().unwrap_or_default();
                 let artist_title = credits_by_album
                     .remove(&id)
                     .filter(|names| !names.is_empty())
@@ -3728,7 +3783,7 @@ pub async fn get_entries_for_genre(
     let entries: Vec<MediaEntry> = rows
         .into_iter()
         .map(|(id, title, year, end_year, folder_path, parent_id, entry_type, selected_cover, tmdb_id, season_display)| {
-            let covers = covers_map.remove(&folder_path).unwrap_or_default();
+            let covers = covers_map.get(&folder_path).cloned().unwrap_or_default();
             MediaEntry {
                 id,
                 title,
@@ -4599,7 +4654,7 @@ pub async fn get_entries_for_person(
         return Err("People browsing is only supported for video libraries".to_string());
     }
 
-    let mut covers_map = get_all_cached_covers(&state.app_db, &library_id)
+    let covers_map = get_all_cached_covers(&state.app_db, &library_id)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -4810,7 +4865,7 @@ pub async fn get_entries_for_person(
     let entries: Vec<MediaEntry> = rows
         .into_iter()
         .map(|(id, title, year, end_year, folder_path, parent_id, entry_type, selected_cover, tmdb_id)| {
-            let covers = covers_map.remove(&folder_path).unwrap_or_default();
+            let covers = covers_map.get(&folder_path).cloned().unwrap_or_default();
             // Voiced characters are their own group ("voices …") separate from
             // played ones ("as …"); director/creator credit comes last:
             // "as Walter White · voices 3 characters · director of 2 episodes".

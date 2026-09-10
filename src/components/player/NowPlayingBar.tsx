@@ -1,8 +1,8 @@
 import { useState, useRef, useEffect, useSyncExternalStore, type ReactNode } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
-import { Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, X, Music2, ChevronUp, ChevronDown, Shuffle, Repeat, Repeat1, ListMusic, Heart } from "lucide-react";
+import { Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, X, Music2, ChevronUp, ChevronDown, Shuffle, Repeat, Repeat1, ListMusic, Heart, Loader2 } from "lucide-react";
 import { Slider } from "../ui/slider";
-import { MusicPlayerState, MusicPlayerActions, currentMusicItem } from "../../hooks/useMusicPlayer";
+import { MusicPlayerState, MusicPlayerActions, currentMusicItem, useMusicLoading } from "../../hooks/useMusicPlayer";
 import { useLoved } from "../music/LoveButton";
 import type { LoveLevel } from "../../types";
 import { UpNextPanel } from "./UpNextPanel";
@@ -11,7 +11,8 @@ const MARQUEE_PX_PER_SEC = 40;
 const MARQUEE_PAUSE_MS = 2000;
 const MARQUEE_GAP_PX = 40;
 
-/** SoundCloud-style waveform seekbar: mirrored peak bars on a canvas, played
+/** Waveform seekbar: left channel above the midline, right below (mono =
+ *  mirrored) as peak bars on a canvas, played
  *  portion at full alpha. Pointer drag/click seeks; the parent owns the
  *  drag-value plumbing so the time readout stays glued to the cursor exactly
  *  like the plain slider. */
@@ -54,16 +55,22 @@ function WaveformSeekbar({
     ctx.scale(dpr, dpr);
     ctx.clearRect(0, 0, w, h);
     const color = getComputedStyle(el).color; // text-primary — theme-aware
-    const n = peaks.length;
+    // Stored as LEFT peaks then RIGHT peaks (same count each): left draws
+    // up from the midline, right draws down — a stereo file reads the way a
+    // DAW stacks it, and mono (identical halves) still looks mirrored.
+    const n = peaks.length >> 1;
     const frac = duration > 0 ? Math.min(position / duration, 1) : 0;
     const barW = w / n;
     const gap = barW > 2 ? 1 : 0;
+    const mid = h / 2;
+    const half = mid - 1;
     ctx.fillStyle = color;
     for (let i = 0; i < n; i++) {
-      const amp = Math.max(peaks[i] / 255, 0.04); // silence still draws a hairline
-      const bh = amp * (h - 2);
+      // Silence still draws a hairline on each side.
+      const up = Math.max(peaks[i] / 255, 0.04) * half;
+      const down = Math.max(peaks[n + i] / 255, 0.04) * half;
       ctx.globalAlpha = (i + 0.5) / n <= frac ? 1 : 0.3;
-      ctx.fillRect(i * barW, (h - bh) / 2, Math.max(barW - gap, 1), bh);
+      ctx.fillRect(i * barW, mid - up, Math.max(barW - gap, 1), up + down);
     }
   });
   const valueAt = (e: React.PointerEvent) => {
@@ -74,7 +81,7 @@ function WaveformSeekbar({
   return (
     <canvas
       ref={canvasRef}
-      className="h-6 w-full cursor-pointer text-primary"
+      className="h-5 w-full cursor-pointer text-primary"
       onPointerDown={(e) => {
         dragRef.current = true;
         e.currentTarget.setPointerCapture(e.pointerId);
@@ -273,6 +280,10 @@ export function NowPlayingBar({ state, actions, hidden, onOpenAlbum, onOpenArtis
       cancelled = true;
     };
   }, [currentTrackId, settingsNonce]);
+
+  // Hooks stay above the early returns below — a hook after them runs only
+  // once the bar activates, and React throws on the changed hook count.
+  const loading = useMusicLoading();
 
   if (!state.isActive || hidden) return null;
 
@@ -476,8 +487,10 @@ export function NowPlayingBar({ state, actions, hidden, onOpenAlbum, onOpenArtis
           </button>
         </div>
         <div className="flex w-full max-w-2xl items-center gap-2">
-          <span className="w-10 shrink-0 text-right font-mono text-[10px] text-muted-foreground">
-            {fmtTime(shownPosition)}
+          {/* Elapsed time — or a spinner while the file is still opening,
+              instead of a 0:00 that sits there through a drive spin-up. */}
+          <span className="flex w-10 shrink-0 items-center justify-end font-mono text-[10px] text-muted-foreground">
+            {loading ? <Loader2 size={11} className="animate-spin" /> : fmtTime(shownPosition)}
           </span>
           <div className="flex-1">
             {waveform ? (

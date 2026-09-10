@@ -146,6 +146,15 @@ interface MbGapRow {
   title: string;
   /** MusicBrainz's title at the same slot, when both sides have one. */
   counterpart: string | null;
+  /** The diff's release folder — names the slot for Accept. */
+  folder_path: string;
+  /** Which pairing witness failed at a shared slot: the loose title check,
+   *  the five-second length window, or both (= probably a different song).
+   *  A title match pairs on its own unless the length is off by more than
+   *  fifteen seconds, so a same-title row here is a big gap, not a rip's
+   *  usual couple of seconds. */
+  title_off: boolean;
+  length_off: boolean;
 }
 
 interface MbGapAlbum {
@@ -154,6 +163,8 @@ interface MbGapAlbum {
   artist_title: string | null;
   /** Which release of a multi-version card this diff belongs to. */
   release_label: string | null;
+  /** That release's row id — the album page opens onto it. */
+  release_id: number | null;
   rows: MbGapRow[];
 }
 
@@ -220,6 +231,10 @@ interface MetadataCenterProps {
    *  when the row names a release still needing a pick. Hosts that can't
    *  navigate (the wizard) leave this unset and titles stay plain text. */
   onOpenAlbum?: (albumId: number, title: string, releaseId: number | null) => void;
+  /** An artist name was clicked: open their page. Same host rule. */
+  onOpenArtist?: (artistId: number, name: string) => void;
+  /** Land on this pane and card instead of the map; a new nonce re-lands. */
+  focus?: CenterFocus | null;
 }
 
 type PaneId = "map" | "albums" | "artists" | "credits" | "gaps" | "files" | "history";
@@ -901,11 +916,14 @@ function ArtistRow({
   onLink,
   onIgnore,
   onPersona,
+  onOpen,
   disabled,
 }: {
   a: MbArtistRow;
   first: boolean;
   onMatch: (id: number) => void;
+  /** Name link → the artist page (undefined = host can't navigate). */
+  onOpen?: (a: MbArtistRow) => void;
   /** Unidentified rows only — a name MusicBrainz can't place is very often
    *  several artists in one tag, and that is the fix. */
   onSplit?: (a: MbArtistRow) => void;
@@ -938,7 +956,18 @@ function ArtistRow({
   return (
     <div className={`flex items-center gap-1.5 px-3 py-1.5 text-sm ${first ? "" : "border-t"}`}>
       <span className="min-w-0 flex-1 truncate">
-        {a.title}
+        {onOpen ? (
+          <button
+            type="button"
+            className="underline-offset-2 hover:underline"
+            title="Open this artist's page"
+            onClick={() => onOpen(a)}
+          >
+            {a.title}
+          </button>
+        ) : (
+          a.title
+        )}
         <span className="ml-1.5 text-[11px] text-muted-foreground">
           {a.album_count} {a.album_count === 1 ? "release" : "releases"}
         </span>
@@ -1146,6 +1175,7 @@ function AlbumRow({
 /** Change kinds in the log → words. */
 const KIND_WORD: Record<string, string> = {
   track_credits: "credits",
+  track_titles: "track titles",
   album_artists: "album artist",
   album_type: "type",
   album_title: "title",
@@ -1172,11 +1202,16 @@ export function MetadataCenter({
   onDecisionsChange,
   onRunPass,
   onOpenAlbum,
+  onOpenArtist,
+  focus,
 }: MetadataCenterProps) {
-  // Album-row title links. undefined (not a no-op) when the host can't
-  // navigate, so rows render plain text instead of dead buttons.
+  // Album/artist-row title links. undefined (not a no-op) when the host
+  // can't navigate, so rows render plain text instead of dead buttons.
   const openAlbumRow = onOpenAlbum
     ? (a: MbAlbumRow) => onOpenAlbum(a.album_id, a.title, a.focus_release_id)
+    : undefined;
+  const openArtistRow = onOpenArtist
+    ? (a: MbArtistRow) => onOpenArtist(a.artist_id, a.title)
     : undefined;
   const [review, setReview] = useState<MbReview | null>(null);
   const [matchState, setMatchState] = useState<MusicMatchState | null>(null);
@@ -1376,6 +1411,41 @@ export function MetadataCenter({
     });
   const dismissGaps = (albumId: number) =>
     run(`gaps:${albumId}`, () => invoke("mb_dismiss_gaps", { albumId }));
+  // The person is the witness: pair this one track with MB's at its slot
+  // even though the automatic check couldn't. Title, credits, history row.
+  const acceptTrack = (g: MbGapAlbum, r: MbGapRow) =>
+    run(`accept:${g.album_id}:${r.folder_path}:${r.disc}:${r.position}`, async () => {
+      await invoke("mb_accept_track", {
+        albumId: g.album_id,
+        folderPath: r.folder_path,
+        disc: r.disc,
+        position: r.position,
+      });
+      toast.success(`Took MusicBrainz's track — “${r.counterpart ?? ""}”.`);
+    });
+  // A row Accept can act on: ours, paired with an MB slot, and not flagged
+  // as probably a different song (both witnesses off).
+  const acceptable = (r: MbGapRow) =>
+    r.side === "ours" && r.counterpart != null && !(r.title_off && r.length_off);
+  // Accept all: every acceptable row on the card in one backend call (one
+  // release fetch, one history batch). Rows can span releases of a combined
+  // album, so group by folder.
+  const acceptAll = (g: MbGapAlbum) =>
+    run(`accept-all:${g.album_id}`, async () => {
+      const byFolder = new Map<string, [number, number][]>();
+      for (const r of g.rows) {
+        if (!acceptable(r)) continue;
+        const list = byFolder.get(r.folder_path) ?? [];
+        list.push([r.disc, r.position]);
+        byFolder.set(r.folder_path, list);
+      }
+      let n = 0;
+      for (const [folderPath, slots] of byFolder) {
+        await invoke("mb_accept_tracks", { albumId: g.album_id, folderPath, slots });
+        n += slots.length;
+      }
+      toast.success(`Took MusicBrainz's titles for ${n} track${n === 1 ? "" : "s"}.`);
+    });
   const markPartial = (albumId: number) =>
     run(`partial:${albumId}`, async () => {
       await invoke("mb_set_partial", { entityId: albumId, partial: true });
@@ -1512,9 +1582,23 @@ export function MetadataCenter({
   useEffect(() => {
     if (!review || landedRef.current) return;
     landedRef.current = true;
-    // The map is home — the whole-library picture and the guided path.
-    setPane(!onlineEnabled ? "files" : "map");
-  }, [review, onlineEnabled]);
+    // The map is home — the whole-library picture and the guided path —
+    // unless the opener pointed at one card (an album's mismatch count).
+    setPane(focus?.pane ?? (!onlineEnabled ? "files" : "map"));
+  }, [review, onlineEnabled, focus?.pane]);
+  // A focus handed in while already open (or on first land) re-lands and
+  // scrolls its card into view once the pane has rendered.
+  useEffect(() => {
+    if (!focus || !review) return;
+    setPane(focus.pane);
+    const id = requestAnimationFrame(() => {
+      document
+        .querySelector(`[data-gap-album="${focus.albumId}"]`)
+        ?.scrollIntoView({ block: "center" });
+    });
+    return () => cancelAnimationFrame(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focus?.nonce, review]);
 
   const running = matchState?.running ?? false;
 
@@ -2121,16 +2205,19 @@ export function MetadataCenter({
         scroll-container padding, so scrolled content passes flush beneath
         the line. -ml-4/pl-4: both hosts pad 16px left; the row backs out of
         it to run the border to the modal's edge, and the nav puts it back. */}
-    <div className="-ml-4 flex min-h-0 flex-1 gap-4 border-t">
-      {/* Nav rail: every section at a glance with its size, so nothing hides
-          below a fold and the panel stops being one long scroll. */}
-      {/* px-3 matches the pt-3 rhythm: buttons sit 12px off the modal edge,
-          12px off the border-r, and 12px under the top rule. */}
+    <div className="-ml-4 flex min-h-0 flex-1 flex-col border-t">
+      {/* Section tabs across the top (user's call, 2026-09-10 — the page has
+          the width): every section at a glance with its size, so nothing
+          hides below a fold. History sits at the far end, apart from the
+          work sections — it's the ledger, not a queue. */}
       {/* gap-1, not gap-0.5: at 125%/150% display scaling a 2px gap is a
           fractional device-pixel step, so alternating rows rendered on
           half-pixels — the tiny warn icons visibly smeared off-center on
           those rows. 4px stays integer at every common scale factor. */}
-      <nav className="flex w-64 shrink-0 flex-col gap-1 border-r px-3 pt-3">
+      {/* pl-4 on the tabs and the pane put back what the row's -ml-4 took
+          out, so content lines up with the host's padding while the rules
+          run edge to edge. */}
+      <nav className="flex shrink-0 flex-wrap items-center gap-1 border-b py-2 pl-4 pr-3">
         {NAV.map((n) => (
           <button
             key={n.id}
@@ -2139,7 +2226,7 @@ export function MetadataCenter({
               pane === n.id ? "bg-accent text-foreground" : "text-muted-foreground hover:text-foreground"
             }`}
           >
-            <span className="min-w-0 flex-1 truncate">{n.label}</span>
+            <span className="whitespace-nowrap">{n.label}</span>
             {/* The two numbers sit together as one cluster — they're both
                 "how much is in here", so the label is what they're apart from. */}
             <span className="flex shrink-0 items-center gap-1">
@@ -2168,7 +2255,7 @@ export function MetadataCenter({
                     </span>
                   )}
                   {n.count > 0 && (
-                    <span className="w-8 text-right text-xs tabular-nums text-muted-foreground">
+                    <span className="text-xs tabular-nums text-muted-foreground">
                       {n.count}
                     </span>
                   )}
@@ -2178,47 +2265,33 @@ export function MetadataCenter({
           </button>
         ))}
         {/* Progress lives in the match modal, not here — this is just the
-            pointer to it (App closes this center when the modal opens). */}
+            pointer to it. */}
         {running && (
-          <div className="mt-2 border-t pt-2">
-            <button
-              onClick={() =>
-                window.dispatchEvent(
-                  new CustomEvent("waverunner:open-match", { detail: { libraryId } }),
-                )
-              }
-              className="flex w-full items-center gap-1.5 rounded-md px-1 py-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
-            >
-              <Spinner className="size-3" />
-              Matching pass running — open
-            </button>
-          </div>
-        )}
-        {/* Pinned to the bottom, apart from the work sections: History is the
-            ledger of what happened, not a queue of things to do. */}
-        {/* The separator runs edge to edge: -ml-4 back out through the nav's
-            left padding to the modal edge, -mr-2 through its right padding to
-            meet the border-r; the paddings then restore button alignment.
-            pt-3/pb-3 mirror the nav's own pt-3 under the top rule, so the
-            three gaps (top rule→first button, this rule→History, History→
-            footer) all read as one rhythm. */}
-        <div className="-mx-3 mt-auto border-t px-3 pb-3 pt-3">
           <button
-            onClick={() => goTo("history")}
-            className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm transition-colors ${
-              pane === "history"
-                ? "bg-accent text-foreground"
-                : "text-muted-foreground hover:text-foreground"
-            }`}
+            onClick={() =>
+              window.dispatchEvent(
+                new CustomEvent("waverunner:open-match", { detail: { libraryId } }),
+              )
+            }
+            className="flex items-center gap-1.5 rounded-md px-2 py-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground"
           >
-            <span className="min-w-0 flex-1 truncate">History</span>
-            {historyCount > 0 && (
-              <span className="w-8 text-right text-xs tabular-nums text-muted-foreground">
-                {historyCount}
-              </span>
-            )}
+            <Spinner className="size-3" />
+            Matching pass running — open
           </button>
-        </div>
+        )}
+        <button
+          onClick={() => goTo("history")}
+          className={`ml-auto flex items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm transition-colors ${
+            pane === "history"
+              ? "bg-accent text-foreground"
+              : "text-muted-foreground hover:text-foreground"
+          }`}
+        >
+          <span className="whitespace-nowrap">History</span>
+          {historyCount > 0 && (
+            <span className="text-xs tabular-nums text-muted-foreground">{historyCount}</span>
+          )}
+        </button>
       </nav>
 
       {/* Padding on the SCROLL CONTAINER: at rest it holds the header clear
@@ -2234,7 +2307,7 @@ export function MetadataCenter({
           cards below visibly slide up into the freed space. */}
       <div
         ref={flipContainerRef}
-        className="min-h-0 flex-1 space-y-4 overflow-y-auto pr-4 pt-3 pb-4 [overflow-anchor:none]"
+        className="min-h-0 flex-1 space-y-4 overflow-y-auto pl-4 pr-4 pt-3 pb-4 [overflow-anchor:none]"
       >
       {/* The library map: guide checklist up top (the grind order that
           actually converges — between stages the PASS does the multiplying),
@@ -2243,8 +2316,64 @@ export function MetadataCenter({
           colorblindness never hides the difference. */}
       {pane === "map" && (
         <section className="space-y-4">
-          {/* The doctrine, up front: every name and every album ends in one
-              of a handful of states, and the grind has an order. Collapsed by
+          {/* The pass entry point, first thing on the page: a pass still has
+              work with an empty queue (unchecked albums, suggestion sweeps,
+              the backfills), and the amber queue banner only exists while
+              rows wait. Hidden when that banner is up: one button. */}
+          {pendingPass.length === 0 && (
+            <div className="flex items-center gap-3 rounded-md border px-3 py-2">
+              <RefreshCw size={14} className="shrink-0 text-muted-foreground" />
+              <p className="min-w-0 flex-1 text-xs text-muted-foreground">
+                A pass checks unmatched albums and sweeps for suggestions — run one after a batch
+                of decisions, or any time.
+              </p>
+              <Button
+                size="sm"
+                variant="outline"
+                className="shrink-0 gap-1.5"
+                disabled={busy || running || pending.length > 0}
+                title={pending.length > 0 ? "Staged changes need a rescan first" : undefined}
+                onClick={rerunMatching}
+              >
+                <RefreshCw size={13} />
+                {pending.length > 0 ? "Rescan first" : running ? "Pass running…" : "Run pass now"}
+              </Button>
+            </div>
+          )}
+
+          {/* Presentation, per library: the grind can live entirely in here —
+              flipping this clears MB chips and Match menu items from album
+              and artist pages and track lists, without touching matching
+              itself. The sidebar's pending-work triangle stays (cheap to
+              clear, and it marks real queued work). */}
+          <div className="flex items-center justify-between gap-4 rounded-md border px-3 py-2">
+            <div>
+              <p className="text-sm">Hide MusicBrainz outside this page</p>
+              <p className="text-xs text-muted-foreground">
+                Match status chips, track-list check, and “Match to MusicBrainz” menu items stay
+                in here; the rest of the app shows none of it. Matching keeps working.
+              </p>
+            </div>
+            <Switch
+              checked={hideOutside}
+              onCheckedChange={async (v) => {
+                setHideOutside(v);
+                setMbHiddenLocal(libraryId, v); // outside pages flip instantly
+                try {
+                  await invoke("set_library_setting", {
+                    libraryId,
+                    key: "hide_mb_outside_center",
+                    value: v ? "on" : "off",
+                  });
+                } catch (e) {
+                  toast.error(String(e));
+                }
+              }}
+            />
+          </div>
+
+          {/* The doctrine: every name and every album ends in one of a
+              handful of states, and the grind has an order. Collapsed by
               default so veterans never scroll past it twice. */}
           <details className="rounded-md border px-3 py-2">
             <summary className="cursor-pointer select-none text-sm font-medium">
@@ -2446,31 +2575,6 @@ export function MetadataCenter({
             </p>
           )}
 
-          {/* The pass entry point when nothing is queued — a pass still has
-              work with an empty queue (unchecked albums, suggestion sweeps,
-              original-date backfill), and the amber queue banner only exists
-              while rows wait. Hidden when that banner is up: one button. */}
-          {pendingPass.length === 0 && (
-            <div className="flex items-center gap-3 rounded-md border px-3 py-2">
-              <RefreshCw size={14} className="shrink-0 text-muted-foreground" />
-              <p className="min-w-0 flex-1 text-xs text-muted-foreground">
-                A pass checks unmatched albums and sweeps for suggestions — run one after a batch
-                of decisions, or any time.
-              </p>
-              <Button
-                size="sm"
-                variant="outline"
-                className="shrink-0 gap-1.5"
-                disabled={busy || running || pending.length > 0}
-                title={pending.length > 0 ? "Staged changes need a rescan first" : undefined}
-                onClick={rerunMatching}
-              >
-                <RefreshCw size={13} />
-                {pending.length > 0 ? "Rescan first" : running ? "Pass running…" : "Run pass now"}
-              </Button>
-            </div>
-          )}
-
           {/* Legend. */}
           <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
             <span className="flex items-center gap-1.5">
@@ -2490,37 +2594,6 @@ export function MetadataCenter({
               ignored
             </span>
             <span className="ml-auto">click a node to match · right-click to ignore</span>
-          </div>
-
-          {/* Presentation, per library: the grind can live entirely in here —
-              flipping this clears MB chips and Match menu items from album
-              and artist pages and track lists, without touching matching
-              itself. The sidebar's pending-work triangle stays (cheap to
-              clear, and it marks real queued work). */}
-          <div className="flex items-center justify-between gap-4 rounded-md border px-3 py-2">
-            <div>
-              <p className="text-sm">Hide MusicBrainz outside this center</p>
-              <p className="text-xs text-muted-foreground">
-                Match status chips, track-list check, and “Match to MusicBrainz” menu items stay
-                in here; the rest of the app shows none of it. Matching keeps working.
-              </p>
-            </div>
-            <Switch
-              checked={hideOutside}
-              onCheckedChange={async (v) => {
-                setHideOutside(v);
-                setMbHiddenLocal(libraryId, v); // outside pages flip instantly
-                try {
-                  await invoke("set_library_setting", {
-                    libraryId,
-                    key: "hide_mb_outside_center",
-                    value: v ? "on" : "off",
-                  });
-                } catch (e) {
-                  toast.error(String(e));
-                }
-              }}
-            />
           </div>
 
           {/* Artist rows: the tree with containment instead of edges. Rows
@@ -2953,6 +3026,7 @@ export function MetadataCenter({
                         first
                         disabled={!!sug}
                         onMatch={setMatchArtist}
+                        onOpen={openArtistRow}
                         onSplit={setSplitArtist}
                         onLink={(row) => setLinkSource({ name: row.title, artistId: row.artist_id })}
                         onPersona={(row) => setPersonaSource({ id: row.artist_id, name: row.title })}
@@ -2985,6 +3059,7 @@ export function MetadataCenter({
                         first
                         disabled={!!sug}
                         onMatch={setMatchArtist}
+                        onOpen={openArtistRow}
                         onSplit={setSplitArtist}
                         onLink={(row) => setLinkSource({ name: row.title, artistId: row.artist_id })}
                         onPersona={(row) => setPersonaSource({ id: row.artist_id, name: row.title })}
@@ -3006,7 +3081,7 @@ export function MetadataCenter({
               </h4>
               <div className="overflow-hidden rounded-md border border-emerald-500/30">
                 {artistsIdentified.slice(0, artistLimit).map((a, i) => (
-                  <ArtistRow key={a.artist_id} a={a} first={i === 0} onMatch={setMatchArtist} onPersona={(row) => setPersonaSource({ id: row.artist_id, name: row.title })} />
+                  <ArtistRow key={a.artist_id} a={a} first={i === 0} onMatch={setMatchArtist} onOpen={openArtistRow} onPersona={(row) => setPersonaSource({ id: row.artist_id, name: row.title })} />
                 ))}
                 {artistsIdentified.length > artistLimit && (
                   <button
@@ -3104,10 +3179,13 @@ export function MetadataCenter({
             Track lists that don’t line up ({review!.gaps.length})
           </h3>
           <p className="mb-2 text-xs text-muted-foreground">
-            These albums matched, but some tracks couldn’t be paired with the release. MusicBrainz
-            data — artist credits included — was <span className="font-medium">not</span> applied to
-            those tracks, so they keep whatever their tags said. Fix the tags at the source, rescan,
-            then <span className="font-medium">Re-check</span>.{" "}
+            These albums matched, but some tracks couldn’t be paired with the release — the title
+            was too different, or the file’s length is more than fifteen seconds off MusicBrainz’s.
+            MusicBrainz data — title and artist credits — was <span className="font-medium">not</span>{" "}
+            applied to those tracks, so they keep whatever their tags said.{" "}
+            <span className="font-medium">Accept</span> says it’s the same song anyway and takes
+            MusicBrainz’s title and credits for it. Or fix the tags at the source, rescan, then{" "}
+            <span className="font-medium">Re-check</span>.{" "}
             <span className="font-medium">Partial</span> declares the missing tracks deliberate —
             you only keep part of this album — and holds through every future check.{" "}
             <span className="font-medium">Ignore</span> just hides the warning — it returns on the
@@ -3120,11 +3198,30 @@ export function MetadataCenter({
               return (
                 <div
                   key={`${g.album_id}:${g.release_label ?? ""}`}
-                  className="rounded-md border border-amber-500/40 bg-amber-500/5 p-3"
+                  data-gap-album={g.album_id}
+                  className={`rounded-md border bg-amber-500/5 p-3 ${
+                    // The focused card brightens its own border rather than
+                    // drawing a ring outside it — a ring sits past the box
+                    // and the pane's scroll edge clipped it on the left.
+                    focus?.albumId === g.album_id ? "border-amber-400" : "border-amber-500/40"
+                  }`}
                 >
                   <div className="flex items-start justify-between gap-3">
                     <p className="min-w-0 break-words text-sm">
-                      <span className="font-medium">{g.title}</span>
+                      {/* The title opens the album page on THIS diff's release,
+                          the same link the Albums pane's rows carry. */}
+                      {onOpenAlbum ? (
+                        <button
+                          type="button"
+                          onClick={() => onOpenAlbum(g.album_id, g.title, g.release_id)}
+                          className="text-left font-medium underline-offset-2 hover:underline"
+                          title="Open this album on this release"
+                        >
+                          {g.title}
+                        </button>
+                      ) : (
+                        <span className="font-medium">{g.title}</span>
+                      )}
                       {g.artist_title && (
                         <span className="text-muted-foreground"> — {g.artist_title}</span>
                       )}
@@ -3133,10 +3230,13 @@ export function MetadataCenter({
                           {g.release_label}
                         </span>
                       )}
-                      <span className="mt-0.5 flex items-center gap-1 text-xs text-amber-200/90">
+                      {/* leading-none: the text's line box equals its font
+                          size, so items-center truly centers it on the icon
+                          instead of on a taller box with descender room. */}
+                      <span className="mt-1 flex items-center gap-1 text-xs leading-none text-amber-200/90">
                         <TriangleAlert size={12} className="shrink-0" />
                         {[
-                          mine > 0 && `${mine} of your track${mine === 1 ? "" : "s"} unmatched`,
+                          mine > 0 && `${mine} of your tracks unmatched`,
                           theirs > 0 && `${theirs} on the release missing here`,
                         ]
                           .filter(Boolean)
@@ -3144,6 +3244,19 @@ export function MetadataCenter({
                       </span>
                     </p>
                     <div className="flex shrink-0 gap-1.5">
+                      {g.rows.filter(acceptable).length > 1 && (
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="gap-1.5"
+                          disabled={busy}
+                          title="Every pairable track here is the same song — take MusicBrainz's title and credits for all of them"
+                          onClick={() => acceptAll(g)}
+                        >
+                          {busyKey === `accept-all:${g.album_id}` && <Spinner className="size-3" />}
+                          Accept all
+                        </Button>
+                      )}
                       <Button
                         size="sm"
                         variant="outline"
@@ -3198,6 +3311,28 @@ export function MetadataCenter({
                             <>
                               “{r.title}” — MusicBrainz has “
                               <span className="text-foreground">{r.counterpart}</span>”
+                              {r.title_off && r.length_off ? (
+                                <span className="italic opacity-70"> — probably a different song</span>
+                              ) : (
+                                <>
+                                  {r.length_off && (
+                                    <span className="italic opacity-70"> — same title, length differs</span>
+                                  )}
+                                  <button
+                                    type="button"
+                                    disabled={busy}
+                                    onClick={() => acceptTrack(g, r)}
+                                    className="ml-1.5 rounded border border-border px-1.5 py-px text-[11px] text-foreground hover:bg-accent disabled:opacity-60"
+                                    title="This is the same song — take MusicBrainz's title and credits for it"
+                                  >
+                                    {busyKey === `accept:${g.album_id}:${r.folder_path}:${r.disc}:${r.position}` ? (
+                                      <Spinner className="inline size-3" />
+                                    ) : (
+                                      "Accept"
+                                    )}
+                                  </button>
+                                </>
+                              )}
                             </>
                           ) : (
                             <>“{r.title}” — nothing at this position on MusicBrainz</>
@@ -3588,44 +3723,10 @@ export function MetadataCenter({
   );
 }
 
-interface MetadataCenterDialogProps {
-  libraryId: string | null;
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  onChanged?: () => void;
-  /** Album title links — the host closes this dialog and navigates. */
-  onOpenAlbum?: (albumId: number, title: string, releaseId: number | null) => void;
+/** A one-shot landing target for the center; `nonce` makes repeats fire. */
+export interface CenterFocus {
+  pane: "gaps";
+  albumId: number;
+  nonce: number;
 }
 
-/** Standalone host — the sidebar's always-available entrance to the center. */
-export function MetadataCenterDialog({
-  libraryId,
-  open,
-  onOpenChange,
-  onChanged,
-  onOpenAlbum,
-}: MetadataCenterDialogProps) {
-  const [reloadKey, setReloadKey] = useState(0);
-  useEffect(() => {
-    if (open) setReloadKey((k) => k + 1);
-  }, [open]);
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      {/* pb-0: the nav/pane columns (and the nav's border-r) run to the modal's
-          bottom edge; the nav's own pb-3 keeps History on the 12px rhythm. */}
-      <DialogContent className="flex h-[85vh] max-h-[85vh] w-[min(72rem,calc(100vw-3rem))] max-w-none flex-col overflow-hidden pr-0 pb-0">
-        <DialogHeader>
-          <DialogTitle>Metadata center</DialogTitle>
-        </DialogHeader>
-        {libraryId && open && (
-          <MetadataCenter
-            libraryId={libraryId}
-            reloadKey={reloadKey}
-            onChanged={onChanged}
-            onOpenAlbum={onOpenAlbum}
-          />
-        )}
-      </DialogContent>
-    </Dialog>
-  );
-}

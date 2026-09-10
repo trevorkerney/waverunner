@@ -6,22 +6,20 @@
 
 ## now
 
+I think MB requests are slow enough that it merits congregating all of them, or as much as possible, into 1 phase of the matching process. Theyre just so slow sometimes. I think it would go, match ALL not-feature-only artists and make sure they're correct, then run ALL requests to MB to get the all artists' release groups, then have the user match release groups, then get all MB releases for each of the selected release groups, then have the user select releases. These MB requests should happen in the background allowing the user to still use the library, not like scanning and matching passes. Probably just put the loader and status in the sidebar the same way preloading waveforms does - these should both be able to appear simultaneously, + others potentially later. Applying also takes forever sometimes - we'd need to figure out something that would allow the user to essentially add applies to a queue of requests so that they dont have to wait for each apply to process before going to the next.
+
 
 ## bugs / needs fixing
 
-when playing a song in an album, then changing the album cover, then letting that song end and go to the next plays the next song with the old album cover. explicitly double clicking or clicking the play button plays it with the new cover. both situations should use the new cover. the current song continuing to use the old is fine unless its a simple easy fix.
+make adding local covers where the user can select multiple images in the selection dialog
+
+on people pages in both video and audio (artists) libraries, sometimes when the entries come in (the animated entry), they fall into place but once they land they kinda stutter into place. hard to explain, like the animation brings them down, and instead of smoothly landing they kinda jump a tiny bit at the very end.
+
+does the building portion of rescanning truly have an indeterminate ETA? I get why reading the tags would (sorta) but building?
 
 tracks search needs improving. ALL MUSIC SEARCH NEEDS IMRPOVING
 
-give different releases under a release group unique album covers
-
-when scrolling all the way down on people page then scrolling back up relatively quickly, the app fairly reliably freezes to the point where I have to close it in task manager. im assuming because theres so many or something, idk. theres 14.8K people in my library
-
 consider volume equalization methods like how Apple/Spotify match all tracks -14DBFS volume. Consider making this equalization optional in settings and maybe allow user to choose level of equalization
-
-seems like opening settings modal when window is small causes the modal to overflow horizontally. need to figure something out here (this may be fixed on dev by now, idk, but on prod its happening)
-
-i want 'indeterminate time remaining' on the scan phase like how 'about X minutes remaining' is on match phase
 
 new breadcrumbs functionality. it should just follow the user always. even when creating duplicates in history. the only thing that should reset it is clicking an option in the sidebar. overflow should not create scroll but follow the most recent - when going back by breadcrumbs, and if the breadcrumbs are overflowing, only show the next forward history to the clicked breadcrumb. for instance, if the user has really been digging and there are 30 things in the breadcrumbs: for one, it would definitely be overflowing. the user should also see the most recent fitting ones, and the cut off on the left side of the breadcrumbs section would ideally begin with an ellipsis (still a button tho). Say the user clicks the breadcrumb 4 options back from the most recent. there were 3 in front, say the breadcrumbs were numbered like so: 5 - 4 - 3 - 2 - 1, and the user clicked 4. since the breadcrumbs are overflowing, only 3 should show in front of 4, and greyed out (STILL A BUTTON). I want to always focus on showing previous history over forward history, so when the breadcrumbs are overflowing and the user has forward breadcrumbs, always only show the 1 closes to where the user clicked. The user can nav all the way forward by continually clicking the 1 forward history button until there is no more. im somewhat spitballing here just to have something to record my idea before I forget. what do you think about this one?
 
@@ -98,6 +96,8 @@ WHOLE MUSIC SECTION NEEDS CONTEXT MENU IMPROVEMENTS
 
 ## changes / small new features
 
+error boundaries: right now any render error unmounts the whole React tree and the window goes black with no message (happened when a hook landed after an early return in the now-playing bar). Add regional boundaries (main content, sidebar, now-playing bar, video player, each dialog) with a root one underneath as the last resort. Region fallback = small waverunner-styled panel: what broke, error + component stack in a scrollable box, Retry (re-mounts the region), Copy details. Root fallback adds Reload. Boundary should also log the error through a backend command so prod builds (no console) leave a trace. mpv is native so music survives a reload; F5 rehydration picks the session back up.
+
 little comments at timestamps on tracks (like soundcloud comments except all from the 1 user)
 
 settings checkbox for volume percentage display during playback
@@ -118,6 +118,10 @@ display images (png, jpg, webp, gif, etc) in extras, alongside the video extras 
 
 
 ## new features
+
+new system for modals - animation, minimizable sometimes
+
+allow users to create edited variants of tracks (diff speed, cropped, etc, nothing additive)
 
 EQUALIZER
 

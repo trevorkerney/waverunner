@@ -36,9 +36,19 @@ export function ArtistsGrid({ entries, getCoverUrl, onNavigate, gridRef, sortMod
   //   collection_display — credits mode (per-type breakdown)
   //   role_display       — alphabetical ("2 releases · 4 appearances · 7 loved")
   //   season_display     — loved mode ("N loved")
+  // Liked mode ranks by both hearts together, so its subtitle is the one
+  // combined number ("N loved/liked") — folded here from the loved-mode
+  // string ("N loved · M liked") the backend already ships, so the sort
+  // switch stays a local, refetch-free flip.
+  const hearts = (artist: MediaEntry) => {
+    const m = /(\d+) loved(?: · (\d+) liked)?/.exec(artist.season_display ?? "");
+    if (!m) return artist.season_display;
+    return `${Number(m[1]) + Number(m[2] ?? 0)} loved/liked`;
+  };
   const subtitleFor = (artist: MediaEntry) =>
     sortMode === "credits" ? artist.collection_display
-    : sortMode === "loved" || sortMode === "liked" ? artist.season_display
+    : sortMode === "liked" ? hearts(artist)
+    : sortMode === "loved" ? artist.season_display
     : artist.role_display;
 
   const grid = (items: MediaEntry[]) => (

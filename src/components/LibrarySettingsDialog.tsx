@@ -11,10 +11,11 @@ import {
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { Spinner } from "@/components/ui/spinner";
+import { setTagWritingLocal } from "@/lib/tagWriting";
 
 /** Per-library settings, staged behind Save/Cancel (dialog settings are
- *  explicit commits, unlike in-app implicit prefs). First setting: the
- *  online-metadata opt-out. */
+ *  explicit commits, unlike in-app implicit prefs). Settings: the
+ *  online-metadata opt-out, and (music) the tag-writing opt-in. */
 export function LibrarySettingsDialog({
   library,
   onOpenChange,
@@ -27,6 +28,10 @@ export function LibrarySettingsDialog({
   const [loaded, setLoaded] = useState(false);
   const [online, setOnline] = useState(true);
   const [savedOnline, setSavedOnline] = useState(true);
+  // Music only: may waverunner write tags into this library's files? Off by
+  // default — touching files is a choice made once, per library.
+  const [tagWriting, setTagWriting] = useState(false);
+  const [savedTagWriting, setSavedTagWriting] = useState(false);
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
@@ -40,6 +45,9 @@ export function LibrarySettingsDialog({
         const on = ls["online_metadata"] !== "off";
         setOnline(on);
         setSavedOnline(on);
+        const tw = ls["tag_writing"] === "on";
+        setTagWriting(tw);
+        setSavedTagWriting(tw);
       } catch (e) {
         toast.error(String(e));
       } finally {
@@ -48,7 +56,7 @@ export function LibrarySettingsDialog({
     })();
   }, [library]);
 
-  const dirty = online !== savedOnline;
+  const dirty = online !== savedOnline || tagWriting !== savedTagWriting;
 
   async function save() {
     if (!library) return;
@@ -59,11 +67,19 @@ export function LibrarySettingsDialog({
         key: "online_metadata",
         value: online ? "on" : "off",
       });
+      if (tagWriting !== savedTagWriting) {
+        await invoke("set_library_setting", {
+          libraryId: library.id,
+          key: "tag_writing",
+          value: tagWriting ? "on" : "off",
+        });
+        setTagWritingLocal(library.id, tagWriting);
+      }
       if (online && !savedOnline) {
         toast.success(
           library.format === "music"
             ? "Online metadata is on — run a matching pass from the metadata center to start identifying."
-            : "Online metadata is on — open the metadata center to start matching.",
+            : "Online metadata is on — open Metadata to start matching.",
         );
       }
       onChanged?.(library.id);
@@ -98,6 +114,19 @@ export function LibrarySettingsDialog({
               </p>
             </div>
             <Switch checked={online} onCheckedChange={setOnline} />
+          </div>
+        )}
+        {loaded && library?.format === "music" && (
+          <div className="flex items-center gap-3 rounded-md border px-3 py-2.5">
+            <div className="min-w-0 flex-1">
+              <p className="text-sm font-medium">Write tags to files</p>
+              <p className="text-xs text-muted-foreground">
+                Adds a Write-to-files action on albums, artists and tracks that pushes what
+                waverunner shows — your edits, else MusicBrainz — into the files' own tags,
+                MusicBrainz ids included. Always previewed, never automatic.
+              </p>
+            </div>
+            <Switch checked={tagWriting} onCheckedChange={setTagWriting} />
           </div>
         )}
         {/* Instant action, not a staged setting — Save/Cancel don't apply.

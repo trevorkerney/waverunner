@@ -98,6 +98,13 @@ function musicComplications(
       iconName: "Layers",
       view: { kind: "sources", libraryId },
     },
+    // The metadata center, as a page: matching, review, history.
+    {
+      id: "metadata",
+      label: "Metadata",
+      iconName: "Sparkles",
+      view: { kind: "metadata", libraryId },
+    },
   ];
   // Universal import: under-tagged files import via fallbacks now, so there
   // is no needs-attention node — tag issues live in the metadata center.
@@ -178,6 +185,13 @@ function videoComplications(
       view: { kind: "playlists", libraryId },
       children: playlistChildren,
     },
+    // The TMDB match report, as a page.
+    {
+      id: "metadata",
+      label: "Metadata",
+      iconName: "Sparkles",
+      view: { kind: "metadata", libraryId },
+    },
   ];
 }
 
@@ -202,6 +216,7 @@ export function viewCacheKey(view: ViewSpec): string {
     case "loose-tracks":       return `${view.libraryId}:loose:${view.sounds ? "sounds" : "music"}`;
     case "music-issues":       return `${view.libraryId}:music-issues`;
     case "sources":            return `${view.libraryId}:sources`;
+    case "metadata":           return `${view.libraryId}:metadata`;
   }
 }
 
@@ -236,6 +251,7 @@ export function scopeKeyFor(view: ViewSpec, parentId: number | null): string | n
     case "loose-tracks":
     case "music-issues":
     case "sources":
+    case "metadata":
       return null;
   }
 }

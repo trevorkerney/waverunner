@@ -6573,6 +6573,7 @@ dependencies = [
  "image",
  "libloading 0.8.9",
  "lofty",
+ "percent-encoding",
  "raw-window-handle",
  "reqwest",
  "serde",

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Button } from "../ui/button";
-import { RefreshCw, Sparkles, TriangleAlert } from "lucide-react";
+import { AppWindow, RefreshCw, Sparkles, TriangleAlert } from "lucide-react";
 
 /** The two deferred-work queues a music library carries:
  *  - staged changes a RESCAN applies (splits, combines, separations)
@@ -72,13 +72,43 @@ export function usePendingWork(libraryId: string | null) {
   return { rescan, pass, refetch };
 }
 
-/** Ambient signal on the sidebar's library row: one warning icon, red while
- *  staged changes wait on a rescan, amber when only the pass is left. Click
- *  opens the metadata center — the full picture lives there. Silent when
- *  both queues are empty. (A span, not a button: the row itself renders as a
+/** The sidebar's Metadata row's ONE attention slot — never two icons side by side.
+ *  Priority, top first:
+ *    1. a minimized wizard waiting on this library (window glyph — click
+ *       reopens it; any format)
+ *    2. staged changes waiting on a rescan (red triangle; music)
+ *    3. matches waiting on a matching pass (amber triangle; music)
+ *  2 and 3 open the metadata center — the full picture lives there. Silent
+ *  when nothing applies. (A span, not a button: the row itself renders as a
  *  button and buttons can't nest — same trick as the row's chevron.) */
-export function PendingWorkBadge({ libraryId }: { libraryId: string }) {
-  const { rescan, pass } = usePendingWork(libraryId);
+export function LibraryAttentionBadge({
+  libraryId,
+  format,
+  wizardWaiting,
+  onReopenWizard,
+}: {
+  libraryId: string;
+  format: string;
+  /** A rescan/match wizard for this library is minimized. */
+  wizardWaiting: boolean;
+  onReopenWizard: () => void;
+}) {
+  // Only music carries the deferred-work queues; other formats skip the fetch.
+  const { rescan, pass } = usePendingWork(format === "music" ? libraryId : null);
+  if (wizardWaiting) {
+    return (
+      <span
+        onClick={(e) => {
+          e.stopPropagation();
+          onReopenWizard();
+        }}
+        title="The rescan wizard is waiting — click to reopen"
+        className="flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded text-amber-300 transition-colors hover:bg-foreground/10 hover:text-amber-200"
+      >
+        <AppWindow size={13} />
+      </span>
+    );
+  }
   if (rescan.length === 0 && pass.length === 0) return null;
   const urgent = rescan.length > 0;
   const parts = [
@@ -100,7 +130,7 @@ export function PendingWorkBadge({ libraryId }: { libraryId: string }) {
           new CustomEvent("waverunner:open-music-center", { detail: { libraryId } }),
         );
       }}
-      title={`${parts} — open the metadata center`}
+      title={`${parts} — open Metadata`}
       className={`flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded transition-colors hover:bg-foreground/10 ${
         urgent ? "text-red-400 hover:text-red-300" : "text-amber-300 hover:text-amber-200"
       }`}

@@ -390,12 +390,15 @@ export function TracksPage({ libraryId, onPlayQueue, currentTrackId, playing, on
               <Pencil size={14} />
               Edit metadata
             </ContextMenuItem>
-            {!mbHidden && (
-              <ContextMenuItem onClick={() => setMatchTrack(menuTrackRef.current)}>
-                <Disc3 size={14} />
-                Match to MusicBrainz…
-              </ContextMenuItem>
-            )}
+            {/* Loose tracks only — album tracks match through their release pin. */}
+            {!mbHidden &&
+              menuTrackRef.current != null &&
+              filtered.find((r) => r.id === menuTrackRef.current)?.album_id == null && (
+                <ContextMenuItem onClick={() => setMatchTrack(menuTrackRef.current)}>
+                  <Disc3 size={14} />
+                  Match to MusicBrainz…
+                </ContextMenuItem>
+              )}
             <LoveMenuItem
               resolve={() => {
                 const t = rows?.find((r) => r.id === menuTrackRef.current);

@@ -98,6 +98,62 @@ pub(crate) fn track_fields() -> &'static [&'static str] {
     TRACK_FIELDS
 }
 
+pub(crate) fn album_fields() -> &'static [&'static str] {
+    ALBUM_FIELDS
+}
+
+/// Store TAG-tier values WITHOUT the retag invalidation — the tag writer's
+/// half of the internal/external distinction. A write waverunner made
+/// itself is not the base moving under the upper tiers: the tag tier is
+/// brought in step with the file right here, so the next rescan finds the
+/// two equal and store_tag_tier changes nothing. An external editor leaves
+/// the file disagreeing with this row, which is exactly what fires there.
+pub(crate) async fn set_tag_tier_quiet(
+    pool: &SqlitePool,
+    entity_id: i64,
+    values: &[(&str, String)],
+) -> Result<(), String> {
+    for (field, value) in values {
+        crate::music_mb::set_mb_id(pool, entity_id, field, value, TIER_TAG).await?;
+    }
+    Ok(())
+}
+
+/// After a tag write, drop the user edits the file now carries — but ONLY
+/// where MusicBrainz doesn't disagree. mb outranks tag, so an edit that
+/// differs from the MB value has to stay or MB would paint over the value
+/// that's now in the file. An edit is redundant when the tag tier equals
+/// it and the MB tier is absent, empty, or the same. Returns the fields
+/// dropped.
+pub(crate) async fn drop_redundant_user_edits(
+    pool: &SqlitePool,
+    entity_id: i64,
+    fields: &[&str],
+) -> Result<Vec<String>, String> {
+    let user = tier_values(pool, entity_id, crate::music_mb::TIER_USER).await?;
+    let mb = tier_values(pool, entity_id, crate::music_mb::TIER_MB).await?;
+    let tag = tier_values(pool, entity_id, TIER_TAG).await?;
+    let mut dropped = Vec::new();
+    for field in fields {
+        let Some(u) = user.get(*field) else { continue };
+        if tag.get(*field) != Some(u) {
+            continue;
+        }
+        let mb_agrees = mb.get(*field).map(|m| m.is_empty() || m == u).unwrap_or(true);
+        if !mb_agrees {
+            continue;
+        }
+        sqlx::query("DELETE FROM field_override WHERE entity_id = ? AND field = ? AND tier = 'user'")
+            .bind(entity_id)
+            .bind(field)
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        dropped.push(field.to_string());
+    }
+    Ok(dropped)
+}
+
 fn clear_user_edits_sql(fields: &[&str]) -> String {
     let list = fields.iter().map(|f| format!("'{f}'")).collect::<Vec<_>>().join(", ");
     format!("DELETE FROM field_override WHERE entity_id = ? AND tier = 'user' AND field IN ({list})")
@@ -2027,9 +2083,19 @@ async fn album_tag_identity(
     library_id: &str,
     album_id: i64,
 ) -> Result<(String, String), String> {
+    // The file that NAMES the album: first track of the first disc of the
+    // default release — the scanner's identity is the majority album tag of
+    // that disc alone. An arbitrary row once picked a disc-2 file whose tag
+    // spelled the title differently ("HIStory- … (Disc 2)" vs "HIStory: …
+    // (Disc 1)"), and the directive it keyed never matched anything.
     let (rel,): (String,) = sqlx::query_as(
-        "SELECT t.file_path FROM track t JOIN media_entry me ON me.id = t.id
-         WHERE me.parent_id = ? LIMIT 1",
+        "SELECT t.file_path FROM track t
+         JOIN media_entry me ON me.id = t.id
+         JOIN track_release tr ON tr.track_id = t.id
+         JOIN album_release ar ON ar.id = tr.release_id
+         WHERE me.parent_id = ?
+         ORDER BY ar.is_default DESC, COALESCE(t.disc_number, 1), COALESCE(t.track_number, 999999), t.id
+         LIMIT 1",
     )
     .bind(album_id)
     .fetch_optional(pool)
@@ -2051,7 +2117,9 @@ async fn release_tag_identity(
     let (rel,): (String,) = sqlx::query_as(
         "SELECT t.file_path FROM track t
          JOIN track_release tr ON tr.track_id = t.id
-         WHERE tr.release_id = ? LIMIT 1",
+         WHERE tr.release_id = ?
+         ORDER BY COALESCE(t.disc_number, 1), COALESCE(t.track_number, 999999), t.id
+         LIMIT 1",
     )
     .bind(release_id)
     .fetch_optional(pool)
@@ -2307,6 +2375,9 @@ pub async fn combine_albums_multi(
     };
 
     let mut merge_target_folder: Option<String> = None;
+    // The keeper edition's folder, always — the folder-keyed edition merge
+    // below needs it even when the keeper has a single edition.
+    let mut keeper_folder: Option<String> = None;
     if mode == "merge" {
         // The keeper edition the tracks land in — the only one merge touches,
         // so it's the only one worth comparing against.
@@ -2325,6 +2396,7 @@ pub async fn combine_albums_multi(
         if keeper_editions.len() > 1 {
             merge_target_folder = Some(keeper_release.1.clone());
         }
+        keeper_folder = Some(keeper_release.1.clone());
 
         let mut claimed: std::collections::HashMap<(i64, i64), i64> =
             slots_of_release(keeper_release.0)
@@ -2377,10 +2449,27 @@ pub async fn combine_albums_multi(
     // (folder, disc-named?) per split row to drop, plus the albums involved.
     let mut unsplit: Vec<(String, bool)> = Vec::new();
     let mut unsplit_source_ids: Vec<i64> = Vec::new();
+    // Same-identity pairs under MERGE: the scanner would group them as two
+    // editions, and no combine directive can say otherwise (identical tags
+    // on both sides) — so a folder-keyed edition merge does. Merge means
+    // merge, whatever the folder is called.
+    let mut merge_folders: Vec<String> = Vec::new();
+    let mut merge_source_ids: Vec<i64> = Vec::new();
     for src in &sources {
         let (src_artist, src_title) = album_tag_identity(pool, &library_id, *src).await?;
         let src_name = title_of(*src).await?;
         if src_artist == tgt_artist && src_title == tgt_title {
+            if mode == "merge" {
+                for (_, folder, _) in editions_of(*src).await? {
+                    if keeper_folder.as_deref().is_some_and(|k| k.eq_ignore_ascii_case(&folder)) {
+                        continue;
+                    }
+                    if !merge_folders.iter().any(|f| f.eq_ignore_ascii_case(&folder)) {
+                        merge_folders.push(folder);
+                    }
+                }
+                merge_source_ids.push(*src);
+            }
             // Already one album at scan time — unless a release split is
             // what's keeping them apart, in which case dropping it is the
             // combine. Splits can sit on either side's folders.
@@ -2403,7 +2492,7 @@ pub async fn combine_albums_multi(
                 let disc_named = crate::music::disc_folder_number(leaf).is_some();
                 unsplit.push((folder, disc_named));
             }
-            if !unsplit.is_empty() {
+            if !unsplit.is_empty() && mode != "merge" {
                 unsplit_source_ids.push(*src);
             }
             continue;
@@ -2451,8 +2540,64 @@ pub async fn combine_albums_multi(
         directives.push((src_artist, src_title, src_name));
         staged_source_ids.push(*src);
     }
-    if directives.is_empty() && unsplit.is_empty() {
+    if directives.is_empty() && unsplit.is_empty() && merge_folders.is_empty() {
         return Err("These albums are already combined".to_string());
+    }
+
+    if !merge_folders.is_empty() {
+        let into = keeper_folder
+            .clone()
+            .ok_or_else(|| "The album has no editions".to_string())?;
+        // Any standing split on these folders is superseded by the merge —
+        // dropped here and restored by the staged change's undo.
+        let split_folders: Vec<String> = unsplit.iter().map(|(f, _)| f.clone()).collect();
+        let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+        for folder in &split_folders {
+            sqlx::query("DELETE FROM album_release_split WHERE library_id = ? AND folder_path = ? COLLATE NOCASE")
+                .bind(&library_id)
+                .bind(folder)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        for folder in &merge_folders {
+            sqlx::query(
+                "INSERT OR REPLACE INTO album_release_merge (library_id, folder_path, into_folder)
+                 VALUES (?, ?, ?)",
+            )
+            .bind(&library_id)
+            .bind(folder)
+            .bind(&into)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+        }
+        tx.commit().await.map_err(|e| e.to_string())?;
+        let names: Vec<String> = merge_folders
+            .iter()
+            .map(|f| format!("\u{201c}{}\u{201d}", f.rsplit(['\\', '/']).next().unwrap_or(f)))
+            .collect();
+        stage_pending_change(
+            pool,
+            &library_id,
+            "release_merge",
+            "",
+            &serde_json::json!({
+                "folder_paths": merge_folders,
+                "into_folder": into,
+                "split_folder_paths": split_folders,
+                "source_album_ids": merge_source_ids,
+                "target_album_id": target_id,
+            }),
+            &format!(
+                "Merge {} into \u{201c}{tgt_name}\u{201d} — one track list",
+                names.join(", ")
+            ),
+        )
+        .await?;
+        // A same-identity pair has nothing else to stage: the tag-keyed
+        // directives below can't apply to it.
+        unsplit.clear();
     }
 
     if !unsplit.is_empty() {
@@ -2466,9 +2611,10 @@ pub async fn combine_albums_multi(
                 .map_err(|e| e.to_string())?;
         }
         tx.commit().await.map_err(|e| e.to_string())?;
-        // What the rescan yields is the scanner's call: a disc-named folder
-        // ("CD2 - …") rejoins as a disc of the same release; anything else
-        // comes back as a separate release, whatever mode was clicked.
+        // Separate releases: dropping the split is the whole change — the
+        // scanner groups same-tag folders as editions on its own. (A
+        // disc-named folder, "CD2 - …", rejoins as a disc instead; merge
+        // takes the edition-merge path above and never lands here.)
         let non_disc = unsplit.iter().any(|(_, disc)| !disc);
         let names: Vec<String> = {
             let mut v = Vec::new();
@@ -2490,11 +2636,7 @@ pub async fn combine_albums_multi(
             &format!(
                 "Rejoin {} with \u{201c}{tgt_name}\u{201d}{}",
                 names.join(", "),
-                if mode == "merge" && non_disc {
-                    " — its folder isn't named as a disc, so it returns as a separate release"
-                } else {
-                    ""
-                }
+                if non_disc { " as a separate release" } else { " as a disc" }
             ),
         )
         .await?;
@@ -2616,7 +2758,7 @@ pub(crate) async fn is_staged_for_rescan(
             }
             // A rejoin (dropped release split) freezes both sides the same
             // way a combine does — the rescan rewrites both albums.
-            "album_combine" | "release_split_removed" => {
+            "album_combine" | "release_split_removed" | "release_merge" => {
                 combine_source_ids.extend(
                     p["source_album_ids"]
                         .as_array()
@@ -2760,7 +2902,7 @@ pub async fn get_pending_changes(
                 serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null);
             let locked_ids: Vec<i64> = match kind.as_str() {
                 "artist_split" => p["artist_id"].as_i64().into_iter().collect(),
-                "album_combine" | "release_split_removed" => p["source_album_ids"]
+                "album_combine" | "release_split_removed" | "release_merge" => p["source_album_ids"]
                     .as_array()
                     .into_iter()
                     .flatten()
@@ -2850,6 +2992,50 @@ pub async fn unstage_pending_change(state: State<'_, AppState>, id: i64) -> Resu
                 .execute(pool)
                 .await
                 .map_err(|e| e.to_string())?;
+            }
+        }
+        "release_merge" => {
+            // Un-staging an edition merge drops its rows and puts back any
+            // split the merge superseded.
+            for folder in p["folder_paths"].as_array().into_iter().flatten() {
+                if let Some(folder) = folder.as_str() {
+                    sqlx::query(
+                        "DELETE FROM album_release_merge WHERE library_id = ? AND folder_path = ? COLLATE NOCASE",
+                    )
+                    .bind(&library_id)
+                    .bind(folder)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                }
+            }
+            for folder in p["split_folder_paths"].as_array().into_iter().flatten() {
+                if let Some(folder) = folder.as_str() {
+                    sqlx::query(
+                        "INSERT OR IGNORE INTO album_release_split (library_id, folder_path) VALUES (?, ?)",
+                    )
+                    .bind(&library_id)
+                    .bind(folder)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        "release_merge_removed" => {
+            // Un-staging a separation puts the merge rows back.
+            for row in p["rows"].as_array().into_iter().flatten() {
+                if let (Some(folder), Some(into)) = (row["folder_path"].as_str(), row["into_folder"].as_str()) {
+                    sqlx::query(
+                        "INSERT OR IGNORE INTO album_release_merge (library_id, folder_path, into_folder) VALUES (?, ?, ?)",
+                    )
+                    .bind(&library_id)
+                    .bind(folder)
+                    .bind(into)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                }
             }
         }
         "release_split_removed" => {
@@ -3080,6 +3266,186 @@ pub async fn split_album_release(
         &folder_path.to_lowercase(),
         &serde_json::json!({ "folder_path": folder_path }),
         &format!("Separate an edition of \u{201c}{}\u{201d}", album_title_for(pool, album_id).await?),
+    )
+    .await?;
+    Ok(library_id)
+}
+
+/// Merge one edition of an album into another of the same album — the
+/// versions menu's "Merge into this release". Same folder-keyed row the
+/// combine dialog writes for a same-tag pair, reachable without splitting the
+/// edition out into its own album first. Returns the library to rescan.
+#[tauri::command]
+pub async fn merge_album_release(
+    state: State<'_, AppState>,
+    release_id: i64,
+    into_release_id: i64,
+) -> Result<String, String> {
+    let pool = &state.app_db;
+    if release_id == into_release_id {
+        return Err("Pick a different release to merge into".to_string());
+    }
+    let edition = |id: i64| async move {
+        sqlx::query_as::<_, (i64, String)>(
+            "SELECT album_id, folder_path FROM album_release WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "That edition no longer exists".to_string())
+    };
+    let (album_id, folder_path) = edition(release_id).await?;
+    let (into_album, into_folder) = edition(into_release_id).await?;
+    if album_id != into_album {
+        return Err("Both editions must belong to the same album".to_string());
+    }
+    let (library_id,): (String,) =
+        sqlx::query_as("SELECT library_id FROM media_entry WHERE id = ?")
+            .bind(album_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "Album not found".to_string())?;
+    ensure_not_staged(pool, album_id).await?;
+
+    // Same gate as the combine dialog's merge: one track list can't hold two
+    // tracks at the same disc & track number.
+    let slots = |rid: i64| async move {
+        sqlx::query_as::<_, (Option<i64>, Option<i64>)>(
+            "SELECT t.disc_number, t.track_number FROM track t
+             JOIN track_release tr ON tr.track_id = t.id WHERE tr.release_id = ?",
+        )
+        .bind(rid)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())
+        .map(|rows| {
+            rows.into_iter()
+                .filter_map(|(d, n)| n.map(|n| (d.unwrap_or(1), n)))
+                .collect::<std::collections::HashSet<(i64, i64)>>()
+        })
+    };
+    let keeper_slots = slots(into_release_id).await?;
+    if let Some((d, n)) = slots(release_id).await?.into_iter().find(|s| keeper_slots.contains(s)) {
+        return Err(format!(
+            "Both releases have a Disc {d}, Track {n} — retag one of them first"
+        ));
+    }
+
+    // A standing split on this folder is superseded (restored by undo).
+    let split_folders: Vec<String> = sqlx::query_as::<_, (String,)>(
+        "SELECT folder_path FROM album_release_split WHERE library_id = ? AND folder_path = ? COLLATE NOCASE",
+    )
+    .bind(&library_id)
+    .bind(&folder_path)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .into_iter()
+    .map(|(f,)| f)
+    .collect();
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+    sqlx::query("DELETE FROM album_release_split WHERE library_id = ? AND folder_path = ? COLLATE NOCASE")
+        .bind(&library_id)
+        .bind(&folder_path)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+    sqlx::query(
+        "INSERT OR REPLACE INTO album_release_merge (library_id, folder_path, into_folder) VALUES (?, ?, ?)",
+    )
+    .bind(&library_id)
+    .bind(&folder_path)
+    .bind(&into_folder)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
+    tx.commit().await.map_err(|e| e.to_string())?;
+
+    let leaf = folder_path.rsplit(['\\', '/']).next().unwrap_or(&folder_path);
+    stage_pending_change(
+        pool,
+        &library_id,
+        "release_merge",
+        "",
+        &serde_json::json!({
+            "folder_paths": [folder_path.clone()],
+            "into_folder": into_folder,
+            "split_folder_paths": split_folders,
+            "source_album_ids": [],
+            "target_album_id": album_id,
+        }),
+        &format!(
+            "Merge \u{201c}{leaf}\u{201d} into \u{201c}{}\u{201d} — one track list",
+            album_title_for(pool, album_id).await?
+        ),
+    )
+    .await?;
+    Ok(library_id)
+}
+
+/// Undo an applied edition merge: the folders folded into this release come
+/// back as editions of their own on the next rescan. Returns the library to
+/// rescan.
+#[tauri::command]
+pub async fn separate_merged_folders(
+    state: State<'_, AppState>,
+    release_id: i64,
+) -> Result<String, String> {
+    let pool = &state.app_db;
+    let (album_id, folder_path): (i64, String) =
+        sqlx::query_as("SELECT album_id, folder_path FROM album_release WHERE id = ?")
+            .bind(release_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "That edition no longer exists".to_string())?;
+    let (library_id,): (String,) =
+        sqlx::query_as("SELECT library_id FROM media_entry WHERE id = ?")
+            .bind(album_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "Album not found".to_string())?;
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT folder_path, into_folder FROM album_release_merge
+         WHERE library_id = ? AND into_folder = ? COLLATE NOCASE",
+    )
+    .bind(&library_id)
+    .bind(&folder_path)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    if rows.is_empty() {
+        return Err("Nothing is merged into this release".to_string());
+    }
+    sqlx::query(
+        "DELETE FROM album_release_merge WHERE library_id = ? AND into_folder = ? COLLATE NOCASE",
+    )
+    .bind(&library_id)
+    .bind(&folder_path)
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let n = rows.len();
+    stage_pending_change(
+        pool,
+        &library_id,
+        "release_merge_removed",
+        "",
+        &serde_json::json!({
+            "rows": rows
+                .iter()
+                .map(|(f, into)| serde_json::json!({ "folder_path": f, "into_folder": into }))
+                .collect::<Vec<_>>(),
+            "target_album_id": album_id,
+        }),
+        &format!(
+            "Separate {n} merged folder{} out of \u{201c}{}\u{201d}",
+            if n == 1 { "" } else { "s" },
+            album_title_for(pool, album_id).await?
+        ),
     )
     .await?;
     Ok(library_id)

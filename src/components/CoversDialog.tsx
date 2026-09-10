@@ -496,6 +496,13 @@ export function CoversDialog({
   getCoverUrl: (filePath: string) => string;
   onChanged: () => void;
 }) {
+  // Every cover mutation also announces itself app-wide: the music queue
+  // snapshots cover paths at enqueue time, so the now-playing bar would keep
+  // showing the OLD art on auto-advance until a rescan re-resolved the queue.
+  const notifyChanged = () => {
+    onChanged();
+    window.dispatchEvent(new Event("waverunner:covers-changed"));
+  };
   const [covers, setCovers] = useState<CoverInfo[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   /** Concrete release id once resolved (target may say "the default"). */
@@ -619,7 +626,7 @@ export function CoversDialog({
         });
       }
       setSelected(path);
-      onChanged();
+      notifyChanged();
     } catch (e) {
       toast.error(String(e));
     } finally {
@@ -637,7 +644,7 @@ export function CoversDialog({
       });
       setConfirmDelete(null);
       await refetch();
-      onChanged();
+      notifyChanged();
     } catch (e) {
       toast.error(String(e));
     } finally {
@@ -835,7 +842,7 @@ export function CoversDialog({
           title={target.title}
           onDownloaded={() => {
             refetch();
-            onChanged();
+            notifyChanged();
           }}
         />
       )}
@@ -853,7 +860,7 @@ export function CoversDialog({
           initialTab="posters"
           onDownloaded={() => {
             refetch();
-            onChanged();
+            notifyChanged();
           }}
         />
       )}

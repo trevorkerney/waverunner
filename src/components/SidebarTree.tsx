@@ -10,6 +10,7 @@ import {
   Library,
   ListMusic,
   Music2,
+  Sparkles,
   Tag,
   TriangleAlert,
   Tv,
@@ -35,6 +36,7 @@ const ICON_MAP: Record<string, LucideIcon> = {
   Library,
   ListMusic,
   Music2,
+  Sparkles,
   Tag,
   TriangleAlert,
   Tv,
@@ -86,10 +88,12 @@ interface SidebarTreeProps {
   onSelectView: (view: ViewSpec) => void;
   /** Return a <ContextMenuItem> subtree for the given node, or null for no menu. */
   renderNodeMenu?: (node: ComplicationNode) => React.ReactNode | null;
+  /** Something to sit beside a node's label (a badge), or null. */
+  renderNodeTrailing?: (node: ComplicationNode) => React.ReactNode | null;
   depth?: number;
 }
 
-export function SidebarTree({ nodes, activeView, onSelectView, renderNodeMenu, depth = 0 }: SidebarTreeProps) {
+export function SidebarTree({ nodes, activeView, onSelectView, renderNodeMenu, renderNodeTrailing, depth = 0 }: SidebarTreeProps) {
   return (
     <ul className="flex flex-col">
       {nodes.map((node) => (
@@ -99,6 +103,7 @@ export function SidebarTree({ nodes, activeView, onSelectView, renderNodeMenu, d
           activeView={activeView}
           onSelectView={onSelectView}
           renderNodeMenu={renderNodeMenu}
+          renderNodeTrailing={renderNodeTrailing}
           depth={depth}
         />
       ))}
@@ -111,10 +116,11 @@ interface TreeNodeProps {
   activeView: ViewSpec | null;
   onSelectView: (view: ViewSpec) => void;
   renderNodeMenu?: (node: ComplicationNode) => React.ReactNode | null;
+  renderNodeTrailing?: (node: ComplicationNode) => React.ReactNode | null;
   depth: number;
 }
 
-function TreeNode({ node, activeView, onSelectView, renderNodeMenu, depth }: TreeNodeProps) {
+function TreeNode({ node, activeView, onSelectView, renderNodeMenu, renderNodeTrailing, depth }: TreeNodeProps) {
   const [expanded, setExpanded] = useState(!node.defaultCollapsed);
   const Icon = getIcon(node.iconName);
   const hasChildren = (node.children?.length ?? 0) > 0;
@@ -184,6 +190,7 @@ function TreeNode({ node, activeView, onSelectView, renderNodeMenu, depth }: Tre
           <span className="text-sidebar-foreground/40"> ({formatCount(node.count)})</span>
         )}
       </span>
+      {renderNodeTrailing?.(node)}
     </button>
   );
 
@@ -203,6 +210,7 @@ function TreeNode({ node, activeView, onSelectView, renderNodeMenu, depth }: Tre
           activeView={activeView}
           onSelectView={onSelectView}
           renderNodeMenu={renderNodeMenu}
+          renderNodeTrailing={renderNodeTrailing}
           depth={depth + 1}
         />
       )}

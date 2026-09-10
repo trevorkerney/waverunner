@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
@@ -36,12 +36,17 @@ export type MbEntityKind = "album" | "artist" | "track";
 export interface MbStatus {
   kind: MbEntityKind;
   entity_id: number;
+  /** The owning library — for opening the metadata center from here. */
+  library_id: string;
   title: string;
   /** Owning artist (album) or album (track) — narrows the search. */
   context: string | null;
   /** Albums only: first MATCHED credited artist's MBID — enables browsing
    *  their discography instead of text-searching all of MusicBrainz. */
   context_mbid: string | null;
+  /** Albums: every credited artist in credit order, MBID when identified.
+   *  Two or more identified → per-artist chips plus "All" (union). */
+  credited_artists: { name: string; mbid: string | null }[];
   mbid: string | null;
   /** "user" = you picked it, "mb" = the automatic pass did. */
   tier: string | null;
@@ -95,6 +100,37 @@ interface ArtistGroup {
   album_type: string | null;
   first_release_date: string | null;
   disambiguation: string | null;
+}
+
+/** A discography row plus which credited artist's page(s) it came from —
+ *  the "All" view is a union across artists and says so per row. */
+type BrowseRow = ArtistGroup & { via: string[] };
+
+const GROUP_TYPE_RANK: Record<string, number> = { album: 0, ep: 1, single: 2, compilation: 3 };
+
+/** MusicBrainz's Various Artists. A real, matchable identity for the pass,
+ *  but its "discography" is every compilation ever entered — tens of
+ *  thousands, capped here at 500 oldest-first — so the dialog never browses
+ *  it: a Various Artists album opens straight onto the text search. */
+const VARIOUS_ARTISTS_MBID = "89ad4ac3-39f7-470e-963a-56509c546377";
+
+/** MB joins a multi-medium format with "+", repeating the medium name each
+ *  time — "Hybrid SACD (CD layer)+Hybrid SACD (SACD layer, 2 channels)+…"
+ *  runs past the dialog. When every part shares the same base name, say it
+ *  once and list the parentheticals: "Hybrid SACD (CD layer + SACD layer,
+ *  2 channels + …)". Mixed formats ("CD+DVD") just get spaced. */
+function compactFormat(format: string): string {
+  const parts = format.split("+").map((p) => p.trim()).filter(Boolean);
+  if (parts.length < 2) return format;
+  const split = parts.map((p) => {
+    const m = /^(.*?)\s*\((.*)\)$/.exec(p);
+    return m ? { base: m[1], detail: m[2] } : { base: p, detail: null };
+  });
+  const base = split[0].base;
+  if (split.every((s) => s.base === base && s.detail)) {
+    return `${base} (${split.map((s) => s.detail).join(" + ")})`;
+  }
+  return parts.join(" + ");
 }
 
 /** An unmatched album credited to the artist being matched — the "match their
@@ -265,8 +301,14 @@ export function MatchDialog({
   const [loadingReleases, setLoadingReleases] = useState(false);
   // Matched-artist albums don't search either — they browse the artist's
   // discography. searchAll is the escape hatch (compilations, V/A albums).
-  const [artistGroups, setArtistGroups] = useState<ArtistGroup[] | null>(null);
+  const [artistGroups, setArtistGroups] = useState<BrowseRow[] | null>(null);
+  // Which credited artist's discography to browse: an MBID, or "all" for
+  // the union of every identified credit (the default with 2+ identified).
+  const [browseChip, setBrowseChip] = useState<string>("all");
   const [loadingGroups, setLoadingGroups] = useState(false);
+  // What's still happening behind a list that's already on screen: more
+  // pages of a cold fetch, or the silent refresh of a cached discography.
+  const [groupsNote, setGroupsNote] = useState<string | null>(null);
   const [groupFilter, setGroupFilter] = useState("");
   const [searchAll, setSearchAll] = useState(false);
   // Pasted release link/ID for the release picker (MB pages a group's
@@ -343,9 +385,9 @@ export function MatchDialog({
     setResults(null);
     setGroupReleases(null);
     setArtistGroups(null);
+    setBrowseChip("all");
     setGroupFilter("");
     setSearchAll(false);
-    setConfirmApply(null);
     setReleaseRef("");
     setTracksOpen(false);
     setOurTracks(undefined);
@@ -385,32 +427,124 @@ export function MatchDialog({
   const groupId = kind === "album" ? (status?.release_group_id ?? null) : null;
   // Discography browsing: album unmatched but a credited artist IS matched.
   // Nothing browses (or fetches) while staged — the dialog is read-only then.
-  const artistMbid =
-    kind === "album" && !groupId && !status?.staged && !status?.declared_none
-      ? (status?.context_mbid ?? null)
-      : null;
-  const browseMode = !!artistMbid && !searchAll;
+  // Identified credits are the browse targets; "All" unions their pages
+  // (a joint album may sit under either member).
+  const browseTargets = useMemo(
+    () =>
+      kind === "album" && !groupId && !status?.staged && !status?.declared_none
+        ? (status?.credited_artists ?? [])
+            .filter((c): c is { name: string; mbid: string } => !!c.mbid)
+            .filter((c) => c.mbid.toLowerCase() !== VARIOUS_ARTISTS_MBID)
+            .filter((c, i, arr) => arr.findIndex((o) => o.mbid === c.mbid) === i)
+        : [],
+    [kind, groupId, status],
+  );
+  const browseMode = browseTargets.length > 0 && !searchAll;
+  // The chip's targets: one artist, or all of them. A single identified
+  // credit ignores the chip state entirely.
+  const activeTargets =
+    browseTargets.length <= 1 || browseChip === "all"
+      ? browseTargets
+      : browseTargets.filter((c) => c.mbid === browseChip);
+  const activeKey = activeTargets.map((c) => c.mbid).join("|");
   useEffect(() => {
-    if (!open || !artistMbid) {
+    if (!open || activeTargets.length === 0) {
       setArtistGroups(null);
+      setGroupsNote(null);
       return;
     }
     let stale = false;
+    // Per-artist lists, merged on every change: deduped by group with every
+    // source artist noted, sorted the way a discography comes back —
+    // albums, EPs, singles, compilations, oldest first within each.
+    const perArtist = new Map<string, BrowseRow[]>();
+    const publish = () => {
+      if (stale) return;
+      const byId = new Map<string, BrowseRow>();
+      for (const rows of perArtist.values()) {
+        for (const row of rows) {
+          const have = byId.get(row.group_id);
+          if (have) {
+            for (const v of row.via) if (!have.via.includes(v)) have.via.push(v);
+          } else byId.set(row.group_id, { ...row, via: [...row.via] });
+        }
+      }
+      const merged = [...byId.values()];
+      merged.sort((a, b) => {
+        const ra = GROUP_TYPE_RANK[a.album_type ?? ""] ?? 4;
+        const rb = GROUP_TYPE_RANK[b.album_type ?? ""] ?? 4;
+        if (ra !== rb) return ra - rb;
+        return (a.first_release_date ?? "9999").localeCompare(b.first_release_date ?? "9999");
+      });
+      setArtistGroups(merged);
+    };
+    const tag = (rows: ArtistGroup[], name: string): BrowseRow[] =>
+      rows.map((g) => ({ ...g, via: [name] }));
+
     setLoadingGroups(true);
-    invoke<ArtistGroup[]>("mb_artist_release_groups", { artistMbid })
-      .then((rows) => {
-        if (!stale) setArtistGroups(rows);
-      })
+    setGroupsNote(null);
+    (async () => {
+      // 1. Cached discographies first — instant, no network.
+      for (const c of activeTargets) {
+        const cached = await invoke<ArtistGroup[] | null>("mb_artist_groups_cached", {
+          artistMbid: c.mbid,
+        });
+        if (stale) return;
+        if (cached) perArtist.set(c.mbid, tag(cached, c.name));
+      }
+      if (perArtist.size > 0) {
+        publish();
+        setLoadingGroups(false);
+      }
+      // 2. Refresh from MusicBrainz, one artist at a time, page by page.
+      //    A cold artist renders as pages land; a cached one keeps its
+      //    list on screen and swaps in the fresh one once complete.
+      for (const c of activeTargets) {
+        const hadCache = perArtist.has(c.mbid);
+        setGroupsNote(
+          hadCache
+            ? `Checking MusicBrainz for anything new from ${c.name}…`
+            : `Loading more from MusicBrainz…`,
+        );
+        const fresh: BrowseRow[] = [];
+        let offset = 0;
+        for (;;) {
+          const page = await invoke<{ groups: ArtistGroup[]; total: number; done: boolean }>(
+            "mb_artist_release_groups_page",
+            { artistMbid: c.mbid, offset },
+          );
+          if (stale) return;
+          fresh.push(...tag(page.groups, c.name));
+          offset += page.groups.length;
+          if (!hadCache) {
+            perArtist.set(c.mbid, [...fresh]);
+            publish();
+            setLoadingGroups(false);
+          }
+          if (page.done) break;
+        }
+        if (hadCache) {
+          perArtist.set(c.mbid, fresh);
+          publish();
+        }
+      }
+    })()
       .catch((e) => {
         if (!stale) toast.error(String(e));
       })
       .finally(() => {
-        if (!stale) setLoadingGroups(false);
+        if (!stale) {
+          setLoadingGroups(false);
+          setGroupsNote(null);
+          if (perArtist.size === 0) setArtistGroups([]);
+        }
       });
     return () => {
       stale = true;
     };
-  }, [open, artistMbid]);
+    // activeKey stands in for activeTargets (derived each render).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, activeKey]);
   useEffect(() => {
     if (!open || !groupId || status?.staged || status?.declared_none) {
       setGroupReleases(null);
@@ -499,44 +633,11 @@ export function MatchDialog({
     }
   };
 
-  // A mismatch found by the consistency check, awaiting the user's yes.
-  const [confirmApply, setConfirmApply] = useState<{
-    mbid: string;
-    mbidKind?: string;
-    credited: string;
-  } | null>(null);
-
-  // Consistency check before applying from the free-text search: that path
-  // can hand back anyone's album, so a target whose MB credit lacks the
-  // album's matched artist warns first. The browse/release lists skip this —
-  // they're consistent by construction.
-  const applyChecked = async (mbid: string, mbidKind?: string) => {
-    if (
-      kind === "album" &&
-      status?.context_mbid &&
-      (mbidKind === "release-group" || mbidKind === "release")
-    ) {
-      setBusy(`check:${mbid}`);
-      try {
-        const chk = await invoke<{ credited: string[]; includes: boolean }>("mb_credit_check", {
-          mbidKind,
-          mbid,
-          artistMbid: status.context_mbid,
-        });
-        if (!chk.includes) {
-          setConfirmApply({ mbid, mbidKind, credited: chk.credited.join(" · ") || "another artist" });
-          setBusy(null);
-          return;
-        }
-      } catch (e) {
-        toast.error(String(e));
-        setBusy(null);
-        return;
-      }
-      setBusy(null);
-    }
-    await apply(mbid, mbidKind);
-  };
+  // No credit-consistency confirmation before applying (user decision
+  // 2026-09-09): the apply adopts MusicBrainz's credit wholesale — new
+  // artist rows where needed, the album re-credited — and that IS the
+  // wanted outcome even when MB's credit names someone else. A wrong pick
+  // is one Unmatch away, with history rows for every side effect.
 
   // Pasted release for a group-matched album: HARD guard — a release from a
   // different group contradicts the existing album match; the fix for that
@@ -737,7 +838,12 @@ export function MatchDialog({
           <DialogTitle>Match {kind} to MusicBrainz</DialogTitle>
           <DialogDescription>
             {status?.title}
-            {status?.context ? ` — ${status.context}` : ""}
+            {/* Albums name the full credit, not just the first artist. */}
+            {status?.credited_artists?.length
+              ? ` — ${status.credited_artists.map((c) => c.name).join(" · ")}`
+              : status?.context
+                ? ` — ${status.context}`
+                : ""}
           </DialogDescription>
         </DialogHeader>
 
@@ -757,7 +863,31 @@ export function MatchDialog({
                   (descender room) and needing a 1px fudge to look right. */}
               <p className={`flex items-center gap-1.5 text-sm leading-none ${stateColor}`}>
                 <StateIcon size={14} className="shrink-0" />
-                {st.label}
+                {/* A track-list mismatch is a link: the metadata center's
+                    differ pane is where the tracks get accepted or fixed,
+                    so the count takes you straight to this album's card. */}
+                {kind === "album" && st.state === "mismatch" && status ? (
+                  <button
+                    type="button"
+                    className="underline decoration-current/40 underline-offset-2 hover:decoration-current"
+                    title="See these tracks in the metadata center"
+                    onClick={() => {
+                      onOpenChange(false);
+                      window.dispatchEvent(
+                        new CustomEvent("waverunner:open-music-center", {
+                          detail: {
+                            libraryId: status.library_id,
+                            focus: { pane: "gaps", albumId: status.entity_id },
+                          },
+                        }),
+                      );
+                    }}
+                  >
+                    {st.label}
+                  </button>
+                ) : (
+                  st.label
+                )}
               </p>
               {/* Albums carry TWO ids — the release group (the album as a
                   work) ABOVE the release (the pressing), mirroring how they
@@ -1054,11 +1184,67 @@ export function MatchDialog({
               (compilations, V/A). */}
           {browseMode && (
             <>
+              {/* Joint albums: whose discography to browse. "All" unions
+                  every identified credit; a credit MusicBrainz hasn't
+                  identified yet shows disabled — match the artist first. */}
+              {(status?.credited_artists.length ?? 0) > 1 && (
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {browseTargets.length > 1 && (
+                    <button
+                      type="button"
+                      onClick={() => setBrowseChip("all")}
+                      className={`rounded-full border px-2.5 py-0.5 text-xs transition-colors ${
+                        browseChip === "all"
+                          ? "border-primary bg-primary/10 text-foreground"
+                          : "text-muted-foreground hover:text-foreground"
+                      }`}
+                    >
+                      All
+                    </button>
+                  )}
+                  {status!.credited_artists.map((c) =>
+                    c.mbid?.toLowerCase() === VARIOUS_ARTISTS_MBID ? (
+                      <span
+                        key={c.name}
+                        title="MusicBrainz's Various Artists catalogue is every compilation ever entered — too big to browse; use the search"
+                        className="rounded-full border border-dashed px-2.5 py-0.5 text-xs text-muted-foreground/60"
+                      >
+                        {c.name}
+                      </span>
+                    ) : c.mbid ? (
+                      <button
+                        key={`${c.name}-${c.mbid}`}
+                        type="button"
+                        onClick={() => setBrowseChip(c.mbid!)}
+                        className={`rounded-full border px-2.5 py-0.5 text-xs transition-colors ${
+                          browseChip === c.mbid || browseTargets.length === 1
+                            ? "border-primary bg-primary/10 text-foreground"
+                            : "text-muted-foreground hover:text-foreground"
+                        }`}
+                      >
+                        {c.name}
+                      </button>
+                    ) : (
+                      <span
+                        key={c.name}
+                        title="Not identified on MusicBrainz yet — match this artist to browse their releases"
+                        className="rounded-full border border-dashed px-2.5 py-0.5 text-xs text-muted-foreground/60"
+                      >
+                        {c.name}
+                      </span>
+                    ),
+                  )}
+                </div>
+              )}
               <Input
                 value={groupFilter}
                 onChange={(e) => setGroupFilter(e.target.value)}
                 className="h-8 w-full text-sm"
-                placeholder={`Filter ${status?.context ?? "this artist"}’s releases — or paste a MusicBrainz link or ID…`}
+                placeholder={`Filter ${
+                  activeTargets.length > 1
+                    ? "these artists"
+                    : `${activeTargets[0]?.name ?? status?.context ?? "this artist"}’s`
+                } releases — or paste a MusicBrainz link or ID…`}
               />
               <button
                 type="button"
@@ -1086,7 +1272,13 @@ export function MatchDialog({
                   Look up pasted MusicBrainz {MBID_RE.test(groupFilter.trim()) ? "ID" : "link"}
                 </Button>
               )}
-              {loadingGroups ? (
+              {groupsNote && artistGroups && (
+                <p className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                  <Spinner className="size-3" />
+                  {groupsNote}
+                </p>
+              )}
+              {loadingGroups && !artistGroups ? (
                 <div className="flex flex-col items-center gap-1.5 py-4">
                   <Spinner className="size-4" />
                   <MbLoadingNote busy={mbBusy} label="Loading discography from MusicBrainz…" />
@@ -1096,7 +1288,7 @@ export function MatchDialog({
                   <div className="max-h-72 overflow-y-auto overflow-x-hidden rounded-md border">
                     {artistGroups.length === 0 && (
                       <p className="px-3 py-2 text-xs text-muted-foreground">
-                        MusicBrainz lists nothing for this artist.
+                        MusicBrainz lists nothing for {activeTargets.length > 1 ? "these artists" : "this artist"}.
                       </p>
                     )}
                     {artistGroups
@@ -1115,7 +1307,13 @@ export function MatchDialog({
                           <span className="min-w-0">
                             <span className="block break-words text-sm">{g.title}</span>
                             <span className="block break-words text-xs text-muted-foreground">
-                              {[g.album_type, g.first_release_date, g.disambiguation]
+                              {[
+                                g.album_type,
+                                g.first_release_date,
+                                g.disambiguation,
+                                // Union view: which credited artist's page listed it.
+                                activeTargets.length > 1 ? `via ${g.via.join(" & ")}` : null,
+                              ]
                                 .filter(Boolean)
                                 .join(" · ")}
                             </span>
@@ -1160,6 +1358,20 @@ export function MatchDialog({
               the user explicitly widens out. */}
           {!artistSettled && !groupId && !browseMode && !resolvedLock && (
             <>
+          {/* Widened out of the discography (search-all / pasted link):
+              the way back, so the chips are never one-way. */}
+          {browseTargets.length > 0 && searchAll && (
+            <button
+              type="button"
+              onClick={() => {
+                setSearchAll(false);
+                setResults(null);
+              }}
+              className="self-start px-1 text-[11px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+            >
+              ← Back to {browseTargets.length > 1 ? "their" : `${browseTargets[0].name}’s`} releases
+            </button>
+          )}
           <div className="flex gap-2">
             <Input
               value={query}
@@ -1243,15 +1455,19 @@ export function MatchDialog({
                       </option>
                     ))}
                   </select>
+                  {/* Capped and ellipsized: a native select sizes to its
+                      widest option, and multi-medium formats can be a
+                      sentence long. The popup list still shows full text. */}
                   <select
                     value={relFormat}
                     onChange={(e) => setRelFormat(e.target.value)}
-                    className="h-8 rounded-md border border-input bg-background px-2 text-xs"
+                    title={relFormat === "all" ? undefined : compactFormat(relFormat)}
+                    className="h-8 max-w-48 truncate rounded-md border border-input bg-background px-2 text-xs"
                   >
                     <option value="all">Any format</option>
                     {releaseFormatOptions.map((f) => (
                       <option key={f} value={f}>
-                        {f}
+                        {compactFormat(f)}
                       </option>
                     ))}
                   </select>
@@ -1338,7 +1554,7 @@ export function MatchDialog({
                             )}
                             {(() => {
                               const tail = [
-                                r.format,
+                                r.format ? compactFormat(r.format) : null,
                                 r.track_count != null ? `${r.track_count} tracks` : null,
                                 r.label,
                                 r.status && r.status !== "Official" ? r.status : null,
@@ -1417,40 +1633,6 @@ export function MatchDialog({
             </>
           )}
 
-          {/* The consistency warning: MB's credit disagrees with the album's
-              matched artist. A yes proceeds — compilations and V/A albums
-              really do live under other artists. */}
-          {confirmApply && (
-            <div className="flex items-center gap-3 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2">
-              <TriangleAlert size={14} className="shrink-0 text-amber-300" />
-              <p className="min-w-0 flex-1 text-xs text-amber-200/90">
-                MusicBrainz credits this album to{" "}
-                <span className="font-medium">{confirmApply.credited}</span>
-                {status?.context ? ` — not ${status.context}` : ""}. Match anyway?
-              </p>
-              <Button
-                size="sm"
-                className="shrink-0"
-                disabled={busy !== null}
-                onClick={() => {
-                  const c = confirmApply;
-                  setConfirmApply(null);
-                  void apply(c.mbid, c.mbidKind);
-                }}
-              >
-                Match anyway
-              </Button>
-              <Button
-                size="sm"
-                variant="outline"
-                className="shrink-0"
-                onClick={() => setConfirmApply(null)}
-              >
-                Cancel
-              </Button>
-            </div>
-          )}
-
           {/* Results */}
           {searching ? (
             <div className="flex flex-col items-center gap-1.5 py-4">
@@ -1515,12 +1697,10 @@ export function MatchDialog({
                         onClick={() =>
                           c.kind === "artist"
                             ? apply(c.mbid, c.kind, useEnglish[c.mbid] ? c.en_name : null)
-                            : applyChecked(c.mbid, c.kind)
+                            : apply(c.mbid, c.kind)
                         }
                       >
-                        {(busy === `apply:${c.mbid}` || busy === `check:${c.mbid}`) && (
-                          <Spinner className="size-3" />
-                        )}
+                        {busy === `apply:${c.mbid}` && <Spinner className="size-3" />}
                         Apply
                       </Button>
                     </span>

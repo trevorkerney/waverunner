@@ -650,6 +650,17 @@ const MIGRATIONS: &[Migration] = &[
         // NULL for pins made before this column existed until re-pinned.
         statements: &["ALTER TABLE release_match ADD COLUMN title TEXT"],
     },
+    Migration {
+        id: 37,
+        app_version: "1.0.0-alpha.12.5",
+        description: "album_match_gap.length_off — the file's runtime disagrees with MB's length",
+        requires_table: Some("album_match_gap"),
+        // A same-slot title disagreement whose lengths ALSO disagree (beyond
+        // the two-second window) is probably a different song: the differ
+        // page offers no Accept for it. Rewritten with the rows on every
+        // check, so no backfill.
+        statements: &["ALTER TABLE album_match_gap ADD COLUMN length_off INTEGER NOT NULL DEFAULT 0"],
+    },
 ];
 
 /// Copy the database beside itself before the first migration of a run
@@ -1516,6 +1527,22 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .execute(&pool)
     .await?;
 
+    // ── Artist discography cache (match dialog) ───────────────────────
+    // One row per MB artist whose release groups the dialog has browsed:
+    // served instantly on the next open, refreshed in the background on
+    // every open (stale-while-revalidate — never on a schedule), and
+    // evicted once the artist has no unmatched album left anywhere
+    // (evict_artist_group_caches). Kilobytes per artist.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS mb_artist_groups_cache (
+            artist_mbid TEXT PRIMARY KEY,
+            groups_json TEXT NOT NULL,
+            fetched_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     // ── Artist name redirects ─────────────────────────────────────────
     // Former spellings that must keep resolving to an artist: names absorbed
     // by merges and pre-rename titles ("J Cole" → "J. Cole"). Despite the
@@ -1665,6 +1692,9 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             position INTEGER NOT NULL,
             title TEXT NOT NULL,
             counterpart TEXT,
+            -- Same-slot title disagreement whose lengths disagree too (beyond
+            -- two seconds): probably a different song, no Accept offered.
+            length_off INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (album_id, folder_path, side, disc, position),
             FOREIGN KEY (album_id) REFERENCES album(id) ON DELETE CASCADE
         )",
@@ -1960,6 +1990,24 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .execute(&pool)
     .await?;
 
+
+    // ── Edition merging (the inverse of album_release_split) ─────────
+    // Two folders with identical album tags scan as two editions of one
+    // album; a row here says the edition at folder_path is instead folded
+    // INTO the edition at into_folder (one track list, discs from tags).
+    // "Merge" in the combine dialog for a same-tag pair — keyed by folder
+    // because the tags can't tell the two apart. Applied every scan.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS album_release_merge (
+            library_id TEXT NOT NULL,
+            folder_path TEXT NOT NULL,
+            into_folder TEXT NOT NULL,
+            PRIMARY KEY (library_id, folder_path),
+            FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
 
     // Virtual sound COLLECTIONS: the user-facing grouping for sounds. A row
     // marks an album entry as a collection — never folder-claimed by rescans,

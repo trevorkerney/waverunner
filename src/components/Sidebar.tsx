@@ -2,8 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
-import { PendingWorkBadge } from "@/components/music/PendingWork";
-import { Trash2, RefreshCw, FolderPlus, FolderCog, ChevronRight, Sparkles, Pencil, Home, CircleAlert, Music2, Settings2, TriangleAlert } from "lucide-react";
+import { LibraryAttentionBadge } from "@/components/music/PendingWork";
+import { Trash2, RefreshCw, FolderPlus, FolderCog, ChevronRight, Sparkles, Pencil, Home, CircleAlert, Music2, Settings2 } from "lucide-react";
 import { open as openFolderPicker } from "@tauri-apps/plugin-dialog";
 import { Spinner } from "@/components/ui/spinner";
 import {
@@ -58,10 +58,6 @@ interface SidebarProps {
   onLibraryRenamed: (libraryId: string, oldName: string, newName: string) => void;
   /** Called after a playlist is created via the sidebar so App.tsx can invalidate caches. */
   onPlaylistChanged: (libraryId: string) => void;
-  /** Opens the App-owned Match-to-MusicBrainz review modal. */
-  onOpenMusicBrainzReview: (libraryId: string) => void;
-  /** Opens the App-owned video metadata center (TMDB match review). */
-  onOpenVideoMetadataCenter: (libraryId: string) => void;
   /** Per-library playlists to show as children of the "Playlists" sidebar node. */
   sidebarPlaylists: Record<string, PlaylistSummary[]>;
   /** Per-library counts shown dimmed on sidebar nodes. */
@@ -100,8 +96,6 @@ export function Sidebar({
   onLibraryRescanned,
   onLibraryRenamed,
   onPlaylistChanged,
-  onOpenMusicBrainzReview,
-  onOpenVideoMetadataCenter,
   sidebarPlaylists,
   sidebarCounts,
   sidebarGenres,
@@ -544,19 +538,6 @@ export function Sidebar({
                           the row's far edge — the outer span owns flex-1. */}
                       <span className="flex min-w-0 flex-1 items-start gap-1">
                         <span className="min-w-0 break-words">{lib.name}</span>
-                        {lib.format === "music" && <PendingWorkBadge libraryId={lib.id} />}
-                        {wizard && wizard.kind !== "create" && wizard.libraryId === lib.id && wizardMinimized && (
-                          <span
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setWizardMinimized(false);
-                            }}
-                            title="The rescan wizard is waiting — click to reopen"
-                            className="flex h-5 flex-shrink-0 cursor-pointer items-center"
-                          >
-                            <TriangleAlert size={12} className="text-amber-400 hover:text-amber-300" />
-                          </span>
-                        )}
                       </span>
                     </ContextMenuTrigger>
                     <ContextMenuContent>
@@ -597,14 +578,10 @@ export function Sidebar({
                         {defaultLibraryId === lib.id ? "Unset as default" : "Set as default"}
                       </ContextMenuItem>
                       <ContextMenuItem
-                        onClick={() =>
-                          lib.format === "music"
-                            ? onOpenMusicBrainzReview(lib.id)
-                            : onOpenVideoMetadataCenter(lib.id)
-                        }
+                        onClick={() => onSelectView({ kind: "metadata", libraryId: lib.id })}
                       >
                         <Sparkles size={14} />
-                        Metadata center
+                        Metadata
                       </ContextMenuItem>
                       <ContextMenuItem
                         onClick={() => setDeleteTarget(lib)}
@@ -641,6 +618,20 @@ export function Sidebar({
                         onSelectView(view);
                       }}
                       renderNodeMenu={renderNodeMenu}
+                      // The attention badge rides the Metadata row — that's
+                      // where its click leads (staged work, a waiting wizard).
+                      renderNodeTrailing={(node) =>
+                        node.id === "metadata" ? (
+                          <LibraryAttentionBadge
+                            libraryId={lib.id}
+                            format={lib.format}
+                            wizardWaiting={
+                              !!wizard && wizard.kind !== "create" && wizard.libraryId === lib.id && wizardMinimized
+                            }
+                            onReopenWizard={() => setWizardMinimized(false)}
+                          />
+                        ) : null
+                      }
                       depth={1}
                     />
                   )}

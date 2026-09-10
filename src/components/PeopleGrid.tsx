@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type RefObject } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { ListFilter, Search, Star, User } from "lucide-react";
 import { ClearableInput } from "@/components/ui/clearable-input";
@@ -379,6 +379,44 @@ export function PeoplePage({ people, libraryId, role, initialMode, onModeChange,
     playDropIn(cards);
   });
 
+  // ── Context menu (one root for the whole grid) ────────────────────────────
+  // The right-clicked card is read off the event; empty space gets no menu.
+  const [ctxPerson, setCtxPerson] = useState<PersonSummary | null>(null);
+  const peopleById = useMemo(() => new Map(people.map((p) => [p.id, p])), [people]);
+  const onGridContextMenu = useCallback(
+    (e: ReactMouseEvent<HTMLDivElement> & { preventBaseUIHandler?: () => void }) => {
+      const card = (e.target as HTMLElement).closest<HTMLElement>("[data-person-id]");
+      const p = card ? peopleById.get(Number(card.dataset.personId)) : undefined;
+      if (!p) {
+        e.preventDefault();
+        e.preventBaseUIHandler?.();
+        return;
+      }
+      setCtxPerson(p);
+    },
+    [peopleById],
+  );
+
+  // ── Visible window ────────────────────────────────────────────────────────
+  // Binary-search the first row that can be on screen, then walk forward
+  // until one is past the bottom — instead of testing all ~2.5K rows on every
+  // scroll frame.
+  const visible = useMemo(() => {
+    const top = scrollTop - OVERSCAN_PX;
+    const bottom = scrollTop + viewport.height + OVERSCAN_PX;
+    const rowH = (r: Row) => (r.kind === "header" ? HEADER_H : r.cardH + ROW_GAP);
+    let lo = 0;
+    let hi = rows.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (offsets[mid] + rowH(rows[mid]) < top) lo = mid + 1;
+      else hi = mid;
+    }
+    const out: number[] = [];
+    for (let i = lo; i < rows.length && offsets[i] <= bottom; i++) out.push(i);
+    return out;
+  }, [rows, offsets, scrollTop, viewport.height]);
+
   // ── Scrubber ──────────────────────────────────────────────────────────────
   const showScrubber = effectiveMode === "all" && letters.length > 1;
 
@@ -441,13 +479,14 @@ export function PeoplePage({ people, libraryId, role, initialMode, onModeChange,
           {rows.length === 0 ? (
             <p className="p-4 text-sm text-muted-foreground">No people found.</p>
           ) : (
-            <div className="relative" style={{ height: total }}>
-              {rows.map((row, i) => {
-                const h = row.kind === "header" ? HEADER_H : row.cardH + ROW_GAP;
+            <ContextMenu>
+            <ContextMenuTrigger
+              onContextMenu={onGridContextMenu}
+              render={<div className="relative" style={{ height: total }} />}
+            >
+              {visible.map((i) => {
+                const row = rows[i];
                 const y = offsets[i];
-                if (y + h < scrollTop - OVERSCAN_PX || y > scrollTop + viewport.height + OVERSCAN_PX) {
-                  return null;
-                }
                 if (row.kind === "header") {
                   return (
                     <div
@@ -490,13 +529,21 @@ export function PeoplePage({ people, libraryId, role, initialMode, onModeChange,
                         height={row.cardH}
                         subtitle={subtitleTextFor(p)}
                         onClick={() => onSelectPerson(p)}
-                        onToggleFavorite={() => onToggleFavorite(p)}
                       />
                     ))}
                   </div>
                 );
               })}
-            </div>
+            </ContextMenuTrigger>
+            <ContextMenuContent>
+              {ctxPerson && (
+                <ContextMenuItem onClick={() => onToggleFavorite(ctxPerson)}>
+                  <Star size={14} />
+                  {ctxPerson.favorite ? "Remove from favorites" : "Add to favorites"}
+                </ContextMenuItem>
+              )}
+            </ContextMenuContent>
+            </ContextMenu>
           )}
         </div>
 
@@ -510,60 +557,53 @@ function PersonCard({
   person,
   height,
   onClick,
-  onToggleFavorite,
   subtitle,
 }: {
   person: PersonSummary;
   /** Row-uniform card height, sized upstream to fit the tallest subtitle. */
   height: number;
   onClick: () => void;
-  onToggleFavorite: () => void;
   /** Computed by PeoplePage's subtitleTextFor — the same text row heights were measured against. */
   subtitle: string;
 }) {
-  const imageSrc = person.image_path ? convertFileSrc(person.image_path) : null;
+  // Faces go through the async `wrimg` protocol, not `asset://` — see
+  // src-tauri/src/img_protocol.rs for why the built-in one hangs the window.
+  const imageSrc = person.image_path ? convertFileSrc(person.image_path, "wrimg") : null;
+  // No per-card context menu: the grid owns ONE (see PeoplePage) and reads
+  // data-person-id off the right-clicked card. Mounting a full menu root
+  // per card meant dozens of floating-ui setups/teardowns every frame during
+  // a fast scroll — enough to hang the WebView on a 15K-person library.
   return (
-    <ContextMenu>
-      <ContextMenuTrigger
-        render={
-          <button
-            onClick={onClick}
-            data-person-card=""
-            style={{ height }}
-            className="group flex flex-col items-center gap-2 overflow-hidden rounded-md p-2 text-center transition-colors hover:bg-accent/40 focus:bg-accent/60 focus:outline-none"
+    <button
+      onClick={onClick}
+      data-person-card=""
+      data-person-id={person.id}
+      style={{ height }}
+      className="group flex flex-col items-center gap-2 overflow-hidden rounded-md p-2 text-center transition-colors hover:bg-accent/40 focus:bg-accent/60 focus:outline-none"
+    >
+      <div className="flex h-32 w-32 shrink-0 items-center justify-center overflow-hidden rounded-full bg-muted shadow-md ring-1 ring-foreground/10 transition-all duration-200 group-hover:shadow-lg group-hover:ring-primary/50">
+        {imageSrc ? (
+          <img
+            src={imageSrc}
+            alt={person.name}
+            loading="lazy"
+            decoding="async"
+            className="h-full w-full object-cover"
+            draggable={false}
           />
-        }
-      >
-        <div className="flex h-32 w-32 shrink-0 items-center justify-center overflow-hidden rounded-full bg-muted shadow-md ring-1 ring-foreground/10 transition-all duration-200 group-hover:shadow-lg group-hover:ring-primary/50">
-          {imageSrc ? (
-            <img
-              src={imageSrc}
-              alt={person.name}
-              loading="lazy"
-              decoding="async"
-              className="h-full w-full object-cover"
-              draggable={false}
-            />
-          ) : (
-            <User className="h-12 w-12 text-muted-foreground" />
-          )}
-        </div>
-        <div className="flex min-w-0 flex-col items-center">
-          <span className="line-clamp-2 text-sm font-medium leading-tight">
-            {person.favorite && <Star size={11} className="mb-0.5 mr-1 inline fill-primary text-primary" />}
-            {person.name}
-          </span>
-          <span className="w-full break-words text-xs leading-tight text-muted-foreground" title={subtitle}>
-            {subtitle}
-          </span>
-        </div>
-      </ContextMenuTrigger>
-      <ContextMenuContent>
-        <ContextMenuItem onClick={onToggleFavorite}>
-          <Star size={14} />
-          {person.favorite ? "Remove from favorites" : "Add to favorites"}
-        </ContextMenuItem>
-      </ContextMenuContent>
-    </ContextMenu>
+        ) : (
+          <User className="h-12 w-12 text-muted-foreground" />
+        )}
+      </div>
+      <div className="flex min-w-0 flex-col items-center">
+        <span className="line-clamp-2 text-sm font-medium leading-tight">
+          {person.favorite && <Star size={11} className="mb-0.5 mr-1 inline fill-primary text-primary" />}
+          {person.name}
+        </span>
+        <span className="w-full break-words text-xs leading-tight text-muted-foreground" title={subtitle}>
+          {subtitle}
+        </span>
+      </div>
+    </button>
   );
 }

@@ -767,7 +767,13 @@ export function CreateLibraryDialog({
       }}
     >
       <DialogContent
-        className={`overflow-hidden flex flex-col px-0 gap-0 ${step === 4 ? "w-[min(72rem,calc(100vw-3rem))] max-w-none h-[85vh]" : "sm:w-lg"}`}
+        className={`overflow-hidden flex flex-col px-0 gap-0 ${
+          step === 4
+            ? "w-[min(72rem,calc(100vw-3rem))] max-w-none h-[85vh]"
+            : // Wide enough for the music pass's seven-stage rail with its
+              // finished counts on ONE line — the old 32rem wrapped it.
+              "w-[min(44rem,calc(100vw-3rem))] max-w-none"
+        }`}
       >
         <DialogHeader className="px-4 pb-2">
           <DialogTitle>{title}</DialogTitle>
@@ -809,10 +815,11 @@ export function CreateLibraryDialog({
             </p>
           )}
           {step === 3 && matchPhase === "running" && effFormat === "music" && (
-            <div className="mt-1 flex items-center justify-center gap-2 text-[11px]">
+            <div className="mt-1 flex items-center justify-center gap-2 whitespace-nowrap text-[11px]">
               {(
                 [
                   ["albums", "Albums"],
+                  ["titles", "Titles"],
                   ["artist-ids", "Identify"],
                   ["artist-credits", "Credits"],
                   ["dates", "Dates"],
@@ -856,7 +863,7 @@ export function CreateLibraryDialog({
               rows + cover thumbnails). Video scans emit no phase, so scanSub
               stays empty and this never renders for them. */}
           {step === 2 && Object.keys(scanSub).length > 0 && (
-            <div className="mt-1 flex items-center justify-center gap-2 text-[11px]">
+            <div className="mt-1 flex items-center justify-center gap-2 whitespace-nowrap text-[11px]">
               {(
                 [
                   ["read-tags", "Read tags"],
@@ -1102,6 +1109,11 @@ export function CreateLibraryDialog({
                   <p className="min-h-4 w-full min-w-0 truncate px-2 text-xs text-muted-foreground">
                     {scanProgress?.folder || "Reading folders…"}
                   </p>
+                  {/* Same slot the match step fills with "about N minutes
+                      remaining". Scan pace swings with drive spin-up and
+                      folder shape, so it gets an honest placeholder rather
+                      than a number that would keep revising itself. */}
+                  <p className="min-h-4 text-xs text-muted-foreground">indeterminate time remaining</p>
                   {/* Rescans stop safely: the read phase writes nothing and
                       the build phase stops between artists — a later rescan
                       simply completes the rest. (Create scans cancel through
@@ -1175,6 +1187,8 @@ export function CreateLibraryDialog({
                         ? "Reading album credits on MusicBrainz"
                         : matchProgress?.phase === "dates"
                           ? "Fetching original release dates"
+                          : matchProgress?.phase === "titles"
+                          ? "Applying track titles from matched releases"
                           : matchProgress?.phase === "artist-search"
                           ? "Searching artists on MusicBrainz"
                           : matchProgress?.phase === "artist-images"

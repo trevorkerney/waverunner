@@ -18,9 +18,72 @@ use crate::AppState;
 /// pixels at the bar's rendered width; stored as one normalized byte each.
 const BUCKETS: usize = 480;
 
-/// Decode the whole file and reduce it to BUCKETS absolute-peak bytes,
-/// normalized to the track's own loudest sample (display normalization — a
-/// quiet acoustic track still draws a full-height shape).
+/// Stored layout: LEFT peaks (BUCKETS bytes) then RIGHT peaks (BUCKETS
+/// bytes) — the bar draws left above the midline, right below, the way every
+/// DAW stacks a stereo file. Mono is both. Rows of the old single-channel
+/// length are treated as missing and recomputed on the next request.
+const STORED_LEN: usize = 2 * BUCKETS;
+
+/// Which side(s) each channel of a layout feeds, in interleave order. Left-
+/// and right-positioned channels go to their side, centres to both, LFE to
+/// neither; a layout with no recognizable sides (or one channel) falls back
+/// to both / index parity. Player convention, not DAW: a 5.1 file folds to
+/// two halves rather than six lanes — a seekbar only has a top and a bottom.
+fn channel_sides(channels: symphonia::core::audio::Channels) -> Vec<(bool, bool)> {
+    use symphonia::core::audio::Channels as C;
+    let left = C::FRONT_LEFT
+        | C::REAR_LEFT
+        | C::FRONT_LEFT_CENTRE
+        | C::SIDE_LEFT
+        | C::TOP_FRONT_LEFT
+        | C::TOP_REAR_LEFT
+        | C::REAR_LEFT_CENTRE
+        | C::FRONT_LEFT_WIDE
+        | C::FRONT_LEFT_HIGH;
+    let right = C::FRONT_RIGHT
+        | C::REAR_RIGHT
+        | C::FRONT_RIGHT_CENTRE
+        | C::SIDE_RIGHT
+        | C::TOP_FRONT_RIGHT
+        | C::TOP_REAR_RIGHT
+        | C::REAR_RIGHT_CENTRE
+        | C::FRONT_RIGHT_WIDE
+        | C::FRONT_RIGHT_HIGH;
+    let centre = C::FRONT_CENTRE
+        | C::REAR_CENTRE
+        | C::TOP_CENTRE
+        | C::TOP_FRONT_CENTRE
+        | C::TOP_REAR_CENTRE
+        | C::FRONT_CENTRE_HIGH;
+    let bits = channels.bits();
+    let mut sides: Vec<(bool, bool)> = Vec::new();
+    for b in 0..32 {
+        let flag = 1u32 << b;
+        if bits & flag == 0 {
+            continue;
+        }
+        let ch = C::from_bits_truncate(flag);
+        let l = left.contains(ch) || centre.contains(ch);
+        let r = right.contains(ch) || centre.contains(ch);
+        sides.push((l, r));
+    }
+    let count = sides.len().max(1);
+    let any_side = sides.iter().any(|(l, r)| *l || *r);
+    if count == 1 {
+        return vec![(true, true)];
+    }
+    if !any_side {
+        // Unknown positions: alternate, which is right for the common
+        // unlabelled-stereo case and harmless beyond it.
+        return (0..count).map(|i| (i % 2 == 0, i % 2 == 1)).collect();
+    }
+    sides
+}
+
+/// Decode the whole file and reduce it to STORED_LEN absolute-peak bytes —
+/// left channel(s) then right — normalized to the track's own loudest sample
+/// across both sides (display normalization — a quiet acoustic track still
+/// draws a full-height shape, and a lopsided mix stays lopsided).
 pub(crate) fn compute_peaks(path: &Path) -> Result<Vec<u8>, String> {
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
@@ -38,14 +101,17 @@ pub(crate) fn compute_peaks(path: &Path) -> Result<Vec<u8>, String> {
         .make(&track.codec_params, &Default::default())
         .map_err(|e| e.to_string())?;
 
-    // Coarse pass: absolute peak per fixed sample window, downsampled to
-    // BUCKETS at the end. A 10-hour recording stays a few MB of f32s.
+    // Coarse pass: absolute peak per side per fixed FRAME window, downsampled
+    // to BUCKETS at the end. A 10-hour recording stays a few MB of f32s.
     const WINDOW: usize = 4096;
-    let mut coarse: Vec<f32> = Vec::new();
-    let mut cur_max = 0f32;
+    let mut coarse_l: Vec<f32> = Vec::new();
+    let mut coarse_r: Vec<f32> = Vec::new();
+    let mut max_l = 0f32;
+    let mut max_r = 0f32;
     let mut in_window = 0usize;
     let mut sample_buf: Option<SampleBuffer<f32>> = None;
     let mut buf_cap: u64 = 0;
+    let mut sides: Vec<(bool, bool)> = Vec::new();
     loop {
         let packet = match format.next_packet() {
             Ok(p) => p,
@@ -63,36 +129,60 @@ pub(crate) fn compute_peaks(path: &Path) -> Result<Vec<u8>, String> {
             sample_buf = Some(SampleBuffer::new(cap, *decoded.spec()));
             buf_cap = cap;
         }
+        if sides.is_empty() {
+            sides = channel_sides(decoded.spec().channels);
+        }
+        let nch = sides.len().max(1);
         let buf = sample_buf.as_mut().unwrap();
         buf.copy_interleaved_ref(decoded);
-        for &s in buf.samples() {
-            let a = s.abs();
-            if a > cur_max {
-                cur_max = a;
+        for frame in buf.samples().chunks(nch) {
+            for (s, (l, r)) in frame.iter().zip(&sides) {
+                let a = s.abs();
+                if *l && a > max_l {
+                    max_l = a;
+                }
+                if *r && a > max_r {
+                    max_r = a;
+                }
             }
             in_window += 1;
             if in_window >= WINDOW {
-                coarse.push(cur_max);
-                cur_max = 0.0;
+                coarse_l.push(max_l);
+                coarse_r.push(max_r);
+                max_l = 0.0;
+                max_r = 0.0;
                 in_window = 0;
             }
         }
     }
     if in_window > 0 {
-        coarse.push(cur_max);
+        coarse_l.push(max_l);
+        coarse_r.push(max_r);
     }
-    if coarse.is_empty() {
+    if coarse_l.is_empty() {
         return Err("no audio decoded".to_string());
     }
 
-    let overall = coarse.iter().cloned().fold(0f32, f32::max).max(1e-6);
-    let mut out = vec![0u8; BUCKETS];
-    for (i, slot) in out.iter_mut().enumerate() {
-        let a = i * coarse.len() / BUCKETS;
-        let b = (((i + 1) * coarse.len()) / BUCKETS).max(a + 1).min(coarse.len());
-        let m = coarse[a..b].iter().cloned().fold(0f32, f32::max);
-        *slot = ((m / overall) * 255.0).round().clamp(0.0, 255.0) as u8;
-    }
+    // One normalization across both sides: the loudest sample anywhere hits
+    // full scale, and a channel imbalance shows as one.
+    let overall = coarse_l
+        .iter()
+        .chain(coarse_r.iter())
+        .cloned()
+        .fold(0f32, f32::max)
+        .max(1e-6);
+    let reduce = |coarse: &[f32], out: &mut [u8]| {
+        for (i, slot) in out.iter_mut().enumerate() {
+            let a = i * coarse.len() / BUCKETS;
+            let b = (((i + 1) * coarse.len()) / BUCKETS).max(a + 1).min(coarse.len());
+            let m = coarse[a..b].iter().cloned().fold(0f32, f32::max);
+            *slot = ((m / overall) * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+    };
+    let mut out = vec![0u8; STORED_LEN];
+    let (left, right) = out.split_at_mut(BUCKETS);
+    reduce(&coarse_l, left);
+    reduce(&coarse_r, right);
     Ok(out)
 }
 
@@ -109,7 +199,11 @@ async fn cached_peaks(
     .fetch_optional(pool)
     .await
     .map_err(|e| e.to_string())?;
-    Ok(row.and_then(|(peaks, csize, cmtime)| (csize == size && cmtime == mtime).then_some(peaks)))
+    // A row of the pre-stereo length is a cache miss: it recomputes on this
+    // request (and the preload walk refills the whole library).
+    Ok(row.and_then(|(peaks, csize, cmtime)| {
+        (csize == size && cmtime == mtime && peaks.len() == STORED_LEN).then_some(peaks)
+    }))
 }
 
 /// The one entry point: cached peaks instantly, else decode-and-cache. None =
@@ -346,9 +440,31 @@ mod tests {
             return;
         };
         let peaks = compute_peaks(&file).expect("decode should succeed");
-        assert_eq!(peaks.len(), BUCKETS);
+        assert_eq!(peaks.len(), STORED_LEN);
         assert_eq!(*peaks.iter().max().unwrap(), 255, "normalized to full scale");
         let distinct: std::collections::HashSet<u8> = peaks.iter().copied().collect();
         assert!(distinct.len() > 8, "waveform should vary, got {} levels", distinct.len());
+        // Both sides carry signal on a real track.
+        assert!(peaks[..BUCKETS].iter().any(|&p| p > 0), "left side empty");
+        assert!(peaks[BUCKETS..].iter().any(|&p| p > 0), "right side empty");
+    }
+
+    #[test]
+    fn channel_sides_fold_layouts_to_two_halves() {
+        use symphonia::core::audio::Channels as C;
+        assert_eq!(channel_sides(C::FRONT_LEFT), vec![(true, true)]);
+        assert_eq!(
+            channel_sides(C::FRONT_LEFT | C::FRONT_RIGHT),
+            vec![(true, false), (false, true)]
+        );
+        // 5.1: L R C LFE Ls Rs → centre feeds both, LFE neither.
+        assert_eq!(
+            channel_sides(
+                C::FRONT_LEFT | C::FRONT_RIGHT | C::FRONT_CENTRE | C::LFE1 | C::REAR_LEFT | C::REAR_RIGHT
+            ),
+            vec![(true, false), (false, true), (true, true), (false, false), (true, false), (false, true)]
+        );
+        // No recognizable sides → alternate by index.
+        assert_eq!(channel_sides(C::LFE1 | C::LFE2), vec![(true, false), (false, true)]);
     }
 }

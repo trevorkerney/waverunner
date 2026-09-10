@@ -121,6 +121,7 @@ export function CombineSelectedDialog({
                 const sub = [
                   meta?.artist,
                   meta?.year,
+                  meta ? `${meta.track_count} track${meta.track_count === 1 ? "" : "s"}` : null,
                   meta && meta.editions.length > 1 ? `${meta.editions.length} editions` : null,
                 ]
                   .filter(Boolean)

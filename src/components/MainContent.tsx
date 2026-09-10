@@ -145,6 +145,8 @@ import { ArtistsGrid } from "@/components/music/ArtistsGrid";
 import { AlbumDetailPage } from "@/components/music/AlbumDetailPage";
 import { MusicIssuesPage } from "@/components/music/MusicIssuesPage";
 import { SourcesPage } from "@/components/music/SourcesPage";
+import { MetadataPage } from "@/components/MetadataPage";
+import type { CenterFocus } from "@/components/music/MetadataCenter";
 import { TracksPage } from "@/components/music/TracksPage";
 import { LooseTracksSection } from "@/components/music/LooseTracksSection";
 import { LooseTracksPage } from "@/components/music/LooseTracksPage";
@@ -154,7 +156,17 @@ function letterForTitle(title: string): string {
   // Mirrors the backend's generate_sort_title: grids sort with leading English
   // articles stripped ("The Office" files under O), so the scrubber letter must
   // come from the same key or T-jumps land on "The …" titles sorted elsewhere.
-  let t = title.trim().toLowerCase();
+  // Accents fold to their base letter (Ænima → A, Björk → B) the way the
+  // backend's sort key folds them, so the rail and the order agree.
+  let t = title
+    .trim()
+    .toLowerCase()
+    .replace(/æ/g, "ae")
+    .replace(/œ/g, "oe")
+    .replace(/ø/g, "o")
+    .replace(/ß/g, "ss")
+    .normalize("NFKD")
+    .replace(/[̀-ͯ]/g, "");
   for (const article of ["the ", "a ", "an "]) {
     if (t.startsWith(article)) {
       t = t.slice(article.length).trim();
@@ -296,6 +308,12 @@ interface MainContentProps {
    *  title link) and/or switch onto a release (metadata center link). The
    *  nonce distinguishes repeat clicks. */
   musicFocusRequest?: { albumId: number; trackId?: number; releaseId?: number; nonce: number } | null;
+  /** Metadata page: one-shot landing target (pane + card). */
+  metadataFocus?: CenterFocus | null;
+  /** Metadata page: a match/undo landed — the host drops caches and refreshes. */
+  onMetadataChanged?: (libraryId: string) => void;
+  /** Metadata page album links: open the album, switched onto a release. */
+  onOpenMusicAlbumFromMetadata?: (albumId: number, title: string, releaseId: number | null) => void;
 }
 
 export function MainContent({
@@ -360,6 +378,9 @@ export function MainContent({
   musicCurrentTrackId,
   musicPlaying,
   musicFocusRequest,
+  metadataFocus,
+  onMetadataChanged,
+  onOpenMusicAlbumFromMetadata,
 }: MainContentProps) {
   // Album SELECTION MODE — entered from a card's context menu, exited with
   // Escape or Done. Cards grow checkboxes and clicking toggles instead of
@@ -556,7 +577,17 @@ export function MainContent({
       if (!target || !container) return;
       // window.CSS — the bare `CSS` identifier is dnd-kit's transform helper here.
       const sel = `[data-flip-id="${window.CSS.escape(String(sortableIdFor(target)))}"]`;
-      gridRef.current?.querySelector(sel)?.scrollIntoView({ block: "start" });
+      // Land the row where a row rests at the top of the page: under the
+      // scroller's own padding, not against its edge. Scrolled by hand
+      // (scrollTop arithmetic on THIS container) rather than scrollIntoView,
+      // which aligns to the scrollport edge, ignores the padding, and is
+      // free to move ancestor scrollers too — the jump sat visibly off.
+      const padTop = parseFloat(getComputedStyle(container).paddingTop) || 0;
+      const offset = (el: Element) =>
+        el.getBoundingClientRect().top - (container.getBoundingClientRect().top + padTop);
+      const first = gridRef.current?.querySelector(sel);
+      if (!first) return;
+      container.scrollTop += offset(first);
       // content-visibility makes offsets above the target ESTIMATES until that
       // region renders, so the first jump can land off (worse at some zoom
       // levels). Re-align over a few frames until the target stops moving —
@@ -565,10 +596,10 @@ export function MainContent({
       const settle = () => {
         const el = gridRef.current?.querySelector(sel);
         if (!el) return;
-        const delta = el.getBoundingClientRect().top - container.getBoundingClientRect().top;
-        if (Math.abs(delta) > 2 && attempts < 8) {
+        const delta = offset(el);
+        if (Math.abs(delta) > 1 && attempts < 8) {
           attempts++;
-          el.scrollIntoView({ block: "start" });
+          container.scrollTop += delta;
           requestAnimationFrame(settle);
         }
       };
@@ -1153,6 +1184,26 @@ export function MainContent({
         {breadcrumbBar}
         <div ref={scrollContainerRef} className="relative flex min-h-0 flex-1 flex-col overflow-y-auto">
           <SourcesPage libraryId={activeView.libraryId} />
+        </div>
+      </main>
+    );
+  }
+
+  if (activeView?.kind === "metadata") {
+    // The center scrolls its own pane; the ref'd wrapper only keeps the
+    // scroll save/restore plumbing pointed somewhere (it never scrolls).
+    return (
+      <main className="flex flex-1 flex-col overflow-hidden bg-background">
+        {breadcrumbBar}
+        <div ref={scrollContainerRef} className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
+          <MetadataPage
+            libraryId={activeView.libraryId}
+            format={selectedLibrary?.format ?? "music"}
+            focus={metadataFocus ?? null}
+            onChanged={() => onMetadataChanged?.(activeView.libraryId)}
+            onOpenAlbum={(albumId, title, releaseId) => onOpenMusicAlbumFromMetadata?.(albumId, title, releaseId)}
+            onOpenArtist={(artistId, name) => onOpenMusicArtist?.(artistId, name)}
+          />
         </div>
       </main>
     );
@@ -2420,7 +2471,7 @@ function SortableCoverCard({
                 const img = e.currentTarget;
                 if (!img.dataset.fullFallback && coverPath) {
                   img.dataset.fullFallback = "1";
-                  img.src = convertFileSrc(coverPath);
+                  img.src = convertFileSrc(coverPath, "wrimg");
                 }
               }}
               // With a reserved box the image fills it exactly (real aspect → no crop);
@@ -3029,7 +3080,7 @@ function PersonFace({ imagePath, className, iconSize }: { imagePath: string | nu
   return (
     <span className={`flex shrink-0 items-center justify-center overflow-hidden rounded-full bg-muted ring-1 ring-foreground/10 ${className}`}>
       {imagePath ? (
-        <img src={convertFileSrc(imagePath)} alt="" className="h-full w-full object-cover" draggable={false} />
+        <img src={convertFileSrc(imagePath, "wrimg")} alt="" className="h-full w-full object-cover" draggable={false} />
       ) : (
         <UserIcon size={iconSize} className="text-muted-foreground" />
       )}
@@ -5151,7 +5202,7 @@ function PersonDetailHeader({
 
   const displayName = detail?.name ?? name;
   const displayImage = detail?.image_path ?? imagePath;
-  const imageSrc = displayImage ? convertFileSrc(displayImage) : null;
+  const imageSrc = displayImage ? convertFileSrc(displayImage, "wrimg") : null;
   const roleLabel =
     role === "actor" ? "Actor"
     : role === "director_creator" ? "Director / Creator"

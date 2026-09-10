@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, useSyncExternalStore } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { MusicQueueItem, TrackQueueInfo } from "../types";
@@ -85,6 +85,33 @@ type NextTarget =
   | { kind: "repeat"; item: MusicQueueItem }
   | { kind: "explicit"; item: MusicQueueItem }
   | { kind: "context"; index: number; item: MusicQueueItem };
+
+// ── Loading beacon ───────────────────────────────────────────────────────────
+// True while a loadfile is in flight and taking noticeably long (a cold drive
+// spinning up): set LOADING_GRACE_MS after a load starts, cleared the moment
+// mpv reports the file loaded. A module-level store rather than hook state so
+// the track rows' PlayingIndicator (deep inside memoized lists) and the bar's
+// time slot can read it without threading a prop through every page.
+const LOADING_GRACE_MS = 200;
+let musicLoading = false;
+const loadingSubs = new Set<() => void>();
+function setMusicLoading(v: boolean) {
+  if (musicLoading === v) return;
+  musicLoading = v;
+  loadingSubs.forEach((fn) => fn());
+}
+// Stable subscribe/snapshot identities — an inline subscribe would make React
+// unsubscribe and resubscribe every render.
+function subscribeLoading(cb: () => void) {
+  loadingSubs.add(cb);
+  return () => {
+    loadingSubs.delete(cb);
+  };
+}
+const getLoading = () => musicLoading;
+export function useMusicLoading(): boolean {
+  return useSyncExternalStore(subscribeLoading, getLoading);
+}
 
 const initialState: MusicPlayerState = {
   isActive: false,
@@ -206,6 +233,23 @@ export function useMusicPlayer(): [MusicPlayerState, MusicPlayerActions] {
   // more than once while the next loadfile is in flight).
   const loadingRef = useRef(false);
 
+  // Loading-beacon timer: armed by loadTarget, disarmed by file-loaded/stop.
+  const loadingTimerRef = useRef<number | null>(null);
+  const armLoading = useCallback(() => {
+    if (loadingTimerRef.current != null) window.clearTimeout(loadingTimerRef.current);
+    loadingTimerRef.current = window.setTimeout(() => {
+      loadingTimerRef.current = null;
+      setMusicLoading(true);
+    }, LOADING_GRACE_MS);
+  }, []);
+  const clearLoading = useCallback(() => {
+    if (loadingTimerRef.current != null) {
+      window.clearTimeout(loadingTimerRef.current);
+      loadingTimerRef.current = null;
+    }
+    setMusicLoading(false);
+  }, []);
+
   // The target whose file has been appended to mpv's INTERNAL playlist for
   // gapless advance (null = nothing prefetched). While set, mpv advances
   // natively and eof-reached is not trusted. Any mutation of what-plays-next
@@ -273,7 +317,13 @@ export function useMusicPlayer(): [MusicPlayerState, MusicPlayerActions] {
       prefetchedRef.current = null; // loadfile replaces mpv's playlist
       setPosition(0);
       applyTargetState(t);
-      await invoke("music_play_track", { trackId: t.item.trackId, path: t.item.path });
+      armLoading();
+      try {
+        await invoke("music_play_track", { trackId: t.item.trackId, path: t.item.path });
+      } catch (e) {
+        clearLoading();
+        throw e;
+      }
       void prefetchNext();
       // First play of the session: the BACKEND created the instance at the
       // configured default volume (applied before the file loads, so there is
@@ -289,7 +339,7 @@ export function useMusicPlayer(): [MusicPlayerState, MusicPlayerActions] {
       }
       persistSession();
     },
-    [persistSession, setPosition, prefetchNext, applyTargetState]
+    [persistSession, setPosition, prefetchNext, applyTargetState, armLoading, clearLoading]
   );
 
   const loadContextAt = useCallback(
@@ -310,6 +360,7 @@ export function useMusicPlayer(): [MusicPlayerState, MusicPlayerActions] {
     labelRef.current = null;
     originalOrderRef.current = null;
     setPosition(0);
+    clearLoading();
     setState((s) => ({
       ...initialState,
       volume: s.volume,
@@ -323,7 +374,7 @@ export function useMusicPlayer(): [MusicPlayerState, MusicPlayerActions] {
     } catch {
       // never created — nothing to stop
     }
-  }, [persistSession, setPosition]);
+  }, [persistSession, setPosition, clearLoading]);
 
   /** Natural-order advance without a prefetched entry (fallback paths). */
   const autoAdvance = useCallback(async () => {
@@ -623,6 +674,10 @@ export function useMusicPlayer(): [MusicPlayerState, MusicPlayerActions] {
       })
     );
 
+    // The new file is open and audible — whatever the loading beacon was
+    // waiting on is over (also fires on gapless native advances; harmless).
+    unlisteners.push(listen("music-file-loaded", () => clearLoading()));
+
     unlisteners.push(
       listen<{ reason: number }>("music-end-file", (event) => {
         if (event.payload.reason !== 0 || !activeRef.current) return;
@@ -647,7 +702,7 @@ export function useMusicPlayer(): [MusicPlayerState, MusicPlayerActions] {
     return () => {
       unlisteners.forEach((p) => p.then((fn) => fn()));
     };
-  }, [setPosition, applyTargetState, persistSession]);
+  }, [setPosition, applyTargetState, persistSession, clearLoading]);
 
   // ── F5 rehydration ─────────────────────────────────────────────────────────
   // mpv is native and keeps playing across a webview refresh; restore the bar
@@ -810,8 +865,13 @@ export function useMusicPlayer(): [MusicPlayerState, MusicPlayerActions] {
     const unlisten = listen<{ libraryId: string; state: string }>("scan-state", (event) => {
       if (event.payload.state === "finished") void revalidateQueueRef.current();
     });
+    // A cover add/set/delete re-resolves the queue too, so the next track
+    // (and the bar, for the one playing) picks up the new art immediately.
+    const onCovers = () => void revalidateQueueRef.current();
+    window.addEventListener("waverunner:covers-changed", onCovers);
     return () => {
       unlisten.then((fn) => fn());
+      window.removeEventListener("waverunner:covers-changed", onCovers);
     };
   }, []);
 

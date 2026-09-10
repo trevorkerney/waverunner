@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Play, Music2, Pencil, Scissors, LayoutGrid, List, ArrowUpDown, Disc3, ListPlus, ListStart, ListEnd, VenetianMask } from "lucide-react";
+import { Play, Music2, Pencil, Scissors, LayoutGrid, List, ArrowUpDown, Disc3, ListPlus, ListStart, ListEnd, VenetianMask, HardDriveDownload } from "lucide-react";
 import { CoversDialog, CoversMenuItem } from "../CoversDialog";
 import {
   DropdownMenu,
@@ -22,6 +22,8 @@ import { PlayingIndicator } from "./PlayingIndicator";
 import { LoveButton, LoveMenuItem } from "./LoveButton";
 import { RevealMenuItem } from "./RevealMenuItem";
 import { useMbHidden } from "@/lib/mbVisibility";
+import { useTagWriting } from "@/lib/tagWriting";
+import { TagWriteDialog, TagWriteScope } from "./TagWriteDialog";
 import type { LoveLevel } from "../../types";
 import { CodecBadge } from "./CodecBadge";
 import { MusicArtistDetail, MusicAlbumCard, MusicAlbumDetail, MusicQueueItem, MusicTrack } from "../../types";
@@ -83,6 +85,9 @@ export function ArtistDetailPage({
   const [detail, setDetail] = useState<MusicArtistDetail | null>(null);
   // Per-library "hide MusicBrainz outside the center" (center map toggle).
   const mbHidden = useMbHidden(libraryId);
+  // Per-library tag-writing opt-in: the Write-to-files actions exist only when on.
+  const tagWriting = useTagWriting(libraryId);
+  const [writeScope, setWriteScope] = useState<TagWriteScope | null>(null);
   const [loading, setLoading] = useState(true);
   const [editTrackId, setEditTrackId] = useState<number | null>(null);
   const [editArtistOpen, setEditArtistOpen] = useState(false);
@@ -574,6 +579,15 @@ export function ArtistDetailPage({
             >
               <VenetianMask size={16} />
             </button>
+            {tagWriting && (
+              <button
+                onClick={() => setWriteScope({ kind: "artist", id: detail.id })}
+                className="shrink-0 rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/title:opacity-100"
+                title="Write tags to this artist's files"
+              >
+                <HardDriveDownload size={16} />
+              </button>
+            )}
           </h1>
           <p className="mt-1 text-sm text-muted-foreground">
             {[
@@ -815,10 +829,15 @@ export function ArtistDetailPage({
               <Pencil size={14} />
               Edit metadata
             </ContextMenuItem>
-            {!mbHidden && (
-              <ContextMenuItem onClick={() => setMatchTrack(menuTrackRef.current?.id ?? null)}>
-                <Disc3 size={14} />
-                Match to MusicBrainz…
+            {tagWriting && (
+              <ContextMenuItem
+                onClick={() => {
+                  const m = menuTrackRef.current;
+                  if (m) setWriteScope({ kind: "track", id: m.id });
+                }}
+              >
+                <HardDriveDownload size={14} />
+                Write tags to file…
               </ContextMenuItem>
             )}
             <LoveMenuItem
@@ -934,6 +953,12 @@ export function ArtistDetailPage({
                       <Pencil size={14} />
                       Edit metadata
                     </ContextMenuItem>
+                    {tagWriting && (
+                      <ContextMenuItem onClick={() => setWriteScope({ kind: "track", id: t.id })}>
+                        <HardDriveDownload size={14} />
+                        Write tags to file…
+                      </ContextMenuItem>
+                    )}
                     {!mbHidden && (
                       <ContextMenuItem onClick={() => setMatchTrack(t.id)}>
                         <Disc3 size={14} />
@@ -1062,10 +1087,17 @@ export function ArtistDetailPage({
                   <Pencil size={14} />
                   Edit metadata
                 </ContextMenuItem>
-                <ContextMenuItem onClick={() => setMatchTrack(menuTrackRef.current?.id ?? null)}>
-                  <Disc3 size={14} />
-                  Match to MusicBrainz…
-                </ContextMenuItem>
+                {tagWriting && (
+                  <ContextMenuItem
+                    onClick={() => {
+                      const m = menuTrackRef.current;
+                      if (m) setWriteScope({ kind: "track", id: m.id });
+                    }}
+                  >
+                    <HardDriveDownload size={14} />
+                    Write tags to file…
+                  </ContextMenuItem>
+                )}
                 <LoveMenuItem
                   resolve={() =>
                     menuTrackRef.current
@@ -1102,6 +1134,13 @@ export function ArtistDetailPage({
         open={editArtistOpen}
         onOpenChange={setEditArtistOpen}
         onSaved={handleSaved}
+      />
+      <TagWriteDialog
+        scope={writeScope}
+        onOpenChange={(o) => {
+          if (!o) setWriteScope(null);
+        }}
+        onDone={handleSaved}
       />
       <SplitArtistDialog
         artistId={splitArtistOpen ? entryId : null}

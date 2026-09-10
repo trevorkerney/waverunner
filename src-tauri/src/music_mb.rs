@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -255,6 +255,10 @@ pub fn spawn_enrich(app: AppHandle, library_id: String) {
                 );
             }
         }
+        // Albums the pass just matched free their artists' cached
+        // discographies.
+        let pool = app.state::<AppState>().app_db.clone();
+        let _ = evict_artist_group_caches(&pool).await;
     });
 }
 
@@ -429,6 +433,11 @@ async fn enrich(app: &AppHandle, library_id: &str) -> Result<EnrichOutcome, Stri
     let client = mb_client()?;
 
     let (albums_matched, albums_processed) = enrich_albums(app, &pool, &client, library_id).await?;
+    // Pins made before title adoption existed: re-apply their per-track
+    // data once — self-emptying like the date backfill. Runs BEFORE the
+    // artist phases so the credits it writes are walked for ids in this
+    // same pass, not the next one.
+    backfill_pin_tracks(app, &pool, &client, library_id).await?;
     crate::music::ensure_credit_artists(&pool, library_id).await?;
     let (artists_updated, fetch_failed) =
         enrich_artist_mbids(app, &pool, &client, library_id).await?;
@@ -1021,7 +1030,9 @@ pub async fn mb_set_ignored(
         &serde_json::json!({ "ignored": ignored }),
         batch,
     )
-    .await
+    .await?;
+    // Ignoring an album can leave its artists with nothing left to match.
+    evict_artist_group_caches(pool).await
 }
 
 /// Declare (or undeclare) an album deliberately partial. A human decision, so
@@ -1591,8 +1602,48 @@ pub async fn mb_group_release_art(
     Ok(out)
 }
 
-/// One MB track's credit list: (disc, position, title, [(credited name, artist mbid)]).
-type MbTrack = (i64, i64, String, Vec<(String, Option<String>)>);
+/// One track of a MusicBrainz release, as the pairing and the applies use it.
+#[derive(Clone, Debug)]
+struct MbTrack {
+    disc: i64,
+    position: i64,
+    title: String,
+    /// [(credited name, artist mbid)]
+    credits: Vec<(String, Option<String>)>,
+    /// MB's length, when it has one — a pairing WITNESS only. Never shown:
+    /// the file's own runtime is the duration (user rule — what's inherent
+    /// to the audio is always right; an external length a few seconds off
+    /// would only look wrong).
+    length_ms: Option<i64>,
+}
+
+/// The length witness, two bounds:
+///  - AGREES within five seconds. Honest rips sit a constant 2–3s off MB
+///    per album (pregaps, trailing silence, disc-ID lengths), so a tighter
+///    window flagged whole albums whose titles matched exactly.
+///  - VETOES past fifteen seconds: even a matching title doesn't pair then
+///    (a radio edit at the album cut's slot), and the track lands on the
+///    differ page for a person to Accept.
+/// Between the two, the title decides alone. With the title also off the
+/// differ page calls it "probably a different song" only when the lengths
+/// don't agree — nothing to accept there.
+const LENGTH_WINDOW_MS: i64 = 5000;
+const LENGTH_VETO_MS: i64 = 15000;
+
+fn length_delta_ms(runtime_secs: Option<i64>, length_ms: Option<i64>) -> Option<i64> {
+    match (runtime_secs, length_ms) {
+        (Some(r), Some(l)) => Some((r * 1000 - l).abs()),
+        _ => None, // no witness available — the title decides alone
+    }
+}
+
+fn length_agrees(runtime_secs: Option<i64>, length_ms: Option<i64>) -> bool {
+    length_delta_ms(runtime_secs, length_ms).is_none_or(|d| d <= LENGTH_WINDOW_MS)
+}
+
+fn length_vetoes(runtime_secs: Option<i64>, length_ms: Option<i64>) -> bool {
+    length_delta_ms(runtime_secs, length_ms).is_some_and(|d| d > LENGTH_VETO_MS)
+}
 
 #[derive(Clone)]
 struct MbReleaseFull {
@@ -1661,7 +1712,11 @@ async fn fetch_release_uncached(
                 })
                 .collect();
             if !credits.is_empty() {
-                tracks.push(((mi + 1) as i64, position, title, credits));
+                let length_ms = track["length"]
+                    .as_i64()
+                    .or_else(|| track["recording"]["length"].as_i64())
+                    .filter(|l| *l > 0);
+                tracks.push(MbTrack { disc: (mi + 1) as i64, position, title, credits, length_ms });
             }
         }
     }
@@ -1736,7 +1791,7 @@ fn mb_album_type(rg: &serde_json::Value) -> Option<String> {
 // So: groups are matched automatically when the answer is unambiguous, and a
 // release is only ever adopted when the FILES name one.
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GroupCandidate {
     pub group_id: String,
     pub title: String,
@@ -2524,31 +2579,14 @@ async fn apply_release(
         // logging it as one would make undo restore an empty pin as real.
         .filter(|v| !v.is_empty());
 
-    // Credits: replace our parsed guesses on this release's tracks.
-    if !suppressed(pool, "track_credits", album_id).await? {
-        let changes = apply_release_credits(pool, album_id, folder, &full.tracks).await?;
-        if !changes.is_empty() {
-            let before: HashMap<String, Vec<String>> = changes
-                .iter()
-                .map(|(id, b, _)| (id.to_string(), b.clone()))
-                .collect();
-            let after: HashMap<String, Vec<String>> = changes
-                .iter()
-                .map(|(id, _, a)| (id.to_string(), a.clone()))
-                .collect();
-            log_change(
-                pool,
-                library_id,
-                "track_credits",
-                album_id,
-                &format!("{album_title} — credits on {} tracks", changes.len()),
-                &serde_json::json!(before),
-                &serde_json::json!(after),
-                batch,
-            )
-            .await?;
-        }
-    }
+    // Per-track data on this release's tracks: credits replace our parsed
+    // guesses, titles adopt MusicBrainz's spelling — each its own history
+    // row and its own suppression.
+    let credits_ok = !suppressed(pool, "track_credits", album_id).await?;
+    let titles_ok = !suppressed(pool, "track_titles", album_id).await?;
+    let track_changes =
+        apply_release_credits(pool, album_id, folder, &full.tracks, credits_ok, titles_ok, None, false).await?;
+    log_track_changes(pool, library_id, album_id, album_title, &track_changes, batch).await?;
 
     // Joint albums: MB's release-level artist credit names every owner —
     // written as album_artist_credit rows so the album lands in each of their
@@ -2637,7 +2675,7 @@ async fn apply_release(
         for (name, id) in full
             .album_artists
             .iter()
-            .chain(full.tracks.iter().flat_map(|(_, _, _, credits)| credits.iter()))
+            .chain(full.tracks.iter().flat_map(|t| t.credits.iter()))
         {
             if id.is_some() && seen.insert(name.as_str()) {
                 credit_pairs.push((name.clone(), id.clone()));
@@ -2751,14 +2789,101 @@ async fn apply_release(
 /// matching tracks by (disc, position) and a loose title check. Returns the
 /// per-track (id, before, after) changes for the log. MB-provided artist ids
 /// seed the artist-lookup cache so the MBID pass skips them.
+/// Per-track outcome of applying a release, for the log: credit swaps and
+/// title adoptions, each as (track id, before, after).
+#[derive(Default)]
+struct ReleaseTrackChanges {
+    credits: Vec<(i64, Vec<String>, Vec<String>)>,
+    titles: Vec<(i64, String, String)>,
+}
+
+/// Log a release application's per-track changes: one history row per
+/// kind, keyed by track id so undo can walk them back one by one.
+async fn log_track_changes(
+    pool: &SqlitePool,
+    library_id: &str,
+    album_id: i64,
+    album_title: &str,
+    changes: &ReleaseTrackChanges,
+    batch: i64,
+) -> Result<(), String> {
+    if !changes.credits.is_empty() {
+        let before: HashMap<String, Vec<String>> = changes
+            .credits
+            .iter()
+            .map(|(id, b, _)| (id.to_string(), b.clone()))
+            .collect();
+        let after: HashMap<String, Vec<String>> = changes
+            .credits
+            .iter()
+            .map(|(id, _, a)| (id.to_string(), a.clone()))
+            .collect();
+        log_change(
+            pool,
+            library_id,
+            "track_credits",
+            album_id,
+            &format!("{album_title} — credits on {} tracks", changes.credits.len()),
+            &serde_json::json!(before),
+            &serde_json::json!(after),
+            batch,
+        )
+        .await?;
+    }
+    if !changes.titles.is_empty() {
+        let before: HashMap<String, String> = changes
+            .titles
+            .iter()
+            .map(|(id, b, _)| (id.to_string(), b.clone()))
+            .collect();
+        let after: HashMap<String, String> = changes
+            .titles
+            .iter()
+            .map(|(id, _, a)| (id.to_string(), a.clone()))
+            .collect();
+        log_change(
+            pool,
+            library_id,
+            "track_titles",
+            album_id,
+            &format!("{album_title} — titles on {} tracks", changes.titles.len()),
+            &serde_json::json!(before),
+            &serde_json::json!(after),
+            batch,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Apply the release's per-track data to the album's tracks in this folder,
+/// matching tracks by (disc, position) and a loose title check. A paired
+/// track's MB tier gets the release's title, position and disc (stored even
+/// under a user edit — the reset's fallback and the Sources view), and its
+/// credits. Columns follow unless a user edit outranks: credits replaced,
+/// the title adopted as MusicBrainz spells it. The `_ok` flags are the
+/// callers' suppression checks (an undone application): a suppressed kind
+/// is neither applied nor stored, or the reapply hook would resurrect it.
+/// MB-provided artist ids seed the artist-lookup cache so the MBID pass
+/// skips them.
+///
+/// Pairing takes two witnesses: the loose title check AND the file's runtime
+/// within the length window of MB's length (when MB has one). Either one
+/// failing keeps MB's data off the track and lands it on the differ page.
+/// `only_track` + `force` is that page's Accept: a person confirmed the
+/// track at this slot IS MB's, so the witnesses are skipped for that one.
 async fn apply_release_credits(
     pool: &SqlitePool,
     album_id: i64,
     folder: &str,
     mb_tracks: &[MbTrack],
-) -> Result<Vec<(i64, Vec<String>, Vec<String>)>, String> {
-    let ours: Vec<(i64, String, Option<i64>, Option<i64>)> = sqlx::query_as(
-        "SELECT t.id, t.title, t.disc_number, t.track_number
+    credits_ok: bool,
+    titles_ok: bool,
+    only_track: Option<i64>,
+    force: bool,
+) -> Result<ReleaseTrackChanges, String> {
+    let ours: Vec<(i64, String, Option<i64>, Option<i64>, Option<i64>)> = sqlx::query_as(
+        "SELECT t.id, t.title, t.disc_number, t.track_number, t.runtime
          FROM track t
          JOIN track_release tr ON tr.track_id = t.id
          JOIN album_release ar ON ar.id = tr.release_id
@@ -2770,17 +2895,45 @@ async fn apply_release_credits(
     .await
     .map_err(|e| e.to_string())?;
 
-    let mut changes = Vec::new();
-    for (track_id, our_title, disc, number) in ours {
+    let mut changes = ReleaseTrackChanges::default();
+    for (track_id, our_title, disc, number, runtime) in ours {
+        if only_track.is_some_and(|t| t != track_id) {
+            continue;
+        }
         let (disc, number) = (disc.unwrap_or(1), number.unwrap_or(0));
-        let Some((_, _, mb_title, credits)) = mb_tracks
-            .iter()
-            .find(|(d, p, _, _)| *d == disc && *p == number)
-        else {
+        let Some(mb) = mb_tracks.iter().find(|t| t.disc == disc && t.position == number) else {
             continue;
         };
-        if !raw_titles_match(&our_title, mb_title) {
-            continue; // positions collide but songs differ — keep tag credits
+        let (mb_disc, mb_pos, mb_title, credits) = (mb.disc, mb.position, &mb.title, &mb.credits);
+        if !force
+            && !(raw_titles_match(&our_title, mb_title) && !length_vetoes(runtime, mb.length_ms))
+        {
+            continue; // positions collide but the witnesses disagree — keep tag data
+        }
+        // The track's own MB tier: what the release calls this track and
+        // where it sits. Position and disc equal ours by construction of the
+        // pairing; stored so the tier is complete (Sources, Clear overrides).
+        if titles_ok {
+            set_mb_id(pool, track_id, "title", mb_title, TIER_MB).await?;
+            set_mb_id(pool, track_id, "track_number", &mb_pos.to_string(), TIER_MB).await?;
+            set_mb_id(pool, track_id, "disc_number", &mb_disc.to_string(), TIER_MB).await?;
+            // The title column follows MB's spelling — the user's own edit
+            // outranks (stored above, not applied).
+            if *mb_title != our_title
+                && !crate::music_edit::has_override(pool, track_id, "title").await?
+            {
+                sqlx::query("UPDATE track SET title = ?, sort_title = ? WHERE id = ?")
+                    .bind(mb_title)
+                    .bind(crate::commands::generate_sort_title(mb_title, "en"))
+                    .bind(track_id)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                changes.titles.push((track_id, our_title.clone(), mb_title.clone()));
+            }
+        }
+        if !credits_ok {
+            continue;
         }
         let after: Vec<String> = credits.iter().map(|(n, _)| n.clone()).collect();
         // MB tier: what the release says, stored even when a user edit
@@ -2823,7 +2976,7 @@ async fn apply_release_credits(
                     .await
                     .map_err(|e| e.to_string())?;
             }
-            changes.push((track_id, before, after));
+            changes.credits.push((track_id, before, after));
         }
         for (name, mbid) in credits {
             if let Some(mbid) = mbid {
@@ -2864,8 +3017,8 @@ async fn record_match_gaps(
     folder: &str,
     mb_tracks: &[MbTrack],
 ) -> Result<MbGapCounts, String> {
-    let ours: Vec<(String, Option<i64>, Option<i64>)> = sqlx::query_as(
-        "SELECT t.title, t.disc_number, t.track_number
+    let ours: Vec<(String, Option<i64>, Option<i64>, Option<i64>)> = sqlx::query_as(
+        "SELECT t.title, t.disc_number, t.track_number, t.runtime
          FROM track t
          JOIN track_release tr ON tr.track_id = t.id
          JOIN album_release ar ON ar.id = tr.release_id
@@ -2877,26 +3030,39 @@ async fn record_match_gaps(
     .await
     .map_err(|e| e.to_string())?;
 
-    // (side, disc, position, title, counterpart)
-    let mut gaps: Vec<(&str, i64, i64, String, Option<String>)> = Vec::new();
+    // (side, disc, position, title, counterpart, length_off)
+    let mut gaps: Vec<(&str, i64, i64, String, Option<String>, bool)> = Vec::new();
     let mut our_slots: Vec<(i64, i64)> = Vec::new();
-    for (our_title, disc, number) in &ours {
+    for (our_title, disc, number, runtime) in &ours {
         let (disc, number) = (disc.unwrap_or(1), number.unwrap_or(0));
         our_slots.push((disc, number));
-        match mb_tracks.iter().find(|(d, p, _, _)| *d == disc && *p == number) {
-            None => gaps.push(("ours", disc, number, our_title.clone(), None)),
-            Some((_, _, mb_title, _)) => {
-                if !raw_titles_match(our_title, mb_title) {
-                    gaps.push(("ours", disc, number, our_title.clone(), Some(mb_title.clone())));
+        match mb_tracks.iter().find(|t| t.disc == disc && t.position == number) {
+            None => gaps.push(("ours", disc, number, our_title.clone(), None, false)),
+            Some(mb) => {
+                // A shared slot is a gap when the titles disagree, or when
+                // the lengths are so far apart the title can't carry it
+                // (see LENGTH_VETO_MS). length_off reports the tighter
+                // window: title off + length off = probably a different song.
+                let titles_ok = raw_titles_match(our_title, &mb.title);
+                let length_ok = length_agrees(*runtime, mb.length_ms);
+                if !titles_ok || length_vetoes(*runtime, mb.length_ms) {
+                    gaps.push((
+                        "ours",
+                        disc,
+                        number,
+                        our_title.clone(),
+                        Some(mb.title.clone()),
+                        !length_ok,
+                    ));
                 }
             }
         }
     }
     // MB tracks at slots we have nothing for. A differing title at a shared
     // slot is already reported once from our side — don't double-count it.
-    for (disc, pos, mb_title, _) in mb_tracks {
-        if !our_slots.contains(&(*disc, *pos)) {
-            gaps.push(("mb", *disc, *pos, mb_title.clone(), None));
+    for mb in mb_tracks {
+        if !our_slots.contains(&(mb.disc, mb.position)) {
+            gaps.push(("mb", mb.disc, mb.position, mb.title.clone(), None, false));
         }
     }
 
@@ -2906,10 +3072,11 @@ async fn record_match_gaps(
         .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
-    for (side, disc, position, title, counterpart) in &gaps {
+    for (side, disc, position, title, counterpart, length_off) in &gaps {
         sqlx::query(
             "INSERT OR REPLACE INTO album_match_gap
-             (album_id, folder_path, side, disc, position, title, counterpart) VALUES (?, ?, ?, ?, ?, ?, ?)",
+             (album_id, folder_path, side, disc, position, title, counterpart, length_off)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(album_id)
         .bind(folder)
@@ -2918,6 +3085,7 @@ async fn record_match_gaps(
         .bind(position)
         .bind(title)
         .bind(counterpart)
+        .bind(*length_off as i64)
         .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
@@ -3118,7 +3286,7 @@ async fn enrich_artist_mbids(
                                 std::collections::HashSet::new();
                             let mut pairs = Vec::new();
                             for (name, id) in full.album_artists.iter().chain(
-                                full.tracks.iter().flat_map(|(_, _, _, c)| c.iter()),
+                                full.tracks.iter().flat_map(|t| t.credits.iter()),
                             ) {
                                 if id.is_some() && seen.insert(name.clone()) {
                                     pairs.push((name.clone(), id.clone()));
@@ -3380,7 +3548,7 @@ async fn harvest_group_credits(
             for (cname, cid) in full
                 .album_artists
                 .iter()
-                .chain(full.tracks.iter().flat_map(|(_, _, _, c)| c.iter()))
+                .chain(full.tracks.iter().flat_map(|t| t.credits.iter()))
             {
                 let Some(cid) = cid else { continue };
                 if is_placeholder_artist(cid) {
@@ -3543,16 +3711,31 @@ async fn backfill_group_dates(
     client: &reqwest::Client,
     library_id: &str,
 ) -> Result<(), String> {
+    // Pre-tier matches: a group id but no MB-tier TITLE or no MB-tier DATE.
+    // Both tests are tier-scoped — every album now carries a TAG-tier
+    // release_date row, which the old untiered test mistook for "already
+    // backfilled" and skipped the whole library. A standing suppression
+    // (an undone adoption) excludes that field from the selection, since the
+    // adoption below would refuse it and the album would be refetched on
+    // every pass.
     let rows: Vec<(i64, String, String)> = sqlx::query_as(
         "SELECT DISTINCT al.id, al.title, f.value FROM album al
          JOIN media_entry me ON me.id = al.id
          JOIN field_override f ON f.entity_id = al.id
               AND f.field = 'mb_release_group_id' AND f.value IS NOT NULL AND f.value <> ''
+              AND f.tier IN ('user', 'mb')
          WHERE me.library_id = ?
-           AND NOT EXISTS (SELECT 1 FROM field_override d
-                           WHERE d.entity_id = al.id AND d.field = 'release_date')
-           AND NOT EXISTS (SELECT 1 FROM mb_suppression s
-                           WHERE s.kind = 'album_year' AND s.target_id = al.id)",
+           AND (
+             (NOT EXISTS (SELECT 1 FROM field_override t
+                          WHERE t.entity_id = al.id AND t.field = 'title' AND t.tier = 'mb')
+              AND NOT EXISTS (SELECT 1 FROM mb_suppression s
+                              WHERE s.kind = 'album_title' AND s.target_id = al.id))
+             OR
+             (NOT EXISTS (SELECT 1 FROM field_override d
+                          WHERE d.entity_id = al.id AND d.field = 'release_date' AND d.tier = 'mb')
+              AND NOT EXISTS (SELECT 1 FROM mb_suppression s
+                              WHERE s.kind = 'album_year' AND s.target_id = al.id))
+           )",
     )
     .bind(library_id)
     .fetch_all(pool)
@@ -3577,27 +3760,123 @@ async fn backfill_group_dates(
                 continue;
             }
         };
-        // Matches made before the MB tier existed get their group title and
-        // type stored here, so Clear overrides has a fallback without a
-        // re-match (the group is fetched for the date anyway).
-        if let Some(g) = &group {
-            if !g.title.is_empty() && !suppressed(pool, "album_title", album_id).await? {
-                set_mb_id(pool, album_id, "title", &g.title, TIER_MB).await?;
+        let has_mb_date: bool = sqlx::query_as::<_, (i64,)>(
+            "SELECT EXISTS(SELECT 1 FROM field_override
+                           WHERE entity_id = ? AND field = 'release_date' AND tier = 'mb')",
+        )
+        .bind(album_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| e.to_string())?
+        .0 != 0;
+        let Some(g) = group else {
+            // Group gone from MusicBrainz: empty markers stop the refetching;
+            // the resolver treats an empty MB value as "has none".
+            set_mb_id(pool, album_id, "title", "", TIER_MB).await?;
+            if !has_mb_date {
+                set_mb_id(pool, album_id, "release_date", "", TIER_MB).await?;
             }
-            if let Some(t) = &g.album_type {
-                if !suppressed(pool, "album_type", album_id).await? {
-                    set_mb_id(pool, album_id, "album_type", t, TIER_MB).await?;
-                }
+            continue;
+        };
+        let batch = next_batch(pool).await?;
+        // Matches made before the MB tier existed: store the group's title
+        // and type, and adopt the title the way a fresh match does (the
+        // guards inside skip a user edit or a suppression) — the tag title
+        // a rescan put back is replaced right here, not at the next rescan.
+        adopt_group_title(pool, library_id, album_id, &title, &g.title, batch).await?;
+        if let Some(t) = &g.album_type {
+            if !suppressed(pool, "album_type", album_id).await? {
+                set_mb_id(pool, album_id, "album_type", t, TIER_MB).await?;
             }
         }
-        match group.and_then(|g| g.first_release_date) {
-            Some(date) => {
-                let batch = next_batch(pool).await?;
-                adopt_group_date(pool, library_id, album_id, &title, &date, batch).await?;
+        if !has_mb_date {
+            match &g.first_release_date {
+                Some(date) => adopt_group_date(pool, library_id, album_id, &title, date, batch).await?,
+                // Known dateless group: the empty marker stops refetching.
+                None => set_mb_id(pool, album_id, "release_date", "", TIER_MB).await?,
             }
-            // Known dateless group: the empty marker stops refetching.
-            None => set_mb_id(pool, album_id, "release_date", "", TIER_MB).await?,
         }
+        // Columns follow the tiers (type in particular has no adopt helper).
+        crate::music_edit::reapply_album_overrides(pool, album_id).await?;
+    }
+    Ok(())
+}
+
+/// Backfill: pinned releases whose tracks predate title adoption. A pin
+/// applies its per-track data ONCE, at pin time — nothing re-runs it on its
+/// own. A track paired to its pin carries an MB-tier title; one that
+/// doesn't, and isn't recorded as a gap at its slot, is a pin that ran under
+/// an older build. Re-fetch the release once and re-apply with a fresh pin's
+/// guards and history rows, then re-diff so the tracks that still can't
+/// pair get their gap rows and drop out of this selection. Empties itself
+/// after one pass (a dismissed warning re-qualifies its release — the same
+/// "it returns on the next check" the Ignore button promises).
+async fn backfill_pin_tracks(
+    app: &AppHandle,
+    pool: &SqlitePool,
+    client: &reqwest::Client,
+    library_id: &str,
+) -> Result<(), String> {
+    let rows: Vec<(i64, String, String, String)> = sqlx::query_as(
+        "SELECT DISTINCT rm.album_id, al.title, rm.folder_path, rm.mb_release_id
+         FROM release_match rm
+         JOIN album al ON al.id = rm.album_id
+         JOIN media_entry me ON me.id = al.id
+         WHERE me.library_id = ? AND rm.mb_release_id <> ''
+           AND NOT EXISTS (SELECT 1 FROM mb_suppression s
+                           WHERE s.kind = 'track_titles' AND s.target_id = rm.album_id)
+           AND EXISTS (SELECT 1 FROM track t
+                       JOIN track_release tr ON tr.track_id = t.id
+                       JOIN album_release ar ON ar.id = tr.release_id
+                       WHERE ar.album_id = rm.album_id AND ar.folder_path = rm.folder_path
+                         AND NOT EXISTS (SELECT 1 FROM field_override fo
+                                         WHERE fo.entity_id = t.id
+                                           AND fo.field = 'title' AND fo.tier = 'mb')
+                         AND NOT EXISTS (SELECT 1 FROM album_match_gap g
+                                         WHERE g.album_id = rm.album_id
+                                           AND g.folder_path = rm.folder_path
+                                           AND g.side = 'ours'
+                                           AND g.disc = COALESCE(t.disc_number, 1)
+                                           AND g.position = COALESCE(t.track_number, 0)))
+         ORDER BY al.sort_title COLLATE NOCASE",
+    )
+    .bind(library_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let total = rows.len();
+    for (i, (album_id, title, folder, mb_release_id)) in rows.into_iter().enumerate() {
+        if CANCEL.load(Ordering::SeqCst) {
+            break;
+        }
+        let _ = app.emit(
+            "music-enrich-progress",
+            serde_json::json!({ "libraryId": library_id, "phase": "titles", "done": i, "total": total, "name": title }),
+        );
+        // A staged album's tracks are about to be rewritten by the rescan
+        // that applies its directive — leave it for the pass after.
+        if crate::music_edit::is_staged_for_rescan(pool, album_id).await? {
+            continue;
+        }
+        let full = match fetch_release(client, &mb_release_id).await {
+            Ok(Some(f)) => f,
+            Ok(None) => continue,
+            Err(e) => {
+                eprintln!("pin track backfill '{title}': {e}");
+                continue;
+            }
+        };
+        let credits_ok = !suppressed(pool, "track_credits", album_id).await?;
+        let batch = next_batch(pool).await?;
+        let changes = apply_release_credits(
+            pool, album_id, &folder, &full.tracks, credits_ok, true, None, false,
+        )
+        .await?;
+        log_track_changes(pool, library_id, album_id, &title, &changes, batch).await?;
+        record_match_gaps(pool, album_id, &folder, &full.tracks).await?;
     }
     Ok(())
 }
@@ -4512,8 +4791,14 @@ pub struct MbGapRow {
     pub position: i64,
     pub title: String,
     /// MB's title at the same disc/track, when the slot exists on both sides
-    /// but the titles differ. None = the other side has nothing there.
+    /// but the pairing failed. None = the other side has nothing there.
     pub counterpart: Option<String>,
+    /// The diff's release folder — what Accept needs to name the slot.
+    pub folder_path: String,
+    /// Which witness failed at a shared slot. Both = probably a different
+    /// song (no Accept); either alone = a person can accept MB's track.
+    pub title_off: bool,
+    pub length_off: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -4524,6 +4809,8 @@ pub struct MbGapAlbum {
     /// Which release of the album this diff is for — the release's label,
     /// when the card holds more than one. None = single-release album.
     pub release_label: Option<String>,
+    /// The release row the diff is for — the album page opens onto it.
+    pub release_id: Option<i64>,
     pub rows: Vec<MbGapRow>,
 }
 
@@ -4840,12 +5127,17 @@ pub async fn mb_get_review(state: State<'_, AppState>, library_id: String) -> Re
         i64,
         String,
         Option<String>,
+        String,
+        i64,
+        Option<i64>,
         Option<String>,
     )> = sqlx::query_as(
             "SELECT al.id, al.title,
                     (SELECT ac.name FROM album_artist_credit ac
                      WHERE ac.album_id = al.id ORDER BY ac.position LIMIT 1),
-                    g.side, g.disc, g.position, g.title, g.counterpart,
+                    g.side, g.disc, g.position, g.title, g.counterpart, g.folder_path, g.length_off,
+                    (SELECT ar3.id FROM album_release ar3
+                     WHERE ar3.album_id = al.id AND ar3.folder_path = g.folder_path),
                     -- The diff's release label — shown when the card holds
                     -- several releases, each with its own comparison.
                     CASE WHEN (SELECT COUNT(*) FROM album_release ar2
@@ -4872,8 +5164,20 @@ pub async fn mb_get_review(state: State<'_, AppState>, library_id: String) -> Re
         .await
         .map_err(|e| e.to_string())?;
     let mut gaps: Vec<MbGapAlbum> = Vec::new();
-    for (album_id, title, artist_title, side, disc, position, gap_title, counterpart, release_label) in
-        gap_rows
+    for (
+        album_id,
+        title,
+        artist_title,
+        side,
+        disc,
+        position,
+        gap_title,
+        counterpart,
+        folder_path,
+        length_off,
+        release_id,
+        release_label,
+    ) in gap_rows
     {
         // One card per (album, release): a multi-version card can hold a
         // clean box set AND a mismatched remaster at once.
@@ -4885,15 +5189,23 @@ pub async fn mb_get_review(state: State<'_, AppState>, library_id: String) -> Re
                 title,
                 artist_title,
                 release_label,
+                release_id,
                 rows: Vec::new(),
             });
         }
+        let title_off = counterpart
+            .as_deref()
+            .map(|c| !raw_titles_match(&gap_title, c))
+            .unwrap_or(false);
         gaps.last_mut().unwrap().rows.push(MbGapRow {
             side,
             disc,
             position,
             title: gap_title,
             counterpart,
+            folder_path,
+            title_off,
+            length_off: length_off != 0,
         });
     }
 
@@ -4980,7 +5292,17 @@ pub async fn mb_recheck_album(
         return Err("this album isn't matched to a MusicBrainz release".to_string());
     }
     let client = mb_client()?;
+    let (library_id, album_title): (String, String) = sqlx::query_as(
+        "SELECT me.library_id, a.title FROM album a JOIN media_entry me ON me.id = a.id WHERE a.id = ?",
+    )
+    .bind(album_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let credits_ok = !suppressed(pool, "track_credits", album_id).await?;
+    let titles_ok = !suppressed(pool, "track_titles", album_id).await?;
     let mut totals = MbGapCounts { ours: 0, mb: 0 };
+    let mut recredited: Vec<i64> = Vec::new();
     for (folder, mb_release_id) in matches {
         let full = fetch_release(&client, &mb_release_id)
             .await?
@@ -4988,8 +5310,140 @@ pub async fn mb_recheck_album(
         let counts = record_match_gaps(pool, album_id, &folder, &full.tracks).await?;
         totals.ours += counts.ours;
         totals.mb += counts.mb;
+        // The pin's per-track data is applied again as well, with a fresh
+        // pin's guards and history rows — this is how a pin made before
+        // title adoption existed (or a track retitled to pair since) picks
+        // up MusicBrainz's titles and credits.
+        let batch = next_batch(pool).await?;
+        let changes = apply_release_credits(
+            pool, album_id, &folder, &full.tracks, credits_ok, titles_ok, None, false,
+        )
+        .await?;
+        log_track_changes(pool, &library_id, album_id, &album_title, &changes, batch).await?;
+        recredited.extend(changes.credits.iter().map(|(id, _, _)| *id));
+    }
+    // Rewritten credit rows carry no artist stamp until the resolver runs
+    // (pages for new names, then ids on every row) — without this they'd
+    // surface as "credits without an artist" for names that resolve fine.
+    crate::music::ensure_credit_artists(pool, &library_id).await?;
+    // New credits on a matched album are evidence the next pass can walk
+    // for artist ids — the same queue row a pin or a credit edit arms.
+    for track_id in recredited {
+        enqueue_track_credit_recheck(pool, &library_id, track_id).await?;
     }
     Ok(totals)
+}
+
+/// The differ page's Accept: a person confirmed that the track at this slot
+/// IS MusicBrainz's track there, even though the automatic check couldn't
+/// pair them (a title too different, or a length outside the window).
+/// Applies the pin's data for that one track — title, position, credits,
+/// with the usual guards and history rows — and clears its gap row.
+#[tauri::command]
+pub async fn mb_accept_track(
+    state: State<'_, AppState>,
+    album_id: i64,
+    folder_path: String,
+    disc: i64,
+    position: i64,
+) -> Result<(), String> {
+    accept_slots(&state.app_db, album_id, &folder_path, &[(disc, position)]).await
+}
+
+/// The card's "Accept all": every pairable slot on one release in a single
+/// go — one release fetch, one history batch, one resolver pass.
+#[tauri::command]
+pub async fn mb_accept_tracks(
+    state: State<'_, AppState>,
+    album_id: i64,
+    folder_path: String,
+    slots: Vec<(i64, i64)>,
+) -> Result<(), String> {
+    accept_slots(&state.app_db, album_id, &folder_path, &slots).await
+}
+
+async fn accept_slots(
+    pool: &SqlitePool,
+    album_id: i64,
+    folder_path: &str,
+    slots: &[(i64, i64)],
+) -> Result<(), String> {
+    if slots.is_empty() {
+        return Ok(());
+    }
+    crate::music_edit::ensure_not_staged(pool, album_id).await?;
+    let mb_release_id = release_match_of(pool, album_id, folder_path)
+        .await?
+        .map(|(v, _)| v)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| "this release isn't matched to a MusicBrainz release".to_string())?;
+    // Resolve every slot to its track first, so a stale slot fails the whole
+    // request before anything is written.
+    let mut track_ids = Vec::with_capacity(slots.len());
+    for &(disc, position) in slots {
+        let track_id: i64 = sqlx::query_as::<_, (i64,)>(
+            "SELECT t.id FROM track t
+             JOIN track_release tr ON tr.track_id = t.id
+             JOIN album_release ar ON ar.id = tr.release_id
+             WHERE ar.album_id = ? AND ar.folder_path = ?
+               AND COALESCE(t.disc_number, 1) = ? AND COALESCE(t.track_number, 0) = ?
+             LIMIT 1",
+        )
+        .bind(album_id)
+        .bind(folder_path)
+        .bind(disc)
+        .bind(position)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?
+        .map(|(id,)| id)
+        .ok_or_else(|| "no track at that position anymore — re-check the album".to_string())?;
+        track_ids.push(track_id);
+    }
+    let client = mb_client()?;
+    let full = fetch_release(&client, &mb_release_id)
+        .await?
+        .ok_or_else(|| "release has no usable track data".to_string())?;
+    let (library_id, album_title): (String, String) = sqlx::query_as(
+        "SELECT me.library_id, a.title FROM album a JOIN media_entry me ON me.id = a.id WHERE a.id = ?",
+    )
+    .bind(album_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let credits_ok = !suppressed(pool, "track_credits", album_id).await?;
+    let titles_ok = !suppressed(pool, "track_titles", album_id).await?;
+    let batch = next_batch(pool).await?;
+    let mut recredited = Vec::new();
+    for (&(disc, position), &track_id) in slots.iter().zip(&track_ids) {
+        let changes = apply_release_credits(
+            pool, album_id, folder_path, &full.tracks, credits_ok, titles_ok, Some(track_id), true,
+        )
+        .await?;
+        log_track_changes(pool, &library_id, album_id, &album_title, &changes, batch).await?;
+        if !changes.credits.is_empty() {
+            recredited.push(track_id);
+        }
+        sqlx::query(
+            "DELETE FROM album_match_gap
+             WHERE album_id = ? AND folder_path = ? AND side = 'ours' AND disc = ? AND position = ?",
+        )
+        .bind(album_id)
+        .bind(folder_path)
+        .bind(disc)
+        .bind(position)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    // Stamp the rewritten credit rows (see mb_recheck_album), then queue the
+    // tracks for the next pass when credits changed: the pin is evidence a
+    // pass can prove the newly credited artists from.
+    crate::music::ensure_credit_artists(pool, &library_id).await?;
+    for track_id in recredited {
+        enqueue_track_credit_recheck(pool, &library_id, track_id).await?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -4997,10 +5451,18 @@ pub async fn mb_recheck_album(
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Serialize)]
+pub struct CreditedArtist {
+    pub name: String,
+    pub mbid: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct MbStatus {
     /// "album" | "artist" | "track"
     pub kind: String,
     pub entity_id: i64,
+    /// The owning library — lets the dialog open the metadata center.
+    pub library_id: String,
     pub title: String,
     /// The owning artist / album, when there is one — disambiguates a search.
     pub context: Option<String>,
@@ -5008,6 +5470,12 @@ pub struct MbStatus {
     /// present the dialog browses that artist's release groups instead of
     /// text-searching all of MusicBrainz.
     pub context_mbid: Option<String>,
+    /// Albums only: every credited artist in credit order, with the MB id of
+    /// each that is identified. Two or more identified = the dialog offers a
+    /// chip per artist plus "All" (the union of their discographies) — a
+    /// joint album can be filed under either member, or under a joint MB
+    /// artist neither page lists.
+    pub credited_artists: Vec<CreditedArtist>,
     pub mbid: Option<String>,
     /// 'user' | 'mb' — who decided. None when unmatched.
     pub tier: Option<String>,
@@ -5137,11 +5605,16 @@ pub async fn mb_status(
     let partial = kind == "album" && mb_id(pool, entity_id, MB_PARTIAL).await?.is_some();
     let staged = crate::music_edit::is_staged_for_rescan(pool, entity_id).await?;
     let mut context_mbid: Option<String> = None;
+    let mut credited_artists: Vec<CreditedArtist> = Vec::new();
     let (title, context) = match kind.as_str() {
         "album" => {
+            // The credit as the ARTIST is named, not as the tag spelled it
+            // ("Various" merged into Various Artists shows the latter);
+            // the tag name only for a credit no artist row backs.
             let row: (String, Option<String>) = sqlx::query_as(
                 "SELECT al.title,
-                        (SELECT ac.name FROM album_artist_credit ac
+                        (SELECT COALESCE(ar.title, ac.name) FROM album_artist_credit ac
+                         LEFT JOIN artist ar ON ar.id = ac.artist_id
                          WHERE ac.album_id = al.id ORDER BY ac.position LIMIT 1)
                  FROM album al
                  WHERE al.id = ?",
@@ -5163,6 +5636,20 @@ pub async fn mb_status(
             .await
             .map_err(|e| e.to_string())?;
             context_mbid = ctx_mbid.map(|(m,)| m);
+            credited_artists = sqlx::query_as::<_, (String, Option<String>)>(
+                "SELECT COALESCE(ar.title, ac.name), NULLIF(ar.musicbrainz_id, '')
+                 FROM album_artist_credit ac
+                 LEFT JOIN artist ar ON ar.id = ac.artist_id
+                 WHERE ac.album_id = ?
+                 ORDER BY ac.position",
+            )
+            .bind(entity_id)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|(name, mbid)| CreditedArtist { name, mbid })
+            .collect();
             (row.0, row.1)
         }
         "artist" => {
@@ -5268,9 +5755,11 @@ pub async fn mb_status(
     Ok(MbStatus {
         kind,
         entity_id,
+        library_id: library_of(pool, entity_id).await?,
         title,
         context,
         context_mbid,
+        credited_artists,
         mbid,
         tier,
         release_group_id,
@@ -5959,6 +6448,23 @@ pub async fn mb_apply_entity_match(
             .await?;
         }
         "track" => {
+            // Only LOOSE tracks match on their own. An album's tracks match
+            // through its release pin, all together — a release in
+            // waverunner wants to line up with a release on MusicBrainz,
+            // not accumulate per-song exceptions (user rule, 2026-09-07).
+            let on_album: bool = sqlx::query_as::<_, (i64,)>(
+                "SELECT EXISTS(SELECT 1 FROM media_entry me
+                               WHERE me.id = ? AND me.parent_id IS NOT NULL
+                                 AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = me.parent_id))",
+            )
+            .bind(entity_id)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| e.to_string())?
+            .0 != 0;
+            if on_album {
+                return Err("Album tracks are matched through their album's release, not one at a time.".to_string());
+            }
             let (title,): (String,) = sqlx::query_as("SELECT title FROM track WHERE id = ?")
                 .bind(entity_id)
                 .fetch_one(pool)
@@ -6048,6 +6554,8 @@ pub async fn mb_apply_entity_match(
         "music-enrich-done",
         serde_json::json!({ "libraryId": library_id, "updated": 0, "albumsMatched": 0, "processed": 0, "pendingReview": 0 }),
     );
+    // A matched album may have been its artists' last unmatched one.
+    evict_artist_group_caches(pool).await?;
     Ok(())
 }
 
@@ -6341,7 +6849,9 @@ pub async fn mb_credit_check(
     state: State<'_, AppState>,
     mbid_kind: String,
     mbid: String,
-    artist_mbid: String,
+    // Every identified credited artist: a joint album is consistent when
+    // ANY of them is on MusicBrainz's credit.
+    artist_mbids: Vec<String>,
 ) -> Result<MbCreditCheck, String> {
     let client = mb_client()?;
     let (credited, ids): (Vec<String>, Vec<Option<String>>) = if mbid_kind == "release" {
@@ -6358,74 +6868,53 @@ pub async fn mb_credit_check(
             .ok_or_else(|| "no MusicBrainz release group with that id".to_string())?;
         (g.artists.clone(), g.artist_ids.clone())
     };
-    let mut includes = ids.iter().flatten().any(|i| i == &artist_mbid);
+    let mut includes = ids
+        .iter()
+        .flatten()
+        .any(|i| artist_mbids.iter().any(|m| m == i));
     // A credit to a linked PERSONA (or the persona's human) is the same
     // person wearing another mask — not a mismatch worth warning about.
     if !includes {
-        let linked: Vec<(Option<String>,)> = sqlx::query_as(
-            "SELECT a2.musicbrainz_id
-             FROM artist a JOIN artist_persona p
-               ON p.persona_id = a.id OR p.parent_id = a.id
-             JOIN artist a2 ON a2.id = CASE WHEN p.persona_id = a.id
-                                            THEN p.parent_id ELSE p.persona_id END
-             WHERE a.musicbrainz_id = ?",
-        )
-        .bind(&artist_mbid)
-        .fetch_all(&state.app_db)
-        .await
-        .map_err(|e| e.to_string())?;
-        includes = linked
-            .iter()
-            .filter_map(|(m,)| m.as_ref())
-            .any(|m| !m.is_empty() && ids.iter().flatten().any(|i| i == m));
+        for artist_mbid in &artist_mbids {
+            let linked: Vec<(Option<String>,)> = sqlx::query_as(
+                "SELECT a2.musicbrainz_id
+                 FROM artist a JOIN artist_persona p
+                   ON p.persona_id = a.id OR p.parent_id = a.id
+                 JOIN artist a2 ON a2.id = CASE WHEN p.persona_id = a.id
+                                                THEN p.parent_id ELSE p.persona_id END
+                 WHERE a.musicbrainz_id = ?",
+            )
+            .bind(artist_mbid)
+            .fetch_all(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+            if linked
+                .iter()
+                .filter_map(|(m,)| m.as_ref())
+                .any(|m| !m.is_empty() && ids.iter().flatten().any(|i| i == m))
+            {
+                includes = true;
+                break;
+            }
+        }
     }
     Ok(MbCreditCheck { credited, includes })
 }
 
-/// Every release group of one ARTIST, for the match dialog: an album whose
-/// credited artist is already matched doesn't search all of MusicBrainz by
-/// text — it browses the artist's own discography, where the album either is
-/// or isn't. Albums first, then EPs, singles, compilations; oldest first
-/// within each. Paged at MB's 100/request, capped at 500 groups.
-#[tauri::command]
-pub async fn mb_artist_release_groups(artist_mbid: String) -> Result<Vec<GroupCandidate>, String> {
-    let client = mb_client()?;
-    let mut out: Vec<GroupCandidate> = Vec::new();
-    let mut offset: usize = 0;
-    loop {
-        let offset_s = offset.to_string();
-        let url = url::Url::parse_with_params(
-            "https://musicbrainz.org/ws/2/release-group",
-            &[
-                ("artist", artist_mbid.as_str()),
-                ("inc", "artist-credits"),
-                ("fmt", "json"),
-                ("limit", "100"),
-                ("offset", offset_s.as_str()),
-            ],
-        )
-        .map_err(|e| e.to_string())?;
-        let resp = mb_get(&client, url).await?;
-        if !resp.status().is_success() {
-            return Err(format!("HTTP {}", resp.status()));
-        }
-        let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-        let total = body["release-group-count"].as_i64().unwrap_or(0) as usize;
-        let page: Vec<GroupCandidate> = body["release-groups"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|g| group_of(g, 100))
-            .collect();
-        if page.is_empty() {
-            break;
-        }
-        offset += page.len();
-        out.extend(page);
-        if offset >= total || offset >= 500 {
-            break;
-        }
-    }
+// ── Artist discography (match dialog) ──────────────────────────────────────
+// An album whose credited artist is already matched doesn't search all of
+// MusicBrainz by text — it browses the artist's own discography, where the
+// album either is or isn't. Served three ways, fastest first:
+//   1. `mb_artist_groups_cached` — the last complete fetch, instantly.
+//   2. `mb_artist_release_groups_page` — MB's 100/request pages, one call
+//      each, so a cold open renders page 1 while page 2 is in flight.
+//   3. The last page stores the whole sorted list back into the cache.
+// The dialog always refreshes on open (stale-while-revalidate) and never on
+// a schedule; `evict_artist_group_caches` drops an artist's row once no
+// unmatched album of theirs remains. Capped at 500 groups.
+
+/// Albums first, then EPs, singles, compilations; oldest first within each.
+fn sort_groups(out: &mut [GroupCandidate]) {
     out.sort_by(|a, b| {
         let rank = |t: &Option<String>| match t.as_deref() {
             Some("album") => 0,
@@ -6443,7 +6932,133 @@ pub async fn mb_artist_release_groups(artist_mbid: String) -> Result<Vec<GroupCa
                 (None, None) => std::cmp::Ordering::Equal,
             })
     });
-    Ok(out)
+}
+
+const GROUP_PAGE_LIMIT: usize = 100;
+const GROUP_CAP: usize = 500;
+
+/// Pages fetched so far per artist, until the last one lands and the whole
+/// list is written to the cache table.
+static GROUP_PAGE_BUFFER: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, Vec<GroupCandidate>>>,
+> = std::sync::OnceLock::new();
+
+#[derive(Serialize)]
+pub struct GroupsPage {
+    pub groups: Vec<GroupCandidate>,
+    pub total: usize,
+    /// No more pages (end of discography, or the cap).
+    pub done: bool,
+}
+
+/// The cached discography, if the dialog has browsed this artist before.
+#[tauri::command]
+pub async fn mb_artist_groups_cached(
+    state: State<'_, AppState>,
+    artist_mbid: String,
+) -> Result<Option<Vec<GroupCandidate>>, String> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT groups_json FROM mb_artist_groups_cache WHERE artist_mbid = ?")
+            .bind(&artist_mbid)
+            .fetch_optional(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+    Ok(row.and_then(|(json,)| serde_json::from_str(&json).ok()))
+}
+
+/// One page of an artist's release groups (offset 0 starts a fresh walk).
+#[tauri::command]
+pub async fn mb_artist_release_groups_page(
+    state: State<'_, AppState>,
+    artist_mbid: String,
+    offset: usize,
+) -> Result<GroupsPage, String> {
+    let client = mb_client()?;
+    let offset_s = offset.to_string();
+    let limit_s = GROUP_PAGE_LIMIT.to_string();
+    let url = url::Url::parse_with_params(
+        "https://musicbrainz.org/ws/2/release-group",
+        &[
+            ("artist", artist_mbid.as_str()),
+            ("inc", "artist-credits"),
+            ("fmt", "json"),
+            ("limit", limit_s.as_str()),
+            ("offset", offset_s.as_str()),
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    let resp = mb_get(&client, url).await?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let total = body["release-group-count"].as_i64().unwrap_or(0) as usize;
+    let page: Vec<GroupCandidate> = body["release-groups"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|g| group_of(g, 100))
+        .collect();
+    let next = offset + page.len();
+    let done = page.is_empty() || next >= total || next >= GROUP_CAP;
+
+    let buffer = GROUP_PAGE_BUFFER.get_or_init(|| std::sync::Mutex::new(Default::default()));
+    let complete: Option<Vec<GroupCandidate>> = {
+        let mut map = buffer.lock().map_err(|e| e.to_string())?;
+        let acc = map.entry(artist_mbid.clone()).or_default();
+        if offset == 0 {
+            acc.clear();
+        }
+        acc.extend(page.iter().cloned());
+        if done {
+            map.remove(&artist_mbid)
+        } else {
+            None
+        }
+    };
+    if let Some(mut all) = complete {
+        sort_groups(&mut all);
+        let json = serde_json::to_string(&all).map_err(|e| e.to_string())?;
+        sqlx::query(
+            "INSERT INTO mb_artist_groups_cache (artist_mbid, groups_json, fetched_at)
+             VALUES (?, ?, datetime('now'))
+             ON CONFLICT(artist_mbid) DO UPDATE SET
+               groups_json = excluded.groups_json, fetched_at = excluded.fetched_at",
+        )
+        .bind(&artist_mbid)
+        .bind(&json)
+        .execute(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(GroupsPage { groups: page, total, done })
+}
+
+/// Drop every cached discography whose artist has no unmatched album left:
+/// no album credited to them (in any library) that is still without a
+/// release group and not ignored. Runs after a pass, an apply, or an ignore
+/// — the moments an album stops being unmatched.
+pub(crate) async fn evict_artist_group_caches(pool: &SqlitePool) -> Result<(), String> {
+    sqlx::query(&format!(
+        "DELETE FROM mb_artist_groups_cache
+         WHERE artist_mbid NOT IN (
+           SELECT ar.musicbrainz_id
+           FROM album_artist_credit ac
+           JOIN artist ar ON ar.id = ac.artist_id
+           JOIN album al ON al.id = ac.album_id
+           WHERE ar.musicbrainz_id IS NOT NULL AND ar.musicbrainz_id <> ''
+             AND NOT EXISTS (SELECT 1 FROM field_override fo
+                             WHERE fo.entity_id = al.id AND fo.field = 'mb_release_group_id' AND fo.value <> '')
+             AND NOT EXISTS (SELECT 1 FROM field_override fo
+                             WHERE fo.entity_id = al.id AND fo.field = '{MB_IGNORED}')
+             AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = al.id)
+             AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = al.id)
+         )"
+    ))
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// The releases of one release group, for the match dialog's release picker:
@@ -6866,7 +7481,7 @@ pub async fn mb_apply_album_match(
         for (name, id) in full
             .album_artists
             .iter()
-            .chain(full.tracks.iter().flat_map(|(_, _, _, credits)| credits.iter()))
+            .chain(full.tracks.iter().flat_map(|t| t.credits.iter()))
         {
             if id.is_some() && seen.insert(name.clone()) {
                 credit_pairs.push((name.clone(), id.clone()));
@@ -7075,6 +7690,28 @@ pub async fn mb_undo_change(
                     .execute(pool)
                     .await
                     .map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        "track_titles" => {
+            if let Some(map) = before.as_object() {
+                for (track_id, title) in map {
+                    let Ok(track_id) = track_id.parse::<i64>() else { continue };
+                    // The retracted title leaves the MB tier too — reapply
+                    // would put it back after the next rescan otherwise.
+                    clear_mb_tier(pool, track_id, "title").await?;
+                    if crate::music_edit::has_override(pool, track_id, "title").await? {
+                        continue;
+                    }
+                    if let Some(t) = title.as_str() {
+                        sqlx::query("UPDATE track SET title = ?, sort_title = ? WHERE id = ?")
+                            .bind(t)
+                            .bind(crate::commands::generate_sort_title(t, "en"))
+                            .bind(track_id)
+                            .execute(pool)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                    }
                 }
             }
         }

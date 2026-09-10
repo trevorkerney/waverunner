@@ -2,6 +2,7 @@ mod content_hash;
 mod commands;
 mod db;
 mod discord_presence;
+mod img_protocol;
 pub mod interactive;
 mod interactive_session;
 mod watch;
@@ -12,6 +13,7 @@ mod music_art;
 mod music_edit;
 mod music_mb;
 mod music_player;
+mod music_tagwrite;
 mod player;
 mod rt;
 mod tmdb;
@@ -44,6 +46,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .register_asynchronous_uri_scheme_protocol(img_protocol::SCHEME, img_protocol::handle)
         .setup(|app| {
             let folder = if cfg!(debug_assertions) { "waverunner_dev" } else { "waverunner" };
             let app_data_dir = dirs::data_local_dir()
@@ -257,6 +260,8 @@ pub fn run() {
             music::get_album_detail,
             music::get_music_scan_issues,
             music_edit::get_tier_matrix,
+            music_tagwrite::get_tag_write_plan,
+            music_tagwrite::apply_tag_write,
             music::get_music_counts,
             music::get_recent_music_plays,
             music::get_music_tracks,
@@ -286,6 +291,8 @@ pub fn run() {
             music_edit::get_album_absorbed,
             music_edit::undo_album_combine,
             music_edit::split_album_release,
+            music_edit::separate_merged_folders,
+            music_edit::merge_album_release,
             music_art::music_fetch_artist_image,
             commands::set_library_setup_stage,
             commands::complete_library_setup,
@@ -296,7 +303,8 @@ pub fn run() {
             music_mb::mb_get_review,
             music_mb::mb_search_releases,
             music_mb::mb_group_releases,
-            music_mb::mb_artist_release_groups,
+            music_mb::mb_artist_groups_cached,
+            music_mb::mb_artist_release_groups_page,
             music_mb::mb_credit_check,
             music_mb::mb_release_group_of,
             music_edit::unstage_pending_change,
@@ -304,6 +312,8 @@ pub fn run() {
             music_mb::mb_undo_batch,
             music_mb::mb_recheck_album,
             music_mb::mb_dismiss_gaps,
+            music_mb::mb_accept_track,
+            music_mb::mb_accept_tracks,
             music_edit::search_artist_choices,
             music_edit::resolve_artist_choices,
             music_edit::search_credit_link_choices,

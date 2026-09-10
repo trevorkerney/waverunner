@@ -148,7 +148,9 @@ export type ViewSpec =
   | { kind: "loose-tracks";       libraryId: string; sounds: boolean }
   | { kind: "music-issues";       libraryId: string }
   /** Per-tier view: every album and loose track by artist × tags / MusicBrainz / edits. */
-  | { kind: "sources";            libraryId: string };
+  | { kind: "sources";            libraryId: string }
+  /** The metadata center as a page (music: MusicBrainz review; video: TMDB match report). */
+  | { kind: "metadata";           libraryId: string };
 
 // One node in the static complication tree shown for a library.
 export interface ComplicationNode {
@@ -273,6 +275,9 @@ export interface MusicRelease {
   /** Disc names on multi-disc sets ("Jupiter"): DISCSUBTITLE tags, overlaid
    *  by your renames. */
   disc_titles: { disc: number; title: string }[];
+  /** Folder leaves you merged into this release (applied — they're no longer
+   *  editions of their own). Non-empty = offer to separate them again. */
+  merged_folders: string[];
   tracks: MusicTrack[];
   /** The release's OWN title (its tracks' album tag) — null pre-rescan or
    *  untagged; fall back to the album title. */

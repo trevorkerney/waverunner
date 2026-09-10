@@ -381,8 +381,9 @@ export function PlaylistTrackList({
               <Pencil size={14} />
               Edit metadata
             </ContextMenuItem>
-            {!mbHidden && (
-              <ContextMenuItem onClick={() => menuEntry && setMatchTrack(menuEntry.id)}>
+            {/* Loose tracks only — album tracks match through their release pin. */}
+            {!mbHidden && menuEntry && infos?.get(menuEntry.id)?.album_id == null && (
+              <ContextMenuItem onClick={() => setMatchTrack(menuEntry.id)}>
                 <Disc3 size={14} />
                 Match to MusicBrainz…
               </ContextMenuItem>

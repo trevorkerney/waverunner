@@ -22,7 +22,7 @@ const CONTEXT_TAIL_LIMIT = 50;
 function Thumb({ item }: { item: MusicQueueItem }) {
   return item.cover ? (
     <img
-      src={convertFileSrc(item.cover)}
+      src={convertFileSrc(item.cover, "wrimg")}
       alt=""
       className="size-8 shrink-0 rounded-[2px] object-cover"
       draggable={false}
@@ -244,7 +244,7 @@ export function UpNextPanel({
               >
                 {p.cover ? (
                   <img
-                    src={convertFileSrc(p.cover)}
+                    src={convertFileSrc(p.cover, "wrimg")}
                     alt=""
                     className="size-8 shrink-0 rounded-[2px] object-cover"
                     draggable={false}

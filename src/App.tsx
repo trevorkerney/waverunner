@@ -9,8 +9,7 @@ import { PlayerView } from "@/components/PlayerView";
 import { usePlayer } from "@/hooks/usePlayer";
 import { useMusicPlayer, currentMusicItem } from "@/hooks/useMusicPlayer";
 import { NowPlayingBar } from "@/components/player/NowPlayingBar";
-import { MetadataCenterDialog } from "@/components/music/MetadataCenter";
-import { VideoMetadataCenterDialog } from "@/components/VideoMetadataCenter";
+import type { CenterFocus } from "@/components/music/MetadataCenter";
 import { Toaster } from "@/components/ui/sonner";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
@@ -178,26 +177,29 @@ function App() {
       un.then((fn) => fn());
     };
   }, []);
-  // Match-to-MusicBrainz review modal: opened from the sidebar context menu
-  // or automatically when an enrichment pass leaves items needing review.
-  const [mbReviewLibraryId, setMbReviewLibraryId] = useState<string | null>(null);
-  // Video metadata center (TMDB match review), same shape.
-  const [videoCenterLibraryId, setVideoCenterLibraryId] = useState<string | null>(null);
-  // Surfaces that can't reach this state (the pending-work strip) open the
-  // music metadata center through a window event, same pattern as open-rescan.
+  // The metadata center is a page (view kind "metadata"). Where it should
+  // land when opened from a surface pointing at one thing (an album's
+  // "N tracks unmatched" → its card on the differ pane).
+  const [mbReviewFocus, setMbReviewFocus] = useState<CenterFocus | null>(null);
+  // Surfaces that can't reach navigation (the pending-work strip, the match
+  // dialog, the sidebar badge) open the page through a window event, same
+  // pattern as open-rescan. selectView is defined further down — a ref
+  // bridges the gap without reordering the hooks.
+  const openMetadataRef = useRef<(libraryId: string) => void>(() => {});
   useEffect(() => {
     const onOpen = (e: Event) => {
-      const libraryId = (e as CustomEvent).detail?.libraryId as string | undefined;
-      if (libraryId) setMbReviewLibraryId(libraryId);
+      const detail = (e as CustomEvent).detail as
+        | { libraryId?: string; focus?: { pane: "gaps"; albumId: number } }
+        | undefined;
+      const libraryId = detail?.libraryId;
+      if (libraryId) {
+        setMbReviewFocus(detail?.focus ? { ...detail.focus, nonce: Date.now() } : null);
+        openMetadataRef.current(libraryId);
+      }
     };
     window.addEventListener("waverunner:open-music-center", onOpen);
-    // The match-only wizard is about to open (Sidebar handles the launch) —
-    // close the center so the modal isn't buried under it.
-    const onOpenMatch = () => setMbReviewLibraryId(null);
-    window.addEventListener("waverunner:open-match", onOpenMatch);
     return () => {
       window.removeEventListener("waverunner:open-music-center", onOpen);
-      window.removeEventListener("waverunner:open-match", onOpenMatch);
     };
   }, []);
 
@@ -392,14 +394,14 @@ function App() {
         if (!url) {
           try {
             const thumbPath = toThumbPath(cover);
-            const resp = await fetch(convertFileSrc(thumbPath));
+            const resp = await fetch(convertFileSrc(thumbPath, "wrimg"));
             if (!resp.ok) throw new Error();
             const blob = await resp.blob();
             url = URL.createObjectURL(blob);
           } catch {
             // Fallback: cache full-res as blob
             try {
-              const resp = await fetch(convertFileSrc(cover));
+              const resp = await fetch(convertFileSrc(cover, "wrimg"));
               const blob = await resp.blob();
               url = URL.createObjectURL(blob);
             } catch {
@@ -428,14 +430,14 @@ function App() {
 
   // Same idea for non-entry grids (people faces, playlist covers): fetch and
   // decode before the grid swaps in, so it appears fully formed.
-  const preloadImages = useCallback(async (paths: (string | null)[]) => {
+  const preloadImages = useCallback(async (paths: (string | null)[], scheme?: string) => {
     await Promise.all(
       paths
         .filter((p): p is string => !!p)
         .map(async (p) => {
           try {
             const img = new Image();
-            img.src = convertFileSrc(p);
+            img.src = convertFileSrc(p, scheme);
             await img.decode();
           } catch { /* paint will decode it instead */ }
         })
@@ -445,8 +447,11 @@ function App() {
   // For grid: returns cached thumbnail blob URL. Uncached (beyond the preload
   // cap) falls back to the on-disk thumbnail file — NOT the full-res cover —
   // so lazy-loaded tail entries stay cheap.
+  // The on-disk fallback goes through the async `wrimg` protocol: every grid
+  // tail lazy-loads through here, and `asset://` blocks the window's UI
+  // thread per request (see src-tauri/src/img_protocol.rs).
   const getCoverUrl = useCallback((filePath: string): string => {
-    return thumbCacheRef.current.get(filePath) || convertFileSrc(toThumbPath(filePath));
+    return thumbCacheRef.current.get(filePath) || convertFileSrc(toThumbPath(filePath), "wrimg");
   }, []);
 
   // For carousel: always full-res
@@ -720,18 +725,36 @@ function App() {
     // top-then-jump. Hide it until the first scroll write lands (typically
     // <50ms), with a cap so a slow-loading page shows content (and accepts
     // the jump) rather than sitting blank.
+    //
+    // The ref can point at DIFFERENT elements over the veil's lifetime: this
+    // runs before React commits (so it sees the page being left), and pages
+    // with different layouts (Sources/Home/Tracks vs grids) hand the ref to a
+    // different node — sometimes one React recycled from the old page, inline
+    // style and all. Unveiling only "whatever the ref points at now" therefore
+    // left the hidden flag stranded on the recycled node → a blank page until
+    // something remounted it. So: veil every element the ref lands on while
+    // veiled, remember each one, and unveil all of them.
     let veiled = false;
-    if (saved) {
-      scrollContainerRef.current.style.visibility = "hidden";
-      veiled = true;
-    }
+    const veiledEls = new Set<HTMLElement>();
+    const veil = () => {
+      if (!veiled) return;
+      const c = scrollContainerRef.current;
+      if (c && !veiledEls.has(c)) {
+        c.style.visibility = "hidden";
+        veiledEls.add(c);
+      }
+    };
     const unveil = () => {
       if (!veiled) return;
       veiled = false;
-      const c = scrollContainerRef.current;
-      if (c) c.style.visibility = "";
+      for (const el of veiledEls) el.style.visibility = "";
+      veiledEls.clear();
     };
-    if (saved) window.setTimeout(unveil, 250);
+    if (saved) {
+      veiled = true;
+      veil();
+      window.setTimeout(unveil, 250);
+    }
     // Two restore strategies, both patient about content that isn't there yet:
     //  - Anchored (grids): re-align the card that sat at the top of the
     //    viewport. content-visibility cards above it settle over a few frames
@@ -748,6 +771,9 @@ function App() {
       const c = scrollContainerRef.current;
       if (!c) return;
       if (!saved) { c.scrollTop = 0; return; }
+      // The landing page's container exists by now — hide THAT one too, so the
+      // frames before the first scroll write below don't flash at top.
+      veil();
       attempts++;
       if (saved.anchorId) {
         const el = c.querySelector<HTMLElement>(`[data-flip-id="${window.CSS.escape(saved.anchorId)}"]`);
@@ -847,7 +873,7 @@ function App() {
       // (HomePage / MusicIssuesPage / TracksPage) — just clear grid state.
       // Scroll restores like any grid (the restore waits out the self-fetch);
       // Home is libraryless and keys under a fixed "home" prefix.
-      if (view.kind === "home" || view.kind === "music-issues" || view.kind === "tracks" || view.kind === "loose-tracks" || view.kind === "sources") {
+      if (view.kind === "home" || view.kind === "music-issues" || view.kind === "tracks" || view.kind === "loose-tracks" || view.kind === "sources" || view.kind === "metadata") {
         setEntries([]);
         setPeople(null);
         setPlaylists(null);
@@ -896,7 +922,9 @@ function App() {
             .sort((a, b) => b.work_count - a.work_count)
             .slice(0, 100)
             .map((p) => p.image_path);
-          await preloadImages(topFaces);
+          // Same URL scheme the grid's cards use, so the decode-gate warms the
+          // cache entries they'll actually hit.
+          await preloadImages(topFaces, "wrimg");
           peopleCacheRef.current.set(key, res);
           if (stale()) return;
           setPeople(res);
@@ -1365,20 +1393,6 @@ function App() {
     };
   }, [openHome]);
 
-  // The metadata centers read (and write) the library they're showing —
-  // mid-scan that data is the same inconsistent state the grids get bounced
-  // off of, so they close too. Catches both directions: a rescan starting
-  // under an open center (split from the standalone center, backed-out
-  // wizard) and opening a center onto an already-scanning library.
-  useEffect(() => {
-    if (mbReviewLibraryId && scanningLibs.has(mbReviewLibraryId)) {
-      setMbReviewLibraryId(null);
-    }
-    if (videoCenterLibraryId && scanningLibs.has(videoCenterLibraryId)) {
-      setVideoCenterLibraryId(null);
-    }
-  }, [scanningLibs, mbReviewLibraryId, videoCenterLibraryId]);
-
   // Pending "Needs a decision" entries do NOT lock the library — the user
   // decided metadata questions are the metadata center's business, not a
   // toll booth on playback. The gate lives inside the center itself: while
@@ -1482,6 +1496,7 @@ function App() {
 
   const selectView = useCallback(
     (view: ViewSpec) => {
+      // (openMetadataRef, below, points here — see the open-music-center listener.)
       // Sidebar view switches intentionally discard scroll — they always land at the top.
       // Don't save outgoing scroll; pass restoreScroll=false so loadView resets to 0.
       // Also clear the forward stack so mouse-forward can't cross into a stale view's history.
@@ -1506,6 +1521,7 @@ function App() {
           : kind === "tracks" ? "Tracks"
           : kind === "music-issues" ? "Needs attention"
           : kind === "sources" ? "Sources"
+          : kind === "metadata" ? "Metadata"
           : "";
         return section ? `${libLabel} - ${section}` : libLabel;
       };
@@ -1545,6 +1561,9 @@ function App() {
     },
     [libraries, loadView]
   );
+  // The open-music-center listener (declared above selectView) navigates
+  // through this ref — assigned every render so it always sees the latest.
+  openMetadataRef.current = (libraryId) => selectView({ kind: "metadata", libraryId });
 
   // Drill into a person-detail view while preserving the current breadcrumb chain.
   // Called from PeopleGrid — click on a card anywhere (Actors, People-all, Composers etc.)
@@ -1878,7 +1897,7 @@ function App() {
         // at the library root so the detail page actually renders.
         if (
           activeView &&
-          ["people-list", "people-all", "genres", "playlists", "tracks", "loose-tracks", "music-issues", "sources"].includes(
+          ["people-list", "people-all", "genres", "playlists", "tracks", "loose-tracks", "music-issues", "sources", "metadata"].includes(
             activeView.kind,
           )
         ) {
@@ -1998,12 +2017,10 @@ function App() {
     [openMusicEntryFromBar]
   );
 
-  // Metadata center album links: close the center and land on the album
-  // page, switched onto the release that still needs picking when the row
-  // names one.
+  // Metadata page album links: land on the album page, switched onto the
+  // release that still needs picking when the row names one.
   const openMusicAlbumFromCenter = useCallback(
     (albumId: number, albumTitle: string, releaseId: number | null) => {
-      setMbReviewLibraryId(null);
       if (releaseId != null) {
         musicFocusNonceRef.current += 1;
         setMusicFocusRequest({ albumId, releaseId, nonce: musicFocusNonceRef.current });
@@ -3108,8 +3125,6 @@ function App() {
             }
           }}
           onPlaylistChanged={handlePlaylistChanged}
-          onOpenMusicBrainzReview={(libraryId) => setMbReviewLibraryId(libraryId)}
-          onOpenVideoMetadataCenter={(libraryId) => setVideoCenterLibraryId(libraryId)}
           sidebarPlaylists={sidebarPlaylists}
           sidebarCounts={sidebarCounts}
           sidebarGenres={sidebarGenres}
@@ -3236,6 +3251,21 @@ function App() {
             musicState.isActive ? currentMusicItem(musicState)?.trackId ?? null : null
           }
           musicPlaying={musicState.isActive && musicState.isPlaying}
+          metadataFocus={mbReviewFocus}
+          onOpenMusicAlbumFromMetadata={openMusicAlbumFromCenter}
+          onMetadataChanged={(libraryId) => {
+            // A match/undo landed on the page — same recipe as a rescan:
+            // drop caches, silently refresh the grid, and let self-fetching
+            // pages (Tracks, open album/artist details) refetch off the
+            // event. Video libraries just drop caches.
+            invalidateCache(libraryId);
+            const lib = libraries.find((l) => l.id === libraryId);
+            if (lib?.format !== "music") return;
+            refreshGridInPlace();
+            window.dispatchEvent(new Event("waverunner:library-rescanned"));
+            refreshMusicCountsFor(libraryId);
+            refreshGenresFor(libraryId);
+          }}
         />
       </div>
       {/* Persistent music bar — spans under sidebar + content, survives every
@@ -3292,35 +3322,6 @@ function App() {
           )}
         </DialogContent>
       </Dialog>
-      <MetadataCenterDialog
-        libraryId={mbReviewLibraryId}
-        open={mbReviewLibraryId !== null}
-        onOpenChange={(o) => {
-          if (!o) setMbReviewLibraryId(null);
-        }}
-        onOpenAlbum={openMusicAlbumFromCenter}
-        onChanged={() => {
-          // A match/undo landed behind the dialog — same recipe as a rescan:
-          // drop caches, silently refresh the grid, and let self-fetching
-          // pages (Tracks, open album/artist details) refetch off the event.
-          if (!mbReviewLibraryId) return;
-          invalidateCache(mbReviewLibraryId);
-          refreshGridInPlace();
-          window.dispatchEvent(new Event("waverunner:library-rescanned"));
-          refreshMusicCountsFor(mbReviewLibraryId);
-          refreshGenresFor(mbReviewLibraryId);
-        }}
-      />
-      <VideoMetadataCenterDialog
-        libraryId={videoCenterLibraryId}
-        open={videoCenterLibraryId !== null}
-        onOpenChange={(o) => {
-          if (!o) setVideoCenterLibraryId(null);
-        }}
-        onChanged={() => {
-          if (videoCenterLibraryId) invalidateCache(videoCenterLibraryId);
-        }}
-      />
       <Toaster position="top-center" />
     </div>
   );

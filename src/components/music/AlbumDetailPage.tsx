@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useDeselectOnBackgroundClick } from "./useTrackSelection";
 import { notifyPendingWorkChanged } from "./PendingWork";
 import { toast } from "sonner";
-import { Play, Disc3, Pencil, ListPlus, ListStart, ListEnd, Scissors, Star, ListChecks, FolderOpen } from "lucide-react";
+import { Play, Disc3, Pencil, ListPlus, ListStart, ListEnd, Scissors, Star, ListChecks, FolderOpen, HardDriveDownload, Merge } from "lucide-react";
 import { RenameDialog } from "../RenameDialog";
 import { Spinner } from "../ui/spinner";
 import { MusicAlbumDetail, MusicRelease, MusicQueueItem, MusicTrack } from "../../types";
@@ -29,6 +29,8 @@ import { CodecBadge } from "./CodecBadge";
 import { releaseCover, releaseTitle, queueFromRelease, defaultRelease, fmtTrackTime, fmtAlbumRuntime, trackDisplayTitle } from "./musicQueue";
 import { CoversDialog, CoversMenuItem } from "../CoversDialog";
 import { useMbHidden } from "@/lib/mbVisibility";
+import { useTagWriting } from "@/lib/tagWriting";
+import { TagWriteDialog, TagWriteScope } from "./TagWriteDialog";
 
 interface AlbumDetailPageProps {
   entryId: number;
@@ -76,6 +78,9 @@ export function AlbumDetailPage({
   const [detail, setDetail] = useState<MusicAlbumDetail | null>(null);
   // Per-library "hide MusicBrainz outside the center" (center map toggle).
   const mbHidden = useMbHidden(detail?.library_id);
+  // Per-library tag-writing opt-in: the Write-to-files actions exist only when on.
+  const tagWriting = useTagWriting(detail?.library_id);
+  const [writeScope, setWriteScope] = useState<TagWriteScope | null>(null);
   const [loading, setLoading] = useState(true);
   const [releaseId, setReleaseId] = useState<number | null>(null);
   // Single click selects a row; double click (or the hover play button) plays.
@@ -93,7 +98,6 @@ export function AlbumDetailPage({
   // MusicBrainz matching: which entity the dialog is on, and a nonce that
   // makes the status chips refetch after a match/unmatch.
   const [matchOpen, setMatchOpen] = useState(false);
-  const [matchTrack, setMatchTrack] = useState<{ id: number; title: string } | null>(null);
   const [mbKey, setMbKey] = useState(0);
   // Release whose label is being renamed in the versions menu.
   const [renameRelease, setRenameRelease] = useState<MusicRelease | null>(null);
@@ -251,11 +255,14 @@ export function AlbumDetailPage({
           <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
             {detail.album_type || "album"}
           </p>
-          <h1 className="group/title flex min-w-0 items-center gap-2 font-heading text-4xl font-bold">
-            <span className="truncate">{releaseTitle(detail, release)}</span>
+          {/* Long titles wrap up to three lines before the ellipsis; the
+              hover actions sit on the first line (items-start + a top nudge
+              that centers a 24px button on the 40px line box). */}
+          <h1 className="group/title flex min-w-0 items-start gap-2 font-heading text-4xl font-bold">
+            <span className="line-clamp-3 break-words">{releaseTitle(detail, release)}</span>
             <button
               onClick={() => setEditAlbumOpen(true)}
-              className="shrink-0 rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/title:opacity-100"
+              className="mt-2 shrink-0 rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/title:opacity-100"
               title="Edit album metadata"
             >
               <Pencil size={16} />
@@ -289,10 +296,19 @@ export function AlbumDetailPage({
                   }
                 }}
                 disabled={checking}
-                className="shrink-0 rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/title:opacity-100 disabled:opacity-40"
+                className="mt-2 shrink-0 rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/title:opacity-100 disabled:opacity-40"
                 title="Check track list against MusicBrainz"
               >
                 {checking ? <Spinner className="size-4" /> : <ListChecks size={16} />}
+              </button>
+            )}
+            {tagWriting && !detail.is_sound && (
+              <button
+                onClick={() => setWriteScope({ kind: "album", id: detail.id })}
+                className="mt-2 shrink-0 rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/title:opacity-100"
+                title="Write tags to files"
+              >
+                <HardDriveDownload size={16} />
               </button>
             )}
           </h1>
@@ -472,6 +488,29 @@ export function AlbumDetailPage({
                         >
                           <Pencil size={13} />
                         </button>
+                        {r.id !== releaseId && (
+                          <button
+                            type="button"
+                            title={`Merge into “${releaseLabel(release)}” — one track list (staged — applies on the next rescan)`}
+                            className="rounded p-1 text-muted-foreground hover:bg-foreground/10 hover:text-foreground"
+                            onClick={async (e) => {
+                              e.stopPropagation();
+                              e.preventDefault();
+                              try {
+                                await invoke<string>("merge_album_release", {
+                                  releaseId: r.id,
+                                  intoReleaseId: releaseId,
+                                });
+                                toast("Merge staged — it applies on the next rescan");
+                                notifyPendingWorkChanged();
+                              } catch (err) {
+                                toast.error(String(err));
+                              }
+                            }}
+                          >
+                            <Merge size={13} />
+                          </button>
+                        )}
                         <button
                           type="button"
                           title="Separate into its own album (staged — applies on the next rescan)"
@@ -507,7 +546,13 @@ export function AlbumDetailPage({
             <p className="group/disc mb-1 flex items-center gap-1.5 px-2 pt-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
               <Disc3 size={13} /> Disc {discNo}
               {(release?.disc_titles.find((d) => d.disc === discNo)?.title ?? "") !== "" && (
-                <span>— {release!.disc_titles.find((d) => d.disc === discNo)!.title}</span>
+                // The dash is its own flex item so the row's gap sits on BOTH
+                // sides of it — a "— Name" string put a 6px gap before the
+                // dash and a 4px space after it.
+                <>
+                  <span>—</span>
+                  <span>{release!.disc_titles.find((d) => d.disc === discNo)!.title}</span>
+                </>
               )}
               <button
                 type="button"
@@ -634,16 +679,14 @@ export function AlbumDetailPage({
                       <Pencil size={14} />
                       Edit metadata
                     </ContextMenuItem>
-                    {!detail.is_sound && !mbHidden && (
-                      <ContextMenuItem
-                        onClick={() =>
-                          setMatchTrack({ id: t.id, title: trackDisplayTitle(t.title, t.file_path) })
-                        }
-                      >
-                        <Disc3 size={14} />
-                        Match to MusicBrainz…
+                    {tagWriting && (
+                      <ContextMenuItem onClick={() => setWriteScope({ kind: "track", id: t.id })}>
+                        <HardDriveDownload size={14} />
+                        Write tags to file…
                       </ContextMenuItem>
                     )}
+                    {/* No per-track matching on album tracks: an album's tracks
+                        match through its release pin, all of them together. */}
                     <LoveMenuItem resolve={() => ({ id: t.id, loved: t.loved })} />
                     {onAddToPlaylist && (
                       <ContextMenuItem
@@ -676,19 +719,6 @@ export function AlbumDetailPage({
           onMetadataChanged?.();
         }}
       />
-      {matchTrack && (
-        <MatchDialog
-          kind="track"
-          entityId={matchTrack.id}
-          open={matchTrack !== null}
-          onOpenChange={(o) => !o && setMatchTrack(null)}
-          onChanged={() => {
-            setMbKey((k) => k + 1);
-            setReloadKey((k) => k + 1);
-            onMetadataChanged?.();
-          }}
-        />
-      )}
       <TrackEditDialog
         trackId={editTrackId}
         open={editTrackId !== null}
@@ -702,6 +732,13 @@ export function AlbumDetailPage({
         open={editAlbumOpen}
         onOpenChange={setEditAlbumOpen}
         onSaved={handleSaved}
+      />
+      <TagWriteDialog
+        scope={writeScope}
+        onOpenChange={(o) => {
+          if (!o) setWriteScope(null);
+        }}
+        onDone={handleSaved}
       />
       {detail?.is_sound && (
         <MoveToCollectionDialog
