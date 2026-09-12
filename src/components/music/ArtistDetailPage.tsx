@@ -36,6 +36,11 @@ import { useDeselectOnBackgroundClick } from "./useTrackSelection";
 // vocabulary: "date" = oldest first, "date-desc" = newest first.
 let cachedArtistView: "grid" | "list" | null = null;
 let cachedArtistSort: "date" | "date-desc" | null = null;
+// Detail-view heart filter — "hearts" = liked or loved, "loved" = loved only.
+// Session-sticky (module cache, not a setting): it's a lens you flip on to
+// browse, not a preference to come back to next launch.
+type HeartFilter = "all" | "hearts" | "loved";
+let cachedHeartFilter: HeartFilter = "all";
 
 interface ArtistDetailPageProps {
   entryId: number;
@@ -97,6 +102,9 @@ export function ArtistDetailPage({
   const [matchOpen, setMatchOpen] = useState(false);
   const [matchTrack, setMatchTrack] = useState<number | null>(null);
   const [mbKey, setMbKey] = useState(0);
+  // Detail-view album chip → the album match dialog, scoped to the block's
+  // (default) release like the album page's own chip.
+  const [matchAlbum, setMatchAlbum] = useState<{ id: number; releaseId: number; label: string } | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
   /** Covers menu target — an album card's DEFAULT release. */
   const [coversFor, setCoversFor] = useState<{ id: number; title: string } | null>(null);
@@ -121,6 +129,11 @@ export function ArtistDetailPage({
   }, [detail?.id, mbKey]);
   const [viewMode, setViewMode] = useState<"grid" | "list">(cachedArtistView ?? "grid");
   const [sortDir, setSortDir] = useState<"date" | "date-desc">(cachedArtistSort ?? "date");
+  const [heartFilter, setHeartFilterState] = useState<HeartFilter>(cachedHeartFilter);
+  const setHeartFilter = (f: HeartFilter) => {
+    cachedHeartFilter = f;
+    setHeartFilterState(f);
+  };
   // List view: per-release full details (tracks, type, genres), fetched when
   // the view is first shown and rebuilt after edits (detail changes).
   const [releaseDetails, setReleaseDetails] = useState<Map<number, MusicAlbumDetail> | null>(null);
@@ -301,6 +314,35 @@ export function ArtistDetailPage({
   const albumsSorted = sortCards(detail.albums);
   const appearsSorted = sortCards(detail.appears_on);
 
+  // Heart filter — detail view only (the grid has no track rows to filter).
+  // Blocks whose rows all fall out are hidden entirely rather than left as
+  // empty headers; the section headers follow the LISTED blocks below.
+  const heartOn = viewMode === "list" && heartFilter !== "all";
+  const passesHeart = (t: { loved: LoveLevel }) =>
+    !heartOn || (heartFilter === "loved" ? t.loved === "loved" : t.loved != null);
+  // Rows a release block shows: appears-on blocks list only the tracks this
+  // artist is credited on, own releases list everything — then the hearts.
+  const blockTracks = (album: MusicAlbumCard, onlyCredited: boolean): MusicTrack[] => {
+    const d = releaseDetails?.get(album.id);
+    const release = d ? defaultRelease(d) : null;
+    if (!release) return [];
+    const base = onlyCredited
+      ? release.tracks.filter((t) => t.credits.some((c) => c.artist_id === entryId))
+      : release.tracks;
+    return base.filter(passesHeart);
+  };
+  const albumsListed =
+    heartOn && releaseDetails ? albumsSorted.filter((a) => blockTracks(a, false).length > 0) : albumsSorted;
+  const appearsListed =
+    heartOn && releaseDetails ? appearsSorted.filter((a) => blockTracks(a, true).length > 0) : appearsSorted;
+  const looseListed = detail.loose_tracks.filter(passesHeart);
+  const heartEmpty =
+    heartOn &&
+    releaseDetails !== null &&
+    albumsListed.length === 0 &&
+    appearsListed.length === 0 &&
+    looseListed.length === 0;
+
   // One release block in detail view: cover + album-page details + track
   // rows. Shared between own releases and (credit-filtered) appears-on.
   const renderReleaseBlock = (album: MusicAlbumCard, onlyCredited: boolean) => {
@@ -314,14 +356,7 @@ export function ArtistDetailPage({
               const totalSecs = release
                 ? release.tracks.reduce((s, t) => s + (t.runtime_secs ?? 0), 0)
                 : 0;
-              // Appears-on blocks list only the tracks this artist is
-              // credited on; own releases list everything.
-              const shownTracks =
-                release == null
-                  ? []
-                  : onlyCredited
-                    ? release.tracks.filter((t) => t.credits.some((c) => c.artist_id === entryId))
-                    : release.tracks;
+              const shownTracks = blockTracks(album, onlyCredited);
               return (
                 <section key={album.id}>
                   <div className="flex items-center gap-5">
@@ -378,13 +413,13 @@ export function ArtistDetailPage({
                       </button>
                       <p className="mt-0.5 text-sm text-muted-foreground">
                         {/* Album-page parity: every credited owner, linked —
-                            even when it's just the artist whose page this is. */}
+                            except the artist whose page this already is. */}
                         {album.artists.length > 0 && (
                           <>
                             {album.artists.map((a, ai) => (
                               <span key={`${a.name}-${ai}`}>
                                 {ai > 0 && " · "}
-                                {a.artist_id != null && onNavigateToArtist ? (
+                                {a.artist_id != null && a.artist_id !== entryId && onNavigateToArtist ? (
                                   <span
                                     role="link"
                                     className="cursor-pointer font-medium text-foreground hover:underline"
@@ -415,6 +450,26 @@ export function ArtistDetailPage({
                         <p className="mt-0.5 truncate text-xs text-muted-foreground">
                           {d.genres.join(", ")}
                         </p>
+                      )}
+                      {/* Album-page parity: the MusicBrainz status chip for
+                          the release this block shows, opening its matcher. */}
+                      {!mbHidden && d && release && !d.is_sound && (
+                        <div className="mt-1.5">
+                          <MbStatusChip
+                            kind="album"
+                            entityId={album.id}
+                            reloadKey={mbKey}
+                            releaseId={release.id}
+                            onClick={() => {
+                              const label = release.label ?? "1";
+                              setMatchAlbum({
+                                id: album.id,
+                                releaseId: release.id,
+                                label: release.year ? `${label} (${release.year})` : label,
+                              });
+                            }}
+                          />
+                        </div>
                       )}
                     </div>
                   </div>
@@ -493,7 +548,8 @@ export function ArtistDetailPage({
                                           ? t.credits.map((c, ci) => (
                                               <span key={`${c.name}-${ci}`}>
                                                 {ci > 0 && ", "}
-                                                {c.artist_id != null && onNavigateToArtist ? (
+                                                {/* No self-link: this is already their page. */}
+                                                {c.artist_id != null && c.artist_id !== entryId && onNavigateToArtist ? (
                                                   <span
                                                     role="link"
                                                     className="cursor-pointer hover:underline"
@@ -670,6 +726,32 @@ export function ArtistDetailPage({
           )}
         </div>
         <div className="ml-auto flex shrink-0 items-center gap-2 self-start">
+          {/* Heart filter — detail view only; the grid has no rows to filter. */}
+          {viewMode === "list" &&
+            (detail.albums.length > 0 || detail.appears_on.length > 0 || detail.loose_tracks.length > 0) && (
+              <div className="flex h-8 items-center gap-0.5 rounded-md border p-0.5 text-xs">
+                {(
+                  [
+                    ["all", "All", "Every track"],
+                    ["hearts", "Liked", "Liked tracks (loved ones count too)"],
+                    ["loved", "Loved", "Only loved tracks"],
+                  ] as const
+                ).map(([id, label, title]) => (
+                  <button
+                    key={id}
+                    onClick={() => setHeartFilter(id)}
+                    className={`rounded px-2 py-1 transition-colors ${
+                      heartFilter === id
+                        ? "bg-accent text-foreground"
+                        : "text-muted-foreground hover:text-foreground"
+                    }`}
+                    title={title}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            )}
           {(detail.albums.length > 0 || detail.appears_on.length > 0) && (
             <DropdownMenu>
               <DropdownMenuTrigger className="flex h-8 items-center gap-1.5 rounded-md border border-input bg-background px-2.5 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground">
@@ -707,8 +789,14 @@ export function ArtistDetailPage({
         </div>
       </div>
 
+      {heartEmpty && (
+        <p className="py-10 text-center text-sm text-muted-foreground">
+          {heartFilter === "loved" ? "No loved tracks yet." : "No liked or loved tracks yet."}
+        </p>
+      )}
+
       {/* Own albums */}
-      {detail.albums.length > 0 && detail.appears_on.length > 0 && (
+      {albumsListed.length > 0 && appearsListed.length > 0 && (
         <p className="mb-2 text-sm font-semibold uppercase tracking-wide text-muted-foreground">
           Releases
         </p>
@@ -800,7 +888,7 @@ export function ArtistDetailPage({
           }}
         >
           <ContextMenuTrigger render={<div className="flex flex-col gap-14" />}>
-            {albumsSorted.map((album) => renderReleaseBlock(album, false))}
+            {albumsListed.map((album) => renderReleaseBlock(album, false))}
           </ContextMenuTrigger>
           <ContextMenuContent>
             {onEnqueue && (
@@ -863,13 +951,16 @@ export function ArtistDetailPage({
       )}
 
       {/* Loose tracks — album-less files credited to this artist. */}
-      {detail.loose_tracks.length > 0 && (
+      {looseListed.length > 0 && (
         <>
-          <p className={`mb-2 text-sm font-semibold uppercase tracking-wide text-muted-foreground ${detail.albums.length > 0 ? "mt-6" : ""}`}>
+          <p className={`mb-2 text-sm font-semibold uppercase tracking-wide text-muted-foreground ${albumsListed.length > 0 ? "mt-6" : ""}`}>
             Tracks
           </p>
           <div>
-            {detail.loose_tracks.map((t, i) => {
+            {looseListed.map((t) => {
+              // Queue = every loose track (the heart filter narrows what's
+              // listed, not what plays), so index into the full list.
+              const i = detail.loose_tracks.indexOf(t);
               const queue: MusicQueueItem[] = detail.loose_tracks.map((lt) => ({
                 trackId: lt.id,
                 title: trackDisplayTitle(lt.title, lt.file_path),
@@ -987,9 +1078,9 @@ export function ArtistDetailPage({
 
       {/* Feature credits on other artists' albums — the whole page for
           feature-only artists. */}
-      {detail.appears_on.length > 0 && (
+      {appearsListed.length > 0 && (
         <>
-          <p className={`mb-2 text-sm font-semibold uppercase tracking-wide text-muted-foreground ${detail.albums.length > 0 || detail.loose_tracks.length > 0 ? "mt-6" : ""}`}>
+          <p className={`mb-2 text-sm font-semibold uppercase tracking-wide text-muted-foreground ${albumsListed.length > 0 || looseListed.length > 0 ? "mt-6" : ""}`}>
             Appears On
           </p>
           {viewMode === "grid" ? (
@@ -1058,7 +1149,7 @@ export function ArtistDetailPage({
               }}
             >
               <ContextMenuTrigger render={<div className="flex flex-col gap-14" />}>
-                {appearsSorted.map((album) => renderReleaseBlock(album, true))}
+                {appearsListed.map((album) => renderReleaseBlock(album, true))}
               </ContextMenuTrigger>
               <ContextMenuContent>
                 {onEnqueue && (
@@ -1171,6 +1262,20 @@ export function ArtistDetailPage({
           handleSaved();
         }}
       />
+      {matchAlbum != null && (
+        <MatchDialog
+          kind="album"
+          entityId={matchAlbum.id}
+          open
+          onOpenChange={(o) => !o && setMatchAlbum(null)}
+          releaseId={matchAlbum.releaseId}
+          releaseLabel={matchAlbum.label}
+          onChanged={() => {
+            setMbKey((k) => k + 1);
+            handleSaved();
+          }}
+        />
+      )}
       {matchTrack != null && (
         <MatchDialog
           kind="track"

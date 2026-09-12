@@ -1543,6 +1543,20 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .execute(&pool)
     .await?;
 
+    // ── Release-group releases cache (match dialog's release picker) ──
+    // Same rules as the artist cache: served instantly, refreshed in the
+    // background on open, evicted once no album in the group still has an
+    // unresolved release. Filled on demand and by the prefetch job.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS mb_group_releases_cache (
+            group_id TEXT PRIMARY KEY,
+            releases_json TEXT NOT NULL,
+            fetched_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     // ── Artist name redirects ─────────────────────────────────────────
     // Former spellings that must keep resolving to an artist: names absorbed
     // by merges and pre-rename titles ("J Cole" → "J. Cole"). Despite the
@@ -1555,10 +1569,12 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             artist_id INTEGER NOT NULL,
             name TEXT NOT NULL,
-            -- 'variant' (neutral — recorded, resolves, claims nothing),
-            -- 'misspelling' (USER-declared wrong text — nags with a
-            -- fix-at-source card while the spelling survives in tags), or
-            -- 'nickname' (USER-declared intended moniker — never nags).
+            -- 'variant' (neutral — recorded, resolves, claims nothing;
+            -- listed under File problems for the user to classify),
+            -- 'misspelling' (USER-declared wrong text), or 'nickname'
+            -- (USER-declared intended moniker). The two classified kinds
+            -- behave identically — the library shows the artist's name
+            -- either way — and neither nags; the kind is just recorded.
             -- Only humans write the non-neutral kinds. Migrations 26/27.
             kind TEXT NOT NULL DEFAULT 'variant',
             FOREIGN KEY (artist_id) REFERENCES artist(id) ON DELETE CASCADE

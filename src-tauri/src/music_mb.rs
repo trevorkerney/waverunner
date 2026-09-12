@@ -1236,7 +1236,7 @@ pub async fn clear_mb_id(pool: &SqlitePool, entity_id: i64, field: &str) -> Resu
 // MusicBrainz HTTP
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReleaseCandidate {
     pub release_id: String,
     pub title: String,
@@ -4143,6 +4143,9 @@ pub async fn merge_artists(
 
 #[derive(Debug, Serialize)]
 pub struct TagFixTrack {
+    /// Ids so the card can jump to the track on its album page.
+    pub track_id: i64,
+    pub album_id: Option<i64>,
     pub track_title: String,
     pub album_title: Option<String>,
     pub file_path: String,
@@ -4153,6 +4156,7 @@ pub struct TagFixTrack {
 
 #[derive(Debug, Serialize)]
 pub struct TagFixAlbum {
+    pub album_id: i64,
     pub album_title: String,
     pub folder_path: String,
 }
@@ -4164,8 +4168,8 @@ pub struct TagFix {
     pub canonical: String,
     /// The alias spelling still present in tags.
     pub wrong: String,
-    /// 'misspelling' (user-declared — nags) or 'variant' (neutral — listed
-    /// for the user to classify). Nicknames never appear.
+    /// Always 'variant' (neutral — listed for the user to classify). Once
+    /// classified either way the row leaves this list for good.
     pub kind: String,
     /// Occurrences retagging can actually fix (capped at 30 in the payload).
     pub tracks: Vec<TagFixTrack>,
@@ -4180,9 +4184,13 @@ pub struct TagFix {
 /// an occurrence in neither, on a release-matched album, was authored by the
 /// MusicBrainz credit apply — not tag debt, excluded (retagging can't touch
 /// it). Album-artist occurrences count only on MB-unmatched albums for the
-/// same reason. Declared misspellings nag; 'variant' rows are returned for
-/// the user to classify; nicknames never appear. Retag + rescan clears an
-/// entry by itself — the alias row stays behind as an inert redirect.
+/// same reason. Only unclassified 'variant' rows are returned, for the user
+/// to classify; a classified alias — misspelling OR nickname — never
+/// appears again (user ruling 2026-09-11: a declared misspelling is not
+/// tag debt to nag about, because the library already shows the artist's
+/// MusicBrainz name or override; the kind is recorded, nothing more).
+/// Retag + rescan also clears an entry by itself — the alias row stays
+/// behind as an inert redirect.
 #[tauri::command]
 pub async fn get_tag_fixes(
     state: State<'_, AppState>,
@@ -4194,7 +4202,7 @@ pub async fn get_tag_fixes(
          FROM artist_alias al
          JOIN artist a ON a.id = al.artist_id
          JOIN media_entry me ON me.id = a.id
-         WHERE me.library_id = ? AND al.kind IN ('misspelling', 'variant')
+         WHERE me.library_id = ? AND al.kind = 'variant'
            AND LOWER(al.name) != LOWER(a.title)
          ORDER BY a.sort_title COLLATE NOCASE, al.name COLLATE NOCASE",
     )
@@ -4206,8 +4214,8 @@ pub async fn get_tag_fixes(
     let mut fixes = Vec::new();
     for (artist_id, canonical, wrong, kind) in aliases {
         let wrong_lower = wrong.to_lowercase();
-        let rows: Vec<(String, Option<String>, String, Option<String>, i64)> = sqlx::query_as(
-            "SELECT t.title, alb.title, t.file_path, tm.artist_name,
+        let rows: Vec<(i64, Option<i64>, String, Option<String>, String, Option<String>, i64)> = sqlx::query_as(
+            "SELECT tme.id, alb.id, t.title, alb.title, t.file_path, tm.artist_name,
                     EXISTS (SELECT 1 FROM track_release tr
                             JOIN album_release ar ON ar.id = tr.release_id
                             JOIN release_match rm ON rm.album_id = ar.album_id
@@ -4229,7 +4237,7 @@ pub async fn get_tag_fixes(
         .map_err(|e| e.to_string())?;
         let mut tracks = Vec::new();
         let mut track_total = 0i64;
-        for (track_title, album_title, file_path, tag_artist, release_matched) in rows {
+        for (track_id, album_id, track_title, album_title, file_path, tag_artist, release_matched) in rows {
             let source = if tag_artist
                 .as_deref()
                 .is_some_and(|a| a.to_lowercase().contains(&wrong_lower))
@@ -4247,6 +4255,8 @@ pub async fn get_tag_fixes(
             track_total += 1;
             if tracks.len() < 30 {
                 tracks.push(TagFixTrack {
+                    track_id,
+                    album_id,
                     track_title,
                     album_title,
                     file_path,
@@ -4254,8 +4264,8 @@ pub async fn get_tag_fixes(
                 });
             }
         }
-        let albums: Vec<(String, String)> = sqlx::query_as(
-            "SELECT alb.title, alb.folder_path
+        let albums: Vec<(i64, String, String)> = sqlx::query_as(
+            "SELECT alb.id, alb.title, alb.folder_path
              FROM album_artist_credit ac
              JOIN media_entry me ON me.id = ac.album_id
              JOIN album alb ON alb.id = ac.album_id
@@ -4284,7 +4294,8 @@ pub async fn get_tag_fixes(
             track_total,
             albums: albums
                 .into_iter()
-                .map(|(album_title, folder_path)| TagFixAlbum {
+                .map(|(album_id, album_title, folder_path)| TagFixAlbum {
+                    album_id,
                     album_title,
                     folder_path,
                 })
@@ -4294,9 +4305,10 @@ pub async fn get_tag_fixes(
     Ok(fixes)
 }
 
-/// Flip one alias between 'misspelling' (nags with a fix-at-source card) and
-/// 'nickname' (intended moniker, resolves identically, never nags). A human
-/// decision, so it logs — undo restores the previous kind.
+/// Classify one alias: 'misspelling' (wrong text) or 'nickname' (intended
+/// moniker). Both resolve identically and both retire the card — the kind is
+/// a recorded fact, not a nag. A human decision, so it logs — undo restores
+/// the previous kind (back to 'variant' brings the card back).
 #[tauri::command]
 pub async fn set_alias_kind(
     state: State<'_, AppState>,
@@ -6966,20 +6978,18 @@ pub async fn mb_artist_groups_cached(
     Ok(row.and_then(|(json,)| serde_json::from_str(&json).ok()))
 }
 
-/// One page of an artist's release groups (offset 0 starts a fresh walk).
-#[tauri::command]
-pub async fn mb_artist_release_groups_page(
-    state: State<'_, AppState>,
-    artist_mbid: String,
+/// One raw page of an artist's release groups: (groups, MB's total, done).
+async fn fetch_artist_groups_page(
+    client: &reqwest::Client,
+    artist_mbid: &str,
     offset: usize,
-) -> Result<GroupsPage, String> {
-    let client = mb_client()?;
+) -> Result<(Vec<GroupCandidate>, usize, bool), String> {
     let offset_s = offset.to_string();
     let limit_s = GROUP_PAGE_LIMIT.to_string();
     let url = url::Url::parse_with_params(
         "https://musicbrainz.org/ws/2/release-group",
         &[
-            ("artist", artist_mbid.as_str()),
+            ("artist", artist_mbid),
             ("inc", "artist-credits"),
             ("fmt", "json"),
             ("limit", limit_s.as_str()),
@@ -6987,7 +6997,7 @@ pub async fn mb_artist_release_groups_page(
         ],
     )
     .map_err(|e| e.to_string())?;
-    let resp = mb_get(&client, url).await?;
+    let resp = mb_get(client, url).await?;
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status()));
     }
@@ -7001,7 +7011,40 @@ pub async fn mb_artist_release_groups_page(
         .collect();
     let next = offset + page.len();
     let done = page.is_empty() || next >= total || next >= GROUP_CAP;
+    Ok((page, total, done))
+}
 
+/// Sort and store a complete discography.
+async fn store_artist_groups(
+    pool: &SqlitePool,
+    artist_mbid: &str,
+    mut all: Vec<GroupCandidate>,
+) -> Result<(), String> {
+    sort_groups(&mut all);
+    let json = serde_json::to_string(&all).map_err(|e| e.to_string())?;
+    sqlx::query(
+        "INSERT INTO mb_artist_groups_cache (artist_mbid, groups_json, fetched_at)
+         VALUES (?, ?, datetime('now'))
+         ON CONFLICT(artist_mbid) DO UPDATE SET
+           groups_json = excluded.groups_json, fetched_at = excluded.fetched_at",
+    )
+    .bind(artist_mbid)
+    .bind(&json)
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// One page of an artist's release groups (offset 0 starts a fresh walk).
+#[tauri::command]
+pub async fn mb_artist_release_groups_page(
+    state: State<'_, AppState>,
+    artist_mbid: String,
+    offset: usize,
+) -> Result<GroupsPage, String> {
+    let client = mb_client()?;
+    let (page, total, done) = fetch_artist_groups_page(&client, &artist_mbid, offset).await?;
     let buffer = GROUP_PAGE_BUFFER.get_or_init(|| std::sync::Mutex::new(Default::default()));
     let complete: Option<Vec<GroupCandidate>> = {
         let mut map = buffer.lock().map_err(|e| e.to_string())?;
@@ -7016,28 +7059,17 @@ pub async fn mb_artist_release_groups_page(
             None
         }
     };
-    if let Some(mut all) = complete {
-        sort_groups(&mut all);
-        let json = serde_json::to_string(&all).map_err(|e| e.to_string())?;
-        sqlx::query(
-            "INSERT INTO mb_artist_groups_cache (artist_mbid, groups_json, fetched_at)
-             VALUES (?, ?, datetime('now'))
-             ON CONFLICT(artist_mbid) DO UPDATE SET
-               groups_json = excluded.groups_json, fetched_at = excluded.fetched_at",
-        )
-        .bind(&artist_mbid)
-        .bind(&json)
-        .execute(&state.app_db)
-        .await
-        .map_err(|e| e.to_string())?;
+    if let Some(all) = complete {
+        store_artist_groups(&state.app_db, &artist_mbid, all).await?;
     }
     Ok(GroupsPage { groups: page, total, done })
 }
 
-/// Drop every cached discography whose artist has no unmatched album left:
-/// no album credited to them (in any library) that is still without a
-/// release group and not ignored. Runs after a pass, an apply, or an ignore
-/// — the moments an album stops being unmatched.
+/// Drop every cached discography whose artist has no unmatched album left
+/// (no album credited to them, in any library, still without a release
+/// group and not ignored), and every cached release list whose group has
+/// no album with an unresolved release left. Runs after a pass, an apply,
+/// or an ignore — the moments an album stops being unmatched.
 pub(crate) async fn evict_artist_group_caches(pool: &SqlitePool) -> Result<(), String> {
     sqlx::query(&format!(
         "DELETE FROM mb_artist_groups_cache
@@ -7058,6 +7090,309 @@ pub(crate) async fn evict_artist_group_caches(pool: &SqlitePool) -> Result<(), S
     .execute(pool)
     .await
     .map_err(|e| e.to_string())?;
+    sqlx::query(
+        "DELETE FROM mb_group_releases_cache
+         WHERE group_id NOT IN (
+           SELECT fo.value FROM field_override fo
+           JOIN album al ON al.id = fo.entity_id
+           WHERE fo.field = 'mb_release_group_id' AND fo.value <> ''
+             AND EXISTS (SELECT 1 FROM album_release r
+                         WHERE r.album_id = al.id
+                           AND NOT EXISTS (SELECT 1 FROM release_match rm
+                                           WHERE rm.album_id = r.album_id
+                                             AND rm.folder_path = r.folder_path COLLATE NOCASE))
+         )",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// ── Release-list cache + prefetch jobs ─────────────────────────────────────
+
+/// A group's releases in picker order: official first, oldest first.
+async fn group_releases_sorted(
+    client: &reqwest::Client,
+    group_id: &str,
+) -> Result<Vec<ReleaseCandidate>, String> {
+    let mut releases = releases_in_group(client, group_id).await?;
+    releases.sort_by(|a, b| {
+        let official = |r: &ReleaseCandidate| r.status.as_deref() != Some("Official");
+        official(a)
+            .cmp(&official(b))
+            .then_with(|| match (&a.date, &b.date) {
+                (Some(x), Some(y)) => x.cmp(y),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            })
+    });
+    Ok(releases)
+}
+
+async fn store_group_releases(
+    pool: &SqlitePool,
+    group_id: &str,
+    releases: &[ReleaseCandidate],
+) -> Result<(), String> {
+    let json = serde_json::to_string(releases).map_err(|e| e.to_string())?;
+    sqlx::query(
+        "INSERT INTO mb_group_releases_cache (group_id, releases_json, fetched_at)
+         VALUES (?, ?, datetime('now'))
+         ON CONFLICT(group_id) DO UPDATE SET
+           releases_json = excluded.releases_json, fetched_at = excluded.fetched_at",
+    )
+    .bind(group_id)
+    .bind(&json)
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// The matched release leads the list — it's the row the user came to
+/// check, not something to scroll 40 pressings for.
+fn pin_current(releases: &mut Vec<ReleaseCandidate>, current: Option<&str>) -> bool {
+    let Some(cur) = current.filter(|c| !c.is_empty()) else { return true };
+    if let Some(pos) = releases.iter().position(|r| r.release_id == cur) {
+        let current = releases.remove(pos);
+        releases.insert(0, current);
+        true
+    } else {
+        false
+    }
+}
+
+/// The cached release list for a group, if the picker (or the prefetch) has
+/// fetched it before — no network. The current release is pinned when it's
+/// in the list; a deeper one waits for the fresh fetch to look it up.
+#[tauri::command]
+pub async fn mb_group_releases_cached(
+    state: State<'_, AppState>,
+    group_id: String,
+    current_release_id: Option<String>,
+) -> Result<Option<Vec<ReleaseCandidate>>, String> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT releases_json FROM mb_group_releases_cache WHERE group_id = ?")
+            .bind(&group_id)
+            .fetch_optional(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+    Ok(row.and_then(|(json,)| serde_json::from_str::<Vec<ReleaseCandidate>>(&json).ok()).map(
+        |mut releases| {
+            pin_current(&mut releases, current_release_id.as_deref());
+            releases
+        },
+    ))
+}
+
+#[derive(Serialize)]
+pub struct PrefetchEstimate {
+    /// Identified artists with an unmatched album here and no cached discography.
+    pub artists: usize,
+    /// Matched release groups with an unresolved release here and no cached list.
+    pub groups: usize,
+    pub groups_running: bool,
+    pub releases_running: bool,
+}
+
+pub const PREFETCH_GROUPS_KIND: &str = "mb-prefetch-groups";
+pub const PREFETCH_RELEASES_KIND: &str = "mb-prefetch-releases";
+
+/// Artists whose discographies the groups prefetch would fetch: identified,
+/// credited on an unmatched (un-ignored, real) album of this library, not
+/// Various Artists, and not already cached.
+async fn artists_needing_groups(
+    pool: &SqlitePool,
+    library_id: &str,
+) -> Result<Vec<(String, String)>, String> {
+    sqlx::query_as(&format!(
+        "SELECT DISTINCT ar.musicbrainz_id, ar.title
+         FROM album_artist_credit ac
+         JOIN artist ar ON ar.id = ac.artist_id
+         JOIN album al ON al.id = ac.album_id
+         JOIN media_entry me ON me.id = al.id
+         WHERE me.library_id = ?
+           AND ar.musicbrainz_id IS NOT NULL AND ar.musicbrainz_id <> ''
+           AND LOWER(ar.musicbrainz_id) <> '{VARIOUS_ARTISTS_MBID}'
+           AND NOT EXISTS (SELECT 1 FROM field_override fo
+                           WHERE fo.entity_id = al.id AND fo.field = 'mb_release_group_id' AND fo.value <> '')
+           AND NOT EXISTS (SELECT 1 FROM field_override fo
+                           WHERE fo.entity_id = al.id AND fo.field = '{MB_IGNORED}')
+           AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = al.id)
+           AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = al.id)
+           AND NOT EXISTS (SELECT 1 FROM mb_artist_groups_cache c WHERE c.artist_mbid = ar.musicbrainz_id)
+         ORDER BY ar.title"
+    ))
+    .bind(library_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Release groups whose release lists the releases prefetch would fetch:
+/// matched, with at least one release of the album still unresolved (no
+/// pin, no declared-none), not already cached.
+async fn groups_needing_releases(
+    pool: &SqlitePool,
+    library_id: &str,
+) -> Result<Vec<(String, String)>, String> {
+    sqlx::query_as(
+        "SELECT DISTINCT fo.value, al.title
+         FROM field_override fo
+         JOIN album al ON al.id = fo.entity_id
+         JOIN media_entry me ON me.id = al.id
+         WHERE me.library_id = ? AND fo.field = 'mb_release_group_id' AND fo.value <> ''
+           AND EXISTS (SELECT 1 FROM album_release r
+                       WHERE r.album_id = al.id
+                         AND NOT EXISTS (SELECT 1 FROM release_match rm
+                                         WHERE rm.album_id = r.album_id
+                                           AND rm.folder_path = r.folder_path COLLATE NOCASE))
+           AND NOT EXISTS (SELECT 1 FROM mb_group_releases_cache c WHERE c.group_id = fo.value)
+         ORDER BY al.title",
+    )
+    .bind(library_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Various Artists' MB id — never prefetched (its "discography" is every
+/// compilation ever entered; the dialog doesn't browse it either).
+const VARIOUS_ARTISTS_MBID: &str = "89ad4ac3-39f7-470e-963a-56509c546377";
+
+#[tauri::command]
+pub async fn mb_prefetch_estimate(
+    state: State<'_, AppState>,
+    library_id: String,
+) -> Result<PrefetchEstimate, String> {
+    let pool = &state.app_db;
+    Ok(PrefetchEstimate {
+        artists: artists_needing_groups(pool, &library_id).await?.len(),
+        groups: groups_needing_releases(pool, &library_id).await?.len(),
+        groups_running: crate::jobs::is_running(&format!("{PREFETCH_GROUPS_KIND}:{library_id}")),
+        releases_running: crate::jobs::is_running(&format!("{PREFETCH_RELEASES_KIND}:{library_id}")),
+    })
+}
+
+/// Wait out a running matching pass (it shares the MB request gate — a
+/// prefetch alongside it would halve the pass). True = cancelled meanwhile.
+async fn yield_to_pass(job: &crate::jobs::JobHandle) -> bool {
+    while pass_running() && !job.cancelled() {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    job.cancelled()
+}
+
+/// Background: fill the discography cache for every identified artist that
+/// still has an unmatched album here. Fill-only — artists already cached
+/// are skipped (the dialog refreshes those on open).
+#[tauri::command]
+pub async fn mb_prefetch_groups_start(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    library_id: String,
+) -> Result<(), String> {
+    let pool = state.app_db.clone();
+    let artists = artists_needing_groups(&pool, &library_id).await?;
+    let total = artists.len();
+    let Some(job) = crate::jobs::start(
+        &app,
+        format!("{PREFETCH_GROUPS_KIND}:{library_id}"),
+        PREFETCH_GROUPS_KIND,
+        "prefetching release groups",
+        Some(library_id.clone()),
+        total,
+    ) else {
+        return Ok(());
+    };
+    tauri::async_runtime::spawn(async move {
+        let Ok(client) = mb_client() else { return };
+        let mut done = 0usize;
+        for (mbid, name) in artists {
+            if yield_to_pass(&job).await {
+                break;
+            }
+            job.progress(done, total, Some(name.clone()));
+            let mut all: Vec<GroupCandidate> = Vec::new();
+            let mut offset = 0usize;
+            let mut ok = true;
+            loop {
+                match fetch_artist_groups_page(&client, &mbid, offset).await {
+                    Ok((page, _, finished)) => {
+                        offset += page.len();
+                        all.extend(page);
+                        if finished {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("prefetch groups {name}: {e}");
+                        ok = false;
+                        break;
+                    }
+                }
+                if job.cancelled() {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                let _ = store_artist_groups(&pool, &mbid, all).await;
+            }
+            done += 1;
+            job.progress(done, total, Some(name));
+        }
+        job.finish();
+        use tauri::Emitter;
+        let _ = app.emit("mb-prefetch-done", serde_json::json!({ "libraryId": library_id }));
+    });
+    Ok(())
+}
+
+/// Background: fill the release-list cache for every matched group here that
+/// still has an unresolved release. Fill-only, like the groups prefetch.
+#[tauri::command]
+pub async fn mb_prefetch_releases_start(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    library_id: String,
+) -> Result<(), String> {
+    let pool = state.app_db.clone();
+    let groups = groups_needing_releases(&pool, &library_id).await?;
+    let total = groups.len();
+    let Some(job) = crate::jobs::start(
+        &app,
+        format!("{PREFETCH_RELEASES_KIND}:{library_id}"),
+        PREFETCH_RELEASES_KIND,
+        "prefetching releases",
+        Some(library_id.clone()),
+        total,
+    ) else {
+        return Ok(());
+    };
+    tauri::async_runtime::spawn(async move {
+        let Ok(client) = mb_client() else { return };
+        let mut done = 0usize;
+        for (group_id, title) in groups {
+            if yield_to_pass(&job).await {
+                break;
+            }
+            job.progress(done, total, Some(title.clone()));
+            match group_releases_sorted(&client, &group_id).await {
+                Ok(releases) => {
+                    let _ = store_group_releases(&pool, &group_id, &releases).await;
+                }
+                Err(e) => eprintln!("prefetch releases {title}: {e}"),
+            }
+            done += 1;
+            job.progress(done, total, Some(title));
+        }
+        job.finish();
+        use tauri::Emitter;
+        let _ = app.emit("mb-prefetch-done", serde_json::json!({ "libraryId": library_id }));
+    });
     Ok(())
 }
 
@@ -7073,28 +7408,18 @@ pub async fn mb_group_releases(
     // directly and pinned to the top so "current" always has something to
     // mark.
     current_release_id: Option<String>,
+    state: State<'_, AppState>,
 ) -> Result<Vec<ReleaseCandidate>, String> {
     let client = mb_client()?;
-    let mut releases = releases_in_group(&client, &group_id).await?;
-    releases.sort_by(|a, b| {
-        let official = |r: &ReleaseCandidate| r.status.as_deref() != Some("Official");
-        official(a)
-            .cmp(&official(b))
-            .then_with(|| match (&a.date, &b.date) {
-                (Some(x), Some(y)) => x.cmp(y),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => std::cmp::Ordering::Equal,
-            })
-    });
-    if let Some(cur) = current_release_id.filter(|c| !c.is_empty()) {
-        // The matched release leads the list — it's the row the user came to
-        // check, not something to scroll 40 pressings for.
-        if let Some(pos) = releases.iter().position(|r| r.release_id == cur) {
-            let current = releases.remove(pos);
-            releases.insert(0, current);
-        } else if let Ok(Some(c)) = lookup_release(&client, &cur).await {
-            releases.insert(0, c);
+    let mut releases = group_releases_sorted(&client, &group_id).await?;
+    // Fresh list → the cache (the picker serves it instantly next time and
+    // refreshes through here in the background).
+    store_group_releases(&state.app_db, &group_id, &releases).await?;
+    if !pin_current(&mut releases, current_release_id.as_deref()) {
+        if let Some(cur) = current_release_id.as_deref() {
+            if let Ok(Some(c)) = lookup_release(&client, cur).await {
+                releases.insert(0, c);
+            }
         }
     }
     Ok(releases)

@@ -1,4 +1,6 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
+import { useBackgroundJobs, cancelBackgroundJob } from "@/lib/backgroundJobs";
+import { SourcesPage } from "./SourcesPage";
 import { useFlipList } from "@/hooks/useFlipList";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -230,14 +232,16 @@ interface MetadataCenterProps {
   /** An album title was clicked: open its page, switched onto `releaseId`
    *  when the row names a release still needing a pick. Hosts that can't
    *  navigate (the wizard) leave this unset and titles stay plain text. */
-  onOpenAlbum?: (albumId: number, title: string, releaseId: number | null) => void;
+  /** releaseId switches the page onto that release; trackId scrolls to and
+   *  selects that row (the two are never sent together). */
+  onOpenAlbum?: (albumId: number, title: string, releaseId: number | null, trackId?: number) => void;
   /** An artist name was clicked: open their page. Same host rule. */
   onOpenArtist?: (artistId: number, name: string) => void;
   /** Land on this pane and card instead of the map; a new nonce re-lands. */
   focus?: CenterFocus | null;
 }
 
-type PaneId = "map" | "albums" | "artists" | "credits" | "gaps" | "files" | "history";
+type PaneId = "sources" | "map" | "albums" | "artists" | "credits" | "gaps" | "files" | "history";
 
 /** A credit name resolving to no artist — the residue the scan refused to
  *  guess about (usually a lookalike routed to a merge suggestion instead of
@@ -430,6 +434,8 @@ function LinkArtistDialog({
 }
 
 interface TagFixTrack {
+  track_id: number;
+  album_id: number | null;
   track_title: string;
   album_title: string | null;
   file_path: string;
@@ -438,13 +444,14 @@ interface TagFixTrack {
 }
 
 interface TagFixAlbum {
+  album_id: number;
   album_title: string;
   folder_path: string;
 }
 
-/** An alias spelling that still lives in the files' tags. kind 'misspelling'
- *  = user-declared debt (retag + rescan, and this card says exactly which
- *  files); kind 'variant' = neutral, waiting for the user to classify. */
+/** An alias spelling that still lives in the files' tags, not yet classified
+ *  (kind is always 'variant' here). Classifying it either way retires the
+ *  card — the library shows the artist's name regardless. */
 interface TagFix {
   artist_id: number;
   canonical: string;
@@ -455,24 +462,27 @@ interface TagFix {
   albums: TagFixAlbum[];
 }
 
-/** The fix-at-source card. Declared misspellings say what to retag and where;
- *  neutral variants ask the question instead — "It's a misspelling" starts
- *  the nagging, "It's a nickname" ends it forever. Only the user ever
- *  classifies; the machine records spellings without opinions. */
+/** The classify-a-spelling card. Either answer records the kind and retires
+ *  the card; nothing is flagged for retagging (user ruling 2026-09-11 — the
+ *  library already shows the MusicBrainz name or the override, so a declared
+ *  misspelling is a fact, not debt). Only the user ever classifies; the
+ *  machine records spellings without opinions. */
 function TagFixCard({
   fix,
   busy,
   busyKey,
   onSetKind,
+  onOpenAlbum,
 }: {
   fix: TagFix;
   busy: boolean;
   busyKey: string | null;
   onSetKind: (fix: TagFix, kind: "misspelling" | "nickname") => void;
+  /** Album page link; with a trackId the page scrolls to and selects that row. */
+  onOpenAlbum?: (albumId: number, title: string, trackId?: number) => void;
 }) {
   const [open, setOpen] = useState(false);
   const extra = fix.track_total - fix.tracks.length;
-  const declared = fix.kind === "misspelling";
   const summary = [
     fix.track_total > 0 &&
       `${fix.track_total} track tag${fix.track_total === 1 ? "" : "s"}`,
@@ -486,19 +496,9 @@ function TagFixCard({
     <div className="rounded-md border p-3">
       <div className="flex items-center gap-3">
         <p className="min-w-0 flex-1 text-sm">
-          {declared ? (
-            <>
-              “{fix.wrong}” should be “{fix.canonical}”
-            </>
-          ) : (
-            <>
-              “{fix.wrong}” — a spelling of “{fix.canonical}”
-            </>
-          )}
+          “{fix.wrong}” — a spelling of “{fix.canonical}”
           <span className="block text-[11px] text-muted-foreground">
-            {declared
-              ? `${summary} still carry the old spelling — fix them at the source, then rescan`
-              : `in ${summary} — a misspelling to fix, or a nickname to keep?`}
+            in {summary} — a misspelling, or a nickname?
           </span>
         </p>
         <button
@@ -508,28 +508,25 @@ function TagFixCard({
         >
           {open ? "hide files" : "show files"}
         </button>
-        {!declared && (
-          <Button
-            size="sm"
-            variant="outline"
-            className="shrink-0 gap-1.5"
-            disabled={busy}
-            title="Wrong text — flags these files for retagging until the spelling is gone"
-            onClick={() => onSetKind(fix, "misspelling")}
-          >
-            {spin && <Spinner className="size-3" />}
-            It’s a misspelling
-          </Button>
-        )}
         <Button
           size="sm"
           variant="outline"
           className="shrink-0 gap-1.5"
           disabled={busy}
-          title="Intended moniker, not a typo — keeps resolving here, never flagged"
+          title="Wrong text — recorded as such; the library keeps showing the artist's name, nothing to fix in the files"
+          onClick={() => onSetKind(fix, "misspelling")}
+        >
+          {spin && <Spinner className="size-3" />}
+          It’s a misspelling
+        </Button>
+        <Button
+          size="sm"
+          variant="outline"
+          className="shrink-0"
+          disabled={busy}
+          title="Intended moniker, not a typo — keeps resolving here"
           onClick={() => onSetKind(fix, "nickname")}
         >
-          {spin && declared && <Spinner className="size-3" />}
           It’s a nickname
         </Button>
       </div>
@@ -538,7 +535,19 @@ function TagFixCard({
           {fix.albums.map((al, i) => (
             <div key={`al-${al.folder_path}`} className={`px-3 py-1.5 ${i > 0 ? "border-t" : ""}`}>
               <span className="block text-xs">
-                album-artist tag on <span className="font-medium">{al.album_title}</span>
+                album-artist tag on{" "}
+                {onOpenAlbum ? (
+                  <button
+                    type="button"
+                    className="font-medium hover:underline"
+                    title="Open the album page"
+                    onClick={() => onOpenAlbum(al.album_id, al.album_title)}
+                  >
+                    {al.album_title}
+                  </button>
+                ) : (
+                  <span className="font-medium">{al.album_title}</span>
+                )}
               </span>
               <span className="block min-w-0 break-all font-mono text-[11px] text-muted-foreground">
                 {al.folder_path}
@@ -551,7 +560,20 @@ function TagFixCard({
               className={`px-3 py-1.5 ${i > 0 || fix.albums.length > 0 ? "border-t" : ""}`}
             >
               <span className="block text-xs">
-                “{t.track_title}”{t.album_title ? ` on ${t.album_title}` : ""}
+                {/* Track title → the album page, scrolled to that row. */}
+                {onOpenAlbum && t.album_id != null ? (
+                  <button
+                    type="button"
+                    className="hover:underline"
+                    title="Open the album page at this track"
+                    onClick={() => onOpenAlbum(t.album_id!, t.album_title ?? "", t.track_id)}
+                  >
+                    “{t.track_title}”
+                  </button>
+                ) : (
+                  <>“{t.track_title}”</>
+                )}
+                {t.album_title ? ` on ${t.album_title}` : ""}
                 <span className="text-muted-foreground"> · in the {t.source}</span>
               </span>
               <span className="block min-w-0 break-all font-mono text-[11px] text-muted-foreground">
@@ -1262,6 +1284,40 @@ export function MetadataCenter({
   // landing effect only ever redirects AWAY from it (opt-out libraries), so
   // the initial selection never visibly jumps.
   const [pane, setPane] = useState<PaneId>("map");
+
+  // MusicBrainz prefetch (the guide's two background steps): what's left to
+  // fetch, and whether a job is running. Re-estimated whenever a prefetch
+  // finishes or the page reloads — the caches empty as albums get resolved.
+  const backgroundJobs = useBackgroundJobs();
+  const prefetchJob = (kind: string) =>
+    backgroundJobs.find((j) => j.kind === kind && j.library_id === libraryId) ?? null;
+  const groupsJob = prefetchJob("mb-prefetch-groups");
+  const releasesJob = prefetchJob("mb-prefetch-releases");
+  const [prefetchEstimate, setPrefetchEstimate] = useState<{ artists: number; groups: number } | null>(
+    null,
+  );
+  const jobsRunningKey = `${groupsJob?.id ?? ""}|${releasesJob?.id ?? ""}`;
+  useEffect(() => {
+    let stale = false;
+    const load = () =>
+      invoke<{ artists: number; groups: number }>("mb_prefetch_estimate", { libraryId })
+        .then((e) => {
+          if (!stale) setPrefetchEstimate(e);
+        })
+        .catch(() => {});
+    void load();
+    const un = listen<{ libraryId: string }>("mb-prefetch-done", (e) => {
+      if (e.payload.libraryId === libraryId) void load();
+    });
+    return () => {
+      stale = true;
+      un.then((fn) => fn());
+    };
+  }, [libraryId, reloadKey, jobsRunningKey]);
+  const startPrefetch = (cmd: "mb_prefetch_groups_start" | "mb_prefetch_releases_start") =>
+    invoke(cmd, { libraryId }).catch((e) => toast.error(String(e)));
+  /** ~1.5 requests per artist (pages), 1 per group, at MB's ~1.2s pacing. */
+  const prefetchMinutes = (requests: number) => Math.max(1, Math.ceil((requests * 1.2) / 60));
   const [hideUndone, setHideUndone] = useState(false);
   const [changeLimit, setChangeLimit] = useState(25);
   // Per-library opt-out: false hides every MusicBrainz-backed pane, leaving
@@ -1394,7 +1450,7 @@ export function MetadataCenter({
       toast.success(
         kind === "nickname"
           ? `“${fix.wrong}” kept as a nickname of ${fix.canonical}.`
-          : `“${fix.wrong}” flagged — its files stay listed until retagged.`,
+          : `“${fix.wrong}” noted as a misspelling of ${fix.canonical}.`,
       );
     });
 
@@ -1620,12 +1676,26 @@ export function MetadataCenter({
       !a.ignored &&
       !stagedLockedIds.has(a.album_id),
   ).length;
+  // Stage 3: albums matched to a group whose release(s) still need picking
+  // (state "album" = group known, release not) — the exact-pressing pick
+  // that brings the track list and credits.
+  const guideReleasesLeft = albums.filter(
+    (a) => a.state === "album" && !a.ignored && !stagedLockedIds.has(a.album_id),
+  ).length;
   const guideFeatureLeft = artistSuggestions.filter((s) => {
     const row = artists.find((a) => a.artist_id === s.payload.artist_id);
     return !row ? true : !row.ignored && row.album_count === 0 && notStagedSplit(row);
   }).length;
   const guideStage =
-    guideOwnerLeft > 0 ? 1 : guideAlbumsLeft > 0 ? 2 : guideFeatureLeft > 0 ? 3 : 0;
+    guideOwnerLeft > 0
+      ? 1
+      : guideAlbumsLeft > 0
+        ? 2
+        : guideReleasesLeft > 0
+          ? 3
+          : guideFeatureLeft > 0
+            ? 4
+            : 0;
 
   // Suggestions ordered by the map's doctrine: owner-artist questions are
   // stage-1 work (each answer arid-unlocks a discography), feature-artist
@@ -1960,9 +2030,8 @@ export function MetadataCenter({
     );
   }
 
-  // Declared misspellings nag (Source fixes band + File problems); neutral
-  // variants wait quietly under File problems for the user to classify.
-  const declaredFixes = tagFixes.filter((f) => f.kind === "misspelling");
+  // Unclassified spellings wait quietly under File problems for the user to
+  // classify; once classified (either way) the backend stops listing them.
   const variantFixes = tagFixes.filter((f) => f.kind === "variant");
   // `count` is the size of the pane; `alert` (red) is the blocking work —
   // unidentified owners / unidentified albums — and `warn` (amber) the softer
@@ -1976,6 +2045,10 @@ export function MetadataCenter({
   // The map keeps the top slot — the whole-library picture, with the guided
   // steps and the how-it-works primer living right on it.
   const NAV: { id: PaneId; label: string; count: number; warn?: number; alert?: number }[] = [
+    // Sources first (user's call, 2026-09-11): where every value came from —
+    // tags, MusicBrainz, edits — per album and loose track. Reference, not
+    // work; the map stays the landing.
+    { id: "sources" as const, label: "Sources", count: 0 },
     ...(onlineEnabled
       ? [
           {
@@ -2038,8 +2111,8 @@ export function MetadataCenter({
     {
       id: "files",
       label: "File problems",
-      count: fallbacks.length + issues.length + tagFixes.length,
-      warn: issues.length + declaredFixes.length,
+      count: fallbacks.length + issues.length + variantFixes.length,
+      warn: issues.length,
     },
   ];
   // History is pinned to the nav's bottom, apart from the work sections — a
@@ -2228,7 +2301,10 @@ export function MetadataCenter({
           >
             <span className="whitespace-nowrap">{n.label}</span>
             {/* The two numbers sit together as one cluster — they're both
-                "how much is in here", so the label is what they're apart from. */}
+                "how much is in here", so the label is what they're apart from.
+                Omitted entirely when there's nothing to show (Sources), so
+                the gap doesn't leave a blank tail. */}
+            {(n.id === "map" || (n.alert ?? 0) > 0 || (n.warn ?? 0) > 0 || n.count > 0) && (
             <span className="flex shrink-0 items-center gap-1">
               {n.id === "map" ? (
                 <span
@@ -2262,6 +2338,7 @@ export function MetadataCenter({
                 </>
               )}
             </span>
+            )}
           </button>
         ))}
         {/* Progress lives in the match modal, not here — this is just the
@@ -2314,6 +2391,7 @@ export function MetadataCenter({
           then the whole library as state-colored nodes. Fill carries state
           alongside color (solid / light / hollow / muted) so red-green
           colorblindness never hides the difference. */}
+      {pane === "sources" && <SourcesPage libraryId={libraryId} />}
       {pane === "map" && (
         <section className="space-y-4">
           {/* The pass entry point, first thing on the page: a pass still has
@@ -2507,6 +2585,14 @@ export function MetadataCenter({
                   ],
                   [
                     3,
+                    "Match album releases",
+                    guideReleasesLeft,
+                    0,
+                    "albums",
+                    "Albums matched to a release group still need the exact release your files are — that pick brings the track list and credits.",
+                  ],
+                  [
+                    4,
                     "Feature artists",
                     guideFeatureLeft,
                     artistSuggestionsFeatures.length,
@@ -2515,8 +2601,8 @@ export function MetadataCenter({
                   ],
                 ] as const
               ).map(([n, title, left, ready, target, desc]) => (
+                <Fragment key={n}>
                 <div
-                  key={n}
                   className={`flex items-center gap-3 px-3 py-2 ${n > 1 ? "border-t" : ""} ${
                     guideStage === n ? "bg-accent/40" : ""
                   }`}
@@ -2558,6 +2644,72 @@ export function MetadataCenter({
                     </Button>
                   )}
                 </div>
+                {/* The two background fetches, each under the stage whose
+                    matches scope it — MusicBrainz's request budget is the
+                    bottleneck, so they run while you keep browsing, and the
+                    dialogs open instantly from the cache afterwards. */}
+                {(n === 1 || n === 2) && (() => {
+                  const isGroups = n === 1;
+                  const job = isGroups ? groupsJob : releasesJob;
+                  const count = isGroups ? prefetchEstimate?.artists ?? 0 : prefetchEstimate?.groups ?? 0;
+                  const minutes = prefetchMinutes(isGroups ? count * 1.5 : count);
+                  const title = isGroups ? "Prefetch release groups" : "Prefetch releases";
+                  const scope = isGroups
+                    ? `${count} ${count === 1 ? "artist" : "artists"}`
+                    : `${count} ${count === 1 ? "album" : "albums"}`;
+                  const desc = isGroups
+                    ? "Fetches each identified artist's discography in the background so the match dialog opens instantly. Get the artist matches right first — only matched artists with unmatched albums are fetched."
+                    : "Fetches every matched group's release list in the background so the release picker opens instantly. Pick release groups accurately first — only matched groups with an unresolved release are fetched.";
+                  return (
+                    <div className="flex items-center gap-3 border-t bg-muted/20 py-2 pl-11 pr-3">
+                      <div className="min-w-0 flex-1">
+                        <p className="flex items-center gap-1.5 text-sm">
+                          <span className="shrink-0">
+                            {title}
+                            <span className="text-muted-foreground"> —</span>
+                          </span>
+                          {/* Running: a spinner right after the dash, ahead
+                              of the counter, so the line reads as live. */}
+                          {job && <Spinner className="size-3.5 shrink-0 text-muted-foreground" />}
+                          <span className="truncate text-muted-foreground">
+                            {job
+                              ? `${job.done}/${job.total}${job.detail ? ` · ${job.detail}` : ""}`
+                              : count > 0
+                                ? `${scope}, ~${minutes} min`
+                                : "nothing left to fetch"}
+                          </span>
+                        </p>
+                        <p className="text-xs text-muted-foreground">{desc}</p>
+                      </div>
+                      {job ? (
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="shrink-0"
+                          onClick={() => void cancelBackgroundJob(job.id).catch(() => {})}
+                        >
+                          Cancel
+                        </Button>
+                      ) : count > 0 ? (
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="shrink-0"
+                          disabled={running}
+                          title={running ? "Waits for the matching pass to finish" : undefined}
+                          onClick={() =>
+                            void startPrefetch(
+                              isGroups ? "mb_prefetch_groups_start" : "mb_prefetch_releases_start",
+                            )
+                          }
+                        >
+                          Prefetch
+                        </Button>
+                      ) : null}
+                    </div>
+                  );
+                })()}
+                </Fragment>
               ))}
               {/* Only offered while a pass has something to act on: queued
                   matches, never-examined albums, or artists it can derive.
@@ -3355,29 +3507,6 @@ export function MetadataCenter({
 
       {/* File-level notes. Both are long by nature and neither is actionable
           inside waverunner, so they collapse to a line you open on purpose. */}
-      {pane === "files" && declaredFixes.length > 0 && (
-        <div className="mb-6">
-          <h4 className="mb-0.5 flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-amber-300">
-            <FileWarning size={14} />
-            Misspellings still in tags ({declaredFixes.length})
-          </h4>
-          <p className="mb-1.5 text-xs text-muted-foreground">
-            Spellings you flagged as wrong that the files still carry. Retag them at the source and
-            rescan — each entry disappears once its tags are clean.
-          </p>
-          <div className="space-y-2">
-            {declaredFixes.map((f) => (
-              <TagFixCard
-                key={`${f.artist_id}:${f.wrong}`}
-                fix={f}
-                busy={busy}
-                busyKey={busyKey}
-                onSetKind={setAliasKind}
-              />
-            ))}
-          </div>
-        </div>
-      )}
       {pane === "files" && variantFixes.length > 0 && (
         <div className="mb-6" id="sec-files-variants">
           <h4 className="mb-0.5 flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-muted-foreground">
@@ -3386,8 +3515,9 @@ export function MetadataCenter({
           </h4>
           <p className="mb-1.5 text-xs text-muted-foreground">
             Alternate spellings recorded by merges and matches, still present in your files. The
-            machine takes no position: call each one a misspelling (flags its files for retagging)
-            or a nickname (kept as intended, never flagged). Undoable from History either way.
+            machine takes no position: call each one a misspelling or a nickname. Either way the
+            library keeps showing the artist's name — the answer is just recorded, and the entry
+            leaves this list. Undoable from History.
           </p>
           <div className="space-y-2">
             {variantFixes.map((f) => (
@@ -3397,6 +3527,11 @@ export function MetadataCenter({
                 busy={busy}
                 busyKey={busyKey}
                 onSetKind={setAliasKind}
+                onOpenAlbum={
+                  onOpenAlbum
+                    ? (albumId, title, trackId) => onOpenAlbum(albumId, title, null, trackId)
+                    : undefined
+                }
               />
             ))}
           </div>
@@ -3510,7 +3645,7 @@ export function MetadataCenter({
           Every matched album's track list agrees with its release.
         </p>
       )}
-      {pane === "files" && fallbacks.length === 0 && issues.length === 0 && tagFixes.length === 0 && (
+      {pane === "files" && fallbacks.length === 0 && issues.length === 0 && variantFixes.length === 0 && (
         <p className="py-8 text-center text-sm text-muted-foreground">
           Every file read cleanly and carried the tags it needed.
         </p>

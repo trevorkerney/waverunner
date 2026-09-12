@@ -1470,6 +1470,20 @@ pub struct TierRelease {
     /// The user declared this release has no MusicBrainz counterpart.
     pub declared_none: bool,
     pub fields: HashMap<String, TierValue>,
+    /// The release's tracks in disc/track order — title, credits, disc and
+    /// track number across the tiers (user's ask, 2026-09-11).
+    pub tracks: Vec<TierTrack>,
+}
+
+#[derive(Serialize)]
+pub struct TierTrack {
+    pub id: i64,
+    pub title: String,
+    pub disc: i64,
+    pub number: Option<i64>,
+    /// Matched to a MusicBrainz recording.
+    pub matched: bool,
+    pub fields: HashMap<String, TierValue>,
 }
 
 #[derive(Serialize)]
@@ -1581,6 +1595,38 @@ pub async fn get_tier_matrix(
     .map_err(|e| e.to_string())?;
     let pinned: HashMap<i64, i64> = pins.into_iter().collect();
 
+    // Every album track, bucketed per release in disc/track order, carrying
+    // its own tiers (title, credits, disc and track number).
+    let track_rows: Vec<(i64, i64, String, i64, Option<i64>)> = sqlx::query_as(
+        "SELECT tr.release_id, t.id, t.title, COALESCE(t.disc_number, 1), t.track_number
+         FROM track t
+         JOIN track_release tr ON tr.track_id = t.id
+         JOIN album_release ar ON ar.id = tr.release_id
+         JOIN media_entry me ON me.id = t.id
+         WHERE me.library_id = ?
+           -- Real albums only: loose containers list their tracks as loose
+           -- rows below (their tiers must stay in by_entity for that pass).
+           AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = ar.album_id)
+           AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = ar.album_id)
+         ORDER BY tr.release_id, COALESCE(t.disc_number, 1), COALESCE(t.track_number, 999999),
+                  t.sort_title COLLATE NOCASE",
+    )
+    .bind(&library_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let mut tracks_by_release: HashMap<i64, Vec<TierTrack>> = HashMap::new();
+    for (release_id, id, title, disc, number) in track_rows {
+        tracks_by_release.entry(release_id).or_default().push(TierTrack {
+            id,
+            title,
+            disc,
+            number,
+            matched: recording_matched.contains(&id),
+            fields: by_entity.remove(&id).unwrap_or_default(),
+        });
+    }
+
     // Every release in the library with its pin and label pref, bucketed
     // per album. Tag tier = what the scanner stamped on the release row;
     // MB tier = the pinned pressing; user tier = the label rename.
@@ -1642,6 +1688,7 @@ pub async fn get_tier_matrix(
         fields.retain(|_, v| v.tag.is_some() || v.mb.is_some() || v.user.is_some());
         let leaf = folder.rsplit(['\\', '/']).next().unwrap_or(&folder).to_string();
         releases_by_album.entry(album_id).or_default().push(TierRelease {
+            tracks: tracks_by_release.remove(&id).unwrap_or_default(),
             id,
             label,
             folder: leaf,

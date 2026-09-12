@@ -5,6 +5,7 @@ mod discord_presence;
 mod img_protocol;
 pub mod interactive;
 mod interactive_session;
+mod jobs;
 mod watch;
 mod mp3_frames;
 mod mpv;
@@ -305,6 +306,10 @@ pub fn run() {
             music_mb::mb_group_releases,
             music_mb::mb_artist_groups_cached,
             music_mb::mb_artist_release_groups_page,
+            music_mb::mb_group_releases_cached,
+            music_mb::mb_prefetch_estimate,
+            music_mb::mb_prefetch_groups_start,
+            music_mb::mb_prefetch_releases_start,
             music_mb::mb_credit_check,
             music_mb::mb_release_group_of,
             music_edit::unstage_pending_change,
@@ -354,8 +359,8 @@ pub fn run() {
             music_player::music_track_started,
             waveform::get_track_waveform,
             waveform::waveform_preload_start,
-            waveform::waveform_preload_cancel,
-            waveform::waveform_preload_status,
+            jobs::background_jobs,
+            jobs::background_job_cancel,
             player::init_player,
             player::get_player_stats,
             player::set_player_region,

@@ -4,16 +4,11 @@
 
 
 
-## now
-
-I think MB requests are slow enough that it merits congregating all of them, or as much as possible, into 1 phase of the matching process. Theyre just so slow sometimes. I think it would go, match ALL not-feature-only artists and make sure they're correct, then run ALL requests to MB to get the all artists' release groups, then have the user match release groups, then get all MB releases for each of the selected release groups, then have the user select releases. These MB requests should happen in the background allowing the user to still use the library, not like scanning and matching passes. Probably just put the loader and status in the sidebar the same way preloading waveforms does - these should both be able to appear simultaneously, + others potentially later. Applying also takes forever sometimes - we'd need to figure out something that would allow the user to essentially add applies to a queue of requests so that they dont have to wait for each apply to process before going to the next.
-
-
 ## bugs / needs fixing
 
-make adding local covers where the user can select multiple images in the selection dialog
+NEED a way to tell waverunner that two tracks are the same so their likes, plays, etc can be mirrored. For instance I have 'Arsonist's Lullaby' on both Hozier's self titled album as well as From Eden.
 
-on people pages in both video and audio (artists) libraries, sometimes when the entries come in (the animated entry), they fall into place but once they land they kinda stutter into place. hard to explain, like the animation brings them down, and instead of smoothly landing they kinda jump a tiny bit at the very end.
+do a pass ensuring pages don't show their content until content is loaded or shows a loader. I've always thought it was ugly when you see a page quickly grow at the beginning due to things loading in separately without loaders
 
 does the building portion of rescanning truly have an indeterminate ETA? I get why reading the tags would (sorta) but building?
 

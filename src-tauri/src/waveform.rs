@@ -263,71 +263,24 @@ pub async fn get_track_waveform(
 }
 
 // ── Preload ────────────────────────────────────────────────────────────────
-// Opt-in whole-library backfill (Settings → Audio): walks every music-library
+// Opt-in whole-library backfill (Library settings): walks every music-library
 // track through ensure_waveform — cached rows skip in a millisecond, the rest
 // decode once. Politely paced, yields to matching passes, cancellable, and
-// reports progress via the `waveform-preload` event so the UI can minimize
-// and reattach like a rescan.
+// reports through the background-jobs registry (crate::jobs) so the sidebar
+// shows the line and the progress window can reattach.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
-static PRELOAD_RUNNING: AtomicBool = AtomicBool::new(false);
-static PRELOAD_CANCEL: AtomicBool = AtomicBool::new(false);
-static PRELOAD_DONE: AtomicUsize = AtomicUsize::new(0);
-static PRELOAD_TOTAL: AtomicUsize = AtomicUsize::new(0);
-/// Title of the track currently decoding — the progress window's byline.
-static PRELOAD_TRACK: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-/// Which library this run walks — the sidebar hangs the progress line there.
-static PRELOAD_LIB: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-
-#[derive(serde::Serialize, Clone)]
-pub struct PreloadStatus {
-    pub running: bool,
-    pub done: usize,
-    pub total: usize,
-    pub track: Option<String>,
-    pub library_id: Option<String>,
-}
-
-fn preload_status_now() -> PreloadStatus {
-    PreloadStatus {
-        running: PRELOAD_RUNNING.load(Ordering::SeqCst),
-        done: PRELOAD_DONE.load(Ordering::SeqCst),
-        total: PRELOAD_TOTAL.load(Ordering::SeqCst),
-        track: PRELOAD_TRACK.lock().ok().and_then(|g| g.clone()),
-        library_id: PRELOAD_LIB.lock().ok().and_then(|g| g.clone()),
-    }
-}
-
-/// Reattach point for the UI (app restart, reopened progress window).
-#[tauri::command]
-pub async fn waveform_preload_status() -> Result<PreloadStatus, String> {
-    Ok(preload_status_now())
-}
-
-#[tauri::command]
-pub async fn waveform_preload_cancel() -> Result<(), String> {
-    PRELOAD_CANCEL.store(true, Ordering::SeqCst);
-    Ok(())
-}
+pub const PRELOAD_JOB_KIND: &str = "waveform-preload";
 
 /// Start the backfill for ONE library (launched from its Library settings;
-/// no-op if a run is already going — the caller just reattaches).
+/// no-op if a run for that library is already going — the caller reattaches).
 #[tauri::command]
 pub async fn waveform_preload_start(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     library_id: String,
 ) -> Result<(), String> {
-    if PRELOAD_RUNNING.swap(true, Ordering::SeqCst) {
-        return Ok(());
-    }
-    PRELOAD_CANCEL.store(false, Ordering::SeqCst);
-    if let Ok(mut l) = PRELOAD_LIB.lock() {
-        *l = Some(library_id.clone());
-    }
     let pool = state.app_db.clone();
-    let ids: Vec<(i64,)> = match sqlx::query_as(
+    let ids: Vec<(i64,)> = sqlx::query_as(
         "SELECT t.id FROM track t
          JOIN media_entry me ON me.id = t.id
          WHERE me.library_id = ?
@@ -336,27 +289,26 @@ pub async fn waveform_preload_start(
     .bind(&library_id)
     .fetch_all(&pool)
     .await
-    {
-        Ok(ids) => ids,
-        Err(e) => {
-            PRELOAD_RUNNING.store(false, Ordering::SeqCst);
-            if let Ok(mut l) = PRELOAD_LIB.lock() {
-                *l = None;
-            }
-            return Err(e.to_string());
-        }
+    .map_err(|e| e.to_string())?;
+    let total = ids.len();
+    let Some(job) = crate::jobs::start(
+        &app,
+        format!("{PRELOAD_JOB_KIND}:{library_id}"),
+        PRELOAD_JOB_KIND,
+        "preloading waveforms",
+        Some(library_id),
+        total,
+    ) else {
+        return Ok(()); // already running — reattach
     };
-    PRELOAD_TOTAL.store(ids.len(), Ordering::SeqCst);
-    PRELOAD_DONE.store(0, Ordering::SeqCst);
     tauri::async_runtime::spawn(async move {
-        use tauri::Emitter;
-        let mut last_emit = std::time::Instant::now();
+        let mut done = 0usize;
         for (id,) in ids {
-            if PRELOAD_CANCEL.load(Ordering::SeqCst) {
+            if job.cancelled() {
                 break;
             }
             // A matching pass shares the DB and the CPU — wait it out.
-            while crate::music_mb::pass_running() && !PRELOAD_CANCEL.load(Ordering::SeqCst) {
+            while crate::music_mb::pass_running() && !job.cancelled() {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
             // "Artist — Track" byline: main credit first, track_meta's display
@@ -374,29 +326,18 @@ pub async fn waveform_preload_start(
             .await
             .ok()
             .flatten();
-            if let Ok(mut t) = PRELOAD_TRACK.lock() {
-                *t = row.map(|(title, artist)| match artist {
-                    Some(a) if !a.trim().is_empty() => format!("{a} \u{2014} {title}"),
-                    _ => title,
-                });
-            }
+            let byline = row.map(|(title, artist)| match artist {
+                Some(a) if !a.trim().is_empty() => format!("{a} \u{2014} {title}"),
+                _ => title,
+            });
+            job.progress(done, total, byline.clone());
             let _ = ensure_waveform(&pool, id).await; // failures just skip
-            PRELOAD_DONE.fetch_add(1, Ordering::SeqCst);
-            if last_emit.elapsed().as_millis() >= 250 {
-                last_emit = std::time::Instant::now();
-                let _ = app.emit("waveform-preload", preload_status_now());
-            }
+            done += 1;
+            job.progress(done, total, byline);
             // Politeness gap so playback and the UI never feel the walk.
             tokio::time::sleep(std::time::Duration::from_millis(15)).await;
         }
-        PRELOAD_RUNNING.store(false, Ordering::SeqCst);
-        if let Ok(mut t) = PRELOAD_TRACK.lock() {
-            *t = None;
-        }
-        if let Ok(mut l) = PRELOAD_LIB.lock() {
-            *l = None;
-        }
-        let _ = app.emit("waveform-preload", preload_status_now());
+        job.finish();
     });
     Ok(())
 }

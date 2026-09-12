@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { MetadataCenter, type CenterFocus } from "@/components/music/MetadataCenter";
 import { VideoMetadataCenterPage } from "@/components/VideoMetadataCenter";
+import { Spinner } from "@/components/ui/spinner";
 
 /** The metadata center as a page — the sidebar's Metadata row under every
  *  library (user's call, 2026-09-10: a page like Sources, not a modal).
@@ -16,11 +17,13 @@ export function MetadataPage({
   onOpenArtist,
 }: {
   libraryId: string;
-  format: string;
+  /** null while the library list hasn't caught up (a library the wizard just
+   *  created) — the page waits rather than guessing a center. */
+  format: string | null;
   /** One-shot landing (an album's "N tracks unmatched" → its differ card). */
   focus: CenterFocus | null;
   onChanged: () => void;
-  onOpenAlbum: (albumId: number, title: string, releaseId: number | null) => void;
+  onOpenAlbum: (albumId: number, title: string, releaseId: number | null, trackId?: number) => void;
   onOpenArtist: (artistId: number, name: string) => void;
 }) {
   // A fresh visit refetches — same as the modal reopening did.
@@ -28,6 +31,13 @@ export function MetadataPage({
   useEffect(() => {
     setReloadKey((k) => k + 1);
   }, [libraryId]);
+  if (format === null) {
+    return (
+      <div className="flex flex-1 items-center justify-center">
+        <Spinner className="size-6" />
+      </div>
+    );
+  }
   if (format !== "music") {
     return (
       <div className="flex min-h-0 flex-1 flex-col px-4 pt-2">

@@ -654,24 +654,38 @@ export function CoversDialog({
 
   const addLocal = async () => {
     const picked = await openFileDialog({
-      multiple: false,
+      multiple: true,
       directory: false,
       filters: [{ name: "Image", extensions: ["jpg", "jpeg", "png", "webp", "bmp", "gif"] }],
     });
-    if (!picked || typeof picked !== "string") return;
+    // The plugin returns a string for single picks and an array for multi.
+    const paths = Array.isArray(picked) ? picked : typeof picked === "string" ? [picked] : [];
+    if (paths.length === 0) return;
     setBusy(true);
     try {
-      const added = await invoke<string>("add_cover", {
-        libraryId: target.libraryId,
-        entryId,
-        sourcePath: picked,
-        releaseId: target.kind === "release" ? releaseId : null,
-      });
+      // Imported one by one in the order they were picked; a bad file skips
+      // itself (toast) without dropping the rest of the selection.
+      let first: string | null = null;
+      let failed = 0;
+      for (const sourcePath of paths) {
+        try {
+          const added = await invoke<string>("add_cover", {
+            libraryId: target.libraryId,
+            entryId,
+            sourcePath,
+            releaseId: target.kind === "release" ? releaseId : null,
+          });
+          first ??= added;
+        } catch (e) {
+          failed++;
+          toast.error(String(e));
+        }
+      }
       await refetch();
-      // An added cover is almost always meant to be used — set it directly.
-      await setCover(added);
-    } catch (e) {
-      toast.error(String(e));
+      // An added cover is almost always meant to be used — the first one
+      // picked becomes the cover; the rest are ready in the row.
+      if (first) await setCover(first);
+      if (paths.length > 1 && failed === 0) toast.success(`Added ${paths.length} covers`);
     } finally {
       setBusy(false);
     }

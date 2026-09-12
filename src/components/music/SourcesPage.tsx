@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Disc3, Music2, Users, Layers } from "lucide-react";
+import { ChevronRight, Disc3, Music2, Users } from "lucide-react";
 import { Spinner } from "../ui/spinner";
 import { Input } from "../ui/input";
 
@@ -15,6 +15,16 @@ interface TierValue {
   mb: string | null;
   user: string | null;
 }
+/** One album track: title, credits, disc and track number across the tiers. */
+interface TierTrack {
+  id: number;
+  title: string;
+  disc: number;
+  number: number | null;
+  /** Matched to a MusicBrainz recording. */
+  matched: boolean;
+  fields: Record<string, TierValue>;
+}
 interface TierRelease {
   id: number;
   label: string | null;
@@ -22,6 +32,8 @@ interface TierRelease {
   is_default: boolean;
   declared_none: boolean;
   fields: Record<string, TierValue>;
+  /** The release's tracks in disc/track order. */
+  tracks: TierTrack[];
 }
 interface TierRow {
   id: number;
@@ -196,13 +208,32 @@ export function SourcesPage({ libraryId }: { libraryId: string }) {
     return () => window.removeEventListener("waverunner:library-rescanned", bump);
   }, []);
 
+  // Album tracks are collapsed under their release by default (5K rows
+  // otherwise); a filter that hits a track opens its release so the hit is
+  // visible. Manual toggles are remembered per release for the visit.
+  const [openTracks, setOpenTracks] = useState<Set<number>>(new Set());
+  const toggleTracks = (releaseId: number) =>
+    setOpenTracks((prev) => {
+      const next = new Set(prev);
+      if (next.has(releaseId)) next.delete(releaseId);
+      else next.add(releaseId);
+      return next;
+    });
+  const filtering = filter.trim() !== "" || onlyDisagreeing || onlyEdited;
+  const q = filter.trim().toLowerCase();
+  const fieldsKeep = (title: string, fields: Record<string, TierValue>) =>
+    (!q || title.toLowerCase().includes(q)) &&
+    (!onlyDisagreeing || rowDisagrees(fields)) &&
+    (!onlyEdited || Object.values(fields).some((v) => v.user != null));
+  const trackKeep = (t: TierTrack) => fieldsKeep(t.title, t.fields);
+
   const groups = useMemo(() => {
     if (!matrix) return [];
-    const q = filter.trim().toLowerCase();
     const keep = (r: TierRow) =>
-      (!q || r.title.toLowerCase().includes(q)) &&
-      (!onlyDisagreeing || rowDisagrees(r.fields)) &&
-      (!onlyEdited || Object.values(r.fields).some((v) => v.user != null));
+      fieldsKeep(r.title, r.fields) ||
+      // An album stays when any of its tracks answers the filter — the
+      // track rows are what it opens onto.
+      r.releases.some((rel) => rel.tracks.some(trackKeep));
     return matrix.groups
       .map((g) => {
         const artistHit = !!q && (g.artist_title ?? "").toLowerCase().includes(q);
@@ -214,6 +245,8 @@ export function SourcesPage({ libraryId }: { libraryId: string }) {
         };
       })
       .filter((g) => g.albums.length > 0 || g.loose_tracks.length > 0);
+    // fieldsKeep/trackKeep derive from the same three inputs.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [matrix, filter, onlyDisagreeing, onlyEdited]);
 
   if (matrix === null) {
@@ -296,33 +329,106 @@ export function SourcesPage({ libraryId }: { libraryId: string }) {
     );
   };
 
+  // A release's tracks: a toggle row ("12 tracks"), then one row per track
+  // with title, credits, disc and track number across the tiers. Under a
+  // filter only the matching tracks show, and the release opens itself.
+  const renderTracks = (rel: TierRelease, nested: boolean) => {
+    if (rel.tracks.length === 0) return null;
+    const shown = filtering ? rel.tracks.filter(trackKeep) : rel.tracks;
+    const forcedOpen = filtering && shown.length > 0;
+    const open = forcedOpen || openTracks.has(rel.id);
+    const pad = nested ? "pl-14" : "pl-9";
+    return (
+      <div key={`tracks-${rel.id}`}>
+        <button
+          type="button"
+          onClick={() => toggleTracks(rel.id)}
+          className={`flex w-full items-center gap-1.5 border-t border-border/40 py-1 pr-3 text-left text-[11px] text-muted-foreground hover:bg-accent/30 hover:text-foreground ${pad}`}
+        >
+          <ChevronRight size={12} className={`transition-transform ${open ? "rotate-90" : ""}`} />
+          {filtering && shown.length !== rel.tracks.length
+            ? `${shown.length} of ${rel.tracks.length} tracks`
+            : `${rel.tracks.length} ${rel.tracks.length === 1 ? "track" : "tracks"}`}
+        </button>
+        {open &&
+          shown.map((t) => {
+            const entries = rowEntries(t.fields, onlyDisagreeing);
+            return (
+              <div
+                key={`track-${t.id}`}
+                className="grid items-start border-t border-border/40 hover:bg-accent/30"
+                style={{ gridTemplateColumns: cols }}
+              >
+                <div className={`flex min-w-0 items-start gap-2 py-1.5 pr-3 ${pad}`}>
+                  <span className="w-8 shrink-0 text-right font-mono text-[10px] text-muted-foreground">
+                    {t.disc > 1 ? `${t.disc}·` : ""}
+                    {t.number ?? "–"}
+                  </span>
+                  <div className="min-w-0">
+                    <p className="truncate text-xs" title={t.title}>
+                      {t.title}
+                    </p>
+                    <p className="text-[10px] text-muted-foreground">
+                      track{t.matched && " · matched"}
+                    </p>
+                  </div>
+                </div>
+                {tiers.map((tier) => (
+                  <TierCell key={tier.key} entries={entries} tier={tier.key} />
+                ))}
+              </div>
+            );
+          })}
+      </div>
+    );
+  };
+
   const renderAlbum = (r: TierRow) => (
     <div key={`album-${r.id}`}>
       {renderRow(r)}
-      {r.releases.length > 1 && r.releases.map((rel) => renderRelease(rel, r))}
+      {r.releases.length > 1
+        ? r.releases.map((rel) => (
+            <div key={`rel-block-${rel.id}`}>
+              {renderRelease(rel, r)}
+              {renderTracks(rel, true)}
+            </div>
+          ))
+        : r.releases[0] && renderTracks(r.releases[0], false)}
     </div>
   );
 
   return (
-    <div className="px-6 pb-8">
-      <div className="flex flex-wrap items-center gap-3 py-5">
-        <Layers size={18} className="text-muted-foreground" />
-        <h1 className="font-heading text-xl font-bold">Sources</h1>
-        <span className="text-xs text-muted-foreground">
-          {total} {total === 1 ? "item" : "items"} · the column furthest right with a value is what
-          the library shows
+    // -mx-4: back out of the Metadata pane's padding so the table runs the
+    // full width of the page area (user's call, 2026-09-11); the toolbar
+    // puts the padding back for itself.
+    <div className="-mx-4 pb-8">
+      {/* Header styled like the Artists/Albums tab headers ("N of M albums
+          identified"): the count large, the rest small caps; one tight row. */}
+      <div className="flex flex-wrap items-center gap-3 px-4 py-2">
+        <h3 className="text-base font-semibold uppercase tracking-wide text-muted-foreground">
+          Sources · <span className="text-xl text-foreground">{total}</span>{" "}
+          {total === 1 ? "item" : "items"}
+        </h3>
+        <span className="text-xs leading-none text-muted-foreground">
+          the column furthest right with a value is what the library shows
         </span>
         <div className="ml-auto flex flex-wrap items-center gap-3">
-          <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+          <label className="flex items-center gap-1.5 text-xs leading-none text-muted-foreground">
             <input
               type="checkbox"
+              className="align-middle"
               checked={onlyDisagreeing}
               onChange={(e) => setOnlyDisagreeing(e.target.checked)}
             />
             Only where tiers disagree
           </label>
-          <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
-            <input type="checkbox" checked={onlyEdited} onChange={(e) => setOnlyEdited(e.target.checked)} />
+          <label className="flex items-center gap-1.5 text-xs leading-none text-muted-foreground">
+            <input
+              type="checkbox"
+              className="align-middle"
+              checked={onlyEdited}
+              onChange={(e) => setOnlyEdited(e.target.checked)}
+            />
             Only edited
           </label>
           <Input
@@ -341,10 +447,14 @@ export function SourcesPage({ libraryId }: { libraryId: string }) {
             : "Nothing matches the filter."}
         </p>
       ) : (
-        <div className="overflow-x-auto rounded-md border">
-          {/* Column headings */}
+        // No overflow wrapper: one would become the header's scroll context
+        // and break its stickiness against the pane that actually scrolls.
+        <div className="border-t">
+          {/* Column headings — pinned to the top of the pane as you scroll.
+              -top-3 cancels the pane's 12px top padding: sticky pins at the
+              scroller's content edge, which left a see-through strip above. */}
           <div
-            className="sticky top-0 z-10 grid border-b bg-background"
+            className="sticky -top-3 z-10 grid border-b bg-background"
             style={{ gridTemplateColumns: cols }}
           >
             <div className="px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">

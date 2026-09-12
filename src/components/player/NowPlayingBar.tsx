@@ -435,12 +435,16 @@ export function NowPlayingBar({ state, actions, hidden, onOpenAlbum, onOpenArtis
         </div>
       </div>
 
-      {/* Transport + seek — tight gap; the column centers in the fixed-height
-          bar, so the leftover space splits evenly above and below. */}
-      <div className="flex min-w-0 flex-1 flex-col items-center justify-center gap-0.5">
-        {/* translate (not margin) drops the transport row toward the seek bar
-            without reflowing it — the seek bar stays exactly where it was. */}
-        <div className="flex translate-y-0.5 items-center gap-2">
+      {/* Transport + seek — the column centers in the fixed-height bar, so
+          the leftover space splits evenly above and below; the gap keeps
+          the transport row clear of the waveform so it sits between the
+          bar's top edge and the seek bar rather than hugging the latter. */}
+      {/* The waveform is 20px tall, the plain slider under half that, so the
+          same gap reads differently: the plain bar gets a tighter gap and
+          the transport row nudged down (translate, so the seek bar itself
+          doesn't move) to sit at the same visual height in both. */}
+      <div className={`flex min-w-0 flex-1 flex-col items-center justify-center ${waveform ? "gap-1" : "gap-0.5"}`}>
+        <div className={`flex items-center gap-2 ${waveform ? "" : "translate-y-0.5"}`}>
           <button
             onClick={() => actions.toggleShuffle()}
             className={`rounded-full p-1.5 hover:text-foreground ${state.shuffle ? "text-primary" : "text-muted-foreground"}`}

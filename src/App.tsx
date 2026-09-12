@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { useBackgroundJobs, cancelBackgroundJob } from "@/lib/backgroundJobs";
 import "./App.css";
 import { Titlebar } from "@/components/Titlebar";
 import { Sidebar } from "@/components/Sidebar";
@@ -116,65 +117,28 @@ function App() {
   const [playerState, playerActions] = usePlayer();
   const [musicState, musicActions] = useMusicPlayer();
 
-  // Waveform preload (Settings → Audio → "Preload now"): a background walk
-  // the user can minimize and reattach to, wizard-style — modal when open,
-  // a small pill above the bar while minimized and running.
-  type WavePreloadStatus = {
-    running: boolean;
-    done: number;
-    total: number;
-    track?: string | null;
-    library_id?: string | null;
-  };
-  const [wavePreload, setWavePreload] = useState<{
-    open: boolean;
-    running: boolean;
-    done: number;
-    total: number;
-    track?: string | null;
-    libraryId?: string | null;
-  }>({ open: false, running: false, done: 0, total: 0 });
+  // Background jobs (waveform preload, MusicBrainz prefetches): the live list
+  // from the registry. The sidebar draws a line per job; the waveform preload
+  // also has a progress window the user can minimize and reattach to.
+  const backgroundJobs = useBackgroundJobs();
+  const wavePreloadJob = backgroundJobs.find((j) => j.kind === "waveform-preload") ?? null;
+  const [wavePreloadOpen, setWavePreloadOpen] = useState(false);
+  useEffect(() => {
+    // A finished run closes its own window; a minimized one just ends.
+    if (!wavePreloadJob) setWavePreloadOpen(false);
+  }, [wavePreloadJob]);
   useEffect(() => {
     const onStart = (e: Event) => {
       const libraryId = (e as CustomEvent<{ libraryId: string }>).detail?.libraryId;
       if (!libraryId) return;
-      setWavePreload((p) => ({ ...p, open: true }));
-      void (async () => {
-        try {
-          const s = await invoke<WavePreloadStatus>("waveform_preload_status");
-          // A run in flight (this library's or another's) just reattaches.
-          if (!s.running) await invoke("waveform_preload_start", { libraryId });
-          setWavePreload((p) => ({
-            ...p,
-            ...s,
-            libraryId: s.library_id ?? libraryId,
-            running: true,
-            open: true,
-          }));
-        } catch (e2) {
-          toast.error(String(e2));
-        }
-      })();
+      setWavePreloadOpen(true);
+      // A run in flight for this library just reattaches (the start is a
+      // no-op then).
+      void invoke("waveform_preload_start", { libraryId }).catch((e2) => toast.error(String(e2)));
     };
     window.addEventListener("waverunner:waveform-preload", onStart);
-    const un = listen<WavePreloadStatus>("waveform-preload", (e) => {
-      setWavePreload((p) => ({
-        ...p,
-        ...e.payload,
-        libraryId: e.payload.library_id ?? p.libraryId,
-        // A finished run closes its own modal; a minimized one just ends.
-        open: p.open && e.payload.running,
-      }));
-    });
-    // App start while a preload runs (webview refresh): reattach silently.
-    void invoke<WavePreloadStatus>("waveform_preload_status")
-      .then((s) => {
-        if (s.running) setWavePreload((p) => ({ ...p, ...s, libraryId: s.library_id }));
-      })
-      .catch(() => {});
     return () => {
       window.removeEventListener("waverunner:waveform-preload", onStart);
-      un.then((fn) => fn());
     };
   }, []);
   // The metadata center is a page (view kind "metadata"). Where it should
@@ -873,7 +837,7 @@ function App() {
       // (HomePage / MusicIssuesPage / TracksPage) — just clear grid state.
       // Scroll restores like any grid (the restore waits out the self-fetch);
       // Home is libraryless and keys under a fixed "home" prefix.
-      if (view.kind === "home" || view.kind === "music-issues" || view.kind === "tracks" || view.kind === "loose-tracks" || view.kind === "sources" || view.kind === "metadata") {
+      if (view.kind === "home" || view.kind === "music-issues" || view.kind === "tracks" || view.kind === "loose-tracks" || view.kind === "metadata") {
         setEntries([]);
         setPeople(null);
         setPlaylists(null);
@@ -1520,7 +1484,6 @@ function App() {
           : kind === "sounds" ? "Sounds"
           : kind === "tracks" ? "Tracks"
           : kind === "music-issues" ? "Needs attention"
-          : kind === "sources" ? "Sources"
           : kind === "metadata" ? "Metadata"
           : "";
         return section ? `${libLabel} - ${section}` : libLabel;
@@ -1897,7 +1860,7 @@ function App() {
         // at the library root so the detail page actually renders.
         if (
           activeView &&
-          ["people-list", "people-all", "genres", "playlists", "tracks", "loose-tracks", "music-issues", "sources", "metadata"].includes(
+          ["people-list", "people-all", "genres", "playlists", "tracks", "loose-tracks", "music-issues", "metadata"].includes(
             activeView.kind,
           )
         ) {
@@ -2018,12 +1981,18 @@ function App() {
   );
 
   // Metadata page album links: land on the album page, switched onto the
-  // release that still needs picking when the row names one.
+  // release that still needs picking when the row names one — or scrolled
+  // to a track when a file-problem card names one.
   const openMusicAlbumFromCenter = useCallback(
-    (albumId: number, albumTitle: string, releaseId: number | null) => {
-      if (releaseId != null) {
+    (albumId: number, albumTitle: string, releaseId: number | null, trackId?: number) => {
+      if (releaseId != null || trackId != null) {
         musicFocusNonceRef.current += 1;
-        setMusicFocusRequest({ albumId, releaseId, nonce: musicFocusNonceRef.current });
+        setMusicFocusRequest({
+          albumId,
+          releaseId: releaseId ?? undefined,
+          trackId,
+          nonce: musicFocusNonceRef.current,
+        });
       }
       void openMusicEntryFromBar(fakeMusicEntry("album", albumId, albumTitle));
     },
@@ -3134,12 +3103,13 @@ function App() {
           homeActive={activeView?.kind === "home"}
           scanningLibs={scanningLibs}
           passLibs={passLibs}
-          wavePreload={
-            wavePreload.running
-              ? { done: wavePreload.done, total: wavePreload.total, libraryId: wavePreload.libraryId }
-              : null
-          }
-          onOpenWavePreload={() => setWavePreload((p) => ({ ...p, open: true }))}
+          backgroundJobs={backgroundJobs}
+          onOpenJob={(job) => {
+            // The preload has its own window; everything else lands on the
+            // Metadata page of its library, where the results show up.
+            if (job.kind === "waveform-preload") setWavePreloadOpen(true);
+            else if (job.library_id) selectView({ kind: "metadata", libraryId: job.library_id });
+          }}
           dockedMusic={
             musicCoverDocked && musicState.isActive
               ? (() => {
@@ -3282,39 +3252,43 @@ function App() {
       {/* Waveform preload progress — the house dialog when open, pill when
           minimized. Dismissing (esc/backdrop) minimizes; the walk keeps going. */}
       <Dialog
-        open={wavePreload.open}
+        open={wavePreloadOpen}
         onOpenChange={(o) => {
-          if (!o) setWavePreload((p) => ({ ...p, open: false }));
+          if (!o) setWavePreloadOpen(false);
         }}
       >
         <DialogContent>
           <DialogHeader>
             <DialogTitle>Preloading waveforms</DialogTitle>
             <DialogDescription>
-              {wavePreload.running
-                ? `${wavePreload.done} of ${wavePreload.total} tracks — already-cached tracks fly by.`
-                : "Done — every track's waveform is cached."}
+              {wavePreloadJob
+                ? `${wavePreloadJob.done} of ${wavePreloadJob.total} tracks — already-cached tracks fly by.`
+                : "Starting…"}
             </DialogDescription>
           </DialogHeader>
-          {wavePreload.running && wavePreload.track && (
-            <p className="-mt-2 truncate text-xs text-muted-foreground/80">{wavePreload.track}</p>
+          {wavePreloadJob?.detail && (
+            <p className="-mt-2 truncate text-xs text-muted-foreground/80">{wavePreloadJob.detail}</p>
           )}
           <div className="h-2 overflow-hidden rounded bg-muted">
             <div
               className="h-full bg-primary transition-[width]"
               style={{
-                width: `${wavePreload.total > 0 ? Math.round((wavePreload.done / wavePreload.total) * 100) : 0}%`,
+                width: `${
+                  wavePreloadJob && wavePreloadJob.total > 0
+                    ? Math.round((wavePreloadJob.done / wavePreloadJob.total) * 100)
+                    : 0
+                }%`,
               }}
             />
           </div>
           {/* X / esc / backdrop minimize (the walk keeps going) — no button
               needed for that. Cancel is the only real action. */}
-          {wavePreload.running && (
+          {wavePreloadJob && (
             <DialogFooter>
               <Button
                 size="sm"
                 variant="outline"
-                onClick={() => void invoke("waveform_preload_cancel").catch(() => {})}
+                onClick={() => void cancelBackgroundJob(wavePreloadJob.id).catch(() => {})}
               >
                 Cancel
               </Button>

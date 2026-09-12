@@ -557,16 +557,25 @@ export function MatchDialog({
     }
     let stale = false;
     setLoadingReleases(true);
-    invoke<GroupRelease[]>("mb_group_releases", {
-      groupId,
-      // The matched release (album kind stores it as status.mbid): the
-      // backend pins it into the list if the group pages past it, so the
-      // green "current" always has a row to sit on.
-      currentReleaseId: status?.mbid ?? null,
-    })
-      .then((rows) => {
-        if (!stale) setGroupReleases(rows);
-      })
+    // The matched release (album kind stores it as status.mbid): the
+    // backend pins it into the list if the group pages past it, so the
+    // green "current" always has a row to sit on.
+    const currentReleaseId = status?.mbid ?? null;
+    (async () => {
+      // Cached list first (the prefetch, or a previous open) — instant.
+      const cached = await invoke<GroupRelease[] | null>("mb_group_releases_cached", {
+        groupId,
+        currentReleaseId,
+      });
+      if (stale) return;
+      if (cached) {
+        setGroupReleases(cached);
+        setLoadingReleases(false);
+      }
+      // Then the fresh list, swapped in whole once it lands.
+      const fresh = await invoke<GroupRelease[]>("mb_group_releases", { groupId, currentReleaseId });
+      if (!stale) setGroupReleases(fresh);
+    })()
       .catch((e) => {
         if (!stale) toast.error(String(e));
       })

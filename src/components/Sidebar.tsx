@@ -32,6 +32,7 @@ import { SidebarTree } from "@/components/SidebarTree";
 import { getComplicationsForLibrary } from "@/lib/complications";
 import type { ComplicationNode, GenreSummary, LibraryCounts, PlaylistSummary } from "@/types";
 import { Library, ViewSpec } from "@/types";
+import type { BackgroundJob } from "@/lib/backgroundJobs";
 
 const MIN_WIDTH = 180;
 const MAX_WIDTH = 480;
@@ -77,10 +78,11 @@ interface SidebarProps {
   scanningLibs: Set<string>;
   /** Libraries with a matching pass in flight — locked like a scanning one. */
   passLibs: Set<string>;
-  /** Waveform preload in flight — a progress line under the library being
-   *  walked (null = not running). Clicking it reopens the progress window. */
-  wavePreload?: { done: number; total: number; libraryId?: string | null } | null;
-  onOpenWavePreload?: () => void;
+  /** Running background jobs — one progress line per job under its library
+   *  (waveform preload, MusicBrainz prefetches). Clicking a line hands the
+   *  job to the host (reopen its window, or go where its results land). */
+  backgroundJobs?: BackgroundJob[];
+  onOpenJob?: (job: BackgroundJob) => void;
 }
 
 export function Sidebar({
@@ -106,8 +108,8 @@ export function Sidebar({
   homeActive,
   scanningLibs,
   passLibs,
-  wavePreload,
-  onOpenWavePreload,
+  backgroundJobs,
+  onOpenJob,
 }: SidebarProps) {
   const [width, setWidth] = useState(DEFAULT_WIDTH);
   const [dragging, setDragging] = useState(false);
@@ -592,24 +594,29 @@ export function Sidebar({
                       </ContextMenuItem>
                     </ContextMenuContent>
                   </ContextMenu>
-                  {/* Waveform preload progress — background work lives in the
-                      sidebar; this line sits under the library name, above the
-                      tree, and reopens the progress window. */}
-                  {wavePreload && wavePreload.libraryId === lib.id && (
-                    <button
-                      onClick={onOpenWavePreload}
-                      className="flex items-start gap-1.5 pb-1 pl-6 pr-2 pt-1 text-left text-xs italic text-muted-foreground hover:text-foreground"
-                    >
-                      {/* mt-1 centers the 8px spinner on the first 16px text
-                          line (items-start, so wrapped lines don't drag it). */}
-                      <Spinner className="mt-1 size-2 shrink-0" />
-                      {/* Wraps rather than truncating — a narrow sidebar gets
-                          two lines, never an ellipsis. */}
-                      <span className="min-w-0 break-words">
-                        preloading waveforms · {wavePreload.done}/{wavePreload.total}
-                      </span>
-                    </button>
-                  )}
+                  {/* Background jobs — background work lives in the sidebar;
+                      one line per running job under the library name, above
+                      the tree. Several can run at once (a preload beside a
+                      prefetch), so they stack. */}
+                  {(backgroundJobs ?? [])
+                    .filter((job) => job.library_id === lib.id)
+                    .map((job) => (
+                      <button
+                        key={job.id}
+                        onClick={() => onOpenJob?.(job)}
+                        title={job.detail ?? undefined}
+                        className="flex items-start gap-1.5 pb-1 pl-6 pr-2 pt-1 text-left text-xs italic text-muted-foreground hover:text-foreground"
+                      >
+                        {/* mt-1 centers the 8px spinner on the first 16px text
+                            line (items-start, so wrapped lines don't drag it). */}
+                        <Spinner className="mt-1 size-2 shrink-0" />
+                        {/* Wraps rather than truncating — a narrow sidebar gets
+                            two lines, never an ellipsis. */}
+                        <span className="min-w-0 break-words">
+                          {job.label} · {job.done}/{job.total}
+                        </span>
+                      </button>
+                    ))}
                   {expanded && (
                     <SidebarTree
                       nodes={getComplicationsForLibrary(lib, sidebarPlaylists[lib.id] ?? [], sidebarCounts[lib.id], sidebarGenres[lib.id])}
@@ -728,6 +735,7 @@ export function Sidebar({
         }}
         onCreated={onLibraryCreated}
         onFinished={(libId) => onLibraryRescanned(libId)}
+        onOpenMetadata={(libId) => onSelectView({ kind: "metadata", libraryId: libId })}
       />
       <LibrarySettingsDialog
         library={settingsTarget}

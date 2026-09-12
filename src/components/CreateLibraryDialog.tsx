@@ -26,9 +26,7 @@ import {
 import { Spinner } from "@/components/ui/spinner";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Switch } from "@/components/ui/switch";
-import { MetadataCenter } from "@/components/music/MetadataCenter";
 import { latestEnrichProgress } from "@/hooks/enrichProgress";
-import { VideoMetadataCenter } from "@/components/VideoMetadataCenter";
 import { runBulkMatch } from "@/components/tmdbMatchEngine";
 import type { Library, TmdbBulkTargets } from "@/types";
 import { FolderOpen, Film, Music, Server, HardDrive, Plus, X, Check } from "lucide-react";
@@ -62,6 +60,9 @@ interface CreateLibraryDialogProps {
   onCreated: () => void;
   /** The wizard fully completed for a music library. */
   onFinished?: (libraryId: string) => void;
+  /** Matching is over — land on the library's Metadata page (the review
+   *  step used to be embedded here; now the page IS the review). */
+  onOpenMetadata?: (libraryId: string) => void;
 }
 
 let creatingGlobal = false;
@@ -70,7 +71,7 @@ export function isCreatingLibrary(): boolean {
   return creatingGlobal;
 }
 
-type Step = 1 | 2 | 3 | 4;
+type Step = 1 | 2 | 3;
 type MatchPhase = "elect" | "running";
 
 /** "about N minutes remaining" from a seconds estimate. */
@@ -88,6 +89,7 @@ export function CreateLibraryDialog({
   onOpenChange,
   onCreated,
   onFinished,
+  onOpenMetadata,
 }: CreateLibraryDialogProps) {
   const [name, setName] = useState("");
   // Folders are tagged by kind: movies vs TV shows (video) or music. At least
@@ -140,17 +142,12 @@ export function CreateLibraryDialog({
   // separately because a post-split rescan can have 0 new albums but several
   // new member artists worth looking up.
   const [uncheckedArtists, setUncheckedArtists] = useState<number>(0);
-  // Music review gate: pending "Needs a decision" count reported by the
-  // embedded metadata center. null = not yet loaded — Finish stays held, so a
-  // slow load can't be finished past. Decisions are required work.
-  const [decisionsLeft, setDecisionsLeft] = useState<number | null>(null);
   const [confirmExit, setConfirmExit] = useState(false);
   // Two-step "Skip remaining" during the match run — see the footer.
   const [confirmSkip, setConfirmSkip] = useState(false);
   // Rescan's Stop button was pressed — disable it and wait for the backend
   // to notice the flag (per file in read-tags, between artists in build).
   const [stopRequested, setStopRequested] = useState(false);
-  const [centerReloadKey, setCenterReloadKey] = useState(0);
   // The library the wizard is driving (created here, or resumed/rescanned).
   const [libraryId, setLibraryId] = useState<string | null>(null);
   const [libraryName, setLibraryName] = useState("");
@@ -359,7 +356,6 @@ export function CreateLibraryDialog({
     setConfirmSkip(false);
     setMatchProgress(null);
     setSubProgress({});
-    setDecisionsLeft(null);
     if (mode.kind === "create") {
       setStep(1);
       setLibraryId(null);
@@ -383,8 +379,9 @@ export function CreateLibraryDialog({
       } else if (mode.stage === "match") {
         void enterMatch(mode.libraryId);
       } else {
-        setStep(4);
-        setCenterReloadKey((k) => k + 1);
+        // Resumed at "review" (an older setup row): review is the Metadata
+        // page now — finish and land there.
+        void enterReview(mode.libraryId);
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -430,7 +427,6 @@ export function CreateLibraryDialog({
     setConfirmExit(false);
     setLibraryId(null);
     setLibraryName("");
-    setDecisionsLeft(null);
   }
 
   function closeWizard() {
@@ -489,22 +485,13 @@ export function CreateLibraryDialog({
     }
   }
 
+  // "Review" is the Metadata page now (user's call, 2026-09-11): once
+  // matching is over the wizard is done — finish, close, and land there.
   async function enterReview(libIdOverride?: string) {
     setConfirmSkip(false);
     const libId = libIdOverride ?? libraryId;
-    if (managesSetupRow && libId) {
-      try {
-        await invoke("set_library_setup_stage", { libraryId: libId, stage: "review" });
-      } catch (e) {
-        console.error(e);
-      }
-      onCreated();
-    }
-    setHeightAnimating(true);
-    setStep(4);
-    setCenterReloadKey((k) => k + 1);
-    // Deliberately no auto-restore when minimized — the sidebar chip flips to
-    // "review ready" and the user reopens when they're ready.
+    await finishWizard(libId ?? undefined);
+    if (libId) onOpenMetadata?.(libId);
   }
 
   async function startMatching() {
@@ -672,7 +659,7 @@ export function CreateLibraryDialog({
       setConfirmExit(true);
       return;
     }
-    // Step 4: closing IS finishing.
+    // No other step stays open — closing is finishing.
     void finishWizard();
   }
 
@@ -725,10 +712,9 @@ export function CreateLibraryDialog({
     { n: 1, label: "Setup" },
     { n: 2, label: "Scan" },
     { n: 3, label: "Match" },
-    { n: 4, label: "Review" },
   ];
-  // Opted out of online metadata at creation: Match and Review never happen,
-  // so the timeline honestly ends at Scan.
+  // Opted out of online metadata at creation: Match never happens, so the
+  // timeline honestly ends at Scan. (Review is the Metadata page.)
   const visibleSteps =
     mode.kind === "create"
       ? onlineMetadata
@@ -767,13 +753,9 @@ export function CreateLibraryDialog({
       }}
     >
       <DialogContent
-        className={`overflow-hidden flex flex-col px-0 gap-0 ${
-          step === 4
-            ? "w-[min(72rem,calc(100vw-3rem))] max-w-none h-[85vh]"
-            : // Wide enough for the music pass's seven-stage rail with its
-              // finished counts on ONE line — the old 32rem wrapped it.
-              "w-[min(44rem,calc(100vw-3rem))] max-w-none"
-        }`}
+        // Wide enough for the music pass's seven-stage rail with its
+        // finished counts on ONE line — the old 32rem wrapped it.
+        className="overflow-hidden flex flex-col px-0 gap-0 w-[min(44rem,calc(100vw-3rem))] max-w-none"
       >
         <DialogHeader className="px-4 pb-2">
           <DialogTitle>{title}</DialogTitle>
@@ -899,40 +881,7 @@ export function CreateLibraryDialog({
           )}
         </DialogHeader>
 
-        {step === 4 && libraryId ? (
-          <div className="flex min-h-0 flex-1 flex-col pl-4 pr-0 pt-2">
-            {effFormat === "music" ? (
-              <MetadataCenter
-                libraryId={libraryId}
-                reloadKey={centerReloadKey}
-                // A split written here needs its migration rescan, and this
-                // wizard already owns the scan flow — loop back through the
-                // Scan step (then Match, then land on Review again) instead of
-                // asking the sidebar to open a second wizard, which it
-                // rightly refuses while this one is up.
-                onRescanNeeded={(libId) => {
-                  setStep(2);
-                  setHeightAnimating(true);
-                  void runRescan(libId);
-                }}
-                onDecisionsChange={setDecisionsLeft}
-                // A pass requested from the review step runs in THIS wizard:
-                // jump back to the match step already running.
-                onRunPass={() => {
-                  if (!libraryId) return;
-                  setHeightAnimating(true);
-                  setStep(3);
-                  setMatchPhase("running");
-                  void invoke("music_match_begin", { libraryId }).catch((e) =>
-                    toast.error(String(e)),
-                  );
-                }}
-              />
-            ) : (
-              <VideoMetadataCenter libraryId={libraryId} reloadKey={centerReloadKey} />
-            )}
-          </div>
-        ) : (
+        {(
           <div
             ref={wrapperRef}
             // Scrolling only exists for step 1 (folder lists can outgrow a
@@ -1283,19 +1232,7 @@ export function CreateLibraryDialog({
                 </Button>
               </div>
             )
-          ) : (
-            <div className="flex w-full items-center justify-end gap-3">
-              {/* Informational, not a gate — decisions wait in the metadata
-                  center; the library is never held hostage to them. */}
-              {effFormat === "music" && (decisionsLeft ?? 0) > 0 && (
-                <span className="text-xs text-muted-foreground">
-                  {decisionsLeft} {decisionsLeft === 1 ? "suggestion" : "suggestions"} waiting in
-                  the metadata center
-                </span>
-              )}
-              <Button onClick={() => void finishWizard()}>Finish</Button>
-            </div>
-          )}
+          ) : null}
         </DialogFooter>
       </DialogContent>
     </Dialog>

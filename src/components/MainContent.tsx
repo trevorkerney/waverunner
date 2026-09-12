@@ -107,6 +107,7 @@ import {
   ListEnd,
   Check,
   ListChecks,
+  UserMinus,
 } from "lucide-react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { toast } from "sonner";
@@ -144,7 +145,6 @@ import { TmdbPersonSearchDialog } from "@/components/TmdbPersonSearchDialog";
 import { ArtistsGrid } from "@/components/music/ArtistsGrid";
 import { AlbumDetailPage } from "@/components/music/AlbumDetailPage";
 import { MusicIssuesPage } from "@/components/music/MusicIssuesPage";
-import { SourcesPage } from "@/components/music/SourcesPage";
 import { MetadataPage } from "@/components/MetadataPage";
 import type { CenterFocus } from "@/components/music/MetadataCenter";
 import { TracksPage } from "@/components/music/TracksPage";
@@ -313,8 +313,21 @@ interface MainContentProps {
   /** Metadata page: a match/undo landed — the host drops caches and refreshes. */
   onMetadataChanged?: (libraryId: string) => void;
   /** Metadata page album links: open the album, switched onto a release. */
-  onOpenMusicAlbumFromMetadata?: (albumId: number, title: string, releaseId: number | null) => void;
+  onOpenMusicAlbumFromMetadata?: (albumId: number, title: string, releaseId: number | null, trackId?: number) => void;
 }
+
+// Artists page: hide artists whose only presence is feature credits on other
+// artists' albums. An implicit in-app pref (instant apply, persisted in the
+// background), cached module-wide so later mounts don't flash the default
+// before the settings load — the ArtistDetailPage view/sort pattern.
+const HIDE_FEATURE_ONLY_KEY = "artists_hide_feature_only";
+let cachedHideFeatureOnly: boolean | null = null;
+// Feature-only = the credits-mode subtitle is nothing but "N appearance(s)"
+// — no albums/EPs/singles/compilations, no loose tracks. The backend bakes
+// that breakdown into collection_display for the sort-mode subtitles, so
+// the same string tells us the shape of an artist's presence without a
+// refetch (the hearts subtitle is read the same way in ArtistsGrid).
+const isFeatureOnlyArtist = (e: MediaEntry) => /^\d+ appearances?$/.test(e.collection_display ?? "");
 
 export function MainContent({
   entries,
@@ -511,13 +524,42 @@ export function MainContent({
     return found ?? coverDialogEntry;
   }, [coverDialogEntry, entries, selectedEntry]);
   const isSearching = searchResults != null;
-  const filteredEntries = isSearching ? searchResults : entries;
 
   // The music Artists view mirrors People pages: its own two-mode sort
   // (alphabetical / most credited), letter sections, no presets, no size
   // slider, and instant (unanimated) sort switches.
   const isArtistsView =
     selectedLibrary?.format === "music" && activeView?.kind === "library-root" && !searchResults;
+
+  // Artists-page "hide feature-only" toggle (see isFeatureOnlyArtist).
+  const [hideFeatureOnly, setHideFeatureOnlyState] = useState(cachedHideFeatureOnly ?? false);
+  useEffect(() => {
+    if (cachedHideFeatureOnly !== null) return;
+    invoke<Record<string, string>>("get_settings")
+      .then((s) => {
+        if (cachedHideFeatureOnly !== null) return;
+        cachedHideFeatureOnly = s[HIDE_FEATURE_ONLY_KEY] === "true";
+        setHideFeatureOnlyState(cachedHideFeatureOnly);
+      })
+      .catch(() => {});
+  }, []);
+  const setHideFeatureOnly = (v: boolean) => {
+    cachedHideFeatureOnly = v;
+    setHideFeatureOnlyState(v);
+    invoke("set_setting", { key: HIDE_FEATURE_ONLY_KEY, value: v ? "true" : "false" }).catch(() => {});
+  };
+
+  // Search results are never filtered — a feature-only artist you searched
+  // for by name should still be found.
+  const filteredEntries = useMemo(
+    () =>
+      isSearching
+        ? searchResults
+        : isArtistsView && hideFeatureOnly
+          ? entries.filter((e) => !isFeatureOnlyArtist(e))
+          : entries,
+    [isSearching, searchResults, isArtistsView, hideFeatureOnly, entries],
+  );
 
   // Jump rail for big grids — letters in alphabetical sort, decades in date sort.
   // Hidden while searching (ranked order) and for grids small enough to scan.
@@ -1178,17 +1220,6 @@ export function MainContent({
     );
   }
 
-  if (activeView?.kind === "sources") {
-    return (
-      <main className="flex flex-1 flex-col overflow-hidden bg-background">
-        {breadcrumbBar}
-        <div ref={scrollContainerRef} className="relative flex min-h-0 flex-1 flex-col overflow-y-auto">
-          <SourcesPage libraryId={activeView.libraryId} />
-        </div>
-      </main>
-    );
-  }
-
   if (activeView?.kind === "metadata") {
     // The center scrolls its own pane; the ref'd wrapper only keeps the
     // scroll save/restore plumbing pointed somewhere (it never scrolls).
@@ -1198,10 +1229,12 @@ export function MainContent({
         <div ref={scrollContainerRef} className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
           <MetadataPage
             libraryId={activeView.libraryId}
-            format={selectedLibrary?.format ?? "music"}
+            format={selectedLibrary?.format ?? null}
             focus={metadataFocus ?? null}
             onChanged={() => onMetadataChanged?.(activeView.libraryId)}
-            onOpenAlbum={(albumId, title, releaseId) => onOpenMusicAlbumFromMetadata?.(albumId, title, releaseId)}
+            onOpenAlbum={(albumId, title, releaseId, trackId) =>
+              onOpenMusicAlbumFromMetadata?.(albumId, title, releaseId, trackId)
+            }
             onOpenArtist={(artistId, name) => onOpenMusicArtist?.(artistId, name)}
           />
         </div>
@@ -1570,6 +1603,25 @@ export function MainContent({
                 )}
               </DropdownMenuContent>
             </DropdownMenu>
+            {isArtistsView && (
+              <button
+                onClick={() => setHideFeatureOnly(!hideFeatureOnly)}
+                aria-pressed={hideFeatureOnly}
+                className={`flex h-8 items-center gap-1.5 rounded-md border border-input px-2.5 text-xs transition-colors ${
+                  hideFeatureOnly
+                    ? "bg-accent text-foreground"
+                    : "bg-background text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+                }`}
+                title={
+                  hideFeatureOnly
+                    ? "Showing artists with their own releases or tracks — click to show feature-only artists too"
+                    : "Hide artists who only appear as features on other artists' albums"
+                }
+              >
+                <UserMinus size={12} />
+                Hide feature-only
+              </button>
+            )}
             {/* Save-preset button: visible only in pristine custom sort at a sortable scope
                 with items to save. Clicking opens the name dialog. */}
             {activeView?.kind === "playlist-detail"

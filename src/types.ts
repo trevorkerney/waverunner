@@ -147,9 +147,8 @@ export type ViewSpec =
   | { kind: "tracks";             libraryId: string }
   | { kind: "loose-tracks";       libraryId: string; sounds: boolean }
   | { kind: "music-issues";       libraryId: string }
-  /** Per-tier view: every album and loose track by artist × tags / MusicBrainz / edits. */
-  | { kind: "sources";            libraryId: string }
-  /** The metadata center as a page (music: MusicBrainz review; video: TMDB match report). */
+  /** The metadata center as a page (music: MusicBrainz review, with Sources
+   *  as its first tab; video: TMDB match report). */
   | { kind: "metadata";           libraryId: string };
 
 // One node in the static complication tree shown for a library.
