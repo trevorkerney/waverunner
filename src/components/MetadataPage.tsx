@@ -46,10 +46,10 @@ export function MetadataPage({
     );
   }
   // pl-4/pr-0: the center backs out of the left padding for its full-width
-  // rule and keeps the pane scrollbar flush right — same hosting the wizard
-  // gives it.
+  // rule and keeps the pane scrollbar flush right. No top padding: the tabs
+  // sit flush at the top, and the banners above them carry their own.
   return (
-    <div className="flex min-h-0 flex-1 flex-col pl-4 pr-0 pt-2">
+    <div className="flex min-h-0 flex-1 flex-col pl-4 pr-0">
       <MetadataCenter
         libraryId={libraryId}
         reloadKey={reloadKey}

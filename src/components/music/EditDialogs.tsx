@@ -762,11 +762,17 @@ export function SplitArtistDialog({
   artistName,
   open,
   onOpenChange,
+  beforeSplit,
 }: {
   artistId: number | null;
   artistName: string;
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  /** Runs on confirm, BEFORE the split is staged — the identity card's
+   *  "Merge & split" merges the spellings here, so the split's keys include
+   *  the aliases the merge just made. Cancel never reaches it: nothing is
+   *  merged until the members are confirmed. */
+  beforeSplit?: () => Promise<void>;
 }) {
   // Each row is a decision — an existing artist, a name to create, or nothing
   // yet — rather than free text, so the dialog can show who was chosen.
@@ -817,6 +823,7 @@ export function SplitArtistDialog({
     }
     setBusy(true);
     try {
+      if (beforeSplit) await beforeSplit();
       await invoke<string>("split_artist", { artistId, members: list });
       onOpenChange(false);
       // STAGED, not applied: the migration is a rescan, and splits batch up

@@ -210,3 +210,22 @@ html.player-active #root {
     transform: scaleY(1);
   }
 }
+/* Clickable things get the hand. Browsers default buttons to the arrow
+   cursor; here anything that acts on click shows pointer unless it's
+   disabled (or marked aria-disabled, which the "not yet" cards use with
+   their own not-allowed cursor). In the base layer so a utility class
+   (cursor-not-allowed, cursor-default) still wins. */
+@layer base {
+  button:not(:disabled):not([aria-disabled="true"]),
+  [role="button"]:not([aria-disabled="true"]),
+  [role="switch"]:not([aria-disabled="true"]),
+  [role="menuitem"]:not([aria-disabled="true"]),
+  [role="option"]:not([aria-disabled="true"]),
+  [role="tab"]:not([aria-disabled="true"]),
+  [role="link"],
+  a[href],
+  label[for],
+  summary {
+    cursor: pointer;
+  }
+}

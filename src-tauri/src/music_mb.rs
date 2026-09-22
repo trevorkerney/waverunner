@@ -259,6 +259,9 @@ pub fn spawn_enrich(app: AppHandle, library_id: String) {
         // discographies.
         let pool = app.state::<AppState>().app_db.clone();
         let _ = evict_artist_group_caches(&pool).await;
+        // Artist images ride in the background from here (a skipped pass
+        // too — the wizard is done either way; the library stays usable).
+        let _ = crate::music_art::start_artist_images_job(&app, &pool, &library_id).await;
     });
 }
 
@@ -466,13 +469,8 @@ async fn enrich(app: &AppHandle, library_id: &str) -> Result<EnrichOutcome, Stri
     // credit rows (artist_id is a soft reference) — re-stamp so nothing
     // dangles.
     crate::music::resolve_credit_ids(&pool, library_id).await?;
-
-    // Artist images: Wikidata (by the MBIDs just filled) + Deezer fallback —
-    // gap-fill only, no MusicBrainz requests involved.
-    crate::music_art::fetch_artist_images(app, &pool, library_id, || {
-        CANCEL.load(Ordering::SeqCst)
-    })
-    .await?;
+    // (Artist images are no longer a pass phase — spawn_enrich hands them
+    // to a background job when the pass ends.)
 
     let (pending_suggestions,): (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM mb_suggestion WHERE library_id = ? AND status = 'pending'",
@@ -1664,6 +1662,10 @@ struct MbReleaseFull {
     /// the pass writes album_artist_credit.
     album_artists: Vec<(String, Option<String>)>,
     tracks: Vec<MbTrack>,
+    /// mbid → the artist entity's CANONICAL name, for every artist credited
+    /// anywhere on the release (album line or any track). The credits above
+    /// carry the as-credited spelling; identified pages take this one.
+    artist_names: HashMap<String, String>,
 }
 
 async fn fetch_release_uncached(
@@ -1690,6 +1692,14 @@ async fn fetch_release_uncached(
         .or_else(|| body["date"].as_str().filter(|s| !s.is_empty()))
         .map(|s| s.to_string());
 
+    let mut artist_names: HashMap<String, String> = HashMap::new();
+    let mut note_canonical = |c: &serde_json::Value| {
+        if let (Some(id), Some(name)) = (c["artist"]["id"].as_str(), c["artist"]["name"].as_str()) {
+            if !name.is_empty() {
+                artist_names.entry(id.to_string()).or_insert_with(|| name.to_string());
+            }
+        }
+    };
     let mut tracks: Vec<MbTrack> = Vec::new();
     for (mi, medium) in body["media"].as_array().into_iter().flatten().enumerate() {
         for track in medium["tracks"].as_array().into_iter().flatten() {
@@ -1708,6 +1718,7 @@ async fn fetch_release_uncached(
                     if name.is_empty() {
                         return None;
                     }
+                    note_canonical(c);
                     Some((name, c["artist"]["id"].as_str().map(|s| s.to_string())))
                 })
                 .collect();
@@ -1735,6 +1746,7 @@ async fn fetch_release_uncached(
             if name.is_empty() {
                 return None;
             }
+            note_canonical(c);
             Some((name, c["artist"]["id"].as_str().map(|s| s.to_string())))
         })
         .collect();
@@ -1751,6 +1763,7 @@ async fn fetch_release_uncached(
             date,
             album_artists,
             tracks,
+            artist_names,
         })
     })
 }
@@ -1807,10 +1820,28 @@ pub struct GroupCandidate {
     /// makes ARTIST identity derivable with certainty: matching the album
     /// tells us exactly which "God" its credit means.
     pub artist_ids: Vec<Option<String>>,
+    /// Each credited artist's CANONICAL MusicBrainz name, parallel to
+    /// `artists` — the entity's own name, as opposed to the spelling this
+    /// credit used ("Kanye West" credited, entity "Ye"). An identified
+    /// artist's page takes this name (user rule 2026-09-20). Absent on
+    /// cache rows written before it existed.
+    #[serde(default)]
+    pub artist_names: Vec<Option<String>>,
+}
+
+impl GroupCandidate {
+    /// mbid → canonical name, for the credit stamp's rename step.
+    pub fn canonical_names(&self) -> HashMap<String, String> {
+        self.artist_ids
+            .iter()
+            .zip(self.artist_names.iter())
+            .filter_map(|(id, name)| Some((id.clone()?, name.clone()?)))
+            .collect()
+    }
 }
 
 fn group_of(g: &serde_json::Value, default_score: i64) -> Option<GroupCandidate> {
-    let credit: Vec<(String, Option<String>)> = g["artist-credit"]
+    let credit: Vec<(String, Option<String>, Option<String>)> = g["artist-credit"]
         .as_array()
         .into_iter()
         .flatten()
@@ -1819,11 +1850,16 @@ fn group_of(g: &serde_json::Value, default_score: i64) -> Option<GroupCandidate>
                 .as_str()
                 .or_else(|| c["artist"]["name"].as_str())?
                 .to_string();
-            Some((name, c["artist"]["id"].as_str().map(|s| s.to_string())))
+            Some((
+                name,
+                c["artist"]["id"].as_str().map(|s| s.to_string()),
+                c["artist"]["name"].as_str().filter(|s| !s.is_empty()).map(|s| s.to_string()),
+            ))
         })
         .collect();
-    let artists: Vec<String> = credit.iter().map(|(n, _)| n.clone()).collect();
-    let artist_ids: Vec<Option<String>> = credit.into_iter().map(|(_, id)| id).collect();
+    let artists: Vec<String> = credit.iter().map(|(n, _, _)| n.clone()).collect();
+    let artist_ids: Vec<Option<String>> = credit.iter().map(|(_, id, _)| id.clone()).collect();
+    let artist_names: Vec<Option<String>> = credit.into_iter().map(|(_, _, c)| c).collect();
     Some(GroupCandidate {
         group_id: g["id"].as_str()?.to_string(),
         title: g["title"].as_str().unwrap_or_default().to_string(),
@@ -1840,6 +1876,7 @@ fn group_of(g: &serde_json::Value, default_score: i64) -> Option<GroupCandidate>
         score: g["score"].as_i64().unwrap_or(default_score),
         artists,
         artist_ids,
+        artist_names,
     })
 }
 
@@ -2220,12 +2257,18 @@ fn is_placeholder_artist(mbid: &str) -> bool {
 /// stranger ("God" is several artists on MusicBrainz; the one credited on
 /// Yeezus is Kanye West's collaborator entry or nobody).
 ///
-/// Fills gaps only: an artist that already has an id (user-tier or an earlier
-/// stamp) is left alone — conflicting evidence is a decision, not an update.
+/// Fills id gaps only: an artist that already has a DIFFERENT id (user-tier
+/// or an earlier stamp) is left alone — conflicting evidence is a decision,
+/// not an update. The NAME follows either way: an identified page is called
+/// what MusicBrainz calls the entity (`canonical`: mbid → name, from the
+/// same fetch the credit came from), unless the user renamed it. Same rule
+/// as an explicit match, so a feature-only page born from one credit reads
+/// the same as one matched by hand (user rule 2026-09-20).
 async fn stamp_artist_ids_from_credit(
     pool: &SqlitePool,
     library_id: &str,
     credit: &[(String, Option<String>)],
+    canonical: &HashMap<String, String>,
 ) -> Result<usize, String> {
     let mut stamped = 0usize;
     for (name, mbid) in credit {
@@ -2234,33 +2277,138 @@ async fn stamp_artist_ids_from_credit(
             continue;
         }
         // As-credited name → our artist row (title or redirect), same
-        // resolution surface the credit stamps use.
-        let row: Option<(i64,)> = sqlx::query_as(
-            "SELECT an.artist_id FROM artist_names an
+        // resolution surface the credit stamps use. Unidentified pages get
+        // the id; pages already holding THIS id still get the name step.
+        let row: Option<(i64, Option<String>)> = sqlx::query_as(
+            "SELECT an.artist_id, a.musicbrainz_id FROM artist_names an
              JOIN media_entry me ON me.id = an.artist_id
              JOIN artist a ON a.id = an.artist_id
              WHERE me.library_id = ?1 AND LOWER(an.name) = LOWER(?2)
-               AND (a.musicbrainz_id IS NULL OR a.musicbrainz_id = '')
+               AND (a.musicbrainz_id IS NULL OR a.musicbrainz_id = '' OR a.musicbrainz_id = ?3)
              LIMIT 1",
         )
         .bind(library_id)
         .bind(name)
+        .bind(mbid)
         .fetch_optional(pool)
         .await
         .map_err(|e| e.to_string())?;
-        if let Some((artist_id,)) = row {
-            sqlx::query("UPDATE artist SET musicbrainz_id = ? WHERE id = ?")
-                .bind(mbid)
-                .bind(artist_id)
-                .execute(pool)
-                .await
-                .map_err(|e| e.to_string())?;
-            set_mb_id(pool, artist_id, MB_ARTIST, mbid, TIER_MB).await?;
-            settle_artist_card_derived(pool, library_id, artist_id).await?;
-            stamped += 1;
+        if let Some((artist_id, current)) = row {
+            if current.as_deref().is_none_or(str::is_empty) {
+                sqlx::query("UPDATE artist SET musicbrainz_id = ? WHERE id = ?")
+                    .bind(mbid)
+                    .bind(artist_id)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                set_mb_id(pool, artist_id, MB_ARTIST, mbid, TIER_MB).await?;
+                settle_artist_card_derived(pool, library_id, artist_id).await?;
+                stamped += 1;
+            }
+            if let Some(canon) = canonical.get(mbid.as_str()) {
+                adopt_mb_name(pool, library_id, artist_id, canon).await?;
+            }
         }
     }
     Ok(stamped)
+}
+
+/// An identified artist's page is named what MusicBrainz names the entity.
+/// Records the canonical name as the title's MB tier (the fallback when a
+/// rename is cleared), then — unless the user renamed the artist — retitles
+/// the page, keeping the old spelling as an 'mb' alias so every credit that
+/// carries it keeps resolving. Logged as a rename (undoable) only when the
+/// title actually changes.
+pub(crate) async fn adopt_mb_name(
+    pool: &SqlitePool,
+    library_id: &str,
+    artist_id: i64,
+    canonical: &str,
+) -> Result<(), String> {
+    let canonical = canonical.trim();
+    if canonical.is_empty() {
+        return Ok(());
+    }
+    set_mb_id(pool, artist_id, "title", canonical, TIER_MB).await?;
+    if crate::music_edit::has_override(pool, artist_id, "title").await? {
+        return Ok(());
+    }
+    let (title,): (String,) = sqlx::query_as("SELECT title FROM artist WHERE id = ?")
+        .bind(artist_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    if title == canonical {
+        return Ok(());
+    }
+    let batch = next_batch(pool).await?;
+    rename_artist_page(pool, library_id, artist_id, &title, canonical, "mb", batch).await
+}
+
+/// Retitle an artist page: the old title becomes an alias (with its source),
+/// the title and sort key change, an alias equal to the NEW title is dropped
+/// (a redirect to itself says nothing), and the change is logged for undo.
+pub(crate) async fn rename_artist_page(
+    pool: &SqlitePool,
+    library_id: &str,
+    artist_id: i64,
+    old_title: &str,
+    new_title: &str,
+    alias_source: &str,
+    batch: i64,
+) -> Result<(), String> {
+    sqlx::query("INSERT OR IGNORE INTO artist_alias (artist_id, name, source) VALUES (?, ?, ?)")
+        .bind(artist_id)
+        .bind(old_title)
+        .bind(alias_source)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    sqlx::query("UPDATE artist SET title = ?, sort_title = ? WHERE id = ?")
+        .bind(new_title)
+        .bind(crate::commands::generate_sort_title(new_title, "en"))
+        .bind(artist_id)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    crate::music_edit::drop_self_alias(pool, artist_id).await?;
+    log_change(
+        pool,
+        library_id,
+        "artist_rename",
+        artist_id,
+        &format!("{old_title} — renamed to {new_title}"),
+        &serde_json::json!({ "title": old_title }),
+        &serde_json::json!({ "title": new_title }),
+        batch,
+    )
+    .await
+}
+
+/// The album-credit protection's one exception: a SINGLE MusicBrainz credit
+/// whose artist id is the very artist the album's single existing credit row
+/// already resolves to. Rewriting then changes only the spelling ("Beyonce"
+/// → "Beyoncé"), never which discography the album sits in — so a machine
+/// match may do it. Any other single-credit rewrite stays user-only.
+async fn single_credit_same_artist(
+    pool: &SqlitePool,
+    album_id: i64,
+    mb_artist_ids: &[Option<String>],
+) -> Result<bool, String> {
+    let [Some(mbid)] = mb_artist_ids else { return Ok(false) };
+    if is_placeholder_artist(mbid) {
+        return Ok(false);
+    }
+    let rows: Vec<(Option<String>,)> = sqlx::query_as(
+        "SELECT a.musicbrainz_id FROM album_artist_credit ac
+         LEFT JOIN artist a ON a.id = ac.artist_id
+         WHERE ac.album_id = ?",
+    )
+    .bind(album_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(matches!(rows.as_slice(), [(Some(current),)] if current.eq_ignore_ascii_case(mbid)))
 }
 
 /// A pending "Which artist is this?" card whose artist just got identified by
@@ -2412,16 +2560,21 @@ async fn apply_group(
         .cloned()
         .zip(group.artist_ids.iter().cloned())
         .collect();
-    stamp_artist_ids_from_credit(pool, library_id, &credit_pairs).await?;
+    stamp_artist_ids_from_credit(pool, library_id, &credit_pairs, &group.canonical_names()).await?;
 
     // Same rule as apply_release: multi-name credits always rewrite (the
-    // joint-credits fix), single-name credits rewrite only when a PERSON
-    // applied this match — the mismatch warning was their consent. Machine
-    // matches never recredit a single name (V/A compilation protection).
-    // The MB tier stores what MusicBrainz says whenever the credit rule
-    // admits it — even under a user edit, so Clear overrides can fall back
-    // to it without a fetch. The column write below stays user-guarded.
-    let credits_eligible = (group.artists.len() >= 2 || tier == TIER_USER)
+    // joint-credits fix), single-name credits rewrite when a PERSON applied
+    // this match — the mismatch warning was their consent — or when the
+    // single credit is provably the SAME artist the album already sits under
+    // (only the spelling differs: "Beyonce" → "Beyoncé"). Machine matches
+    // never recredit a single name to a different artist (V/A compilation
+    // protection). The MB tier stores what MusicBrainz says whenever the
+    // credit rule admits it — even under a user edit, so Clear overrides can
+    // fall back to it without a fetch. The column write below stays
+    // user-guarded.
+    let credits_eligible = (group.artists.len() >= 2
+        || tier == TIER_USER
+        || single_credit_same_artist(pool, album_id, &group.artist_ids).await?)
         && !group.artists.is_empty()
         && !suppressed(pool, "album_artists", album_id).await?;
     if credits_eligible {
@@ -2601,9 +2754,16 @@ async fn apply_release(
     // Miller). The MACHINE keeps the old protection — an auto-match must
     // never silently move an album out of an artist's discography (V/A
     // compilations filed under one artist).
+    // A single credit that is provably the SAME artist the album already
+    // sits under (same MBID, different spelling) is eligible on any tier —
+    // only the text changes (see single_credit_same_artist).
     // MB tier first (stored even under a user edit — the reset's fallback),
     // then the user-guarded column write.
-    let credits_eligible = (album_artist_names.len() >= 2 || tier == TIER_USER)
+    let album_artist_ids: Vec<Option<String>> =
+        full.album_artists.iter().map(|(_, id)| id.clone()).collect();
+    let credits_eligible = (album_artist_names.len() >= 2
+        || tier == TIER_USER
+        || single_credit_same_artist(pool, album_id, &album_artist_ids).await?)
         && !album_artist_names.is_empty()
         && !suppressed(pool, "album_artists", album_id).await?;
     if credits_eligible {
@@ -2681,7 +2841,7 @@ async fn apply_release(
                 credit_pairs.push((name.clone(), id.clone()));
             }
         }
-        stamp_artist_ids_from_credit(pool, library_id, &credit_pairs).await?;
+        stamp_artist_ids_from_credit(pool, library_id, &credit_pairs, &full.artist_names).await?;
     }
 
     // Album type: MB's release-group type replaces the track-count guess —
@@ -3230,8 +3390,11 @@ async fn enrich_artist_mbids(
     // One fetch can identify several members (joint albums), so fetches are
     // cached per pass and already-stamped artists are skipped.
     let total = candidates.len();
-    let mut group_cache: HashMap<String, Vec<(String, Option<String>)>> = HashMap::new();
-    let mut release_cache: HashMap<String, Vec<(String, Option<String>)>> = HashMap::new();
+    // Per evidence id: the credit pairs plus mbid → canonical names, so a
+    // page identified here is named like one identified any other way.
+    type Evidence = (Vec<(String, Option<String>)>, HashMap<String, String>);
+    let mut group_cache: HashMap<String, Evidence> = HashMap::new();
+    let mut release_cache: HashMap<String, Evidence> = HashMap::new();
     let mut stamped: std::collections::HashSet<i64> = std::collections::HashSet::new();
     // Evidence fetches that errored, keyed by the group/release id — every
     // artist leaning on one of these gets shielded from the suggestion sweep
@@ -3255,22 +3418,24 @@ async fn enrich_artist_mbids(
         // The credit of this artist's matched evidence, fetched or cached.
         // Transient fetch errors skip the artist (a later pass retries) —
         // never fail the whole phase over one request.
-        let pairs: &[(String, Option<String>)] = if let Some(gid) = gid {
+        let (pairs, canonical): &Evidence = if let Some(gid) = gid {
             match group_cache.entry(gid.clone()) {
                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                 std::collections::hash_map::Entry::Vacant(slot) => {
                     let fetched = match fetch_release_group(client, gid).await {
-                        Ok(Some(g)) => g
-                            .artists
-                            .iter()
-                            .cloned()
-                            .zip(g.artist_ids.iter().cloned())
-                            .collect(),
-                        Ok(None) => Vec::new(),
+                        Ok(Some(g)) => (
+                            g.artists
+                                .iter()
+                                .cloned()
+                                .zip(g.artist_ids.iter().cloned())
+                                .collect(),
+                            g.canonical_names(),
+                        ),
+                        Ok(None) => (Vec::new(), HashMap::new()),
                         Err(e) => {
                             eprintln!("artist identity: group {gid} fetch failed: {e}");
                             failed_keys.insert(gid.clone());
-                            Vec::new()
+                            (Vec::new(), HashMap::new())
                         }
                     };
                     slot.insert(fetched)
@@ -3292,13 +3457,13 @@ async fn enrich_artist_mbids(
                                     pairs.push((name.clone(), id.clone()));
                                 }
                             }
-                            pairs
+                            (pairs, full.artist_names.clone())
                         }
-                        Ok(None) => Vec::new(),
+                        Ok(None) => (Vec::new(), HashMap::new()),
                         Err(e) => {
                             eprintln!("artist identity: release {rid} fetch failed: {e}");
                             failed_keys.insert(rid.clone());
-                            Vec::new()
+                            (Vec::new(), HashMap::new())
                         }
                     };
                     slot.insert(fetched)
@@ -3345,6 +3510,10 @@ async fn enrich_artist_mbids(
                 // the override is the record.
                 set_mb_id(pool, aid, MB_ARTIST, cid, TIER_MB).await?;
                 settle_artist_card_derived(pool, library_id, aid).await?;
+                // Identified → named what MusicBrainz names the entity.
+                if let Some(canon) = canonical.get(cid.as_str()) {
+                    adopt_mb_name(pool, library_id, aid, canon).await?;
+                }
                 stamped.insert(aid);
                 updated += 1;
             }
@@ -3887,7 +4056,10 @@ async fn backfill_pin_tracks(
 
 /// Two artist rows with the SAME MusicBrainz id are provably one person —
 /// auto-merge (logged, undoable): the one with albums keeps the page, the
-/// other's names become aliases, its albums (if any) move over.
+/// other's names become 'mb' aliases, its albums (if any) move over. The
+/// survivor is then named what MusicBrainz names the entity (the title's MB
+/// tier, recorded by whichever side got identified) — not "whichever page
+/// had more albums" (user rule 2026-09-20; a manual rename still wins).
 async fn merge_mbid_duplicates(pool: &SqlitePool, library_id: &str) -> Result<(), String> {
     let rows: Vec<(i64, String, String, i64)> = sqlx::query_as(
         "SELECT a.id, a.title, a.musicbrainz_id,
@@ -3929,8 +4101,28 @@ async fn merge_mbid_duplicates(pool: &SqlitePool, library_id: &str) -> Result<()
             if veto.is_some() {
                 continue;
             }
-            merge_artists(pool, library_id, keep_id, &keep_title, Some(other_id), &other_title)
+            // The canonical name, from whichever page recorded it — read
+            // before the merge deletes the other page's rows.
+            let mut canonical: Option<String> = None;
+            for id in [keep_id, other_id] {
+                let row: Option<(String,)> = sqlx::query_as(
+                    "SELECT value FROM field_override
+                     WHERE entity_id = ? AND field = 'title' AND tier = 'mb' AND value <> ''",
+                )
+                .bind(id)
+                .fetch_optional(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+                if let Some((v,)) = row {
+                    canonical = Some(v);
+                    break;
+                }
+            }
+            merge_artists(pool, library_id, keep_id, &keep_title, Some(other_id), &other_title, "mb")
                 .await?;
+            if let Some(canon) = &canonical {
+                adopt_mb_name(pool, library_id, keep_id, canon).await?;
+            }
         }
     }
     Ok(())
@@ -3981,6 +4173,9 @@ pub async fn merge_artists(
     keep_title: &str,
     other_id: Option<i64>,
     other_name: &str,
+    // alias_source: who decided the absorbed names mean the survivor — 'mb'
+    // for the same-id auto-merge, 'user' for every merge a person clicked.
+    alias_source: &str,
 ) -> Result<(), String> {
     let mut aliases_added: Vec<String> = Vec::new();
     let mut other_aliases: Vec<String> = Vec::new();
@@ -4059,14 +4254,13 @@ pub async fn merge_artists(
             .map_err(|e| e.to_string())?;
     }
     for name in &aliases_added {
-        sqlx::query(
-            "INSERT OR IGNORE INTO artist_alias (artist_id, name, kind) VALUES (?, ?, 'variant')",
-        )
-        .bind(keep_id)
-        .bind(name)
-        .execute(pool)
-        .await
-        .map_err(|e| e.to_string())?;
+        sqlx::query("INSERT OR IGNORE INTO artist_alias (artist_id, name, source) VALUES (?, ?, ?)")
+            .bind(keep_id)
+            .bind(name)
+            .bind(alias_source)
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
     }
 
     // Credit rows stamped with the absorbed artist re-point to the survivor —
@@ -4111,6 +4305,11 @@ pub async fn merge_artists(
             "other_aliases": other_aliases,
             "albums_moved": albums_moved,
             "aliases_added": aliases_added,
+            // Who merged: the undo arm reads this — undoing an AUTOMATIC
+            // (same-id) merge leaves a standing "no" so the pass can't redo
+            // it; undoing a merge a person clicked just puts the question
+            // back (the identity card returns).
+            "alias_source": alias_source,
         }),
         &serde_json::json!({ "keep_id": keep_id, "keep_title": keep_title }),
         batch,
@@ -4137,231 +4336,9 @@ pub async fn merge_artists(
 // auto-merges pages whose STORED (credit-derived, certain) ids prove they're
 // one artist.
 
-// ---------------------------------------------------------------------------
-// Fix-at-source: misspelling aliases still living in the files' tags
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Serialize)]
-pub struct TagFixTrack {
-    /// Ids so the card can jump to the track on its album page.
-    pub track_id: i64,
-    pub album_id: Option<i64>,
-    pub track_title: String,
-    pub album_title: Option<String>,
-    pub file_path: String,
-    /// Which tag carries the spelling: "artist tag" | "track title" |
-    /// "credits" (tag-derived, but not locatable in those two fields).
-    pub source: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct TagFixAlbum {
-    pub album_id: i64,
-    pub album_title: String,
-    pub folder_path: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct TagFix {
-    pub artist_id: i64,
-    /// The artist page's current name.
-    pub canonical: String,
-    /// The alias spelling still present in tags.
-    pub wrong: String,
-    /// Always 'variant' (neutral — listed for the user to classify). Once
-    /// classified either way the row leaves this list for good.
-    pub kind: String,
-    /// Occurrences retagging can actually fix (capped at 30 in the payload).
-    pub tracks: Vec<TagFixTrack>,
-    pub track_total: i64,
-    /// Albums whose album-artist tag carries it — retag the whole folder.
-    pub albums: Vec<TagFixAlbum>,
-}
-
-/// Aliases whose literal spelling still occurs in the FILES' tags — the
-/// retag-and-rescan worklist. Occurrences are classified per track: spelling
-/// found in the raw artist tag or the track title counts (and says which);
-/// an occurrence in neither, on a release-matched album, was authored by the
-/// MusicBrainz credit apply — not tag debt, excluded (retagging can't touch
-/// it). Album-artist occurrences count only on MB-unmatched albums for the
-/// same reason. Only unclassified 'variant' rows are returned, for the user
-/// to classify; a classified alias — misspelling OR nickname — never
-/// appears again (user ruling 2026-09-11: a declared misspelling is not
-/// tag debt to nag about, because the library already shows the artist's
-/// MusicBrainz name or override; the kind is recorded, nothing more).
-/// Retag + rescan also clears an entry by itself — the alias row stays
-/// behind as an inert redirect.
-#[tauri::command]
-pub async fn get_tag_fixes(
-    state: State<'_, AppState>,
-    library_id: String,
-) -> Result<Vec<TagFix>, String> {
-    let pool = &state.app_db;
-    let aliases: Vec<(i64, String, String, String)> = sqlx::query_as(
-        "SELECT al.artist_id, a.title, al.name, al.kind
-         FROM artist_alias al
-         JOIN artist a ON a.id = al.artist_id
-         JOIN media_entry me ON me.id = a.id
-         WHERE me.library_id = ? AND al.kind = 'variant'
-           AND LOWER(al.name) != LOWER(a.title)
-         ORDER BY a.sort_title COLLATE NOCASE, al.name COLLATE NOCASE",
-    )
-    .bind(&library_id)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| e.to_string())?;
-
-    let mut fixes = Vec::new();
-    for (artist_id, canonical, wrong, kind) in aliases {
-        let wrong_lower = wrong.to_lowercase();
-        let rows: Vec<(i64, Option<i64>, String, Option<String>, String, Option<String>, i64)> = sqlx::query_as(
-            "SELECT tme.id, alb.id, t.title, alb.title, t.file_path, tm.artist_name,
-                    EXISTS (SELECT 1 FROM track_release tr
-                            JOIN album_release ar ON ar.id = tr.release_id
-                            JOIN release_match rm ON rm.album_id = ar.album_id
-                                                 AND rm.folder_path = ar.folder_path
-                                                 AND rm.mb_release_id <> ''
-                            WHERE tr.track_id = tme.id)
-             FROM track_credit tc
-             JOIN media_entry tme ON tme.id = tc.track_id
-             JOIN track t ON t.id = tc.track_id
-             LEFT JOIN track_meta tm ON tm.track_id = tc.track_id
-             LEFT JOIN album alb ON alb.id = tme.parent_id
-             WHERE tme.library_id = ?1 AND LOWER(tc.name) = LOWER(?2)
-             ORDER BY alb.sort_title COLLATE NOCASE, t.sort_order",
-        )
-        .bind(&library_id)
-        .bind(&wrong)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| e.to_string())?;
-        let mut tracks = Vec::new();
-        let mut track_total = 0i64;
-        for (track_id, album_id, track_title, album_title, file_path, tag_artist, release_matched) in rows {
-            let source = if tag_artist
-                .as_deref()
-                .is_some_and(|a| a.to_lowercase().contains(&wrong_lower))
-            {
-                "artist tag"
-            } else if track_title.to_lowercase().contains(&wrong_lower) {
-                "track title"
-            } else if release_matched != 0 {
-                // MusicBrainz wrote this credit; the files never carried the
-                // spelling. Nothing to retag.
-                continue;
-            } else {
-                "credits"
-            };
-            track_total += 1;
-            if tracks.len() < 30 {
-                tracks.push(TagFixTrack {
-                    track_id,
-                    album_id,
-                    track_title,
-                    album_title,
-                    file_path,
-                    source: source.to_string(),
-                });
-            }
-        }
-        let albums: Vec<(i64, String, String)> = sqlx::query_as(
-            "SELECT alb.id, alb.title, alb.folder_path
-             FROM album_artist_credit ac
-             JOIN media_entry me ON me.id = ac.album_id
-             JOIN album alb ON alb.id = ac.album_id
-             WHERE me.library_id = ?1 AND LOWER(ac.name) = LOWER(?2)
-               AND NOT EXISTS (SELECT 1 FROM field_override f
-                               WHERE f.entity_id = ac.album_id
-                                 AND f.field = 'mb_release_group_id')
-               AND NOT EXISTS (SELECT 1 FROM release_match rm
-                               WHERE rm.album_id = ac.album_id AND rm.mb_release_id <> '')
-             ORDER BY alb.sort_title COLLATE NOCASE",
-        )
-        .bind(&library_id)
-        .bind(&wrong)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| e.to_string())?;
-        if track_total == 0 && albums.is_empty() {
-            continue; // tags already clean — the alias is dormant insurance
-        }
-        fixes.push(TagFix {
-            artist_id,
-            canonical,
-            wrong,
-            kind,
-            tracks,
-            track_total,
-            albums: albums
-                .into_iter()
-                .map(|(album_id, album_title, folder_path)| TagFixAlbum {
-                    album_id,
-                    album_title,
-                    folder_path,
-                })
-                .collect(),
-        });
-    }
-    Ok(fixes)
-}
-
-/// Classify one alias: 'misspelling' (wrong text) or 'nickname' (intended
-/// moniker). Both resolve identically and both retire the card — the kind is
-/// a recorded fact, not a nag. A human decision, so it logs — undo restores
-/// the previous kind (back to 'variant' brings the card back).
-#[tauri::command]
-pub async fn set_alias_kind(
-    state: State<'_, AppState>,
-    library_id: String,
-    artist_id: i64,
-    name: String,
-    kind: String,
-) -> Result<(), String> {
-    if kind != "misspelling" && kind != "nickname" && kind != "variant" {
-        return Err(format!("unknown alias kind '{kind}'"));
-    }
-    let pool = &state.app_db;
-    let prev: Option<(String,)> =
-        sqlx::query_as("SELECT kind FROM artist_alias WHERE artist_id = ? AND name = ?")
-            .bind(artist_id)
-            .bind(&name)
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| e.to_string())?;
-    let Some((prev,)) = prev else {
-        return Err("Alias not found".to_string());
-    };
-    if prev == kind {
-        return Ok(());
-    }
-    sqlx::query("UPDATE artist_alias SET kind = ? WHERE artist_id = ? AND name = ?")
-        .bind(&kind)
-        .bind(artist_id)
-        .bind(&name)
-        .execute(pool)
-        .await
-        .map_err(|e| e.to_string())?;
-    let batch = next_batch(pool).await?;
-    log_change(
-        pool,
-        &library_id,
-        "alias_kind",
-        artist_id,
-        &format!(
-            "\u{201c}{name}\u{201d} \u{2014} {}",
-            match kind.as_str() {
-                "nickname" => "marked a nickname",
-                "misspelling" => "marked a misspelling",
-                _ => "classification cleared",
-            }
-        ),
-        &serde_json::json!({ "name": name, "kind": prev }),
-        &serde_json::json!({ "name": name, "kind": kind }),
-        batch,
-    )
-    .await?;
-    Ok(())
-}
+// (The alias classification commands — misspelling / nickname cards under
+// File problems — were retired 2026-09-20: an alias is one fact, "this
+// spelling means that page", tiered by who wrote it. See artist_alias.source.)
 
 // ---------------------------------------------------------------------------
 // Identity clusters — the center's "Resolve identities" cards
@@ -4625,7 +4602,7 @@ pub async fn mb_resolve_cluster(
         .await
         .map_err(|e| e.to_string())?;
         let Some((title,)) = row else { continue };
-        merge_artists(pool, &library_id, survivor_id, &survivor_title, Some(id), &title).await?;
+        merge_artists(pool, &library_id, survivor_id, &survivor_title, Some(id), &title, "user").await?;
         merged += 1;
         last_name = title;
     }
@@ -4648,7 +4625,7 @@ pub async fn mb_resolve_cluster(
         if source_id == Some(survivor_id) {
             continue; // already answers to the survivor
         }
-        merge_artists(pool, &library_id, survivor_id, &survivor_title, source_id, &name).await?;
+        merge_artists(pool, &library_id, survivor_id, &survivor_title, source_id, &name, "user").await?;
         merged += 1;
         last_name = name;
     }
@@ -4658,7 +4635,7 @@ pub async fn mb_resolve_cluster(
         } else {
             format!("{merged} spellings")
         };
-        enqueue_pass_recheck(pool, &library_id, survivor_id, &survivor_title, &desc).await?;
+        enqueue_pass_recheck(pool, &library_id, survivor_id, &survivor_title, &desc, merged == 1).await?;
     }
     let _ = app.emit(
         "music-enrich-done",
@@ -4670,7 +4647,12 @@ pub async fn mb_resolve_cluster(
 /// Eject a name from its cluster: a standing "this is NOT the same artist".
 /// Writes the same rejected suggestion row a pairwise "Keep separate" click
 /// left, so the veto is honored everywhere the old ones were (cluster build,
-/// lookalike sweep, auto-merge) and History-undo returns the member.
+/// lookalike sweep, auto-merge) and History-undo returns the member. A name
+/// with no page of its own (the scanner withheld one as a lookalike) GETS
+/// one here — "different artists" has to mean the spelling becomes an
+/// artist, not just that the question stops (user ruling 2026-09-20); its
+/// credits re-stamp to the new page by exact name, ahead of the
+/// punctuation-blind fallback that pointed them at the lookalike.
 #[tauri::command]
 pub async fn mb_keep_separate(
     state: State<'_, AppState>,
@@ -4681,6 +4663,34 @@ pub async fn mb_keep_separate(
     let name = name.trim().to_string();
     if name.is_empty() {
         return Err("No name given".to_string());
+    }
+    let existing: Option<(i64,)> = sqlx::query_as(
+        "SELECT an.artist_id FROM artist_names an
+         JOIN media_entry me ON me.id = an.artist_id
+         WHERE me.library_id = ?1 AND LOWER(an.name) = LOWER(?2) LIMIT 1",
+    )
+    .bind(&library_id)
+    .bind(&name)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let mut created_id: Option<i64> = None;
+    if existing.is_none() {
+        let artist = crate::music::ScannedArtist {
+            title: name.clone(),
+            albums: Vec::new(),
+            loose: Vec::new(),
+        };
+        let order = crate::music::next_artist_order(pool, &library_id).await?;
+        let id = crate::music::insert_artist_row(
+            pool,
+            &library_id,
+            std::path::Path::new(""),
+            &artist,
+            order,
+        )
+        .await?;
+        created_id = Some(id);
     }
     // Payload keeps other_name so an undone rejection (status back to
     // pending) re-enters the cluster build even when the sweep never wrote
@@ -4705,28 +4715,27 @@ pub async fn mb_keep_separate(
     .fetch_one(pool)
     .await
     .map_err(|e| e.to_string())?;
-    let target: Option<(i64,)> = sqlx::query_as(
-        "SELECT an.artist_id FROM artist_names an
-         JOIN media_entry me ON me.id = an.artist_id
-         WHERE me.library_id = ?1 AND LOWER(an.name) = LOWER(?2) LIMIT 1",
-    )
-    .bind(&library_id)
-    .bind(&name)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| e.to_string())?;
+    let target_id = created_id.or(existing.map(|(id,)| id)).unwrap_or(0);
     let batch = next_batch(pool).await?;
     log_change(
         pool,
         &library_id,
         "suggestion_rejected",
-        target.map(|(id,)| id).unwrap_or(0),
-        &format!("\u{201c}{name}\u{201d} kept separate"),
-        &serde_json::json!({ "suggestion_id": suggestion_id }),
+        target_id,
+        &format!(
+            "\u{201c}{name}\u{201d} kept separate{}",
+            if created_id.is_some() { " — its own artist now" } else { "" }
+        ),
+        &serde_json::json!({ "suggestion_id": suggestion_id, "created_artist_id": created_id }),
         &serde_json::json!({ "status": "rejected" }),
         batch,
     )
     .await?;
+    if created_id.is_some() {
+        // The new page answers to its exact name now — credits carrying it
+        // move over from the lookalike the fallback had pointed them at.
+        crate::music::resolve_credit_ids(pool, &library_id).await?;
+    }
     Ok(())
 }
 
@@ -6244,7 +6253,9 @@ pub async fn mb_apply_entity_match(
     // Album group matches: the credit pairs, kept for a second stamping walk
     // at the tail — after ensure_credit_artists creates pages for names new
     // to the library (the in-arm walk ran before they existed).
-    let mut album_credit_pairs: Option<Vec<(String, Option<String>)>> = None;
+    // Credit pairs + mbid → canonical names, for the post-ensure stamp walk.
+    let mut album_credit_pairs: Option<(Vec<(String, Option<String>)>, HashMap<String, String>)> =
+        None;
     // Track matches: whether the recording's credits actually replaced ours —
     // only then does the parent album hold new evidence worth re-checking.
     let mut track_credits_applied = false;
@@ -6264,14 +6275,15 @@ pub async fn mb_apply_entity_match(
                 .await?
                 .ok_or_else(|| "no MusicBrainz release group with that id".to_string())?;
             apply_group(pool, &library_id, entity_id, &title, &group, TIER_USER).await?;
-            album_credit_pairs = Some(
+            album_credit_pairs = Some((
                 group
                     .artists
                     .iter()
                     .cloned()
                     .zip(group.artist_ids.iter().cloned())
-                    .collect(),
-            );
+                    .collect::<Vec<(String, Option<String>)>>(),
+                group.canonical_names(),
+            ));
             stamp(pool, entity_id, "matched").await?;
             // The pending "which album is this?" suggestion is now answered —
             // without this the card lingers after Apply and the decision
@@ -6346,39 +6358,15 @@ pub async fn mb_apply_entity_match(
                     set_mb_id(pool, entity_id, "title", t, TIER_MB).await?;
                 }
                 if let Some(target) = target.filter(|n| *n != title) {
-                    sqlx::query(
-                        "INSERT OR IGNORE INTO artist_alias (artist_id, name, kind) VALUES (?, ?, 'variant')",
-                    )
-                    .bind(entity_id)
-                    .bind(&title)
-                    .execute(pool)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                    sqlx::query("UPDATE artist SET title = ?, sort_title = ? WHERE id = ?")
-                        .bind(&target)
-                        .bind(crate::commands::generate_sort_title(&target, "en"))
-                        .bind(entity_id)
-                        .execute(pool)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    log_change(
-                        pool,
-                        &library_id,
-                        "artist_rename",
-                        entity_id,
-                        &format!("{title} — renamed to {target}"),
-                        &serde_json::json!({ "title": title }),
-                        &serde_json::json!({ "title": target }),
-                        batch,
-                    )
-                    .await?;
+                    rename_artist_page(pool, &library_id, entity_id, &title, &target, "mb", batch)
+                        .await?;
                 }
                 // The canonical spelling must keep resolving to this page
                 // even when the preferred name won the title.
                 if let (Some(pref), Some(canon)) = (preferred.as_deref(), canonical.as_deref()) {
                     if pref != canon {
                         sqlx::query(
-                            "INSERT OR IGNORE INTO artist_alias (artist_id, name, kind) VALUES (?, ?, 'variant')",
+                            "INSERT OR IGNORE INTO artist_alias (artist_id, name, source) VALUES (?, ?, 'mb')",
                         )
                         .bind(entity_id)
                         .bind(canon)
@@ -6547,8 +6535,8 @@ pub async fn mb_apply_entity_match(
     // fresh stamps for every touched row (ensure ends with resolve_credit_ids).
     crate::music::ensure_credit_artists(pool, &library_id).await?;
     // Second stamping walk now that pages for newly-credited names exist.
-    if let Some(pairs) = &album_credit_pairs {
-        stamp_artist_ids_from_credit(pool, &library_id, pairs).await?;
+    if let Some((pairs, canonical)) = &album_credit_pairs {
+        stamp_artist_ids_from_credit(pool, &library_id, pairs, canonical).await?;
     }
     if kind == "album" {
         enqueue_pass_work(pool, &library_id, entity_id).await?;
@@ -7442,6 +7430,7 @@ async fn enqueue_pass_row(
     library_id: &str,
     target: &str,
     label: &str,
+    batch_id: Option<i64>,
 ) -> Result<(), String> {
     sqlx::query("DELETE FROM pending_pass WHERE library_id = ? AND target = ?")
         .bind(library_id)
@@ -7449,14 +7438,31 @@ async fn enqueue_pass_row(
         .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
-    sqlx::query("INSERT INTO pending_pass (library_id, target, label) VALUES (?, ?, ?)")
+    sqlx::query("INSERT INTO pending_pass (library_id, target, label, batch_id) VALUES (?, ?, ?, ?)")
         .bind(library_id)
         .bind(target)
         .bind(label)
+        .bind(batch_id)
         .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// The History batch of the newest live merge into this artist — what a
+/// queue row's Undo points at. None when there isn't exactly one candidate
+/// to name (no merge logged), so the queue shows "see History" instead.
+async fn latest_merge_batch(pool: &SqlitePool, artist_id: i64) -> Result<Option<i64>, String> {
+    let row: Option<(i64,)> = sqlx::query_as(
+        "SELECT batch_id FROM mb_change_log
+         WHERE target_id = ? AND kind = 'artist_merge' AND undone = 0 AND batch_id IS NOT NULL
+         ORDER BY id DESC LIMIT 1",
+    )
+    .bind(artist_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(row.map(|(b,)| b))
 }
 
 pub(crate) async fn enqueue_pass_work(
@@ -7474,6 +7480,7 @@ pub(crate) async fn enqueue_pass_work(
         library_id,
         &album_id.to_string(),
         &format!("Match \u{201c}{title}\u{201d}"),
+        None,
     )
     .await
 }
@@ -7489,7 +7496,12 @@ pub(crate) async fn enqueue_pass_recheck(
     artist_id: i64,
     artist_title: &str,
     merged_name: &str,
+    // `undoable`: this re-check came from ONE merge — link its History batch
+    // so the queue can undo it in place. A cluster of several merges passes
+    // false: one row can't stand for several changes.
+    undoable: bool,
 ) -> Result<(), String> {
+    let batch_id = if undoable { latest_merge_batch(pool, artist_id).await? } else { None };
     enqueue_pass_row(
         pool,
         library_id,
@@ -7497,6 +7509,7 @@ pub(crate) async fn enqueue_pass_recheck(
         &format!(
             "Re-check \u{201c}{artist_title}\u{201d} \u{2014} \u{201c}{merged_name}\u{201d} merged in"
         ),
+        batch_id,
     )
     .await
 }
@@ -7556,6 +7569,7 @@ pub(crate) async fn enqueue_artist_match_recheck(
         &format!(
             "Re-check \u{201c}{title}\u{201d} \u{2014} {retry} unfound {noun} now searchable by artist"
         ),
+        None,
     )
     .await
 }
@@ -7598,6 +7612,7 @@ pub(crate) async fn enqueue_track_credit_recheck(
         library_id,
         &format!("album:{album_id}:credits"),
         &format!("Re-check \u{201c}{title}\u{201d} \u{2014} new credits"),
+        None,
     )
     .await
 }
@@ -7657,6 +7672,7 @@ pub(crate) async fn enqueue_album_credit_recheck(
             library_id,
             &format!("album:{album_id}:credits"),
             &format!("Re-check \u{201c}{title}\u{201d} \u{2014} new credits"),
+            None,
         )
         .await
     } else if retryable != 0 {
@@ -7665,6 +7681,7 @@ pub(crate) async fn enqueue_album_credit_recheck(
             library_id,
             &format!("album:{album_id}:credits"),
             &format!("Search \u{201c}{title}\u{201d} \u{2014} credits changed"),
+            None,
         )
         .await
     } else {
@@ -7705,6 +7722,9 @@ pub struct PendingPassRow {
     /// Album entry id, as text (matches pending_change's target shape).
     pub target: String,
     pub label: String,
+    /// The History batch that queued this row, when exactly one change did
+    /// — the queue's Undo runs it (and the undo clears the row).
+    pub batch_id: Option<i64>,
 }
 
 /// The matching-pass queue — the pass-side twin of get_pending_changes.
@@ -7713,8 +7733,8 @@ pub async fn get_pending_pass(
     state: State<'_, AppState>,
     library_id: String,
 ) -> Result<Vec<PendingPassRow>, String> {
-    let rows: Vec<(i64, String, String)> = sqlx::query_as(
-        "SELECT id, target, label FROM pending_pass WHERE library_id = ? ORDER BY id",
+    let rows: Vec<(i64, String, String, Option<i64>)> = sqlx::query_as(
+        "SELECT id, target, label, batch_id FROM pending_pass WHERE library_id = ? ORDER BY id",
     )
     .bind(&library_id)
     .fetch_all(&state.app_db)
@@ -7722,7 +7742,7 @@ pub async fn get_pending_pass(
     .map_err(|e| e.to_string())?;
     Ok(rows
         .into_iter()
-        .map(|(id, target, label)| PendingPassRow { id, target, label })
+        .map(|(id, target, label, batch_id)| PendingPassRow { id, target, label, batch_id })
         .collect())
 }
 
@@ -7812,7 +7832,7 @@ pub async fn mb_apply_album_match(
                 credit_pairs.push((name.clone(), id.clone()));
             }
         }
-        stamp_artist_ids_from_credit(pool, &library_id, &credit_pairs).await?;
+        stamp_artist_ids_from_credit(pool, &library_id, &credit_pairs, &full.artist_names).await?;
     }
     enqueue_pass_work(pool, &library_id, album_id).await?;
     // Silent refresh (no toast: zero counts).
@@ -7929,9 +7949,9 @@ pub async fn mb_resolve_suggestion(
             .fetch_optional(pool)
             .await
             .map_err(|e| e.to_string())?;
-            merge_artists(pool, &library_id, keep_id, &keep_title, other_id.map(|(id,)| id), other_name)
+            merge_artists(pool, &library_id, keep_id, &keep_title, other_id.map(|(id,)| id), other_name, "user")
                 .await?;
-            enqueue_pass_recheck(pool, &library_id, keep_id, &keep_title, other_name).await?;
+            enqueue_pass_recheck(pool, &library_id, keep_id, &keep_title, other_name, true).await?;
         }
         // album_match acceptance flows through mb_apply_album_match (the
         // modal sends the chosen candidate there).
@@ -8107,8 +8127,10 @@ pub async fn mb_undo_change(
             }
         }
         "artist_rename" => {
-            // The alias row stays (harmless, keeps references resolving) —
-            // only the display name goes back, and the MB tier with it.
+            // The display name goes back, and the MB tier with it. The alias
+            // the rename created is the name coming back — dropped, since a
+            // redirect to the page's own title says nothing. Other aliases
+            // stay and keep references resolving.
             clear_mb_tier(pool, target_id, "title").await?;
             if let Some(t) = before["title"].as_str() {
                 sqlx::query("UPDATE artist SET title = ?, sort_title = ? WHERE id = ?")
@@ -8118,6 +8140,7 @@ pub async fn mb_undo_change(
                     .execute(pool)
                     .await
                     .map_err(|e| e.to_string())?;
+                crate::music_edit::drop_self_alias(pool, target_id).await?;
             }
         }
         "album_type" => {
@@ -8183,10 +8206,10 @@ pub async fn mb_undo_change(
                 .await?;
                 for name in before["other_aliases"].as_array().into_iter().flatten() {
                     if let Some(name) = name.as_str() {
-                        // Kinds weren't recorded in the payload — restored
-                        // aliases return neutral; declarations don't survive
-                        // an undo of the merge that carried them.
-                        sqlx::query("INSERT OR IGNORE INTO artist_alias (artist_id, name, kind) VALUES (?, ?, 'variant')")
+                        // Sources weren't recorded in the payload — restored
+                        // aliases come back as the user's (visible, never
+                        // pruned), the conservative reading.
+                        sqlx::query("INSERT OR IGNORE INTO artist_alias (artist_id, name, source) VALUES (?, ?, 'user')")
                             .bind(new_id)
                             .bind(name)
                             .execute(pool)
@@ -8205,18 +8228,37 @@ pub async fn mb_undo_change(
                     }
                 }
             }
-            // A standing "no" so the auto-merge never redoes it.
+            // What the undo leaves behind depends on who merged. The
+            // automatic same-id merge (alias_source 'mb', or a legacy row
+            // without the field) gets a standing "no" so the next pass can't
+            // redo it. A merge a PERSON clicked ('user') just goes back to a
+            // pending question — the identity card returns as it was, and
+            // "they're different artists" stays a decision only they make.
             if !other_title.is_empty() {
-                sqlx::query(
-                    "INSERT INTO mb_suggestion (library_id, kind, target_key, payload, status)
-                     VALUES (?, 'artist_merge', ?, '{}', 'rejected')
-                     ON CONFLICT(library_id, kind, target_key) DO UPDATE SET status = 'rejected'",
-                )
-                .bind(&library_id)
-                .bind(other_title.to_lowercase())
-                .execute(pool)
-                .await
-                .map_err(|e| e.to_string())?;
+                let automatic = before["alias_source"].as_str().unwrap_or("mb") == "mb";
+                if automatic {
+                    sqlx::query(
+                        "INSERT INTO mb_suggestion (library_id, kind, target_key, payload, status)
+                         VALUES (?, 'artist_merge', ?, '{}', 'rejected')
+                         ON CONFLICT(library_id, kind, target_key) DO UPDATE SET status = 'rejected'",
+                    )
+                    .bind(&library_id)
+                    .bind(other_title.to_lowercase())
+                    .execute(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                } else {
+                    sqlx::query(
+                        "UPDATE mb_suggestion SET status = 'pending'
+                         WHERE library_id = ? AND kind = 'artist_merge' AND target_key = ?
+                           AND status = 'accepted'",
+                    )
+                    .bind(&library_id)
+                    .bind(other_title.to_lowercase())
+                    .execute(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                }
             }
             // The undone merge has nothing left for a pass to re-check.
             sqlx::query("DELETE FROM pending_pass WHERE library_id = ? AND target = ?")
@@ -8225,19 +8267,16 @@ pub async fn mb_undo_change(
                 .execute(pool)
                 .await
                 .map_err(|e| e.to_string())?;
+            // The merge re-pointed every credit stamped with the absorbed
+            // page to the survivor. With that page (and its names) back, a
+            // full re-resolve moves those stamps home — the resolver rewrites
+            // every row whose exact-name lookup disagrees with what's stored.
+            crate::music::resolve_credit_ids(pool, &library_id).await?;
         }
         "alias_kind" => {
-            // Restore the alias's previous kind — flipping a nickname back to
-            // a nagging misspelling, or the reverse.
-            let name = before["name"].as_str().unwrap_or_default();
-            let prev_kind = before["kind"].as_str().unwrap_or("variant");
-            sqlx::query("UPDATE artist_alias SET kind = ? WHERE artist_id = ? AND name = ?")
-                .bind(prev_kind)
-                .bind(target_id)
-                .bind(name)
-                .execute(pool)
-                .await
-                .map_err(|e| e.to_string())?;
+            // Historical: alias classification (misspelling / nickname) was
+            // retired 2026-09-20 with the kind column. Old entries stay
+            // readable in History; undoing one has nothing left to restore.
         }
         "artist_mbid" => {
             // Restore the pre-match id — null for a suggestion-accepted

@@ -82,6 +82,9 @@ function fakeMusicEntry(entryType: "album" | "artist", id: number, title: string
 
 function App() {
   const [libraries, setLibraries] = useState<Library[]>([]);
+  // First library fetch landed — the launch auto-select waits for it, so an
+  // empty list means "no libraries" rather than "not loaded yet".
+  const [librariesLoaded, setLibrariesLoaded] = useState(false);
   // Playlists per-library for the sidebar tree (each library's "Playlists" node shows its
   // playlists as children). Refreshed on libraries change + any onPlaylistChanged.
   const [sidebarPlaylists, setSidebarPlaylists] = useState<Record<string, PlaylistSummary[]>>({});
@@ -429,6 +432,8 @@ function App() {
       setLibraries(libs);
     } catch (e) {
       console.error("Failed to load libraries:", e);
+    } finally {
+      setLibrariesLoaded(true);
     }
   }, []);
 
@@ -1439,17 +1444,18 @@ function App() {
   // Open the default library on launch, once libraries AND settings have both
   // loaded. One-shot: later library-list refreshes (rescan, create, delete)
   // must not yank navigation, and a user click always beats a slow settings read.
-  // No user-set default → Home is the default.
+  // No user-set default → Home is the default. No libraries at all → Home
+  // too: "nothing selected" is never a page the user should land on.
   const didAutoSelectRef = useRef(false);
   useEffect(() => {
     if (didAutoSelectRef.current) return;
-    if (defaultLibraryId === undefined || libraries.length === 0) return;
+    if (defaultLibraryId === undefined || !librariesLoaded) return;
     didAutoSelectRef.current = true;
     if (activeView !== null) return;
     const lib = defaultLibraryId != null ? libraries.find((l) => l.id === defaultLibraryId) : undefined;
     if (lib) selectLibrary(lib);
     else openHome();
-  }, [libraries, defaultLibraryId, activeView, selectLibrary, openHome]);
+  }, [libraries, librariesLoaded, defaultLibraryId, activeView, selectLibrary, openHome]);
 
   // "Set as default" / "Unset as default" in a library's sidebar context menu.
   // Unset stores "" (settings rows are blanked, not deleted).
@@ -1997,39 +2003,6 @@ function App() {
       void openMusicEntryFromBar(fakeMusicEntry("album", albumId, albumTitle));
     },
     [openMusicEntryFromBar]
-  );
-
-  const navigateBreadcrumb = useCallback(
-    (index: number) => {
-      if (!selectedLibrary) return;
-      saveScrollPosition();
-      pushHistory();
-      const newBreadcrumbs = breadcrumbs.slice(0, index + 1);
-      const target = newBreadcrumbs[newBreadcrumbs.length - 1];
-      if (target.view) {
-        // Distinct view step — restore it.
-        setSelectedEntry(null);
-        setActiveView(target.view);
-        loadView(target.view, null, newBreadcrumbs, true);
-      } else if (target.entry) {
-        // Movie/show detail crumb (e.g. clicked back to a movie from a cast member's
-        // page). Restore the detail page and the view that owns the grid behind it,
-        // then quietly reload that grid so a later back lands somewhere sane.
-        const ownerView =
-          [...newBreadcrumbs].reverse().find((c) => c.view)?.view ??
-          ({ kind: "library-root", libraryId: selectedLibrary.id } as ViewSpec);
-        const parentId = newBreadcrumbs[newBreadcrumbs.length - 2]?.id ?? null;
-        setSelectedEntry(target.entry);
-        setActiveView(ownerView);
-        setBreadcrumbs(newBreadcrumbs);
-        loadView(ownerView, parentId, newBreadcrumbs, false, true);
-      } else {
-        // Drill-in within the current view (e.g. a collection chain in library-root).
-        setSelectedEntry(null);
-        loadEntries(selectedLibrary, target.id, newBreadcrumbs);
-      }
-    },
-    [selectedLibrary, breadcrumbs, loadView, loadEntries, saveScrollPosition]
   );
 
   // History-true: pop a visited-page snapshot and restore it exactly. The
@@ -3045,10 +3018,12 @@ function App() {
               setPlaylists(null);
               setBreadcrumbs([]);
               setActiveView(null);
-              // Land somewhere sensible: the first remaining library, or the
-              // empty state when none are left.
+              // Land somewhere sensible: the first remaining library, or Home
+              // when none are left ("nothing selected" is not a page).
               if (libs.length > 0) {
                 selectLibrary(libs[0]);
+              } else {
+                openHome();
               }
             } catch (e) {
               console.error("Failed to reload libraries after delete:", e);
@@ -3165,9 +3140,7 @@ function App() {
           }}
           onOpenLooseTracks={openLooseTracks}
           looseCount={looseCount}
-          onBreadcrumbClick={navigateBreadcrumb}
           selectedLibrary={selectedLibrary}
-          hasLibraries={libraries.length > 0}
           sortMode={sortMode}
           onSortModeChange={changeSortMode}
           presets={presets}
@@ -3223,6 +3196,7 @@ function App() {
           musicPlaying={musicState.isActive && musicState.isPlaying}
           metadataFocus={mbReviewFocus}
           onOpenMusicAlbumFromMetadata={openMusicAlbumFromCenter}
+          hasLibraries={libraries.length > 0}
           onMetadataChanged={(libraryId) => {
             // A match/undo landed on the page — same recipe as a rescan:
             // drop caches, silently refresh the grid, and let self-fetching

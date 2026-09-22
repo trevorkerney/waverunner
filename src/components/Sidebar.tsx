@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
 import { LibraryAttentionBadge } from "@/components/music/PendingWork";
-import { Trash2, RefreshCw, FolderPlus, FolderCog, ChevronRight, Sparkles, Pencil, Home, CircleAlert, Music2, Settings2 } from "lucide-react";
+import { Trash2, RefreshCw, FolderPlus, FolderCog, ChevronRight, Sparkles, Pencil, Home, CircleAlert, Music2, Settings2, Plus } from "lucide-react";
 import { open as openFolderPicker } from "@tauri-apps/plugin-dialog";
 import { Spinner } from "@/components/ui/spinner";
 import {
@@ -180,9 +180,7 @@ export function Sidebar({
               ? `reading album credits ${Math.min(done + 1, total)}/${total}`
               : phase === "artist-search"
                 ? `searching artists ${Math.min(done + 1, total)}/${total}`
-                : phase === "artist-images"
-                  ? `fetching artist images ${Math.min(done + 1, total)}/${total}`
-                  : `matching ${Math.min(done + 1, total)}/${total} — ${name}`;
+                : `matching ${Math.min(done + 1, total)}/${total} — ${name}`;
         setLine(libraryId, line);
       },
     );
@@ -324,11 +322,8 @@ export function Sidebar({
       style={{ width }}
     >
       <aside className="flex flex-1 flex-col overflow-hidden bg-sidebar">
-        <div className="flex items-center justify-between border-b border-border px-4 py-2">
-          <span className="text-xs font-medium text-muted-foreground whitespace-nowrap">
-            Your library
-          </span>
-        </div>
+        {/* No "Your library" header — Home is the first row, flush with the
+            top (user's call, 2026-09-20). */}
         <ContextMenu>
           <ContextMenuTrigger
             render={<nav className="flex-1 overflow-y-auto pb-1" />}
@@ -347,9 +342,16 @@ export function Sidebar({
             <span className="min-w-0 flex-1 break-words">Home</span>
           </button>
           {libraries.length === 0 ? (
-            <p className="px-2 py-1.5 text-sm text-muted-foreground whitespace-nowrap">
-              No libraries yet
-            </p>
+            // The empty sidebar's one job: the same "Create library" the
+            // background context menu offers — a quiet inline link, not a
+            // row that pretends to be a library.
+            <button
+              onClick={() => launchWizard({ kind: "create" })}
+              className="group/create mt-1 flex items-center gap-1 py-1 pl-3 pr-2 text-left text-xs text-sidebar-foreground"
+            >
+              <Plus size={10} className="shrink-0" />
+              <span className="leading-none group-hover/create:underline">create a library…</span>
+            </button>
           ) : (
             libraries.map((lib) => {
               const expanded = !collapsedLibs.has(lib.id);

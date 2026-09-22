@@ -96,6 +96,27 @@ pub fn run() {
                 }
             }
 
+            // WebView2's form autofill ("Saved info" dropdown under text
+            // inputs, password save prompts) is a browser feature with no
+            // place in a desktop app's dialogs — off at the engine level,
+            // since autocomplete="off" on inputs is only a hint to it.
+            #[cfg(windows)]
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.with_webview(|webview| unsafe {
+                    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Settings4;
+                    use windows_core::Interface;
+                    let controller = webview.controller();
+                    if let Ok(core) = controller.CoreWebView2() {
+                        if let Ok(settings) = core.Settings() {
+                            if let Ok(s4) = settings.cast::<ICoreWebView2Settings4>() {
+                                let _ = s4.SetIsGeneralAutofillEnabled(false);
+                                let _ = s4.SetIsPasswordAutosaveEnabled(false);
+                            }
+                        }
+                    }
+                });
+            }
+
             #[cfg(windows)]
             win_maximize_fix::install(app);
 
@@ -138,6 +159,7 @@ pub fn run() {
             music::get_release_covers,
             music_art::caa_release_images,
             music_art::caa_release_scans,
+            music_art::caa_image_size,
             music_mb::mb_group_release_art,
             commands::check_for_update,
             commands::download_and_install_update,
@@ -339,8 +361,6 @@ pub fn run() {
             music_mb::mb_identity_clusters,
             music_mb::mb_resolve_cluster,
             music_mb::mb_keep_separate,
-            music_mb::get_tag_fixes,
-            music_mb::set_alias_kind,
             music_mb::mb_set_partial,
             music_edit::set_release_label,
             music_edit::set_default_release,
@@ -359,6 +379,7 @@ pub fn run() {
             music_player::music_track_started,
             waveform::get_track_waveform,
             waveform::waveform_preload_start,
+            music_art::artist_images_start,
             jobs::background_jobs,
             jobs::background_job_cancel,
             player::init_player,

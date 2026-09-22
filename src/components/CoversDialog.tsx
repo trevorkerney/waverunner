@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { toast } from "sonner";
@@ -14,6 +14,85 @@ import { Spinner } from "@/components/ui/spinner";
 import { Check, Download, FolderOpen, Globe, Image as ImageIcon, Lock, Trash2 } from "lucide-react";
 import { ContextMenuItem } from "@/components/ui/context-menu";
 import { TmdbImageBrowserDialog } from "./TmdbImageBrowserDialog";
+
+// ── CAA image pixel sizes ──────────────────────────────────────────────
+// The archive's listing carries no dimensions, so each is a header-only
+// fetch (caa_image_size, first 64KB). Session-cached by URL, started only
+// once the caption scrolls into view, and at most 3 in flight — a group
+// with 100+ releases must not fan out into 100 requests on open.
+type ImageDims = [number, number] | null;
+const dimsCache = new Map<string, ImageDims>();
+const dimsWaiters = new Map<string, Set<(d: ImageDims) => void>>();
+const dimsQueue: string[] = [];
+let dimsInFlight = 0;
+const DIMS_CONCURRENCY = 3;
+
+function pumpDims() {
+  while (dimsInFlight < DIMS_CONCURRENCY && dimsQueue.length > 0) {
+    const url = dimsQueue.shift()!;
+    dimsInFlight++;
+    invoke<ImageDims>("caa_image_size", { url })
+      .catch(() => null)
+      .then((d) => {
+        dimsCache.set(url, d);
+        dimsInFlight--;
+        const ws = dimsWaiters.get(url);
+        dimsWaiters.delete(url);
+        ws?.forEach((w) => w(d));
+        pumpDims();
+      });
+  }
+}
+
+/** "1400 × 1400" for a CAA image URL, once known; nothing while loading or
+ *  when the header couldn't be read. `prefix` (" · ") joins it onto text
+ *  already in the caption without leaving a dangling separator. */
+function ImageSize({ url, prefix = "" }: { url: string; prefix?: string }) {
+  const ref = useRef<HTMLSpanElement | null>(null);
+  const [dims, setDims] = useState<ImageDims | undefined>(() => dimsCache.get(url));
+  useEffect(() => {
+    const cached = dimsCache.get(url);
+    if (cached !== undefined) {
+      setDims(cached);
+      return;
+    }
+    const el = ref.current;
+    if (!el) return;
+    let live = true;
+    let ws: Set<(d: ImageDims) => void> | undefined;
+    const cb = (d: ImageDims) => {
+      if (live) setDims(d);
+    };
+    const io = new IntersectionObserver((entries) => {
+      if (!entries.some((e) => e.isIntersecting)) return;
+      io.disconnect();
+      const again = dimsCache.get(url);
+      if (again !== undefined) {
+        cb(again);
+        return;
+      }
+      ws = dimsWaiters.get(url);
+      if (!ws) {
+        ws = new Set();
+        dimsWaiters.set(url, ws);
+        dimsQueue.push(url);
+      }
+      ws.add(cb);
+      pumpDims();
+    });
+    io.observe(el);
+    return () => {
+      live = false;
+      io.disconnect();
+      ws?.delete(cb);
+    };
+  }, [url]);
+  return (
+    <span ref={ref}>
+      {dims ? `${prefix}${dims[0]} × ${dims[1]}` : null}
+    </span>
+  );
+}
 
 /** The "Covers…" context-menu entry, everywhere one exists. The menu stays
  *  OPEN while the dialog preps (it waits for covers to fetch + decode so it
@@ -233,11 +312,10 @@ function CaaImageBrowserDialog({
                 </span>
               )}
             </button>
-            {img.types.length > 0 && (
-              <p className="mt-1 truncate text-center text-[11px] text-muted-foreground">
-                {img.types.join(", ")}
-              </p>
-            )}
+            <p className="mt-1 truncate text-center text-[11px] text-muted-foreground">
+              {img.types.join(", ")}
+              <ImageSize url={img.url} prefix={img.types.length > 0 ? " · " : ""} />
+            </p>
           </div>
         );
       })}
@@ -366,15 +444,23 @@ function CaaImageBrowserDialog({
                                     .filter(Boolean)
                                     .join(" · ") || "Release"}
                                 </p>
-                                <p className="truncate text-xs text-muted-foreground">
-                                  {[
+                                {(() => {
+                                  const meta = [
                                     r.label,
                                     r.disambiguation,
                                     r.status && r.status !== "Official" ? r.status : null,
                                   ]
                                     .filter(Boolean)
-                                    .join(" · ")}
-                                </p>
+                                    .join(" · ");
+                                  return (
+                                    <p className="truncate text-xs text-muted-foreground">
+                                      {meta}
+                                      {r.has_front && (
+                                        <ImageSize url={frontFull} prefix={meta ? " · " : ""} />
+                                      )}
+                                    </p>
+                                  );
+                                })()}
                                 {r.art_count > (r.has_front ? 1 : 0) && expanded === undefined && (
                                   <Button
                                     variant="ghost"

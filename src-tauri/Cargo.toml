@@ -45,6 +45,9 @@ symphonia = { version = "0.5", features = ["mp3", "aac", "alac", "isomp4"] }
 discord-rich-presence = "1.1"
 
 [target.'cfg(windows)'.dependencies]
+# WebView2 settings access (autofill off) — the versions tauri already pulls.
+webview2-com = "0.38"
+windows-core = "0.61"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dwm",

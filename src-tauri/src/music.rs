@@ -4813,13 +4813,17 @@ pub(crate) async fn artist_resolution_maps(
     ))
 }
 
-/// A display credit from a stamped row: linked when its artist_id points at a
-/// live artist, shown under that artist's current title (renames propagate).
-/// A NULL or stale id keeps the as-credited spelling, unlinked. No name
-/// matching happens here — resolve_credit_ids already decided who this is.
+/// A display credit from a stamped row: the spelling AS CREDITED (what the
+/// matched release says, else what the tags say), linked when its artist_id
+/// points at a live artist. Renaming an artist changes their page, not what
+/// records say — MusicBrainz's own credited-as model (user ruling
+/// 2026-09-20: Yeezus reads "Kanye West" and links to the Ye page; "God"
+/// reads "God" and links wherever the user pointed it). A NULL or stale id
+/// stays unlinked. No name matching happens here — resolve_credit_ids
+/// already decided who this is.
 fn credit_view(name: String, artist_id: Option<i64>, titles: &HashMap<i64, String>) -> CreditView {
-    match artist_id.and_then(|id| titles.get(&id).map(|t| (id, t.clone()))) {
-        Some((id, title)) => CreditView { name: title, artist_id: Some(id) },
+    match artist_id.filter(|id| titles.contains_key(id)) {
+        Some(id) => CreditView { name, artist_id: Some(id) },
         None => CreditView { name, artist_id: None },
     }
 }

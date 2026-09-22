@@ -74,11 +74,111 @@ export function isCreatingLibrary(): boolean {
 type Step = 1 | 2 | 3;
 type MatchPhase = "elect" | "running";
 
-/** "about N minutes remaining" from a seconds estimate. */
+/** Humanized time remaining from a seconds estimate: minutes under an hour,
+ *  hours (with a minutes remainder while short) under a day, and a hard cap
+ *  above that — an estimate that can't be trusted to the minute shouldn't
+ *  print one ("about 80932 minutes" happened). */
 export function fmtEta(secs: number): string {
   if (secs < 60) return "less than a minute remaining";
-  const m = Math.round(secs / 60);
-  return `about ${m} ${m === 1 ? "minute" : "minutes"} remaining`;
+  if (secs < 3600) {
+    const m = Math.round(secs / 60);
+    return `about ${m} ${m === 1 ? "minute" : "minutes"} remaining`;
+  }
+  if (secs < 86400) {
+    const h = Math.floor(secs / 3600);
+    const m = Math.round((secs % 3600) / 60);
+    if (h < 3 && m >= 5) {
+      return `about ${h} ${h === 1 ? "hour" : "hours"} ${m} min remaining`;
+    }
+    const hr = Math.round(secs / 3600);
+    return `about ${hr} ${hr === 1 ? "hour" : "hours"} remaining`;
+  }
+  return "more than a day remaining";
+}
+
+/** Steady rate for a phase: overall elapsed over items completed since the
+ *  phase began, not a window over the last few events — a burst of instant
+ *  items or one long stall skewed the old per-gap average into nonsense.
+ *  Silent (null) until enough has happened to mean anything. */
+const ETA_MIN_ITEMS = 5;
+const ETA_MIN_ELAPSED_MS = 8000;
+function etaFromPhase(
+  s: { startedAt: number; startDone: number },
+  done: number,
+  total: number,
+): number | null {
+  const completed = done - s.startDone;
+  const elapsed = performance.now() - s.startedAt;
+  if (completed < ETA_MIN_ITEMS || elapsed < ETA_MIN_ELAPSED_MS) return null;
+  const remaining = Math.max(0, total - done);
+  return Math.round(((elapsed / completed) * remaining) / 1000);
+}
+
+/** The matching pass's phases, in the order the backend runs them (see
+ *  music_mb::enrich). Artist images are NOT a phase any more — they're a
+ *  background job the pass hands off to at its end. */
+const MATCH_STAGES = [
+  ["albums", "Matching albums"],
+  ["titles", "Applying track titles"],
+  ["artist-ids", "Identifying artists"],
+  ["artist-credits", "Reading album credits"],
+  ["dates", "Filling release dates"],
+  ["artist-search", "Searching artists"],
+] as const;
+const SCAN_STAGES = [
+  ["read-tags", "Reading tags"],
+  ["build", "Building the library"],
+] as const;
+
+/** Segmented progress across a run's stages: one thin segment per stage,
+ *  filled as stages finish, the current one pulsing, and a "Stage N of M ·
+ *  name" line beneath. A fixed strip that never wraps, unlike the old rail
+ *  of labels — the live counter belongs to the spinner line below it.
+ *  Finished stages carry their item count in the segment's hover title. */
+function StageBar({
+  stages,
+  currentKey,
+  sub,
+}: {
+  stages: readonly (readonly [string, string])[];
+  currentKey: string | undefined;
+  sub: Record<string, { done: number; total: number }>;
+}) {
+  const currentIdx = stages.findIndex(([k]) => k === currentKey);
+  return (
+    <div className="mx-auto mt-2 w-56">
+      <div className="flex gap-1">
+        {stages.map(([key, label], i) => {
+          const state =
+            currentIdx === -1 ? "pending" : i < currentIdx ? "done" : i === currentIdx ? "current" : "pending";
+          const p = sub[key];
+          return (
+            <span
+              key={key}
+              title={state === "done" && p ? `${label} · ${p.total}` : label}
+              className={`h-1 flex-1 rounded-full ${
+                state === "done"
+                  ? "bg-primary"
+                  : state === "current"
+                    ? "animate-pulse bg-primary/60"
+                    : "bg-border"
+              }`}
+            />
+          );
+        })}
+      </div>
+      <p className="mt-1.5 text-center text-[11px] text-muted-foreground">
+        {currentIdx === -1 ? (
+          "Starting…"
+        ) : (
+          <>
+            Stage {currentIdx + 1} of {stages.length} ·{" "}
+            <span className="text-foreground">{stages[currentIdx][1]}</span>
+          </>
+        )}
+      </p>
+    </div>
+  );
 }
 
 export function CreateLibraryDialog({
@@ -133,10 +233,15 @@ export function CreateLibraryDialog({
   const [subProgress, setSubProgress] = useState<Record<string, { done: number; total: number }>>({});
   // Which sweep of the pass's no-progress loop is running (1-based, cap 3).
   const [passSweep, setPassSweep] = useState(1);
-  // Rolling per-step timestamps for the time-remaining estimate: average gap
-  // between recent steps × steps left. Reset when the pass changes phase
-  // (albums → artists) since their per-step costs differ.
-  const etaSamplesRef = useRef<{ phase: string; times: number[] }>({ phase: "", times: [] });
+  // Time-remaining estimate: when the current phase started and how many
+  // items it had done then, so the rate is elapsed / completed over the
+  // whole phase (see etaFromPhase). Reset when the pass changes phase
+  // (albums → artists) since their per-item costs differ.
+  const etaSamplesRef = useRef<{ phase: string; startedAt: number; startDone: number }>({
+    phase: "",
+    startedAt: 0,
+    startDone: 0,
+  });
   const [uncheckedCount, setUncheckedCount] = useState<number | null>(null);
   // Music only: artists without an MBID — the pass's second phase. Counted
   // separately because a post-split rescan can have 0 new albums but several
@@ -145,6 +250,13 @@ export function CreateLibraryDialog({
   const [confirmExit, setConfirmExit] = useState(false);
   // Two-step "Skip remaining" during the match run — see the footer.
   const [confirmSkip, setConfirmSkip] = useState(false);
+  // Skip confirmed: the pass finishes its current item before the done
+  // event lands, which can take a while — the button becomes a spinner so
+  // the wait reads as "working on it", not "did that register".
+  const [skipRequested, setSkipRequested] = useState(false);
+  useEffect(() => {
+    setSkipRequested(false);
+  }, [step, matchPhase]);
   // Rescan's Stop button was pressed — disable it and wait for the backend
   // to notice the flag (per file in read-tags, between artists in build).
   const [stopRequested, setStopRequested] = useState(false);
@@ -267,16 +379,10 @@ export function CreateLibraryDialog({
         const s = etaSamplesRef.current;
         if (s.phase !== e.payload.phase) {
           s.phase = e.payload.phase;
-          s.times = [];
+          s.startedAt = performance.now();
+          s.startDone = e.payload.done;
         }
-        s.times.push(performance.now());
-        if (s.times.length > 30) s.times.shift();
-        let etaSecs: number | null = null;
-        if (s.times.length >= 3) {
-          const avgMs = (s.times[s.times.length - 1] - s.times[0]) / (s.times.length - 1);
-          const remaining = Math.max(0, e.payload.total - e.payload.done - 1);
-          etaSecs = Math.round((avgMs * remaining) / 1000);
-        }
+        const etaSecs = etaFromPhase(s, e.payload.done, e.payload.total);
         setMatchProgress({
           done: e.payload.done,
           total: e.payload.total,
@@ -510,6 +616,7 @@ export function CreateLibraryDialog({
   }
 
   async function skipMatching() {
+    setSkipRequested(true);
     if (effFormat !== "music") {
       if (matchPhase === "elect") {
         await enterReview();
@@ -753,9 +860,12 @@ export function CreateLibraryDialog({
       }}
     >
       <DialogContent
-        // Wide enough for the music pass's seven-stage rail with its
-        // finished counts on ONE line — the old 32rem wrapped it.
-        className="overflow-hidden flex flex-col px-0 gap-0 w-[min(44rem,calc(100vw-3rem))] max-w-none"
+        // 30rem. The width used to be held at 44rem so the music pass's
+        // seven-stage rail fit on one line; the rail now wraps instead
+        // (user's call 2026-09-20 — the setup step is what people see, and
+        // it read as needlessly wide). One width for every step — the
+        // dialog must not resize between them.
+        className="overflow-hidden flex flex-col px-0 gap-0 w-[min(30rem,calc(100vw-3rem))] max-w-none"
       >
         <DialogHeader className="px-4 pb-2">
           <DialogTitle>{title}</DialogTitle>
@@ -796,88 +906,18 @@ export function CreateLibraryDialog({
               <span className="font-medium text-foreground">Sweep {passSweep}</span> of up to 3
             </p>
           )}
+          {/* Stage bar: one segment per pass phase, filled as they finish —
+              never wraps, whatever the dialog width; the current stage is
+              named below it (the spinner line carries the live detail).
+              Artist images left the pass for a background job. */}
           {step === 3 && matchPhase === "running" && effFormat === "music" && (
-            <div className="mt-1 flex items-center justify-center gap-2 whitespace-nowrap text-[11px]">
-              {(
-                [
-                  ["albums", "Albums"],
-                  ["titles", "Titles"],
-                  ["artist-ids", "Identify"],
-                  ["artist-credits", "Credits"],
-                  ["dates", "Dates"],
-                  ["artist-search", "Artists"],
-                  ["artist-images", "Images"],
-                ] as const
-              ).map(([key, label], i, arr) => {
-                const p = subProgress[key];
-                const currentIdx = arr.findIndex(([k]) => k === matchProgress?.phase);
-                const idx = i;
-                const state =
-                  currentIdx === -1 ? "pending"
-                  : idx < currentIdx ? "done"
-                  : idx === currentIdx ? "current"
-                  : "pending";
-                return (
-                  <span key={key} className="flex items-center gap-2">
-                    {i > 0 && <span className="h-px w-3 bg-border" />}
-                    <span
-                      className={
-                        state === "current"
-                          ? "text-foreground"
-                          : state === "done"
-                            ? "text-primary"
-                            : "text-muted-foreground"
-                      }
-                    >
-                      {label}
-                      {/* Count only once a stage FINISHES — "(237)" as a
-                          record of what it covered. Live progress belongs to
-                          the spinner line below; five stages of counters
-                          overflow the dialog's fixed width. */}
-                      {state === "done" && p ? ` (${p.total})` : ""}
-                    </span>
-                  </span>
-                );
-              })}
-            </div>
+            <StageBar stages={MATCH_STAGES} currentKey={matchProgress?.phase} sub={subProgress} />
           )}
           {/* Scan sub-stages (music): read tags (per file) → build (album
               rows + cover thumbnails). Video scans emit no phase, so scanSub
               stays empty and this never renders for them. */}
           {step === 2 && Object.keys(scanSub).length > 0 && (
-            <div className="mt-1 flex items-center justify-center gap-2 whitespace-nowrap text-[11px]">
-              {(
-                [
-                  ["read-tags", "Read tags"],
-                  ["build", "Build"],
-                ] as const
-              ).map(([key, label], i, arr) => {
-                const p = scanSub[key];
-                const currentIdx = arr.findIndex(([k]) => k === scanProgress?.phase);
-                const state =
-                  currentIdx === -1 ? "pending"
-                  : i < currentIdx ? "done"
-                  : i === currentIdx ? "current"
-                  : "pending";
-                return (
-                  <span key={key} className="flex items-center gap-2">
-                    {i > 0 && <span className="h-px w-3 bg-border" />}
-                    <span
-                      className={
-                        state === "current"
-                          ? "text-foreground"
-                          : state === "done"
-                            ? "text-primary"
-                            : "text-muted-foreground"
-                      }
-                    >
-                      {label}
-                      {state === "done" && p ? ` (${p.total})` : ""}
-                    </span>
-                  </span>
-                );
-              })}
-            </div>
+            <StageBar stages={SCAN_STAGES} currentKey={scanProgress?.phase} sub={scanSub} />
           )}
         </DialogHeader>
 
@@ -911,6 +951,7 @@ export function CreateLibraryDialog({
                       value={name}
                       onChange={(e) => setName(e.target.value)}
                       placeholder={format === "video" ? "Videos" : "Music"}
+                      autoComplete="off"
                     />
                   </div>
                   <div className="grid gap-3">
@@ -1140,8 +1181,6 @@ export function CreateLibraryDialog({
                           ? "Applying track titles from matched releases"
                           : matchProgress?.phase === "artist-search"
                           ? "Searching artists on MusicBrainz"
-                          : matchProgress?.phase === "artist-images"
-                            ? "Fetching artist images"
                             : "Matching against MusicBrainz"}
                     {matchProgress ? ` — ${matchProgress.done + 1}/${matchProgress.total}` : "…"}
                   </p>
@@ -1227,9 +1266,16 @@ export function CreateLibraryDialog({
               </div>
             ) : (
               <div className="flex w-full items-center justify-end gap-2">
-                <Button variant="outline" size="sm" onClick={() => setConfirmSkip(true)}>
-                  Skip remaining
-                </Button>
+                {skipRequested ? (
+                  <Button variant="outline" size="sm" disabled className="gap-1.5">
+                    <Spinner className="size-3.5" />
+                    Skipping…
+                  </Button>
+                ) : (
+                  <Button variant="outline" size="sm" onClick={() => setConfirmSkip(true)}>
+                    Skip remaining
+                  </Button>
+                )}
               </div>
             )
           ) : null}
@@ -1271,7 +1317,7 @@ function VideoMatchStep({
   const [doRatings, setDoRatings] = useState(false);
   const [progress, setProgress] = useState({ current: 0, total: 0, label: "" });
   const [etaSecs, setEtaSecs] = useState<number | null>(null);
-  const etaTimesRef = useRef<number[]>([]);
+  const etaStartRef = useRef<{ startedAt: number; startDone: number }>({ startedAt: 0, startDone: 0 });
   const cancelRef = useRef(false);
 
   useEffect(() => {
@@ -1348,20 +1394,13 @@ function VideoMatchStep({
   const start = async () => {
     if (!targets) return;
     cancelRef.current = false;
-    etaTimesRef.current = [];
+    etaStartRef.current = { startedAt: performance.now(), startDone: 0 };
     setEtaSecs(null);
     const total = workCount;
     let step = 0;
     const tick = (label: string) => {
       step++;
-      const times = etaTimesRef.current;
-      times.push(performance.now());
-      if (times.length > 30) times.shift();
-      let eta: number | null = null;
-      if (times.length >= 3) {
-        const avgMs = (times[times.length - 1] - times[0]) / (times.length - 1);
-        eta = Math.round((avgMs * Math.max(0, total - step)) / 1000);
-      }
+      const eta = etaFromPhase(etaStartRef.current, step, total);
       setEtaSecs(eta);
       setProgress({ current: step, total, label });
       emitChip({ current: step, total, label, etaSecs: eta, done: false });
@@ -1550,10 +1589,16 @@ function FolderSection({
             )}
           </div>
         ))}
-        <Button variant="ghost" size="sm" onClick={addPath} className="justify-start gap-1.5 text-muted-foreground">
-          <Plus size={14} />
-          Add folder
-        </Button>
+        {/* A quiet inline link, not a full-width row: takes the space it
+            needs, no hover background, underline on hover. */}
+        <button
+          type="button"
+          onClick={addPath}
+          className="group/add flex w-fit items-center gap-1 px-2 pb-0 pt-0.5 text-xs text-foreground"
+        >
+          <Plus size={12} className="shrink-0" />
+          <span className="leading-none group-hover/add:underline">add folder</span>
+        </button>
       </div>
     </div>
   );

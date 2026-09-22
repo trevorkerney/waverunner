@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { toast } from "sonner";
-import { Play, Info, Film, Tv, Music2, ChevronLeft, ChevronRight, Eye, X } from "lucide-react";
+import { Play, Info, Film, Tv, Music2, ChevronLeft, ChevronRight, Eye, X, LibraryBig } from "lucide-react";
 import { Spinner } from "./ui/spinner";
+import { Empty, EmptyHeader, EmptyMedia, EmptyTitle, EmptyDescription } from "./ui/empty";
 import {
   ContextMenu,
   ContextMenuTrigger,
@@ -31,6 +32,9 @@ interface HomePageProps {
   onOpenLibraryEntry?: (libraryId: string, entry: MediaEntry, focusTrackId?: number) => void;
   /** Album-less tiles → the Tracks page, scrolled to the track. */
   onOpenLibraryTrack?: (libraryId: string, trackId: number) => void;
+  /** No libraries at all — Home is the landing page then, and says how to
+   *  start instead of showing empty rails. */
+  hasLibraries: boolean;
 }
 
 /** Minimal MediaEntry for detail navigation — the detail page fetches its own
@@ -160,6 +164,7 @@ export function HomePage({
   onPlayEpisode,
   onOpenLibraryEntry,
   onOpenLibraryTrack,
+  hasLibraries,
 }: HomePageProps) {
   const [continueItems, setContinueItems] = useState<ContinueWatchingItem[] | null>(null);
   const [recentWatched, setRecentWatched] = useState<ContinueWatchingItem[] | null>(null);
@@ -326,6 +331,24 @@ export function HomePage({
   const loading = continueItems == null || recentWatched == null || recentTiles == null;
   const empty =
     !loading && continueItems.length === 0 && recentWatched.length === 0 && recentTiles.length === 0;
+
+  // No libraries: the old landing page's message, now living on Home (the
+  // only page there is until a library exists).
+  if (!hasLibraries) {
+    return (
+      <Empty className="min-h-full border-none">
+        <EmptyHeader>
+          <EmptyMedia>
+            <LibraryBig size={48} className="text-muted-foreground" />
+          </EmptyMedia>
+          <EmptyTitle>No libraries yet</EmptyTitle>
+          <EmptyDescription>
+            Create a library from the sidebar to start organizing your media.
+          </EmptyDescription>
+        </EmptyHeader>
+      </Empty>
+    );
+  }
 
   return (
     <div className="px-6 pb-8">

@@ -661,6 +661,31 @@ const MIGRATIONS: &[Migration] = &[
         // check, so no backfill.
         statements: &["ALTER TABLE album_match_gap ADD COLUMN length_off INTEGER NOT NULL DEFAULT 0"],
     },
+    Migration {
+        id: 38,
+        app_version: "1.0.0-alpha.12.5",
+        description: "artist_alias: kind → source — an alias is one fact, tiered by who wrote it",
+        requires_table: Some("artist_alias"),
+        // User ruling 2026-09-20: no misspelling / nickname / variant
+        // classification — an alias is just "this spelling means that page".
+        // What matters is WHO wrote it ('mb' = a MusicBrainz match adopted
+        // the canonical name, 'user' = a rename / merge / link by hand), the
+        // same tier vocabulary the Sources view uses. Existing rows can't be
+        // told apart, so they land as 'user' — visible, never pruned.
+        statements: &[
+            "ALTER TABLE artist_alias ADD COLUMN source TEXT NOT NULL DEFAULT 'user'",
+            "ALTER TABLE artist_alias DROP COLUMN kind",
+        ],
+    },
+    Migration {
+        id: 39,
+        app_version: "1.0.0-alpha.12.5",
+        description: "pending_pass.batch_id — the change that queued a re-check, for Undo from the queue",
+        requires_table: Some("pending_pass"),
+        // NULL on existing rows (they predate the link) — those keep the
+        // "see History" fallback in the queue banner.
+        statements: &["ALTER TABLE pending_pass ADD COLUMN batch_id INTEGER"],
+    },
 ];
 
 /// Copy the database beside itself before the first migration of a run
@@ -1569,14 +1594,11 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             artist_id INTEGER NOT NULL,
             name TEXT NOT NULL,
-            -- 'variant' (neutral — recorded, resolves, claims nothing;
-            -- listed under File problems for the user to classify),
-            -- 'misspelling' (USER-declared wrong text), or 'nickname'
-            -- (USER-declared intended moniker). The two classified kinds
-            -- behave identically — the library shows the artist's name
-            -- either way — and neither nags; the kind is just recorded.
-            -- Only humans write the non-neutral kinds. Migrations 26/27.
-            kind TEXT NOT NULL DEFAULT 'variant',
+            -- Who wrote the redirect — the Sources view's tier vocabulary:
+            -- 'mb' (a MusicBrainz match adopted the canonical name and the
+            -- old spelling lives on here) or 'user' (a rename, merge or
+            -- link by hand). No classification beyond that (migration 38).
+            source TEXT NOT NULL DEFAULT 'user',
             FOREIGN KEY (artist_id) REFERENCES artist(id) ON DELETE CASCADE
         )",
     )
@@ -1867,22 +1889,11 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             library_id TEXT NOT NULL,
             target TEXT NOT NULL DEFAULT '',
             label TEXT NOT NULL,
+            -- The History batch whose change put this row here (a merge or
+            -- link), when exactly one did — the queue's Undo runs it.
+            batch_id INTEGER,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    // Personas: independent artist identities linked back to the human
-    // behind them (kiLL edward → J. Cole). NOT a merge — both pages live on
-    // with their own credits/matching (the persona may have its own MBID, or
-    // none: God). One parent per persona, one level deep. Distinct from
-    // artist_alias, which is spellings of a SINGLE identity.
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS artist_persona (
-            persona_id INTEGER PRIMARY KEY,
-            parent_id INTEGER NOT NULL
         )",
     )
     .execute(&pool)

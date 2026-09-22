@@ -6,6 +6,10 @@
 
 ## bugs / needs fixing
 
+on albums page, put a little record-icon (same one used for albums in sidebar) + release-count on albums with multiple releases. start by trying it on the same line as the title (at the end if multiple lines) separated a bit from the end of the title. The last word ideally always wraps with it.
+
+the new metadata page acts weird when matching things. one time I match an album release group and then the page I'm on acts like its empty. another time i match an album release group and it takes me to the library map tab for some reason.
+
 NEED a way to tell waverunner that two tracks are the same so their likes, plays, etc can be mirrored. For instance I have 'Arsonist's Lullaby' on both Hozier's self titled album as well as From Eden.
 
 do a pass ensuring pages don't show their content until content is loaded or shows a loader. I've always thought it was ugly when you see a page quickly grow at the beginning due to things loading in separately without loaders
@@ -90,6 +94,8 @@ WHOLE MUSIC SECTION NEEDS CONTEXT MENU IMPROVEMENTS
 
 
 ## changes / small new features
+
+exclusive audio mode setting
 
 error boundaries: right now any render error unmounts the whole React tree and the window goes black with no message (happened when a hook landed after an early return in the now-playing bar). Add regional boundaries (main content, sidebar, now-playing bar, video player, each dialog) with a root one underneath as the last resort. Region fallback = small waverunner-styled panel: what broke, error + component stack in a scrollable box, Retry (re-mounts the region), Copy details. Root fallback adds Reload. Boundary should also log the error through a backend command so prod builds (no console) leave a trace. mpv is native so music survives a reload; F5 rehydration picks the session back up.
 

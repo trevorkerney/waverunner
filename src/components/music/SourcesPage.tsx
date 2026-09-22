@@ -44,12 +44,82 @@ interface TierRow {
   fields: Record<string, TierValue>;
   releases: TierRelease[];
 }
+interface NamedArtist {
+  artist_id: number;
+  title: string;
+}
+/** Who an artist is, beyond the name — what the merge/link/persona/split
+ *  flows wrote. Never the tags': it lands in the MusicBrainz/Edits columns. */
+interface ArtistIdentity {
+  /** Spellings that resolve to this page, each with who wrote it. */
+  aliases: { name: string; source: "mb" | "user" | string }[];
+  persona_of: NamedArtist | null;
+  personas: NamedArtist[];
+  splits: { source: string; members: string[]; role: "source" | "member" | string; staged: boolean }[];
+  kept_separate: string[];
+}
 interface TierGroup {
   artist_id: number | null;
   artist_title: string | null;
   artist_fields: Record<string, TierValue>;
+  identity: ArtistIdentity;
   albums: TierRow[];
   loose_tracks: TierRow[];
+}
+
+/** The identity facts as rows of the tier grid: label, then what each tier
+ *  column shows (lines). Aliases split by who wrote them; everything else is
+ *  the user's. */
+function identityRows(id: ArtistIdentity): { key: string; label: string; cells: Record<Tier, string[]> }[] {
+  const empty = (): Record<Tier, string[]> => ({ tag: [], mb: [], user: [] });
+  const rows: { key: string; label: string; cells: Record<Tier, string[]> }[] = [];
+  if (id.aliases.length > 0) {
+    const cells = empty();
+    for (const a of id.aliases) (a.source === "mb" ? cells.mb : cells.user).push(a.name);
+    rows.push({ key: "aliases", label: "Also known as", cells });
+  }
+  if (id.persona_of) {
+    const cells = empty();
+    cells.user.push(id.persona_of.title);
+    rows.push({ key: "persona_of", label: "Persona of", cells });
+  }
+  if (id.personas.length > 0) {
+    const cells = empty();
+    cells.user.push(...id.personas.map((p) => p.title));
+    rows.push({ key: "personas", label: "Personas", cells });
+  }
+  for (const s of id.splits) {
+    const cells = empty();
+    const note = s.staged ? " (staged — applies on rescan)" : "";
+    if (s.role === "source") {
+      cells.user.push(`${s.members.join(" · ")}${note}`);
+      rows.push({ key: `split-${s.source}`, label: "Split into", cells });
+    } else {
+      cells.user.push(`“${s.source}”${note}`);
+      rows.push({ key: `split-${s.source}`, label: "Split from", cells });
+    }
+  }
+  if (id.kept_separate.length > 0) {
+    const cells = empty();
+    cells.user.push(...id.kept_separate);
+    rows.push({ key: "kept", label: "Kept separate from", cells });
+  }
+  return rows;
+}
+
+/** Any identity fact the user wrote (the "Only edited" filter's test). */
+function identityEdited(id: ArtistIdentity): boolean {
+  return (
+    id.aliases.some((a) => a.source === "user") ||
+    id.persona_of != null ||
+    id.personas.length > 0 ||
+    id.splits.length > 0 ||
+    id.kept_separate.length > 0
+  );
+}
+
+function identityEmpty(id: ArtistIdentity): boolean {
+  return identityRows(id).length === 0;
 }
 interface TierMatrix {
   mb_enabled: boolean;
@@ -244,7 +314,18 @@ export function SourcesPage({ libraryId }: { libraryId: string }) {
             artistHit && !onlyDisagreeing && !onlyEdited ? g.loose_tracks : g.loose_tracks.filter(keep),
         };
       })
-      .filter((g) => g.albums.length > 0 || g.loose_tracks.length > 0);
+      .filter(
+        (g) =>
+          g.albums.length > 0 ||
+          g.loose_tracks.length > 0 ||
+          // An artist-only group (identity facts, or a name beyond the tag's)
+          // answers the filters on its own header row.
+          ((!q || (g.artist_title ?? "").toLowerCase().includes(q)) &&
+            (!onlyDisagreeing || rowDisagrees(g.artist_fields)) &&
+            (!onlyEdited ||
+              identityEdited(g.identity) ||
+              Object.values(g.artist_fields).some((v) => v.user != null))),
+      );
     // fieldsKeep/trackKeep derive from the same three inputs.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [matrix, filter, onlyDisagreeing, onlyEdited]);
@@ -501,6 +582,39 @@ export function SourcesPage({ libraryId }: { libraryId: string }) {
                   );
                 })()}
               </div>
+              {/* Identity facts — who this artist is, beyond the name: aliases
+                  by who wrote them, persona links, splits, kept-separate names.
+                  Read-only here; the flows that write them live on the
+                  Artists tab and the artist page. */}
+              {!identityEmpty(g.identity) &&
+                !(onlyDisagreeing && !identityRows(g.identity).some((r) => r.cells.mb.length > 0 && r.cells.user.length > 0)) &&
+                identityRows(g.identity).map((row) => (
+                  <div
+                    key={`id-${g.artist_id}-${row.key}`}
+                    className="grid items-start border-t border-border/40 bg-muted/10"
+                    style={{ gridTemplateColumns: cols }}
+                  >
+                    <div className="flex min-w-0 items-start gap-2 py-1.5 pl-9 pr-3">
+                      <p className="truncate text-xs text-muted-foreground">{row.label}</p>
+                    </div>
+                    {tiers.map((t) => {
+                      const lines = row.cells[t.key];
+                      return (
+                        <div key={t.key} className="flex min-w-0 flex-col gap-0.5 px-3 py-1.5">
+                          {lines.length === 0 ? (
+                            <span className="text-xs text-muted-foreground/40">—</span>
+                          ) : (
+                            lines.map((line, i) => (
+                              <span key={i} className="min-w-0 truncate text-xs text-foreground" title={line}>
+                                {line}
+                              </span>
+                            ))
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                ))}
               {g.loose_tracks.map(renderRow)}
               {g.albums.map(renderAlbum)}
             </div>

@@ -13,7 +13,7 @@
 use std::path::Path;
 
 use sqlx::SqlitePool;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Manager, State};
 
 use crate::AppState;
 
@@ -202,20 +202,25 @@ async fn fetch_one(
     Ok(None)
 }
 
-/// Enrichment phase: fetch images for every artist that has none. Attempts
-/// are stamped (found/notfound) so settled artists aren't re-queried every
-/// pass; transient errors stay unstamped and retry. Honors the shared
-/// skip-remaining flag via `cancelled`.
-pub async fn fetch_artist_images(
+pub const IMAGE_JOB_KIND: &str = "artist-images";
+
+/// Artist images as a BACKGROUND JOB (user's call 2026-09-20 — it used to
+/// be the matching pass's last phase, which held the wizard open for
+/// hundreds of Wikidata/Deezer round-trips that touch no MusicBrainz
+/// budget). Same walk as before: every identified artist with no image and
+/// no stamped attempt; attempts stamp found / notfound so settled artists
+/// aren't re-queried, transient errors stay unstamped and retry next time.
+/// The pass starts it at its end; it yields while a pass runs. No-op when
+/// one is already going for this library (the caller just reattaches).
+pub async fn start_artist_images_job(
     app: &AppHandle,
     pool: &SqlitePool,
     library_id: &str,
-    cancelled: impl Fn() -> bool,
-) -> Result<usize, String> {
+) -> Result<(), String> {
     // IDENTIFIED artists only: Wikidata needs the MBID, and the Deezer
     // fallback is a name search — a guess when the artist is unmatched (a
     // same-named stranger's face on an unidentified page). Unmatched artists
-    // stay UNSTAMPED, so the pass after they're matched picks them up —
+    // stay UNSTAMPED, so the walk after they're matched picks them up —
     // images are one more thing the match cascade unlocks.
     let artists: Vec<(i64, String, String, Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT a.id, a.title, a.folder_path, a.selected_cover, a.musicbrainz_id
@@ -230,38 +235,75 @@ pub async fn fetch_artist_images(
     .await
     .map_err(|e| e.to_string())?;
     if artists.is_empty() {
-        return Ok(0);
+        return Ok(());
     }
-
-    let client = art_client()?;
-    let cache_base = app.state::<AppState>().app_data_dir.join("cache").join(library_id);
     let total = artists.len();
-    let mut fetched = 0usize;
-    for (i, (artist_id, title, folder_path, selected_cover, mbid)) in artists.into_iter().enumerate() {
-        if cancelled() {
-            break;
-        }
-        let _ = app.emit(
-            "music-enrich-progress",
-            serde_json::json!({ "libraryId": library_id, "phase": "artist-images", "done": i, "total": total, "name": title }),
-        );
-        if artist_has_image(pool, library_id, artist_id, &folder_path, selected_cover.as_deref()).await? {
-            stamp(pool, artist_id, "has-own").await?;
-            continue;
-        }
-        match fetch_one(pool, library_id, &cache_base, &client, artist_id, &title, mbid.as_deref()).await {
-            Ok(Some(source)) => {
-                fetched += 1;
-                stamp(pool, artist_id, source).await?;
+    let Some(job) = crate::jobs::start(
+        app,
+        format!("{IMAGE_JOB_KIND}:{library_id}"),
+        IMAGE_JOB_KIND,
+        "fetching artist images",
+        Some(library_id.to_string()),
+        total,
+    ) else {
+        return Ok(()); // already running — reattach
+    };
+    let app = app.clone();
+    let pool = pool.clone();
+    let library_id = library_id.to_string();
+    tauri::async_runtime::spawn(async move {
+        let Ok(client) = art_client() else {
+            job.finish();
+            return;
+        };
+        let cache_base = app.state::<AppState>().app_data_dir.join("cache").join(&library_id);
+        for (i, (artist_id, title, folder_path, selected_cover, mbid)) in artists.into_iter().enumerate() {
+            if job.cancelled() {
+                break;
             }
-            Ok(None) => stamp(pool, artist_id, "notfound").await?,
-            // Transient (network, rate limiting) — unstamped, retried later.
-            Err(e) => eprintln!("artist image fetch '{title}': {e}"),
+            // A matching pass rewrites the very rows this reads — wait it out.
+            while crate::music_mb::pass_running() && !job.cancelled() {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            job.progress(i, total, Some(title.clone()));
+            match artist_has_image(&pool, &library_id, artist_id, &folder_path, selected_cover.as_deref()).await {
+                Ok(true) => {
+                    let _ = stamp(&pool, artist_id, "has-own").await;
+                    continue;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    eprintln!("artist image check '{title}': {e}");
+                    continue;
+                }
+            }
+            match fetch_one(&pool, &library_id, &cache_base, &client, artist_id, &title, mbid.as_deref()).await {
+                Ok(Some(source)) => {
+                    let _ = stamp(&pool, artist_id, source).await;
+                }
+                Ok(None) => {
+                    let _ = stamp(&pool, artist_id, "notfound").await;
+                }
+                // Transient (network, rate limiting) — unstamped, retried later.
+                Err(e) => eprintln!("artist image fetch '{title}': {e}"),
+            }
+            // Politeness gap for Wikidata/Deezer (no hard limit, but be gentle).
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
-        // Politeness gap for Wikidata/Deezer (no hard limit, but be gentle).
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    }
-    Ok(fetched)
+        job.progress(total, total, None);
+        job.finish();
+    });
+    Ok(())
+}
+
+/// Start (or reattach to) the image walk by hand.
+#[tauri::command]
+pub async fn artist_images_start(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    library_id: String,
+) -> Result<(), String> {
+    start_artist_images_job(&app, &state.app_db, &library_id).await
 }
 
 async fn stamp(pool: &SqlitePool, artist_id: i64, status: &str) -> Result<(), String> {
@@ -387,6 +429,135 @@ pub async fn caa_release_scans(release_mbid: String) -> Result<Vec<CaaImage>, St
     }
     let client = art_client()?;
     caa_fetch(&client, &format!("release/{release_mbid}")).await
+}
+
+/// Pixel size of one Cover Art Archive image, read from its header alone:
+/// CAA's listing doesn't carry dimensions and full images run to several
+/// MB, so this is a ranged GET for the first 64KB (streamed and cut off
+/// there even if the host ignores Range) parsed for a JPEG SOF / PNG IHDR /
+/// GIF screen descriptor. None = header not found in that window or an
+/// unknown format — a blank in the UI, never an error to show.
+#[tauri::command]
+pub async fn caa_image_size(url: String) -> Result<Option<(u32, u32)>, String> {
+    if !url.starts_with("https://coverartarchive.org/") && !url.starts_with("https://archive.org/") {
+        return Err("Not a Cover Art Archive URL".into());
+    }
+    const HEAD_BYTES: usize = 64 * 1024;
+    let client = art_client()?;
+    let mut resp = client
+        .get(&url)
+        .header(reqwest::header::RANGE, format!("bytes=0-{}", HEAD_BYTES - 1))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Ok(None);
+    }
+    let mut buf: Vec<u8> = Vec::with_capacity(HEAD_BYTES);
+    while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+        buf.extend_from_slice(&chunk);
+        if buf.len() >= HEAD_BYTES {
+            break;
+        }
+    }
+    Ok(image_dimensions(&buf))
+}
+
+/// (width, height) from the leading bytes of a JPEG, PNG, or GIF.
+fn image_dimensions(b: &[u8]) -> Option<(u32, u32)> {
+    if b.len() >= 24 && b.starts_with(b"\x89PNG\r\n\x1a\n") {
+        let w = u32::from_be_bytes([b[16], b[17], b[18], b[19]]);
+        let h = u32::from_be_bytes([b[20], b[21], b[22], b[23]]);
+        return Some((w, h));
+    }
+    if b.len() >= 10 && (b.starts_with(b"GIF87a") || b.starts_with(b"GIF89a")) {
+        let w = u16::from_le_bytes([b[6], b[7]]) as u32;
+        let h = u16::from_le_bytes([b[8], b[9]]) as u32;
+        return Some((w, h));
+    }
+    if b.len() >= 4 && b[0] == 0xFF && b[1] == 0xD8 {
+        // Walk the marker segments to the first SOFn (C0–CF minus C4/C8/CC),
+        // whose payload is precision, height, width.
+        let mut i = 2;
+        while i + 4 <= b.len() {
+            if b[i] != 0xFF {
+                i += 1; // resync on stray bytes
+                continue;
+            }
+            let marker = b[i + 1];
+            if marker == 0xFF {
+                i += 1; // fill byte
+                continue;
+            }
+            if marker == 0xD8 || marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
+                i += 2; // standalone markers carry no length
+                continue;
+            }
+            if marker == 0xD9 || marker == 0xDA {
+                return None; // end of image / scan data before any SOF
+            }
+            let is_sof = (0xC0..=0xCF).contains(&marker) && !matches!(marker, 0xC4 | 0xC8 | 0xCC);
+            if is_sof {
+                if i + 9 > b.len() {
+                    return None;
+                }
+                let h = u16::from_be_bytes([b[i + 5], b[i + 6]]) as u32;
+                let w = u16::from_be_bytes([b[i + 7], b[i + 8]]) as u32;
+                return Some((w, h));
+            }
+            let len = u16::from_be_bytes([b[i + 2], b[i + 3]]) as usize;
+            if len < 2 {
+                return None;
+            }
+            i += 2 + len;
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod dimension_tests {
+    use super::image_dimensions;
+
+    #[test]
+    fn png_ihdr() {
+        let mut b = b"\x89PNG\r\n\x1a\n".to_vec();
+        b.extend_from_slice(&[0, 0, 0, 13]);
+        b.extend_from_slice(b"IHDR");
+        b.extend_from_slice(&1400u32.to_be_bytes());
+        b.extend_from_slice(&1401u32.to_be_bytes());
+        assert_eq!(image_dimensions(&b), Some((1400, 1401)));
+    }
+
+    #[test]
+    fn jpeg_sof_after_app_segments() {
+        let mut b = vec![0xFF, 0xD8];
+        // APP0 segment, 16 bytes long (length includes itself).
+        b.extend_from_slice(&[0xFF, 0xE0, 0x00, 0x10]);
+        b.extend_from_slice(&[0u8; 14]);
+        // SOF0: length 17, precision 8, height 600, width 800.
+        b.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x11, 0x08]);
+        b.extend_from_slice(&600u16.to_be_bytes());
+        b.extend_from_slice(&800u16.to_be_bytes());
+        b.extend_from_slice(&[0u8; 10]);
+        assert_eq!(image_dimensions(&b), Some((800, 600)));
+    }
+
+    #[test]
+    fn truncated_before_sof_is_none() {
+        let mut b = vec![0xFF, 0xD8, 0xFF, 0xE1, 0xFF, 0xFF];
+        b.extend_from_slice(&[0u8; 100]);
+        assert_eq!(image_dimensions(&b), None);
+        assert_eq!(image_dimensions(b"nope"), None);
+    }
+
+    #[test]
+    fn gif_screen() {
+        let mut b = b"GIF89a".to_vec();
+        b.extend_from_slice(&300u16.to_le_bytes());
+        b.extend_from_slice(&200u16.to_le_bytes());
+        assert_eq!(image_dimensions(&b), Some((300, 200)));
+    }
 }
 
 /// Cover Art Archive images for one release of an album — the CAA browser

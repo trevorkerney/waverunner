@@ -29,14 +29,6 @@ import { ClearableInput } from "@/components/ui/clearable-input";
 import { useFlipList } from "@/hooks/useFlipList";
 import { Slider } from "@/components/ui/slider";
 import {
-  Breadcrumb,
-  BreadcrumbList,
-  BreadcrumbItem as BreadcrumbUIItem,
-  BreadcrumbLink,
-  BreadcrumbPage,
-  BreadcrumbSeparator,
-} from "@/components/ui/breadcrumb";
-import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
@@ -68,13 +60,6 @@ import {
 } from "@/components/ui/carousel";
 import { Spinner } from "@/components/ui/spinner";
 import {
-  Empty,
-  EmptyHeader,
-  EmptyMedia,
-  EmptyTitle,
-  EmptyDescription,
-} from "@/components/ui/empty";
-import {
   Search,
   Folder,
   ArrowUpDown,
@@ -82,7 +67,6 @@ import {
   Pencil,
   Play,
   Image as ImageIcon,
-  LibraryBig,
   FolderPlus,
   Film,
   Tv,
@@ -251,9 +235,7 @@ interface MainContentProps {
   /** Loose-track count for the Albums/Sounds header button — rides the grid
    *  payload/cache so the button renders in the same commit as the grid. */
   looseCount?: number | null;
-  onBreadcrumbClick: (index: number) => void;
   selectedLibrary: Library | null;
-  hasLibraries: boolean;
   sortMode: string;
   onSortModeChange: (mode: string) => void;
   presets: SortPreset[];
@@ -314,6 +296,8 @@ interface MainContentProps {
   onMetadataChanged?: (libraryId: string) => void;
   /** Metadata page album links: open the album, switched onto a release. */
   onOpenMusicAlbumFromMetadata?: (albumId: number, title: string, releaseId: number | null, trackId?: number) => void;
+  /** Any library exists — Home shows the "create one" landing otherwise. */
+  hasLibraries: boolean;
 }
 
 // Artists page: hide artists whose only presence is feature credits on other
@@ -354,9 +338,7 @@ export function MainContent({
   onSoundCollectionsChanged,
   onOpenLooseTracks,
   looseCount,
-  onBreadcrumbClick,
   selectedLibrary,
-  hasLibraries,
   sortMode,
   onSortModeChange,
   presets,
@@ -394,6 +376,7 @@ export function MainContent({
   metadataFocus,
   onMetadataChanged,
   onOpenMusicAlbumFromMetadata,
+  hasLibraries,
 }: MainContentProps) {
   // Album SELECTION MODE — entered from a card's context menu, exited with
   // Escape or Done. Cards grow checkboxes and clicking toggles instead of
@@ -1126,30 +1109,14 @@ export function MainContent({
       ? activeView.collectionId !== null
       : breadcrumbs.length > 1;
 
-  const breadcrumbBar = (
-    <Breadcrumb className="border-b border-border">
-      <BreadcrumbList className="!flex-nowrap overflow-x-auto px-4 py-2 pr-8 text-xs font-medium">
-        {breadcrumbs.map((crumb, i) => (
-          <BreadcrumbUIItem key={i} className="whitespace-nowrap">
-            {i > 0 && <BreadcrumbSeparator />}
-            {i === breadcrumbs.length - 1 ? (
-              <BreadcrumbPage>{crumb.title}</BreadcrumbPage>
-            ) : (
-              <BreadcrumbLink render={<button onClick={() => onBreadcrumbClick(i)} />}>
-                {crumb.title}
-              </BreadcrumbLink>
-            )}
-          </BreadcrumbUIItem>
-        ))}
-      </BreadcrumbList>
-    </Breadcrumb>
-  );
+  // No breadcrumb bar (removed 2026-09-20). The `breadcrumbs` path still
+  // drives navigation state — parent ids for drill-ins, view keys, history
+  // snapshots — it just isn't displayed.
 
   if (activeView?.kind === "people-list" || activeView?.kind === "people-all") {
     const role: PersonRole = activeView.kind === "people-all" ? "all" : activeView.role;
     return (
       <main className="flex flex-1 flex-col overflow-hidden bg-background">
-        {breadcrumbBar}
         {loading && (
           <div className="flex flex-1 items-center justify-center">
             <Spinner className="size-6" />
@@ -1181,7 +1148,6 @@ export function MainContent({
     // Intentionally basic — placement first, we'll iterate on the look.
     return (
       <main className="flex flex-1 flex-col overflow-hidden bg-background">
-        {breadcrumbBar}
         {loading && (
           <div className="flex flex-1 items-center justify-center">
             <Spinner className="size-6" />
@@ -1211,7 +1177,6 @@ export function MainContent({
   if (activeView?.kind === "music-issues") {
     return (
       <main className="flex flex-1 flex-col overflow-hidden bg-background">
-        {breadcrumbBar}
         {/* relative: the page's loading spinner centers absolutely over this box */}
         <div ref={scrollContainerRef} className="relative flex min-h-0 flex-1 flex-col overflow-y-auto">
           <MusicIssuesPage libraryId={activeView.libraryId} />
@@ -1225,7 +1190,6 @@ export function MainContent({
     // scroll save/restore plumbing pointed somewhere (it never scrolls).
     return (
       <main className="flex flex-1 flex-col overflow-hidden bg-background">
-        {breadcrumbBar}
         <div ref={scrollContainerRef} className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
           <MetadataPage
             libraryId={activeView.libraryId}
@@ -1245,7 +1209,6 @@ export function MainContent({
   if (activeView?.kind === "home") {
     return (
       <main className="flex flex-1 flex-col overflow-hidden bg-background">
-        {breadcrumbBar}
         <div ref={scrollContainerRef} className="relative flex min-h-0 flex-1 flex-col overflow-y-auto">
           <HomePage
             getCoverUrl={getCoverUrl}
@@ -1253,6 +1216,7 @@ export function MainContent({
             onPlayEpisode={(args) => onPlayEpisode?.(args)}
             onOpenLibraryEntry={onOpenLibraryEntry}
             onOpenLibraryTrack={onOpenLibraryTrack}
+            hasLibraries={hasLibraries}
           />
         </div>
       </main>
@@ -1262,7 +1226,6 @@ export function MainContent({
   if (activeView?.kind === "tracks") {
     return (
       <main className="flex flex-1 flex-col overflow-hidden bg-background">
-        {breadcrumbBar}
         {/* relative: the page's loading spinner centers absolutely over this box */}
         <div ref={scrollContainerRef} className="relative flex min-h-0 flex-1 flex-col overflow-y-auto">
           <TracksPage
@@ -1325,7 +1288,6 @@ export function MainContent({
   if (activeView?.kind === "loose-tracks") {
     return (
       <main className="flex flex-1 flex-col overflow-hidden bg-background">
-        {breadcrumbBar}
         {/* relative: the page's loading spinner centers absolutely over this box */}
         {/* p-4 matches the generic detail container the album/collection
             pages render in, so this page sits identically in the frame. */}
@@ -1373,7 +1335,6 @@ export function MainContent({
         libraryId={activeView.libraryId}
         playlists={playlists}
         loading={loading}
-        breadcrumbBar={breadcrumbBar}
         scrollContainerRef={scrollContainerRef}
         onNavigateToPlaylist={onNavigateToPlaylist}
         onPlaylistChanged={onPlaylistChanged}
@@ -1397,8 +1358,7 @@ export function MainContent({
     <main className="flex flex-1 flex-col overflow-hidden bg-background">
       {selectedLibrary && (
         <>
-          {breadcrumbBar}
-
+  
           {/* Deferred-work strip: staged rescan changes and matches awaiting
               a pass, with their actions — visible on every page of a music
               library so queued work is never a surprise. */}
@@ -1804,24 +1764,12 @@ export function MainContent({
           />
         )}
         {!selectedLibrary ? (
-          <Empty className="border-none min-h-full">
-            <EmptyHeader>
-              <EmptyMedia>
-                <LibraryBig size={48} className="text-muted-foreground" />
-              </EmptyMedia>
-              {hasLibraries ? (
-                <>
-                  <EmptyTitle>No library selected</EmptyTitle>
-                  <EmptyDescription>Select a library from the sidebar to get started.</EmptyDescription>
-                </>
-              ) : (
-                <>
-                  <EmptyTitle>No libraries yet</EmptyTitle>
-                  <EmptyDescription>Create a library from the sidebar to start organizing your media.</EmptyDescription>
-                </>
-              )}
-            </EmptyHeader>
-          </Empty>
+          // "Nothing selected" is not a navigable state: launch lands on Home
+          // (or the default library), deleting the last library goes Home.
+          // It still exists for a frame between clearing a view and landing
+          // on the next one, so it renders blank rather than a message that
+          // would flash.
+          <div className="min-h-full" />
         ) : loading ? (
           <div className="flex flex-1 items-center justify-center">
             <Spinner className="size-6" />
@@ -5373,7 +5321,6 @@ function PlaylistsView({
   libraryId,
   playlists,
   loading,
-  breadcrumbBar,
   scrollContainerRef,
   onNavigateToPlaylist,
   onPlaylistChanged,
@@ -5393,7 +5340,6 @@ function PlaylistsView({
   libraryId: string;
   playlists: PlaylistSummary[] | null;
   loading: boolean;
-  breadcrumbBar: React.ReactNode;
   scrollContainerRef: RefObject<HTMLDivElement | null>;
   onNavigateToPlaylist: (p: PlaylistSummary) => void;
   onPlaylistChanged: (libraryId: string) => void;
@@ -5528,7 +5474,6 @@ function PlaylistsView({
 
   return (
     <main className="flex flex-1 flex-col overflow-hidden bg-background">
-      {breadcrumbBar}
       {/* Search + Sort + Size — parity with the library grid's toolbar. */}
       {!loading && (
         <div className="flex items-center gap-3 border-b border-border px-4 py-2">

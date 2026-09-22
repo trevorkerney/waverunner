@@ -1,8 +1,8 @@
-import { Fragment, useCallback, useEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState, useTransition } from "react";
 import { useBackgroundJobs, cancelBackgroundJob } from "@/lib/backgroundJobs";
 import { SourcesPage } from "./SourcesPage";
 import { useFlipList } from "@/hooks/useFlipList";
-import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
@@ -20,7 +20,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import { useMbBusy } from "./MbBusy";
 import { setMbHiddenLocal } from "@/lib/mbVisibility";
-import { Search, Undo2, GitMerge, Equal, CircleAlert, CircleCheck, CircleSlash, Combine, RefreshCw, FileWarning, TriangleAlert, ChevronRight, Scissors, Music2, VenetianMask } from "lucide-react";
+import { Search, Undo2, GitMerge, Equal, CircleAlert, CircleCheck, CircleSlash, Combine, RefreshCw, FileWarning, TriangleAlert, ChevronRight, Scissors, VenetianMask } from "lucide-react";
 import {
   ContextMenu,
   ContextMenuTrigger,
@@ -37,7 +37,7 @@ import { MatchDialog } from "./MatchDialog";
 import { SplitArtistDialog } from "./EditDialogs";
 import { CombineSelectedDialog, type AlbumSelection } from "./CombineSelectedDialog";
 import { notifyPendingWorkChanged } from "./PendingWork";
-import { PersonaDialog } from "./PersonaDialog";
+import { IdentityDialog, type IdentityMode } from "./IdentityDialog";
 
 /** The metadata matching/cleaning center — the permanent home for a music
  *  library's external-source state. Two entrances: the import wizard's final
@@ -254,13 +254,6 @@ interface UnlinkedCredit {
   near_miss_title: string | null;
 }
 
-interface ArtistChoice {
-  id: number;
-  name: string;
-  image: string | null;
-  release_count: number;
-}
-
 /** Album states, in the order the rail's warning count reads them. The lists
  *  group these into identified (release, album) and not (notfound, unchecked). */
 const STATE_ORDER: MbAlbumState[] = ["release", "album", "notfound", "unchecked"];
@@ -296,299 +289,6 @@ function Collapsible({
         </>
       )}
     </section>
-  );
-}
-
-/** "This name is really that artist" — search-and-pick over the library's
- *  existing artists, applied as a merge (name becomes a redirect, credits
- *  re-stamp, undoable from History). For wrong-name credits like "God" on
- *  Yeezus → Kanye West. */
-function LinkArtistDialog({
-  libraryId,
-  sourceName,
-  sourceArtistId,
-  onOpenChange,
-  onDone,
-}: {
-  libraryId: string;
-  sourceName: string;
-  /** The name's auto-created page, when acting on an artist row — excluded
-   *  from the search so it can't be merged into itself. */
-  sourceArtistId: number | null;
-  onOpenChange: (open: boolean) => void;
-  onDone: () => void;
-}) {
-  const [query, setQuery] = useState("");
-  const [results, setResults] = useState<ArtistChoice[] | null>(null);
-  const [applying, setApplying] = useState<number | null>(null);
-  const seq = useRef(0);
-  const timer = useRef<number | undefined>(undefined);
-
-  const search = (q: string) => {
-    window.clearTimeout(timer.current);
-    const trimmed = q.trim();
-    if (trimmed.length < 1) {
-      setResults(null);
-      return;
-    }
-    const mine = ++seq.current;
-    timer.current = window.setTimeout(async () => {
-      try {
-        const rows = await invoke<ArtistChoice[]>("search_credit_link_choices", {
-          libraryId,
-          query: trimmed,
-          limit: 8,
-          excludeArtistId: sourceArtistId,
-        });
-        if (seq.current === mine) setResults(rows);
-      } catch {
-        if (seq.current === mine) setResults([]);
-      }
-    }, 150);
-  };
-
-  const apply = async (target: ArtistChoice) => {
-    setApplying(target.id);
-    try {
-      await invoke("link_credit_name", {
-        libraryId,
-        name: sourceName,
-        targetArtistId: target.id,
-      });
-      toast.success(`“${sourceName}” is now ${target.name}.`);
-      onOpenChange(false);
-      onDone();
-    } catch (e) {
-      toast.error(String(e));
-      setApplying(null);
-    }
-  };
-
-  return (
-    <Dialog open onOpenChange={onOpenChange}>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>“{sourceName}” is an alias for…</DialogTitle>
-        </DialogHeader>
-        <p className="text-xs text-muted-foreground">
-          Everything credited to “{sourceName}” moves to the artist you pick, and the name keeps
-          resolving there through future rescans. Undoable from History. (For an independent
-          identity of the same person — an alter ego with its own work — use Persona instead.)
-        </p>
-        <Input
-          autoFocus
-          value={query}
-          onChange={(e) => {
-            setQuery(e.target.value);
-            search(e.target.value);
-          }}
-          placeholder="Search artists…"
-          className="h-8 text-sm"
-        />
-        <div className="overflow-hidden rounded-md border">
-          {(results ?? []).map((o, i) => (
-            <button
-              key={o.id}
-              type="button"
-              disabled={applying !== null}
-              onClick={() => apply(o)}
-              className={`flex w-full items-center gap-2 px-2 py-1.5 text-left hover:bg-accent disabled:opacity-60 ${
-                i === 0 ? "" : "border-t"
-              }`}
-            >
-              {o.image ? (
-                <img
-                  src={convertFileSrc(o.image)}
-                  alt=""
-                  draggable={false}
-                  className="size-7 shrink-0 rounded-full object-cover"
-                />
-              ) : (
-                <span className="flex size-7 shrink-0 items-center justify-center rounded-full bg-muted text-muted-foreground">
-                  <Music2 size={14} />
-                </span>
-              )}
-              <span className="min-w-0 flex-1">
-                <span className="block truncate text-sm">{o.name}</span>
-                <span className="block text-[11px] text-muted-foreground">
-                  {o.release_count} {o.release_count === 1 ? "release" : "releases"}
-                </span>
-              </span>
-              {applying === o.id && <Spinner className="size-3.5 shrink-0" />}
-            </button>
-          ))}
-          {(results ?? []).length === 0 && (
-            <p className="flex items-center gap-1.5 px-2 py-1.5 text-[11px] text-muted-foreground">
-              <Search size={12} />
-              {query.trim().length < 1
-                ? "Type to search existing artists"
-                : results === null
-                  ? "Searching…"
-                  : "No matching artists"}
-            </p>
-          )}
-        </div>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
-interface TagFixTrack {
-  track_id: number;
-  album_id: number | null;
-  track_title: string;
-  album_title: string | null;
-  file_path: string;
-  /** Which tag carries the spelling: "artist tag" | "track title" | "credits". */
-  source: string;
-}
-
-interface TagFixAlbum {
-  album_id: number;
-  album_title: string;
-  folder_path: string;
-}
-
-/** An alias spelling that still lives in the files' tags, not yet classified
- *  (kind is always 'variant' here). Classifying it either way retires the
- *  card — the library shows the artist's name regardless. */
-interface TagFix {
-  artist_id: number;
-  canonical: string;
-  wrong: string;
-  kind: string;
-  tracks: TagFixTrack[];
-  track_total: number;
-  albums: TagFixAlbum[];
-}
-
-/** The classify-a-spelling card. Either answer records the kind and retires
- *  the card; nothing is flagged for retagging (user ruling 2026-09-11 — the
- *  library already shows the MusicBrainz name or the override, so a declared
- *  misspelling is a fact, not debt). Only the user ever classifies; the
- *  machine records spellings without opinions. */
-function TagFixCard({
-  fix,
-  busy,
-  busyKey,
-  onSetKind,
-  onOpenAlbum,
-}: {
-  fix: TagFix;
-  busy: boolean;
-  busyKey: string | null;
-  onSetKind: (fix: TagFix, kind: "misspelling" | "nickname") => void;
-  /** Album page link; with a trackId the page scrolls to and selects that row. */
-  onOpenAlbum?: (albumId: number, title: string, trackId?: number) => void;
-}) {
-  const [open, setOpen] = useState(false);
-  const extra = fix.track_total - fix.tracks.length;
-  const summary = [
-    fix.track_total > 0 &&
-      `${fix.track_total} track tag${fix.track_total === 1 ? "" : "s"}`,
-    fix.albums.length > 0 &&
-      `${fix.albums.length} album tag${fix.albums.length === 1 ? "" : "s"}`,
-  ]
-    .filter(Boolean)
-    .join(" · ");
-  const spin = busyKey?.startsWith(`aliaskind:${fix.artist_id}:${fix.wrong}`);
-  return (
-    <div className="rounded-md border p-3">
-      <div className="flex items-center gap-3">
-        <p className="min-w-0 flex-1 text-sm">
-          “{fix.wrong}” — a spelling of “{fix.canonical}”
-          <span className="block text-[11px] text-muted-foreground">
-            in {summary} — a misspelling, or a nickname?
-          </span>
-        </p>
-        <button
-          type="button"
-          onClick={() => setOpen((o) => !o)}
-          className="shrink-0 text-[11px] text-muted-foreground underline underline-offset-2 hover:text-foreground"
-        >
-          {open ? "hide files" : "show files"}
-        </button>
-        <Button
-          size="sm"
-          variant="outline"
-          className="shrink-0 gap-1.5"
-          disabled={busy}
-          title="Wrong text — recorded as such; the library keeps showing the artist's name, nothing to fix in the files"
-          onClick={() => onSetKind(fix, "misspelling")}
-        >
-          {spin && <Spinner className="size-3" />}
-          It’s a misspelling
-        </Button>
-        <Button
-          size="sm"
-          variant="outline"
-          className="shrink-0"
-          disabled={busy}
-          title="Intended moniker, not a typo — keeps resolving here"
-          onClick={() => onSetKind(fix, "nickname")}
-        >
-          It’s a nickname
-        </Button>
-      </div>
-      {open && (
-        <div className="mt-2 overflow-hidden rounded-md border">
-          {fix.albums.map((al, i) => (
-            <div key={`al-${al.folder_path}`} className={`px-3 py-1.5 ${i > 0 ? "border-t" : ""}`}>
-              <span className="block text-xs">
-                album-artist tag on{" "}
-                {onOpenAlbum ? (
-                  <button
-                    type="button"
-                    className="font-medium hover:underline"
-                    title="Open the album page"
-                    onClick={() => onOpenAlbum(al.album_id, al.album_title)}
-                  >
-                    {al.album_title}
-                  </button>
-                ) : (
-                  <span className="font-medium">{al.album_title}</span>
-                )}
-              </span>
-              <span className="block min-w-0 break-all font-mono text-[11px] text-muted-foreground">
-                {al.folder_path}
-              </span>
-            </div>
-          ))}
-          {fix.tracks.map((t, i) => (
-            <div
-              key={`t-${t.file_path}`}
-              className={`px-3 py-1.5 ${i > 0 || fix.albums.length > 0 ? "border-t" : ""}`}
-            >
-              <span className="block text-xs">
-                {/* Track title → the album page, scrolled to that row. */}
-                {onOpenAlbum && t.album_id != null ? (
-                  <button
-                    type="button"
-                    className="hover:underline"
-                    title="Open the album page at this track"
-                    onClick={() => onOpenAlbum(t.album_id!, t.album_title ?? "", t.track_id)}
-                  >
-                    “{t.track_title}”
-                  </button>
-                ) : (
-                  <>“{t.track_title}”</>
-                )}
-                {t.album_title ? ` on ${t.album_title}` : ""}
-                <span className="text-muted-foreground"> · in the {t.source}</span>
-              </span>
-              <span className="block min-w-0 break-all font-mono text-[11px] text-muted-foreground">
-                {t.file_path}
-              </span>
-            </div>
-          ))}
-          {extra > 0 && (
-            <p className="border-t px-3 py-1.5 text-[11px] text-muted-foreground">
-              +{extra} more track{extra === 1 ? "" : "s"}
-            </p>
-          )}
-        </div>
-      )}
-    </div>
   );
 }
 
@@ -799,6 +499,7 @@ function ClusterCard({
   busyKey,
   onMatch,
   onMergeOnly,
+  onMergeAndSplit,
   onDismiss,
 }: {
   cluster: IdentityCluster;
@@ -806,6 +507,12 @@ function ClusterCard({
   busyKey: string | null;
   onMatch: (cluster: IdentityCluster, survivorId: number) => void;
   onMergeOnly: (cluster: IdentityCluster, survivorId: number) => void;
+  /** Merge every spelling into the survivor, then open the split editor on
+   *  it — for joint names ("Drake & Lil Wayne" / "Drake, Lil Wayne"): the
+   *  merge makes the other spellings aliases, and a split is keyed by every
+   *  alias, so one staged split then covers all of them. Offered on every
+   *  cluster (user's call — no guessing from the text which ones are joint). */
+  onMergeAndSplit: (cluster: IdentityCluster, survivorId: number) => void;
   onDismiss: (cluster: IdentityCluster) => void;
 }) {
   const pages = cluster.members.filter((m) => m.artist_id != null);
@@ -839,16 +546,17 @@ function ClusterCard({
           <GitMerge size={14} className="mr-1.5 inline text-muted-foreground" />
           One artist, {cluster.members.length} spellings?
         </p>
-        {/* One card-level out instead of per-row "not the same" links: it
-            records standing ejections for every non-primary spelling, so the
-            card dissolves and merging is never re-suggested. */}
+        {/* The other answer: every non-primary spelling becomes (or stays)
+            its own artist — a withheld spelling gets its page — and the
+            merge is never re-suggested. */}
         <button
           type="button"
           disabled={busy}
           onClick={() => onDismiss(cluster)}
+          title="Each spelling is a separate artist — one without a page gets its own"
           className="shrink-0 text-[11px] text-muted-foreground underline underline-offset-2 hover:text-foreground"
         >
-          {busyKey === `dismiss:${cluster.key}` ? "…" : "dismiss suggestion"}
+          {busyKey === `dismiss:${cluster.key}` ? "…" : "they’re different artists"}
         </button>
       </div>
       <div className="mb-2 overflow-hidden rounded-md border">
@@ -919,6 +627,17 @@ function ClusterCard({
               </Button>
             </>
           )}
+          <Button
+            size="sm"
+            variant="outline"
+            className="gap-1.5"
+            disabled={busy || effSurvivor == null}
+            title="Merge the spellings, then split the result into its members (staged for the next rescan)"
+            onClick={() => onMergeAndSplit(cluster, effSurvivor as number)}
+          >
+            <Scissors size={12} />
+            Merge & split…
+          </Button>
           {identityKnown && (
             <span className="text-[11px] text-muted-foreground">
               already matched — one click finishes it
@@ -969,7 +688,7 @@ function ArtistRow({
       <TooltipProvider key={key}>
         <Tooltip>
           <TooltipTrigger render={<span className="shrink-0" />}>{btn}</TooltipTrigger>
-          <TooltipContent>dismiss suggestion to unlock</TooltipContent>
+          <TooltipContent>answer the “one artist, N spellings?” card first</TooltipContent>
         </Tooltip>
       </TooltipProvider>
     ) : (
@@ -1039,7 +758,7 @@ function ArtistRow({
             onClick={() => onLink(a)}
           >
             <Equal size={12} />
-            Alias
+            Is really…
           </Button>,
           "alias",
         )}
@@ -1247,7 +966,7 @@ export function MetadataCenter({
   // Applied matches a matching pass has yet to cash in (stamp the artists
   // their credits prove). Cleared wholesale by a completed pass.
   const [pendingPass, setPendingPass] = useState<
-    { id: number; target: string; label: string }[]
+    { id: number; target: string; label: string; batch_id: number | null }[]
   >([]);
   const [loading, setLoading] = useState(false);
   // Which mutation is in flight ("apply:…", "resolve:…", "undo:…") — the
@@ -1268,12 +987,20 @@ export function MetadataCenter({
   const [matchAlbum, setMatchAlbum] = useState<number | null>(null);
   const [matchArtist, setMatchArtist] = useState<number | null>(null);
   const [splitArtist, setSplitArtist] = useState<MbArtistRow | null>(null);
-  // "Is really…" target: a credit name (and its auto-created page, if any).
-  const [linkSource, setLinkSource] = useState<{ name: string; artistId: number | null } | null>(null);
-  // "Persona of…" target: an artist page being linked to its human.
-  const [personaSource, setPersonaSource] = useState<{ id: number; name: string } | null>(null);
+  // "Is really…" target: a credit name (and its page, if it has one), the
+  // mode the dialog opens on, and — for unlinked credits — the lookalike
+  // page the scanner spotted. `row` lets the split mode hand off to the
+  // split editor for artist rows.
+  const [identitySource, setIdentitySource] = useState<{
+    name: string;
+    artistId: number | null;
+    mode: IdentityMode;
+    suggested: { id: number; name: string } | null;
+    row: MbArtistRow | null;
+  } | null>(null);
+  const openIdentity = (row: MbArtistRow, mode: IdentityMode) =>
+    setIdentitySource({ name: row.title, artistId: row.artist_id, mode, suggested: null, row });
   const [clusters, setClusters] = useState<IdentityCluster[]>([]);
-  const [tagFixes, setTagFixes] = useState<TagFix[]>([]);
   const [clusterMatch, setClusterMatch] = useState<{
     cluster: IdentityCluster;
     survivorId: number;
@@ -1284,6 +1011,16 @@ export function MetadataCenter({
   // landing effect only ever redirects AWAY from it (opt-out libraries), so
   // the initial selection never visibly jumps.
   const [pane, setPane] = useState<PaneId>("map");
+  // The tab strip highlights `tab` — set synchronously on click, so the
+  // click registers instantly — while `pane` (what's rendered) follows in
+  // a transition. Some panes are heavy (hundreds of rows, the Sources
+  // matrix), and rendering them blocked the highlight for a beat. While
+  // they differ, the pane area shows a spinner instead of the old page.
+  const [tab, setTab] = useState<PaneId>("map");
+  const [paneSwitching, startPaneSwitch] = useTransition();
+  useEffect(() => {
+    setTab(pane); // programmatic pane changes (landing, focus) drag the tab along
+  }, [pane]);
 
   // MusicBrainz prefetch (the guide's two background steps): what's left to
   // fetch, and whether a job is running. Re-estimated whenever a prefetch
@@ -1329,7 +1066,7 @@ export function MetadataCenter({
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
-      const [rev, ms, fb, iss, unl, pend, pass, ls, clus, tf] = await Promise.all([
+      const [rev, ms, fb, iss, unl, pend, pass, ls, clus] = await Promise.all([
         invoke<MbReview>("mb_get_review", { libraryId }),
         invoke<MusicMatchState>("music_match_state", { libraryId }),
         invoke<TagFallbackRow[]>("get_music_tag_fallbacks", { libraryId }),
@@ -1338,12 +1075,11 @@ export function MetadataCenter({
         invoke<
           { id: number; label: string; kind: string; target: string; locked_ids: number[] }[]
         >("get_pending_changes", { libraryId }),
-        invoke<{ id: number; target: string; label: string }[]>("get_pending_pass", {
+        invoke<{ id: number; target: string; label: string; batch_id: number | null }[]>("get_pending_pass", {
           libraryId,
         }),
         invoke<Record<string, string>>("get_library_settings", { libraryId }),
         invoke<IdentityCluster[]>("mb_identity_clusters", { libraryId }),
-        invoke<TagFix[]>("get_tag_fixes", { libraryId }),
       ]);
       setReview(rev);
       setMatchState(ms);
@@ -1353,7 +1089,6 @@ export function MetadataCenter({
       setPending(pend);
       setPendingPass(pass);
       setClusters(clus);
-      setTagFixes(tf);
       setOnlineEnabled(ls["online_metadata"] !== "off");
       setHideOutside(ls["hide_mb_outside_center"] === "on");
       // Outside surfaces (sidebar badge, library-page strip) mirror both
@@ -1430,6 +1165,27 @@ export function MetadataCenter({
       });
       toast.success(`${c.members.length} spellings merged into “${survivorName}”.`);
     });
+  // "Merge & split": the split editor opens FIRST on the survivor; nothing
+  // happens until the members are confirmed, and cancel does nothing at
+  // all (user's call). On confirm the merge runs, then the split is staged
+  // — the merge turns the other spellings into aliases, and a split
+  // directive is keyed by every name the artist answers to, so the one
+  // staged split catches "Drake & Lil Wayne" AND "Drake, Lil Wayne".
+  const [mergeSplit, setMergeSplit] = useState<{ cluster: IdentityCluster; survivorId: number } | null>(
+    null,
+  );
+  const mergeAndSplitCluster = (c: IdentityCluster, survivorId: number) =>
+    setMergeSplit({ cluster: c, survivorId });
+  const runClusterMerge = async (c: IdentityCluster, survivorId: number) => {
+    const others = c.members.filter((m) => m.artist_id !== survivorId);
+    if (others.length === 0) return;
+    await invoke("mb_resolve_cluster", {
+      libraryId,
+      survivorId,
+      mergeArtistIds: others.filter((m) => m.artist_id != null).map((m) => m.artist_id as number),
+      mergeNames: others.filter((m) => m.artist_id == null).map((m) => m.name),
+    });
+  };
   // Card-level dismissal: a standing ejection for every non-primary spelling
   // dissolves the cluster and stops the merge ever being re-suggested (each
   // one is a rejected suggestion row — undoable from History like before).
@@ -1438,22 +1194,13 @@ export function MetadataCenter({
       for (const m of c.members.slice(1)) {
         await invoke("mb_keep_separate", { libraryId, name: m.name });
       }
-    });
-  const setAliasKind = (fix: TagFix, kind: "misspelling" | "nickname") =>
-    run(`aliaskind:${fix.artist_id}:${fix.wrong}`, async () => {
-      await invoke("set_alias_kind", {
-        libraryId,
-        artistId: fix.artist_id,
-        name: fix.wrong,
-        kind,
-      });
+      const pageless = c.members.slice(1).filter((m) => m.artist_id == null).map((m) => m.name);
       toast.success(
-        kind === "nickname"
-          ? `“${fix.wrong}” kept as a nickname of ${fix.canonical}.`
-          : `“${fix.wrong}” noted as a misspelling of ${fix.canonical}.`,
+        pageless.length > 0
+          ? `Kept separate — ${pageless.map((n) => `“${n}”`).join(", ")} ${pageless.length === 1 ? "is its own artist" : "are their own artists"} now.`
+          : "Kept separate.",
       );
     });
-
   const undo = (batchId: number) =>
     run(`undo:${batchId}`, () => invoke("mb_undo_batch", { libraryId, batchId }));
   const recheck = (albumId: number) =>
@@ -2018,9 +1765,11 @@ export function MetadataCenter({
     setPaneAnchor(null);
   }, [pane, paneAnchor]);
   const goTo = (p: PaneId, anchor?: string) => {
+    setTab(p);
     setPaneAnchor(anchor ?? "__top");
-    setPane(p);
+    startPaneSwitch(() => setPane(p));
   };
+  const paneReady = !paneSwitching && tab === pane;
 
   if (loading && !review) {
     return (
@@ -2030,9 +1779,6 @@ export function MetadataCenter({
     );
   }
 
-  // Unclassified spellings wait quietly under File problems for the user to
-  // classify; once classified (either way) the backend stops listing them.
-  const variantFixes = tagFixes.filter((f) => f.kind === "variant");
   // `count` is the size of the pane; `alert` (red) is the blocking work —
   // unidentified owners / unidentified albums — and `warn` (amber) the softer
   // tier: feature-only names and albums awaiting a release pick. Same colors
@@ -2111,7 +1857,7 @@ export function MetadataCenter({
     {
       id: "files",
       label: "File problems",
-      count: fallbacks.length + issues.length + variantFixes.length,
+      count: fallbacks.length + issues.length,
       warn: issues.length,
     },
   ];
@@ -2119,11 +1865,16 @@ export function MetadataCenter({
   // ledger, not a queue.
   const historyCount = review?.changes.length ?? 0;
 
+  // Banners above the tabs (opt-out notice, staged changes, pass queue).
+  // With none showing, the tabs sit flush at the top: no spacer, no rule.
+  const bannersAbove =
+    (!!review && !onlineEnabled) || pending.length > 0 || (onlineEnabled && pendingPass.length > 0);
+
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       {/* The recorded opt-out, visible and reversible where it bites. */}
       {review && !onlineEnabled && (
-        <div className="mb-3 mr-4 flex items-center gap-3 rounded-md border px-3 py-2">
+        <div className="mb-3 mr-4 mt-2 flex items-center gap-3 rounded-md border px-3 py-2">
           <p className="min-w-0 flex-1 text-sm text-muted-foreground">
             Online metadata is off for this library — nothing here talks to MusicBrainz, and
             albums and artists aren’t matched.
@@ -2157,7 +1908,7 @@ export function MetadataCenter({
       {pending.length > 0 && (
         // mr-4: the host containers end at the modal edge (pr-0, so the pane
         // scrollbar can sit flush) — right spacing is each block's own job.
-        <div className="mb-3 mr-4 rounded-md border border-red-500/40 bg-red-500/5 px-3 py-2">
+        <div className="mb-3 mr-4 mt-2 rounded-md border border-red-500/40 bg-red-500/5 px-3 py-2">
           <div className="flex items-center gap-3">
             <TriangleAlert size={14} className="shrink-0 text-red-400" />
             <p className="min-w-0 flex-1 text-sm text-red-200/90">
@@ -2210,7 +1961,7 @@ export function MetadataCenter({
           enforces): rescan first, then pass. "Unmatch" per line rather than
           "Undo": nothing staged here, undoing means forgetting the match. */}
       {onlineEnabled && pendingPass.length > 0 && (
-        <div className="mb-3 mr-4 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2">
+        <div className="mb-3 mr-4 mt-2 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2">
           <div className="flex items-center gap-3">
             <RefreshCw size={14} className="shrink-0 text-amber-300" />
             <p className="min-w-0 flex-1 text-sm text-amber-200/90">
@@ -2246,11 +1997,12 @@ export function MetadataCenter({
               >
                 <span className="shrink-0">•</span>
                 <span className="min-w-0 truncate">{p.label}</span>
-                {/* Only album-match rows (bare album-id targets) can offer
-                    Unmatch. Re-check/search rows — merges, artist matches,
-                    credit changes, renames — have no match to forget; each
-                    one's undo is its own History entry, which dequeues it. */}
-                {/^\d+$/.test(p.target) && (
+                {/* Album-match rows (bare album-id targets) offer Unmatch.
+                    Re-check rows queued by ONE merge/link carry that change's
+                    History batch and undo it right here (the undo clears the
+                    row); rows from several changes, or older rows without
+                    the link, point at History instead of guessing. */}
+                {/^\d+$/.test(p.target) ? (
                   <button
                     onClick={() =>
                       run(`passunmatch:${p.id}`, () =>
@@ -2265,6 +2017,22 @@ export function MetadataCenter({
                   >
                     {busyKey === `passunmatch:${p.id}` ? "…" : "Unmatch"}
                   </button>
+                ) : p.batch_id != null ? (
+                  <button
+                    onClick={() => undo(p.batch_id as number)}
+                    disabled={busy}
+                    className="shrink-0 underline underline-offset-2 hover:text-foreground"
+                  >
+                    {busyKey === `undo:${p.batch_id}` ? "…" : "Undo"}
+                  </button>
+                ) : (
+                  <button
+                    onClick={() => goTo("history")}
+                    disabled={busy}
+                    className="shrink-0 underline underline-offset-2 hover:text-foreground"
+                  >
+                    see History
+                  </button>
                 )}
               </li>
             ))}
@@ -2278,7 +2046,7 @@ export function MetadataCenter({
         scroll-container padding, so scrolled content passes flush beneath
         the line. -ml-4/pl-4: both hosts pad 16px left; the row backs out of
         it to run the border to the modal's edge, and the nav puts it back. */}
-    <div className="-ml-4 flex min-h-0 flex-1 flex-col border-t">
+    <div className={`-ml-4 flex min-h-0 flex-1 flex-col ${bannersAbove ? "border-t" : ""}`}>
       {/* Section tabs across the top (user's call, 2026-09-10 — the page has
           the width): every section at a glance with its size, so nothing
           hides below a fold. History sits at the far end, apart from the
@@ -2296,7 +2064,7 @@ export function MetadataCenter({
             key={n.id}
             onClick={() => goTo(n.id)}
             className={`flex items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm transition-colors ${
-              pane === n.id ? "bg-accent text-foreground" : "text-muted-foreground hover:text-foreground"
+              tab === n.id ? "bg-accent text-foreground" : "text-muted-foreground hover:text-foreground"
             }`}
           >
             <span className="whitespace-nowrap">{n.label}</span>
@@ -2359,7 +2127,7 @@ export function MetadataCenter({
         <button
           onClick={() => goTo("history")}
           className={`ml-auto flex items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm transition-colors ${
-            pane === "history"
+            tab === "history"
               ? "bg-accent text-foreground"
               : "text-muted-foreground hover:text-foreground"
           }`}
@@ -2386,6 +2154,17 @@ export function MetadataCenter({
         ref={flipContainerRef}
         className="min-h-0 flex-1 space-y-4 overflow-y-auto pl-4 pr-4 pt-3 pb-4 [overflow-anchor:none]"
       >
+      {/* Mid-switch: nothing of the old pane, nothing of the new until it's
+          fully rendered — just the spinner. */}
+      {!paneReady && (
+        // h-full: the scroll container is a flex item with a resolved
+        // height, so this fills it and the spinner sits mid-pane.
+        <div className="flex h-full items-center justify-center">
+          <Spinner className="size-6" />
+        </div>
+      )}
+      {paneReady && (
+      <>
       {/* The library map: guide checklist up top (the grind order that
           actually converges — between stages the PASS does the multiplying),
           then the whole library as state-colored nodes. Fill carries state
@@ -3152,6 +2931,7 @@ export function MetadataCenter({
                     busyKey={busyKey}
                     onMatch={(cluster, survivorId) => setClusterMatch({ cluster, survivorId })}
                     onMergeOnly={mergeCluster}
+                    onMergeAndSplit={mergeAndSplitCluster}
                     onDismiss={dismissCluster}
                   />
                 ))}
@@ -3180,8 +2960,8 @@ export function MetadataCenter({
                         onMatch={setMatchArtist}
                         onOpen={openArtistRow}
                         onSplit={setSplitArtist}
-                        onLink={(row) => setLinkSource({ name: row.title, artistId: row.artist_id })}
-                        onPersona={(row) => setPersonaSource({ id: row.artist_id, name: row.title })}
+                        onLink={(row) => openIdentity(row, "same")}
+                        onPersona={(row) => openIdentity(row, "persona")}
                         onIgnore={(row) => setConfirmIgnore({ entityId: row.artist_id, name: row.title })}
                       />
                       {sug && renderArtistSuggestionBody(sug)}
@@ -3213,8 +2993,8 @@ export function MetadataCenter({
                         onMatch={setMatchArtist}
                         onOpen={openArtistRow}
                         onSplit={setSplitArtist}
-                        onLink={(row) => setLinkSource({ name: row.title, artistId: row.artist_id })}
-                        onPersona={(row) => setPersonaSource({ id: row.artist_id, name: row.title })}
+                        onLink={(row) => openIdentity(row, "same")}
+                        onPersona={(row) => openIdentity(row, "persona")}
                         onIgnore={(row) => setConfirmIgnore({ entityId: row.artist_id, name: row.title })}
                       />
                       {sug && renderArtistSuggestionBody(sug)}
@@ -3233,7 +3013,7 @@ export function MetadataCenter({
               </h4>
               <div className="overflow-hidden rounded-md border border-emerald-500/30">
                 {artistsIdentified.slice(0, artistLimit).map((a, i) => (
-                  <ArtistRow key={a.artist_id} a={a} first={i === 0} onMatch={setMatchArtist} onOpen={openArtistRow} onPersona={(row) => setPersonaSource({ id: row.artist_id, name: row.title })} />
+                  <ArtistRow key={a.artist_id} a={a} first={i === 0} onMatch={setMatchArtist} onOpen={openArtistRow} onPersona={(row) => openIdentity(row, "persona")} />
                 ))}
                 {artistsIdentified.length > artistLimit && (
                   <button
@@ -3281,37 +3061,30 @@ export function MetadataCenter({
                       .join(" · ")}
                   </span>
                 </span>
-                {u.near_miss_id != null && (
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    className="h-6 shrink-0 gap-1 px-2 text-xs text-amber-300 hover:text-amber-200"
-                    disabled={busy}
-                    onClick={() =>
-                      run(`link:${u.name}`, async () => {
-                        await invoke("link_credit_name", {
-                          libraryId,
-                          name: u.name,
-                          targetArtistId: u.near_miss_id,
-                        });
-                        toast.success(`“${u.name}” is now ${u.near_miss_title}.`);
-                      })
-                    }
-                  >
-                    {busyKey === `link:${u.name}` && <Spinner className="size-3" />}
-                    <Equal size={12} />
-                    Is “{u.near_miss_title}”
-                  </Button>
-                )}
+                {/* One dialog for every answer; the lookalike the scanner
+                    spotted leads its list, so the likely case is two clicks. */}
                 <Button
                   size="sm"
                   variant="ghost"
-                  className="h-6 shrink-0 gap-1 px-2 text-xs"
+                  className={`h-6 shrink-0 gap-1 px-2 text-xs ${
+                    u.near_miss_id != null ? "text-amber-300 hover:text-amber-200" : ""
+                  }`}
                   disabled={busy}
-                  onClick={() => setLinkSource({ name: u.name, artistId: null })}
+                  onClick={() =>
+                    setIdentitySource({
+                      name: u.name,
+                      artistId: null,
+                      mode: "same",
+                      suggested:
+                        u.near_miss_id != null && u.near_miss_title
+                          ? { id: u.near_miss_id, name: u.near_miss_title }
+                          : null,
+                      row: null,
+                    })
+                  }
                 >
                   <Equal size={12} />
-                  Alias
+                  {u.near_miss_title ? `Is “${u.near_miss_title}”?` : "Is really…"}
                 </Button>
               </div>
             ))}
@@ -3507,36 +3280,6 @@ export function MetadataCenter({
 
       {/* File-level notes. Both are long by nature and neither is actionable
           inside waverunner, so they collapse to a line you open on purpose. */}
-      {pane === "files" && variantFixes.length > 0 && (
-        <div className="mb-6" id="sec-files-variants">
-          <h4 className="mb-0.5 flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-muted-foreground">
-            <FileWarning size={14} />
-            Spelling variants to classify ({variantFixes.length})
-          </h4>
-          <p className="mb-1.5 text-xs text-muted-foreground">
-            Alternate spellings recorded by merges and matches, still present in your files. The
-            machine takes no position: call each one a misspelling or a nickname. Either way the
-            library keeps showing the artist's name — the answer is just recorded, and the entry
-            leaves this list. Undoable from History.
-          </p>
-          <div className="space-y-2">
-            {variantFixes.map((f) => (
-              <TagFixCard
-                key={`${f.artist_id}:${f.wrong}`}
-                fix={f}
-                busy={busy}
-                busyKey={busyKey}
-                onSetKind={setAliasKind}
-                onOpenAlbum={
-                  onOpenAlbum
-                    ? (albumId, title, trackId) => onOpenAlbum(albumId, title, null, trackId)
-                    : undefined
-                }
-              />
-            ))}
-          </div>
-        </div>
-      )}
       {pane === "files" && fallbacks.length > 0 && (
         <Collapsible
           title={`Incomplete tags (${fallbacks.length})`}
@@ -3645,7 +3388,7 @@ export function MetadataCenter({
           Every matched album's track list agrees with its release.
         </p>
       )}
-      {pane === "files" && fallbacks.length === 0 && issues.length === 0 && variantFixes.length === 0 && (
+      {pane === "files" && fallbacks.length === 0 && issues.length === 0 && (
         <p className="py-8 text-center text-sm text-muted-foreground">
           Every file read cleanly and carried the tags it needed.
         </p>
@@ -3654,6 +3397,9 @@ export function MetadataCenter({
         <p className="py-8 text-center text-sm text-muted-foreground">
           Nothing has been applied yet.
         </p>
+      )}
+
+      </>
       )}
 
       {splitArtist && (
@@ -3670,6 +3416,25 @@ export function MetadataCenter({
             }}
           />
         )}
+      {mergeSplit && (
+          <SplitArtistDialog
+            artistId={mergeSplit.survivorId}
+            artistName={
+              mergeSplit.cluster.members.find((m) => m.artist_id === mergeSplit.survivorId)?.name ?? ""
+            }
+            open
+            beforeSplit={() => runClusterMerge(mergeSplit.cluster, mergeSplit.survivorId)}
+            onOpenChange={(o) => {
+              if (!o) {
+                setMergeSplit(null);
+                // Confirmed: a merge happened and a split is staged; cancelled:
+                // nothing did. Refetch either way — cheap, and always right.
+                refresh();
+                onChanged?.();
+              }
+            }}
+          />
+        )}
       {clusterMatch && (
           <ClusterMatchDialog
             libraryId={libraryId}
@@ -3682,28 +3447,27 @@ export function MetadataCenter({
             }}
           />
         )}
-      {personaSource && (
-          <PersonaDialog
+      {identitySource && (
+          <IdentityDialog
             libraryId={libraryId}
-            personaId={personaSource.id}
-            personaName={personaSource.name}
-            onOpenChange={(o) => !o && setPersonaSource(null)}
+            sourceName={identitySource.name}
+            sourceArtistId={identitySource.artistId}
+            initialMode={identitySource.mode}
+            suggested={identitySource.suggested}
+            onOpenChange={(o) => !o && setIdentitySource(null)}
             onDone={() => {
               refresh();
               onChanged?.();
             }}
-          />
-        )}
-      {linkSource && (
-          <LinkArtistDialog
-            libraryId={libraryId}
-            sourceName={linkSource.name}
-            sourceArtistId={linkSource.artistId}
-            onOpenChange={(o) => !o && setLinkSource(null)}
-            onDone={() => {
-              refresh();
-              onChanged?.();
-            }}
+            onSplit={
+              identitySource.row
+                ? () => {
+                    const row = identitySource.row!;
+                    setIdentitySource(null);
+                    setSplitArtist(row);
+                  }
+                : undefined
+            }
           />
         )}
       {matchArtist != null && (

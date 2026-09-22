@@ -482,6 +482,7 @@ pub(crate) async fn resolve_artist_fields(
                 .execute(pool)
                 .await
                 .map_err(|e| e.to_string())?;
+            drop_self_alias(pool, artist_id).await?;
         }
     }
     Ok(())
@@ -986,9 +987,9 @@ pub async fn link_credit_name(
     if source_id == Some(target_artist_id) {
         return Err(format!("\u{201c}{name}\u{201d} already resolves to {target_title}"));
     }
-    crate::music_mb::merge_artists(pool, &library_id, target_artist_id, &target_title, source_id, &name)
+    crate::music_mb::merge_artists(pool, &library_id, target_artist_id, &target_title, source_id, &name, "user")
         .await?;
-    crate::music_mb::enqueue_pass_recheck(pool, &library_id, target_artist_id, &target_title, &name)
+    crate::music_mb::enqueue_pass_recheck(pool, &library_id, target_artist_id, &target_title, &name, true)
         .await
 }
 
@@ -1503,6 +1504,56 @@ pub struct TierRow {
     pub releases: Vec<TierRelease>,
 }
 
+/// An alias (a spelling that resolves to this page) and who wrote it:
+/// 'mb' (a match adopted the canonical name) or 'user' (rename/merge/link).
+#[derive(Serialize)]
+pub struct TierAlias {
+    pub name: String,
+    pub source: String,
+}
+
+#[derive(Serialize)]
+pub struct NamedArtist {
+    pub artist_id: i64,
+    pub title: String,
+}
+
+/// A staged-or-applied artist split this page is party to: `source` = the
+/// joint name being split, `members` = who it splits into, `role` = this
+/// page's side of it ("source" — it dissolves on rescan — or "member"),
+/// `staged` = still waiting for the rescan that applies it.
+#[derive(Serialize)]
+pub struct TierSplit {
+    pub source: String,
+    pub members: Vec<String>,
+    pub role: String,
+    pub staged: bool,
+}
+
+/// Everything the library knows about WHO an artist is, beyond the name:
+/// the identity facts the merge/link/persona/split flows write. All of it
+/// is the user's or MusicBrainz's, never the tags' — the Sources view's
+/// "Edits"/"MusicBrainz" columns.
+#[derive(Serialize, Default)]
+pub struct ArtistIdentity {
+    pub aliases: Vec<TierAlias>,
+    pub persona_of: Option<NamedArtist>,
+    pub personas: Vec<NamedArtist>,
+    pub splits: Vec<TierSplit>,
+    /// Names the user declined to merge into this page (a standing "no").
+    pub kept_separate: Vec<String>,
+}
+
+impl ArtistIdentity {
+    fn is_empty(&self) -> bool {
+        self.aliases.is_empty()
+            && self.persona_of.is_none()
+            && self.personas.is_empty()
+            && self.splits.is_empty()
+            && self.kept_separate.is_empty()
+    }
+}
+
 #[derive(Serialize)]
 pub struct TierGroup {
     /// None = the leading group: loose tracks (and credit-less albums)
@@ -1511,6 +1562,7 @@ pub struct TierGroup {
     pub artist_title: Option<String>,
     /// The artist's own name across the tiers ("title" only).
     pub artist_fields: HashMap<String, TierValue>,
+    pub identity: ArtistIdentity,
     pub albums: Vec<TierRow>,
     pub loose_tracks: Vec<TierRow>,
 }
@@ -1714,6 +1766,7 @@ pub async fn get_tier_matrix(
             artist_id: Some(*id),
             artist_title: Some(title.clone()),
             artist_fields: by_entity.remove(id).unwrap_or_default(),
+            identity: ArtistIdentity::default(),
             albums: Vec::new(),
             loose_tracks: Vec::new(),
         })
@@ -1722,9 +1775,132 @@ pub async fn get_tier_matrix(
         artist_id: None,
         artist_title: None,
         artist_fields: HashMap::new(),
+        identity: ArtistIdentity::default(),
         albums: Vec::new(),
         loose_tracks: Vec::new(),
     };
+
+    // ── Identity facts per artist ──────────────────────────────────────
+    // Aliases: every spelling that resolves here, with who wrote it.
+    let alias_rows: Vec<(i64, String, String)> = sqlx::query_as(
+        "SELECT al.artist_id, al.name, al.source FROM artist_alias al
+         JOIN media_entry me ON me.id = al.artist_id
+         WHERE me.library_id = ? ORDER BY al.name COLLATE NOCASE",
+    )
+    .bind(&library_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    for (artist_id, name, source) in alias_rows {
+        if let Some(&i) = index.get(&artist_id) {
+            groups[i].identity.aliases.push(TierAlias { name, source });
+        }
+    }
+    // Personas, seen from both ends.
+    let persona_rows: Vec<(i64, i64, String, String)> = sqlx::query_as(
+        "SELECT p.persona_id, p.parent_id, pa.title, pr.title FROM artist_persona p
+         JOIN artist pa ON pa.id = p.persona_id
+         JOIN artist pr ON pr.id = p.parent_id
+         JOIN media_entry me ON me.id = p.persona_id
+         WHERE me.library_id = ?",
+    )
+    .bind(&library_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    for (persona_id, parent_id, persona_title, parent_title) in persona_rows {
+        if let Some(&i) = index.get(&persona_id) {
+            groups[i].identity.persona_of = Some(NamedArtist { artist_id: parent_id, title: parent_title });
+        }
+        if let Some(&i) = index.get(&parent_id) {
+            groups[i].identity.personas.push(NamedArtist { artist_id: persona_id, title: persona_title });
+        }
+    }
+    // Splits: the directive is keyed by the joint name; it shows under the
+    // joint page while staged (it dissolves on rescan) and under each
+    // member page that exists (before and after).
+    let split_rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT source_name, members FROM artist_split WHERE library_id = ?")
+            .bind(&library_id)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    if !split_rows.is_empty() {
+        let staged_names: Vec<String> = sqlx::query_as::<_, (String,)>(
+            "SELECT payload FROM pending_change WHERE library_id = ? AND kind = 'artist_split'",
+        )
+        .bind(&library_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .flat_map(|(payload,)| {
+            serde_json::from_str::<serde_json::Value>(&payload)
+                .ok()
+                .and_then(|p| {
+                    p["sources"].as_array().map(|a| {
+                        a.iter().filter_map(|s| s.as_str().map(|s| s.to_lowercase())).collect::<Vec<_>>()
+                    })
+                })
+                .unwrap_or_default()
+        })
+        .collect();
+        // name (lowercased) → artist id, over titles and aliases.
+        let name_rows: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT an.artist_id, an.name FROM artist_names an
+             JOIN media_entry me ON me.id = an.artist_id WHERE me.library_id = ?",
+        )
+        .bind(&library_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        let by_name: HashMap<String, i64> =
+            name_rows.into_iter().map(|(id, n)| (n.to_lowercase(), id)).collect();
+        for (source, members_json) in split_rows {
+            let members: Vec<String> = serde_json::from_str(&members_json).unwrap_or_default();
+            let staged = staged_names.iter().any(|s| *s == source.to_lowercase());
+            let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+            if let Some(&i) = by_name.get(&source.to_lowercase()).and_then(|id| index.get(id)) {
+                seen.insert(i);
+                groups[i].identity.splits.push(TierSplit {
+                    source: source.clone(),
+                    members: members.clone(),
+                    role: "source".into(),
+                    staged,
+                });
+            }
+            for m in &members {
+                if let Some(&i) = by_name.get(&m.to_lowercase()).and_then(|id| index.get(id)) {
+                    if seen.insert(i) {
+                        groups[i].identity.splits.push(TierSplit {
+                            source: source.clone(),
+                            members: members.clone(),
+                            role: "member".into(),
+                            staged,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    // Kept separate: rejected merge suggestions that name their keeper.
+    let rejected: Vec<(String,)> = sqlx::query_as(
+        "SELECT payload FROM mb_suggestion
+         WHERE library_id = ? AND kind = 'artist_merge' AND status = 'rejected'",
+    )
+    .bind(&library_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    for (payload,) in rejected {
+        let Ok(p) = serde_json::from_str::<serde_json::Value>(&payload) else { continue };
+        let (Some(keep_id), Some(other)) = (p["keep_id"].as_i64(), p["other_name"].as_str()) else {
+            continue;
+        };
+        if let Some(&i) = index.get(&keep_id) {
+            groups[i].identity.kept_separate.push(other.to_string());
+        }
+    }
 
     // Real albums (not loose containers, not sound collections), filed under
     // their first credit's artist — the same rule the artist pages use.
@@ -1789,7 +1965,18 @@ pub async fn get_tier_matrix(
         }
     }
 
-    groups.retain(|g| !g.albums.is_empty() || !g.loose_tracks.is_empty());
+    // A page with nothing under it still earns a row when it carries
+    // information beyond "the tag said X": an identity fact, or a name
+    // MusicBrainz / the user chose (a feature-only artist identified through
+    // a credit shows its tag spelling next to its MusicBrainz name here).
+    groups.retain(|g| {
+        !g.albums.is_empty()
+            || !g.loose_tracks.is_empty()
+            || !g.identity.is_empty()
+            || g.artist_fields
+                .get("title")
+                .is_some_and(|t| t.mb.as_deref().is_some_and(|v| !v.is_empty()) || t.user.is_some())
+    });
     // The artist-less group leads the page: loose tracks sit at the top,
     // above the artists (his call), not trailing after them.
     if !orphan.albums.is_empty() || !orphan.loose_tracks.is_empty() {
@@ -2026,9 +2213,10 @@ pub async fn set_artist_fields(
             .map_err(|e| e.to_string())?;
         if !old_name.eq_ignore_ascii_case(&new_name) {
             renamed = true;
-            // The tag name lives on as an alias — identity survives the rename.
+            // The old name lives on as a user alias — identity survives the
+            // rename (credits still carrying it keep resolving here).
             sqlx::query(
-                "INSERT OR IGNORE INTO artist_alias (artist_id, name, kind) VALUES (?, ?, 'variant')",
+                "INSERT OR IGNORE INTO artist_alias (artist_id, name, source) VALUES (?, ?, 'user')",
             )
             .bind(artist_id)
             .bind(&old_name)
@@ -2048,10 +2236,27 @@ pub async fn set_artist_fields(
     Ok(())
 }
 
+/// An alias equal to the artist's current title says nothing — drop it. Runs
+/// after every title change (rename, reset, MB adoption, undo) so a name
+/// that came back never lingers as a redirect to itself.
+pub(crate) async fn drop_self_alias(pool: &SqlitePool, artist_id: i64) -> Result<(), String> {
+    sqlx::query(
+        "DELETE FROM artist_alias
+         WHERE artist_id = ?1
+           AND LOWER(name) = (SELECT LOWER(title) FROM artist WHERE id = ?1)",
+    )
+    .bind(artist_id)
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Drop an artist's rename. The name falls back to MusicBrainz's when the
 /// artist is matched, else the tag spelling — immediately, from the stored
-/// tiers (the alias rows are left in place — they're harmless and keep old
-/// references resolving).
+/// tiers. The alias the rename created (the name coming back) is dropped by
+/// resolve_artist_fields; other aliases stay and keep old references
+/// resolving.
 #[tauri::command]
 pub async fn reset_artist_fields(
     state: State<'_, AppState>,
