@@ -7730,6 +7730,7 @@ pub async fn rescan_library(
     state: tauri::State<'_, AppState>,
     library_id: String,
 ) -> Result<Vec<String>, String> {
+    crate::music_mb::ensure_not_matching(&state.app_db, &library_id).await?;
     let (format, lib_paths, _default_sort_mode) = get_library_meta(&state.app_db, &library_id).await?;
 
     let cache_base = state.app_data_dir.join("cache").join(&library_id);

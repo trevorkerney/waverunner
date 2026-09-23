@@ -206,7 +206,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
       {/* Rows: sidebar+content, then a full-width Save/Cancel footer. */}
       {/* max-w override is load-bearing: the base DialogContent pins max-w-md
           (384px), which silently clamped the w-[1024px] below it. */}
-      <DialogContent className="grid h-[576px] w-[1024px] max-w-[min(1024px,calc(100vw-3rem))] grid-cols-[11rem_1fr] grid-rows-[minmax(0,1fr)_auto] gap-0 overflow-hidden p-0">
+      <DialogContent width="1024px" height="576px" className="grid grid-cols-[11rem_1fr] grid-rows-[minmax(0,1fr)_auto] gap-0 overflow-hidden p-0">
         {/* Sidebar */}
         <div className="flex w-44 shrink-0 flex-col border-r bg-muted/30 p-2">
           <p className="mb-2 px-2 pt-1 text-xs font-semibold uppercase tracking-wider text-muted-foreground">

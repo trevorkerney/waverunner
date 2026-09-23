@@ -166,7 +166,7 @@ export function TrackEditDialog({ trackId, open, onOpenChange, onSaved }: TrackE
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md">
+      <DialogContent size="md">
         <DialogHeader>
           <DialogTitle>Edit track</DialogTitle>
         </DialogHeader>
@@ -441,7 +441,7 @@ export function AlbumEditDialog({ albumId, open, onOpenChange, onSaved }: AlbumE
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md">
+      <DialogContent size="md">
         <DialogHeader>
           <DialogTitle>Edit album</DialogTitle>
         </DialogHeader>
@@ -671,7 +671,7 @@ export function ArtistEditDialog({ artistId, open, onOpenChange, onSaved }: Arti
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md">
+      <DialogContent size="md">
         <DialogHeader>
           <DialogTitle>Edit artist</DialogTitle>
         </DialogHeader>
@@ -841,7 +841,7 @@ export function SplitArtistDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md">
+      <DialogContent size="md">
         <DialogHeader>
           <DialogTitle>Split artist</DialogTitle>
         </DialogHeader>

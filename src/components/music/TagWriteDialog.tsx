@@ -136,7 +136,7 @@ export function TagWriteDialog({
 
   return (
     <Dialog open={scope !== null} onOpenChange={(o) => { if (!o && !busy) onOpenChange(false); }}>
-      <DialogContent className="flex max-h-[85vh] w-[min(40rem,calc(100vw-3rem))] max-w-none flex-col overflow-hidden">
+      <DialogContent width="40rem" className="flex max-h-[85vh] flex-col overflow-hidden">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <HardDriveDownload size={16} className="shrink-0 text-muted-foreground" />

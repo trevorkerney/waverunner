@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
+import { useLibraryRuns } from "@/hooks/libraryRuns";
 import { LibraryAttentionBadge } from "@/components/music/PendingWork";
 import { Trash2, RefreshCw, FolderPlus, FolderCog, ChevronRight, Sparkles, Pencil, Home, CircleAlert, Music2, Settings2, Plus } from "lucide-react";
 import { open as openFolderPicker } from "@tauri-apps/plugin-dialog";
@@ -22,7 +22,7 @@ import {
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { CreateLibraryDialog, type WizardMode } from "@/components/CreateLibraryDialog";
+import { CreateLibraryDialog } from "@/components/CreateLibraryDialog";
 import { CreatePlaylistDialog } from "@/components/CreatePlaylistDialog";
 import { RenameDialog } from "@/components/RenameDialog";
 import { LibrarySettingsDialog } from "@/components/LibrarySettingsDialog";
@@ -50,11 +50,10 @@ interface SidebarProps {
   defaultLibraryId: string | null;
   /** Set (library id) or clear (null) the default library. */
   onSetDefaultLibrary: (libraryId: string | null) => void;
-  onLibraryCreated: () => void;
   onLibraryDeleted: (deletedId: string) => void;
-  /** Wizard completed (create finish, rescan finish, or skip-out) — the id
-   *  tells App which library's caches to drop. */
-  onLibraryRescanned: (libraryId?: string) => void;
+  /** A library being scanned (possibly mid-creation, so not yet in
+   *  `libraries`): open its page — App shows the scan view there. */
+  onOpenScanning: (libraryId: string) => void;
   /** Called after a rename so App can reload libraries and fix baked-in labels. */
   onLibraryRenamed: (libraryId: string, oldName: string, newName: string) => void;
   /** Called after a playlist is created via the sidebar so App.tsx can invalidate caches. */
@@ -74,10 +73,6 @@ interface SidebarProps {
   /** The Home pseudo-library pinned above the real ones. */
   onOpenHome: () => void;
   homeActive: boolean;
-  /** Libraries with a scan/rescan in flight — locked rows with a spinner. */
-  scanningLibs: Set<string>;
-  /** Libraries with a matching pass in flight — locked like a scanning one. */
-  passLibs: Set<string>;
   /** Running background jobs — one progress line per job under its library
    *  (waveform preload, MusicBrainz prefetches). Clicking a line hands the
    *  job to the host (reopen its window, or go where its results land). */
@@ -93,9 +88,7 @@ export function Sidebar({
   onSelectView,
   defaultLibraryId,
   onSetDefaultLibrary,
-  onLibraryCreated,
   onLibraryDeleted,
-  onLibraryRescanned,
   onLibraryRenamed,
   onPlaylistChanged,
   sidebarPlaylists,
@@ -106,16 +99,15 @@ export function Sidebar({
   dockedMusic,
   onOpenHome,
   homeActive,
-  scanningLibs,
-  passLibs,
+  onOpenScanning,
   backgroundJobs,
   onOpenJob,
 }: SidebarProps) {
   const [width, setWidth] = useState(DEFAULT_WIDTH);
   const [dragging, setDragging] = useState(false);
-  // The import wizard (create / resume unfinished setup / rescan), or null.
-  const [wizard, setWizard] = useState<WizardMode | null>(null);
-  const [wizardMinimized, setWizardMinimized] = useState(false);
+  // Library runs (scan / prompt / match) — progress lines and locked rows.
+  const { runs, rescan } = useLibraryRuns();
+  const [createOpen, setCreateOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Library | null>(null);
   // Typed-name gate for the delete dialog — must equal the library's name.
   const [deleteConfirmText, setDeleteConfirmText] = useState("");
@@ -143,138 +135,35 @@ export function Sidebar({
     return null;
   }, []);
 
-  // Live per-library matching progress — the library row's status line.
-  // Music streams tauri events (backend pass); video dispatches window
-  // CustomEvents (the TMDB run lives in the frontend). Both carry libraryId.
-  const [matchStatus, setMatchStatus] = useState<Map<string, string>>(new Map());
-  useEffect(() => {
-    const setLine = (libraryId: string, line: string | null) =>
-      setMatchStatus((prev) => {
-        const next = new Map(prev);
-        if (line == null) next.delete(libraryId);
-        else next.set(libraryId, line);
-        return next;
-      });
-    const onVideoProgress = (e: Event) => {
-      const d = (e as CustomEvent).detail as {
-        libraryId?: string;
-        current?: number;
-        total?: number;
-        label?: string;
-        done?: boolean;
-      };
-      if (!d.libraryId) return;
-      if (d.done) setLine(d.libraryId, null);
-      else setLine(d.libraryId, `matching ${d.current}/${d.total} — ${d.label}`);
-    };
-    window.addEventListener("video-match-progress", onVideoProgress);
-    const unProgress = listen<{ libraryId?: string; phase: string; done: number; total: number; name: string }>(
-      "music-enrich-progress",
-      (e) => {
-        const { libraryId, phase, done, total, name } = e.payload;
-        if (!libraryId) return;
-        const line =
-          phase === "artist-ids"
-            ? `identifying artists ${Math.min(done + 1, total)}/${total}`
-            : phase === "artist-credits"
-              ? `reading album credits ${Math.min(done + 1, total)}/${total}`
-              : phase === "artist-search"
-                ? `searching artists ${Math.min(done + 1, total)}/${total}`
-                : `matching ${Math.min(done + 1, total)}/${total} — ${name}`;
-        setLine(libraryId, line);
-      },
-    );
-    const unDone = listen<{ libraryId: string }>("music-enrich-done", (e) => {
-      setLine(e.payload.libraryId, null);
-    });
-    return () => {
-      unProgress.then((fn) => fn());
-      unDone.then((fn) => fn());
-      window.removeEventListener("video-match-progress", onVideoProgress);
-    };
-  }, []);
-
-  // Latest scanned-folder line per library — shown under the locked sidebar
-  // row while its scan runs; cleared when the scan-state beacon ends. Names
-  // ride the started beacon so a mid-CREATION library (hidden from
-  // get_libraries) can render under its real name.
-  const [scanFolders, setScanFolders] = useState<Map<string, string>>(new Map());
-  const [scanNames, setScanNames] = useState<Map<string, string>>(new Map());
-  useEffect(() => {
-    const unProgress = listen<{
-      libraryId: string;
-      folder: string;
-      phase?: string;
-      done?: number;
-      total?: number;
-    }>("scan-progress", (e) => {
-      // The stored string is the full display line — phased music scans show
-      // stage + counts, video scans keep the bare folder form.
-      const { libraryId, folder, phase, done, total } = e.payload;
-      const line =
-        phase === "read-tags" && total
-          ? `reading tags ${Math.min((done ?? 0) + 1, total)}/${total} — ${folder}`
-          : phase === "build" && total
-            ? `building ${Math.min((done ?? 0) + 1, total)}/${total} — ${folder}`
-            : `scanning — ${folder}`;
-      setScanFolders((prev) => new Map(prev).set(libraryId, line));
-    });
-    const unState = listen<{ libraryId: string; name?: string; state: string }>("scan-state", (e) => {
-      if (e.payload.state === "started") {
-        if (e.payload.name) {
-          const { libraryId, name } = e.payload;
-          setScanNames((prev) => new Map(prev).set(libraryId, name!));
-        }
-      } else {
-        setScanFolders((prev) => {
-          const next = new Map(prev);
-          next.delete(e.payload.libraryId);
-          return next;
-        });
+  /** The live status line under a library row, from its run: scan folder /
+   *  stage counts while scanning, the pass's item while matching. */
+  const runLine = (libraryId: string): string | null => {
+    const run = runs[libraryId];
+    if (!run) return null;
+    if (run.kind === "scan") {
+      const folder = run.folder ?? "";
+      if (run.phase === "read-tags" && run.total) {
+        return `reading tags ${Math.min((run.done ?? 0) + 1, run.total)}/${run.total} — ${folder}`;
       }
-    });
-    return () => {
-      unProgress.then((fn) => fn());
-      unState.then((fn) => fn());
-    };
-  }, []);
-
-  /** Open a new wizard unless one is already mounted (possibly minimized
-   *  mid-scan/match) — clobbering it would orphan the in-flight run. */
-  const launchWizard = useCallback((next: WizardMode) => {
-    if (wizard) {
-      setWizardMinimized(false);
-      toast.info("Finish the current import first");
-      return;
+      if (run.phase === "build" && run.total) {
+        return `building ${Math.min((run.done ?? 0) + 1, run.total)}/${run.total} — ${folder}`;
+      }
+      return folder ? `scanning — ${folder}` : "scanning…";
     }
-    setWizard(next);
-  }, [wizard]);
-
-  // Rescan requests from surfaces that can't reach the wizard state (the
-  // split-artist dialog, the grid context menu) arrive as window events.
-  useEffect(() => {
-    const onOpenRescan = (e: Event) => {
-      const libraryId = (e as CustomEvent).detail?.libraryId as string | undefined;
-      const lib = libraries.find((l) => l.id === libraryId);
-      if (!lib) return;
-      launchWizard({ kind: "rescan", libraryId: lib.id, name: lib.name, format: lib.format });
-    };
-    window.addEventListener("waverunner:open-rescan", onOpenRescan);
-    // "Run a matching pass" from anywhere (center footer, queue banner,
-    // library-page strip) opens the match-only wizard — the pass runs in the
-    // normal modal, minimizable, instead of a rail spinner somewhere.
-    const onOpenMatch = (e: Event) => {
-      const libraryId = (e as CustomEvent).detail?.libraryId as string | undefined;
-      const lib = libraries.find((l) => l.id === libraryId);
-      if (!lib) return;
-      launchWizard({ kind: "match", libraryId: lib.id, name: lib.name, format: lib.format });
-    };
-    window.addEventListener("waverunner:open-match", onOpenMatch);
-    return () => {
-      window.removeEventListener("waverunner:open-rescan", onOpenRescan);
-      window.removeEventListener("waverunner:open-match", onOpenMatch);
-    };
-  }, [libraries, launchWizard]);
+    if (run.kind === "match") {
+      const p = run.progress;
+      if (!p) return "matching…";
+      const n = `${Math.min(p.done + 1, p.total)}/${p.total}`;
+      return p.phase === "artist-ids"
+        ? `identifying artists ${n}`
+        : p.phase === "artist-credits"
+          ? `reading album credits ${n}`
+          : p.phase === "artist-search"
+            ? `searching artists ${n}`
+            : `matching ${n} — ${p.name}`;
+    }
+    return null;
+  };
 
 
   const toggleLibExpand = useCallback((libId: string) => {
@@ -346,7 +235,7 @@ export function Sidebar({
             // background context menu offers — a quiet inline link, not a
             // row that pretends to be a library.
             <button
-              onClick={() => launchWizard({ kind: "create" })}
+              onClick={() => setCreateOpen(true)}
               className="group/create mt-1 flex items-center gap-1 py-1 pl-3 pr-2 text-left text-xs text-sidebar-foreground"
             >
               <Plus size={10} className="shrink-0" />
@@ -356,23 +245,21 @@ export function Sidebar({
             libraries.map((lib) => {
               const expanded = !collapsedLibs.has(lib.id);
               const isSelected = selectedLibrary?.id === lib.id;
+              const run = runs[lib.id];
               // Scan in flight: the row locks (mid-scan the library's data is
-              // inconsistent) and shows live progress. Clicking brings back a
-              // minimized wizard when one is running; there's nothing else to
-              // do here until the scan ends.
-              if (scanningLibs.has(lib.id)) {
-                const folder = scanFolders.get(lib.id);
+              // inconsistent) and shows live progress. Clicking opens the
+              // library's page, where the scan view stands in for it.
+              if (run?.kind === "scan") {
                 return (
-                  // One clickable unit: title row + progress line highlight
-                  // and reopen the wizard together. Title renders EXACTLY
-                  // like a normal row (spinner sized into the chevron slot)
-                  // so nothing shifts when a rescan starts.
+                  // One clickable unit: title row + progress line. Title
+                  // renders EXACTLY like a normal row (spinner sized into the
+                  // chevron slot) so nothing shifts when a rescan starts.
                   <button
                     key={lib.id}
-                    onClick={() => {
-                      if (wizard && wizardMinimized) setWizardMinimized(false);
-                    }}
-                    className="flex w-full flex-col text-left transition-colors hover:bg-sidebar-accent/50"
+                    onClick={() => onOpenScanning(lib.id)}
+                    className={`flex w-full flex-col text-left transition-colors ${
+                      isSelected ? "bg-sidebar-accent text-sidebar-accent-foreground" : "hover:bg-sidebar-accent/50"
+                    }`}
                   >
                     <span className="flex w-full items-start gap-1 py-1.5 pr-2 pl-1 text-sm font-medium text-sidebar-foreground/90">
                       <span className="flex h-5 w-4 flex-shrink-0 items-center justify-center">
@@ -382,106 +269,21 @@ export function Sidebar({
                     </span>
                     {/* The complication tree's spot while scanning. */}
                     <span className="break-words pb-1 pl-6 pr-2 text-xs italic text-muted-foreground">
-                      {folder ?? "scanning…"}
+                      {runLine(lib.id)}
                     </span>
                   </button>
                 );
               }
-              // Matching in flight (MB/TMDB pass running behind a minimized
-              // wizard): spinner in the chevron slot, live progress line
-              // where the tree renders. Clicking brings the modal back.
-              if (matchStatus.has(lib.id) || passLibs.has(lib.id)) {
-                return (
-                  <button
-                    key={lib.id}
-                    onClick={() => {
-                      // A mounted wizard comes back; after an app reload
-                      // (wizard state lost, backend pass still running)
-                      // resume it — enterMatch detects the running pass.
-                      if (wizard) {
-                        setWizardMinimized(false);
-                        return;
-                      }
-                      if (lib.setup_stage) {
-                        setWizard({
-                          kind: "resume",
-                          libraryId: lib.id,
-                          name: lib.name,
-                          format: lib.format,
-                          stage: (["scan", "match", "review"].includes(lib.setup_stage)
-                            ? lib.setup_stage
-                            : "match") as "scan" | "match" | "review",
-                        });
-                        return;
-                      }
-                      // A finished library running a pass (started from the
-                      // metadata center) has no setup stage to resume — open
-                      // the match wizard on the live pass instead. Without
-                      // this the row locks with no way back to the modal.
-                      if (passLibs.has(lib.id)) {
-                        launchWizard({
-                          kind: "match",
-                          libraryId: lib.id,
-                          name: lib.name,
-                          format: lib.format,
-                        });
-                      }
-                    }}
-                    className="flex w-full flex-col text-left transition-colors hover:bg-sidebar-accent/50"
-                  >
-                    <span className="flex w-full items-start gap-1 py-1.5 pr-2 pl-1 text-sm font-medium text-sidebar-foreground/90">
-                      <span className="flex h-5 w-4 flex-shrink-0 items-center justify-center">
-                        <Spinner className="size-2" />
-                      </span>
-                      <span className="min-w-0 flex-1 break-words">{lib.name}</span>
-                    </span>
-                    <span className="break-words pb-1 pl-6 pr-2 text-xs italic text-muted-foreground">
-                      {matchStatus.get(lib.id) ?? "matching…"}
-                    </span>
-                  </button>
-                );
-              }
-              // Unfinished import, nothing running: the wizard is waiting on
-              // the user — amber alert in the chevron slot, stage-specific
-              // line below. Clicking resumes the wizard where it left off.
-              // (A minimized RESCAN/MATCH wizard with nothing running does NOT
-              // take this branch: the library's data is consistent again, so
-              // the row stays browsable — a triangle beside the name reopens
-              // the waiting wizard instead.)
-              if (lib.setup_stage) {
-                const stageLine =
-                  lib.setup_stage === "review"
-                    ? "Ready to review"
-                    : lib.setup_stage === "match"
-                      ? "Ready to match"
-                      : lib.setup_stage === "scan"
-                        ? "Setup paused — scan incomplete"
-                        : "Ready to continue";
+              // A paused first-time import (its scan was stopped, or the app
+              // died mid-scan): amber alert, click resumes the scan. Libraries
+              // paused at the MATCH question are ordinary rows — browsable,
+              // with the question as a banner on their page.
+              if (lib.setup_stage === "scan") {
                 return (
                   <div key={lib.id} className="flex flex-col">
                     <ContextMenu>
                       <ContextMenuTrigger
-                        render={
-                          <button
-                            onClick={() => {
-                              // A wizard already mounted (minimized mid-flight)
-                              // must not be clobbered — just bring it back.
-                              if (wizard) {
-                                setWizardMinimized(false);
-                                return;
-                              }
-                              setWizard({
-                                kind: "resume",
-                                libraryId: lib.id,
-                                name: lib.name,
-                                format: lib.format,
-                                stage: (["scan", "match", "review"].includes(lib.setup_stage!)
-                                  ? lib.setup_stage
-                                  : "scan") as "scan" | "match" | "review",
-                              });
-                            }}
-                          />
-                        }
+                        render={<button onClick={() => void rescan(lib)} />}
                         className="flex w-full flex-col text-left transition-colors hover:bg-sidebar-accent/50"
                       >
                         <span className="flex w-full items-start gap-1 py-1.5 pr-2 pl-1 text-sm font-medium text-sidebar-foreground/90">
@@ -491,7 +293,7 @@ export function Sidebar({
                           <span className="min-w-0 flex-1 break-words">{lib.name}</span>
                         </span>
                         <span className="break-words pb-1 pl-6 pr-2 text-xs italic text-muted-foreground">
-                          {stageLine}
+                          Setup paused — click to finish scanning
                         </span>
                       </ContextMenuTrigger>
                       <ContextMenuContent>
@@ -513,10 +315,7 @@ export function Sidebar({
                     <ContextMenuTrigger
                       render={
                         <button
-                          // Navigate only — expand/collapse is the chevron's
-                          // job. Exception: a pass running with no wizard to
-                          // show it — the click reattaches the match modal
-                          // (launchWizard un-minimizes an existing one).
+                          // Navigate only — expand/collapse is the chevron's job.
                           onClick={() => onSelectLibrary(lib)}
                         />
                       }
@@ -550,11 +349,9 @@ export function Sidebar({
                         Rename
                       </ContextMenuItem>
                       <ContextMenuItem
-                        onClick={() =>
-                          // Rescans run through the wizard for both formats
-                          // (scan → elective match → review, minimizable).
-                          launchWizard({ kind: "rescan", libraryId: lib.id, name: lib.name, format: lib.format })
-                        }
+                        // Rescans show in place of the library's page, then
+                        // the match question follows as a banner there.
+                        onClick={() => void rescan(lib)}
                       >
                         <RefreshCw size={14} />
                         Rescan
@@ -596,6 +393,20 @@ export function Sidebar({
                       </ContextMenuItem>
                     </ContextMenuContent>
                   </ContextMenu>
+                  {/* A matching pass in flight: its live item under the name,
+                      like a background job. The row stays browsable; the
+                      Metadata page carries the full progress strip. */}
+                  {run?.kind === "match" && (
+                    <button
+                      // Like a background job: the click goes where the
+                      // detail is — the Metadata page's running strip.
+                      onClick={() => onSelectView({ kind: "metadata", libraryId: lib.id })}
+                      className="flex items-start gap-1.5 pb-1 pl-6 pr-2 pt-1 text-left text-xs italic text-muted-foreground hover:text-foreground"
+                    >
+                      <Spinner className="mt-1 size-2 shrink-0" />
+                      <span className="min-w-0 break-words">{runLine(lib.id)}</span>
+                    </button>
+                  )}
                   {/* Background jobs — background work lives in the sidebar;
                       one line per running job under the library name, above
                       the tree. Several can run at once (a preload beside a
@@ -631,14 +442,7 @@ export function Sidebar({
                       // where its click leads (staged work, a waiting wizard).
                       renderNodeTrailing={(node) =>
                         node.id === "metadata" ? (
-                          <LibraryAttentionBadge
-                            libraryId={lib.id}
-                            format={lib.format}
-                            wizardWaiting={
-                              !!wizard && wizard.kind !== "create" && wizard.libraryId === lib.id && wizardMinimized
-                            }
-                            onReopenWizard={() => setWizardMinimized(false)}
-                          />
+                          <LibraryAttentionBadge libraryId={lib.id} format={lib.format} />
                         ) : null
                       }
                       depth={1}
@@ -649,32 +453,34 @@ export function Sidebar({
             })
           )}
           {/* A library mid-CREATION is hidden from get_libraries until its
-              scan lands — its scanning row renders synthetically so the
-              minimized wizard still has a face in the sidebar. */}
-          {[...scanningLibs]
-            .filter((id) => !libraries.some((l) => l.id === id))
-            .map((id) => (
+              scan lands — its scanning row renders from the run so it has
+              a face in the sidebar (and a page: the scan view). */}
+          {Object.values(runs)
+            .filter((r) => r.kind === "scan" && !libraries.some((l) => l.id === r.libraryId))
+            .map((r) => (
               <button
-                key={id}
-                onClick={() => {
-                  if (wizard && wizardMinimized) setWizardMinimized(false);
-                }}
-                className="flex w-full flex-col text-left transition-colors hover:bg-sidebar-accent/50"
+                key={r.libraryId}
+                onClick={() => onOpenScanning(r.libraryId)}
+                className={`flex w-full flex-col text-left transition-colors ${
+                  activeView?.libraryId === r.libraryId
+                    ? "bg-sidebar-accent text-sidebar-accent-foreground"
+                    : "hover:bg-sidebar-accent/50"
+                }`}
               >
                 <span className="flex w-full items-start gap-1 py-1.5 pr-2 pl-1 text-sm font-medium text-sidebar-foreground/90">
                   <span className="flex h-5 w-4 flex-shrink-0 items-center justify-center">
                     <Spinner className="size-2" />
                   </span>
-                  <span className="min-w-0 flex-1 break-words">{scanNames.get(id) ?? "New library"}</span>
+                  <span className="min-w-0 flex-1 break-words">{r.name}</span>
                 </span>
                 <span className="break-words pb-1 pl-6 pr-2 text-xs italic text-muted-foreground">
-                  {scanFolders.get(id) ?? "scanning…"}
+                  {runLine(r.libraryId)}
                 </span>
               </button>
             ))}
           </ContextMenuTrigger>
           <ContextMenuContent>
-            <ContextMenuItem onClick={() => launchWizard({ kind: "create" })}>
+            <ContextMenuItem onClick={() => setCreateOpen(true)}>
               <FolderPlus size={14} />
               Create library
             </ContextMenuItem>
@@ -724,21 +530,7 @@ export function Sidebar({
         onMouseDown={startResize}
         className="absolute top-0 bottom-0 right-0 z-10 w-2 translate-x-1/2 cursor-col-resize"
       />
-      <CreateLibraryDialog
-        open={wizard !== null}
-        mode={wizard ?? { kind: "create" }}
-        minimized={wizardMinimized}
-        onMinimizedChange={setWizardMinimized}
-        onOpenChange={(o) => {
-          if (!o) {
-            setWizard(null);
-            setWizardMinimized(false);
-          }
-        }}
-        onCreated={onLibraryCreated}
-        onFinished={(libId) => onLibraryRescanned(libId)}
-        onOpenMetadata={(libId) => onSelectView({ kind: "metadata", libraryId: libId })}
-      />
+      <CreateLibraryDialog open={createOpen} onOpenChange={setCreateOpen} />
       <LibrarySettingsDialog
         library={settingsTarget}
         onOpenChange={(o) => {
@@ -751,9 +543,9 @@ export function Sidebar({
           if (!o) setManageFoldersTarget(null);
         }}
         onNeedsRescan={(lib) => {
-          // Adds/removals change nothing until a rescan — run it through
-          // the wizard like any other rescan. (Pure repoints skip this.)
-          launchWizard({ kind: "rescan", libraryId: lib.id, name: lib.name, format: lib.format });
+          // Adds/removals change nothing until a rescan. (Pure repoints
+          // skip this.)
+          void rescan(lib);
         }}
       />
       <RenameDialog
@@ -787,8 +579,9 @@ export function Sidebar({
             setDeleteConfirmText("");
           }
         }}
+        dismiss="self"
       >
-        <DialogContent className="sm:max-w-sm">
+        <DialogContent size="sm">
           <DialogHeader>
             <DialogTitle>Delete library?</DialogTitle>
             <DialogDescription>
@@ -917,7 +710,7 @@ function ManageFoldersDialog({
 
   return (
     <Dialog open={open} onOpenChange={(o) => { if (!o) close(); }}>
-      <DialogContent className="sm:max-w-lg">
+      <DialogContent size="lg">
         <DialogHeader>
           <DialogTitle>Manage folders{library ? ` — ${library.name}` : ""}</DialogTitle>
           <DialogDescription>

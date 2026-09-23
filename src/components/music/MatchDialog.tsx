@@ -842,7 +842,7 @@ export function MatchDialog({
     <Dialog open={open} onOpenChange={(o) => !busy && onOpenChange(o)}>
       {/* flex + overflow-hidden: tall content (status + release lists) must
           shrink and scroll inside the rounded frame, not spill past it. */}
-      <DialogContent className="flex max-h-[85vh] w-[min(38rem,calc(100vw-3rem))] max-w-none flex-col overflow-hidden">
+      <DialogContent width="38rem" className="flex max-h-[85vh] flex-col overflow-hidden">
         <DialogHeader>
           <DialogTitle>Match {kind} to MusicBrainz</DialogTitle>
           <DialogDescription>

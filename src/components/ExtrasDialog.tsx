@@ -139,7 +139,8 @@ export function ExtrasDialog({
           corners). */}
       <DialogContent
         showCloseButton={false}
-        className="grid-cols-[minmax(0,1fr)] grid-rows-[auto_minmax(0,1fr)_auto] sm:max-w-md"
+        size="md"
+        className="grid grid-cols-[minmax(0,1fr)] grid-rows-[auto_minmax(0,1fr)_auto]"
       >
         <DialogHeader>
           <DialogTitle>Extras</DialogTitle>

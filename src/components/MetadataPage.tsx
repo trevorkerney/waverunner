@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { MetadataCenter, type CenterFocus } from "@/components/music/MetadataCenter";
 import { VideoMetadataCenterPage } from "@/components/VideoMetadataCenter";
+import { MatchRunStrip } from "@/components/LibraryRunUi";
 import { Spinner } from "@/components/ui/spinner";
 
 /** The metadata center as a page — the sidebar's Metadata row under every
@@ -41,6 +42,9 @@ export function MetadataPage({
   if (format !== "music") {
     return (
       <div className="flex min-h-0 flex-1 flex-col px-4 pt-2">
+        {/* A running pass's detail lives here (the sidebar line leads here).
+            The music center renders its own, in its banner slot. */}
+        <MatchRunStrip libraryId={libraryId} className="-mx-4 -mt-2 mb-2 border-b" />
         <VideoMetadataCenterPage libraryId={libraryId} onChanged={onChanged} />
       </div>
     );

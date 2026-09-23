@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Button } from "../ui/button";
-import { AppWindow, RefreshCw, Sparkles, TriangleAlert } from "lucide-react";
+import { RefreshCw, Sparkles, TriangleAlert } from "lucide-react";
 
 /** The two deferred-work queues a music library carries:
  *  - staged changes a RESCAN applies (splits, combines, separations)
@@ -74,41 +74,20 @@ export function usePendingWork(libraryId: string | null) {
 
 /** The sidebar's Metadata row's ONE attention slot — never two icons side by side.
  *  Priority, top first:
- *    1. a minimized wizard waiting on this library (window glyph — click
- *       reopens it; any format)
- *    2. staged changes waiting on a rescan (red triangle; music)
- *    3. matches waiting on a matching pass (amber triangle; music)
- *  2 and 3 open the metadata center — the full picture lives there. Silent
+ *    1. staged changes waiting on a rescan (red triangle; music)
+ *    2. matches waiting on a matching pass (amber triangle; music)
+ *  Both open the metadata center — the full picture lives there. Silent
  *  when nothing applies. (A span, not a button: the row itself renders as a
  *  button and buttons can't nest — same trick as the row's chevron.) */
 export function LibraryAttentionBadge({
   libraryId,
   format,
-  wizardWaiting,
-  onReopenWizard,
 }: {
   libraryId: string;
   format: string;
-  /** A rescan/match wizard for this library is minimized. */
-  wizardWaiting: boolean;
-  onReopenWizard: () => void;
 }) {
   // Only music carries the deferred-work queues; other formats skip the fetch.
   const { rescan, pass } = usePendingWork(format === "music" ? libraryId : null);
-  if (wizardWaiting) {
-    return (
-      <span
-        onClick={(e) => {
-          e.stopPropagation();
-          onReopenWizard();
-        }}
-        title="The rescan wizard is waiting — click to reopen"
-        className="flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded text-amber-300 transition-colors hover:bg-foreground/10 hover:text-amber-200"
-      >
-        <AppWindow size={13} />
-      </span>
-    );
-  }
   if (rescan.length === 0 && pass.length === 0) return null;
   const urgent = rescan.length > 0;
   const parts = [
@@ -155,8 +134,8 @@ export function PendingWorkStrip({ libraryId }: { libraryId: string }) {
   ]
     .filter(Boolean)
     .join(" · ");
-  // The pass runs in the match-only wizard modal (Sidebar owns the launch);
-  // the modal starts it itself, so this only has to ask.
+  // App's run controller starts the pass and shows it as a banner over the
+  // library; this only has to ask.
   const runPass = () => {
     window.dispatchEvent(
       new CustomEvent("waverunner:open-match", { detail: { libraryId } }),

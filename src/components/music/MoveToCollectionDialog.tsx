@@ -80,7 +80,7 @@ export function MoveToCollectionDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-sm">
+      <DialogContent size="sm">
         <DialogHeader>
           <DialogTitle className="truncate">
             Move “{track?.title ?? ""}” to…
@@ -180,8 +180,8 @@ export function NewSoundCollectionDialog({
   };
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-sm">
+    <Dialog open={open} onOpenChange={onOpenChange} dismiss="self">
+      <DialogContent size="sm">
         <DialogHeader>
           <DialogTitle>New collection</DialogTitle>
         </DialogHeader>

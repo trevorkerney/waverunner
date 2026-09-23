@@ -99,7 +99,7 @@ export function AddToPlaylistDialog({
   return (
     <>
       <Dialog open={open} onOpenChange={onOpenChange}>
-        <DialogContent className="flex max-h-[70vh] flex-col sm:max-w-sm">
+        <DialogContent size="sm" className="flex max-h-[70vh] flex-col">
           <DialogHeader>
             <DialogTitle>
               {entryTitle ? `Add "${entryTitle}" to playlist` : "Add to playlist"}
@@ -150,8 +150,8 @@ export function AddToPlaylistDialog({
           // list reloads via `createOpen` dep in useEffect
         }}
       />
-      <Dialog open={confirmDup != null} onOpenChange={(o) => { if (!o) setConfirmDup(null); }}>
-        <DialogContent className="sm:max-w-sm">
+      <Dialog open={confirmDup != null} onOpenChange={(o) => { if (!o) setConfirmDup(null); }} dismiss="self">
+        <DialogContent size="sm">
           <DialogHeader>
             <DialogTitle>Already in playlist</DialogTitle>
           </DialogHeader>

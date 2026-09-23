@@ -229,3 +229,10 @@ html.player-active #root {
     cursor: pointer;
   }
 }
+
+/* The modal shell's leaving-content fade (ui/dialog.tsx overlay slot): a
+   keyframe so it runs from the moment the slot mounts. */
+@keyframes dialog-shell-fade-out {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}

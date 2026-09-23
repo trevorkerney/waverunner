@@ -382,7 +382,7 @@ export function TmdbMatchDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="flex max-h-[80vh] w-[720px] max-w-[90vw] flex-col gap-0 overflow-hidden p-0">
+      <DialogContent width="720px" className="flex max-h-[80vh] flex-col gap-0 overflow-hidden p-0">
         <DialogHeader className="shrink-0 border-b px-6 py-4">
           <DialogTitle>
             {step === "search" ? "Match with TMDB" : "Review TMDB Metadata"}

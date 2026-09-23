@@ -78,7 +78,7 @@ export function CreatePlaylistCollectionDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-sm">
+      <DialogContent size="sm">
         <DialogHeader>
           <DialogTitle>Create collection</DialogTitle>
         </DialogHeader>

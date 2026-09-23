@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef, useEffect, useLayoutEffect, useMemo, type RefObject } from "react";
+import { useState, useCallback, useRef, useEffect, useLayoutEffect, useMemo, forwardRef, useImperativeHandle, type RefObject } from "react";
 import {
   DndContext,
   closestCenter,
@@ -468,10 +468,14 @@ export function MainContent({
 
   // The unified covers menu. Music albums are release-scoped (grid = the
   // default release); everything else manages the entry's covers.
-  const [coversTarget, setCoversTarget] = useState<CoversTarget | null>(null);
+  // The dialog's open/target state lives in CoversHost (below), reached
+  // through a ref: setting state HERE re-rendered every card in the grid
+  // before the dialog could mount — a visible lag between the menu click
+  // and the modal on big libraries.
+  const coversHostRef = useRef<CoversHostHandle | null>(null);
   const openCoversMenu = useCallback((entry: MediaEntry) => {
     if (!selectedLibrary) return;
-    setCoversTarget(
+    coversHostRef.current?.open(
       selectedLibrary.format === "music" && entry.entry_type === "album"
         ? {
             kind: "release",
@@ -1984,8 +1988,8 @@ export function MainContent({
             {activeView?.kind !== "playlist-detail" && (
               <ContextMenuItem onClick={() => {
                 if (!selectedLibrary) return;
-                // Rescans run through the wizard modal — minimize sends the
-                // progress to the library's sidebar row.
+                // The rescan shows in place of this library's page (App's run
+                // controller owns it).
                 window.dispatchEvent(
                   new CustomEvent("waverunner:open-rescan", {
                     detail: { libraryId: selectedLibrary.id },
@@ -2007,7 +2011,7 @@ export function MainContent({
 
       {/* New Collection Dialog */}
       <Dialog open={newCollectionOpen} onOpenChange={setNewCollectionOpen}>
-        <DialogContent className="sm:max-w-sm">
+        <DialogContent size="sm">
           <DialogHeader>
             <DialogTitle>New Collection</DialogTitle>
           </DialogHeader>
@@ -2044,8 +2048,8 @@ export function MainContent({
 
       {/* Delete Collection Confirmation Dialog (collections are virtual — nothing
           on disk is touched; the items inside move back to the parent) */}
-      <Dialog open={deleteTarget != null} onOpenChange={(open) => { if (!open) setDeleteTarget(null); }}>
-        <DialogContent className="sm:max-w-sm">
+      <Dialog open={deleteTarget != null} onOpenChange={(open) => { if (!open) setDeleteTarget(null); }} dismiss="self">
+        <DialogContent size="sm">
           <DialogHeader>
             <DialogTitle>Delete Collection</DialogTitle>
           </DialogHeader>
@@ -2139,15 +2143,7 @@ export function MainContent({
       )}
 
       {/* The unified covers menu (grid entry point). */}
-      <CoversDialog
-        open={coversTarget !== null}
-        onOpenChange={(o) => {
-          if (!o) setCoversTarget(null);
-        }}
-        target={coversTarget}
-        getCoverUrl={getFullCoverUrl}
-        onChanged={onEntryChanged}
-      />
+      <CoversHost ref={coversHostRef} getCoverUrl={getFullCoverUrl} onChanged={onEntryChanged} />
 
       {/* Add-to-playlist dialog (applies anywhere a media entry is right-clicked) */}
       <AddToPlaylistDialog
@@ -2210,6 +2206,31 @@ export function MainContent({
     </main>
   );
 }
+
+interface CoversHostHandle {
+  open: (target: CoversTarget) => void;
+}
+
+/** Owns the Covers dialog's open state so opening it re-renders only this
+ *  host, never the grid around it (see openCoversMenu). */
+const CoversHost = forwardRef<
+  CoversHostHandle,
+  { getCoverUrl: (filePath: string) => string; onChanged: () => void }
+>(function CoversHost({ getCoverUrl, onChanged }, ref) {
+  const [target, setTarget] = useState<CoversTarget | null>(null);
+  useImperativeHandle(ref, () => ({ open: setTarget }), []);
+  return (
+    <CoversDialog
+      open={target !== null}
+      onOpenChange={(o) => {
+        if (!o) setTarget(null);
+      }}
+      target={target}
+      getCoverUrl={getCoverUrl}
+      onChanged={onChanged}
+    />
+  );
+});
 
 function SortableCoverCard({
   entry,
@@ -2891,7 +2912,7 @@ function CoverCarouselDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-lg">
+      <DialogContent size="lg">
         <DialogHeader>
           <DialogTitle>Choose Cover</DialogTitle>
         </DialogHeader>
@@ -2943,8 +2964,8 @@ function CoverCarouselDialog({
       </DialogContent>
 
       {/* Confirmation for the destructive path */}
-      <Dialog open={confirmingDelete} onOpenChange={(o) => { if (!o) setConfirmingDelete(false); }}>
-        <DialogContent className="sm:max-w-sm">
+      <Dialog open={confirmingDelete} onOpenChange={(o) => { if (!o) setConfirmingDelete(false); }} dismiss="self">
+        <DialogContent size="sm">
           <DialogHeader>
             <DialogTitle>Delete Cover</DialogTitle>
           </DialogHeader>

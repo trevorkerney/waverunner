@@ -4,13 +4,17 @@ import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { toast } from "sonner";
 import {
   Dialog,
+  DialogBody,
   DialogContent,
   DialogHeader,
   DialogTitle,
   DialogFooter,
+  useDialogPhase,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
+import { Skeleton, useSkeletonDelay } from "@/components/ui/skeleton";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { Check, Download, FolderOpen, Globe, Image as ImageIcon, Lock, Trash2 } from "lucide-react";
 import { ContextMenuItem } from "@/components/ui/context-menu";
 import { TmdbImageBrowserDialog } from "./TmdbImageBrowserDialog";
@@ -87,51 +91,162 @@ function ImageSize({ url, prefix = "" }: { url: string; prefix?: string }) {
       ws?.delete(cb);
     };
   }, [url]);
+  // undefined = still to fetch (lazily, on scroll-in): a text-sized skeleton
+  // holds the spot. null = the header couldn't be read: nothing, no prefix.
   return (
     <span ref={ref}>
-      {dims ? `${prefix}${dims[0]} × ${dims[1]}` : null}
+      {dims === undefined ? (
+        <>
+          {prefix}
+          {/* align-middle + a box shorter than the line: sits centred on the
+              text's x-height and never grows the line box, so the caption
+              doesn't shift when the numbers replace it. */}
+          <Skeleton className="inline-block h-2.5 w-16 align-middle" />
+        </>
+      ) : dims ? (
+        `${prefix}${dims[0]} × ${dims[1]}`
+      ) : null}
     </span>
   );
 }
 
-/** The "Covers…" context-menu entry, everywhere one exists. The menu stays
- *  OPEN while the dialog preps (it waits for covers to fetch + decode so it
- *  can appear at final size); past 500ms the icon becomes a spinner. When the
- *  dialog signals ready, the menu is dismissed. */
+/** The "Covers…" context-menu entry, everywhere one exists. The dialog opens
+ *  at once (skeleton tiles until the covers land), so this is a plain item. */
 export function CoversMenuItem({ onOpen }: { onOpen: () => void }) {
-  const [pending, setPending] = useState(false);
-  const [slow, setSlow] = useState(false);
-  useEffect(() => {
-    if (!pending) return;
-    const slowTimer = setTimeout(() => setSlow(true), 500);
-    const done = () => {
-      setPending(false);
-      setSlow(false);
-      // Close the still-open menu the moment the dialog takes over. The
-      // dialog mounts on the NEXT render, so this can't reach it.
-      (document.activeElement ?? document.body).dispatchEvent(
-        new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
-      );
-    };
-    window.addEventListener("waverunner:covers-dialog-ready", done);
-    return () => {
-      clearTimeout(slowTimer);
-      window.removeEventListener("waverunner:covers-dialog-ready", done);
-    };
-  }, [pending]);
   return (
-    <ContextMenuItem
-      closeOnClick={false}
-      onClick={() => {
-        if (pending) return;
-        setPending(true);
-        onOpen();
-      }}
-    >
+    <ContextMenuItem onClick={onOpen}>
       <ImageIcon size={14} />
       Covers…
-      {slow && <Spinner className="ml-auto size-3.5" />}
     </ContextMenuItem>
+  );
+}
+
+/** The covers grid: five fixed columns (a 2xl dialog's width), so a tile is
+ *  always the same size and two rows are always the same height. */
+const COVER_GRID = "grid grid-cols-5 items-start gap-3";
+/** The covers dialogs' fixed height: padding + title + gap + a body of
+ *  exactly two rows of square tiles (the WIDEST tiles a 2xl dialog yields,
+ *  ~135px, plus the gap and the body's padding, with a little slack so two
+ *  rows never overflow by a pixel and summon a scrollbar) + gap + footer.
+ *  16 + 20 + 16 + 312 + 16 + 60 = 440px. */
+const COVERS_HEIGHT = "27.5rem";
+/** The cover art browser with only the group cover to show. 16 padding +
+ *  20 title + 16 gap + 16 subtitle + 14 (gap less the body's 2px pull-up)
+ *  + 24 section label + 135 tile + 20 caption + 14 (gap less 2px, matching
+ *  the space above the label) + 60 footer = 335px, plus a pixel of slack. */
+const CAA_ONE_ROW_HEIGHT = "20rem";
+/** How long a closed dialog keeps its content before resetting — longer
+ *  than the shell's fade-out (200ms) plus its exit (120ms), so the content
+ *  is still there to fade. */
+const CLOSE_RESET_MS = 400;
+
+/** The skeleton → content hand-off both covers dialogs use, in a fixed
+ *  order on content that has already painted:
+ *    1. `ready`: the content is mounted at opacity 0 — WITH will-change:
+ *       opacity, so it's a composited layer whose contents are rasterised
+ *       while invisible (a plain opacity-0 subtree is skipped by the
+ *       renderer and would rasterise during the fade) — and every <img>
+ *       under `contentRef` is waited on until decoded, plus a few frames.
+ *    2. If a skeleton was ever shown (the 500ms delay elapsed), it fades
+ *       out over 200ms, alone.
+ *    3. The content fades in over 200ms, alone.
+ *  Returns the stage, whether a skeleton was seen (keep it MOUNTED through
+ *  its fade — an unmount/remount skips it), and the two derived flags. */
+function useHandoff(ready: boolean, contentRef: React.RefObject<HTMLElement | null>) {
+  const showSkeleton = useSkeletonDelay(!ready);
+  const [stage, setStage] = useState<"hidden" | "tiles-out" | "reveal" | "shown">("hidden");
+  const seenRef = useRef(false);
+  if (showSkeleton) seenRef.current = true;
+  useEffect(() => {
+    if (!ready) {
+      setStage("hidden");
+      seenRef.current = false;
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      const imgs = contentRef.current ? Array.from(contentRef.current.querySelectorAll("img")) : [];
+      // A broken image must not hold the reveal forever.
+      const cap = new Promise<void>((r) => setTimeout(r, 1500));
+      await Promise.race([Promise.allSettled(imgs.map((i) => i.decode())), cap]);
+      for (let i = 0; i < 4; i++) {
+        await new Promise<void>((r) => requestAnimationFrame(() => r()));
+      }
+      if (cancelled) return;
+      if (seenRef.current) {
+        setStage("tiles-out");
+        await new Promise<void>((r) => setTimeout(r, 200));
+        if (cancelled) return;
+      }
+      setStage("reveal");
+      await new Promise<void>((r) => setTimeout(r, 200));
+      if (cancelled) return;
+      setStage("shown");
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ready]);
+  return {
+    stage,
+    skeletonSeen: seenRef.current,
+    shown: stage === "shown",
+    contentVisible: stage === "reveal" || stage === "shown",
+  };
+}
+
+/** A lazily loaded thumbnail: a square skeleton holds the spot until its
+ *  own image has loaded — each tile independently, so a scan set fills in
+ *  as the archive delivers it — then the tile takes the image's natural
+ *  shape (booklets and spines display whole, no letterbox background). A
+ *  failed image just drops the skeleton. */
+function LazyThumb({ src }: { src: string }) {
+  const [loaded, setLoaded] = useState(false);
+  return (
+    <span className={`relative block w-full ${loaded ? "" : "aspect-square"}`}>
+      {!loaded && <Skeleton className="absolute inset-0 rounded-none" />}
+      <img
+        src={src}
+        alt=""
+        loading="lazy"
+        draggable={false}
+        onLoad={() => setLoaded(true)}
+        onError={() => setLoaded(true)}
+        className={`w-full transition-opacity duration-200 ${
+          loaded ? "h-auto opacity-100" : "absolute inset-0 h-full object-contain opacity-0"
+        }`}
+      />
+    </span>
+  );
+}
+
+/** Content added to a dialog that grows in place for it: mounts invisible,
+ *  rides the frame's resize, and fades in (200ms) once the shell reports
+ *  the resize done. Must render INSIDE the dialog's own content — the phase
+ *  hook reads the nearest dialog's entry. */
+function RevealAfterResize({ className = "", children }: { className?: string; children: React.ReactNode }) {
+  const phase = useDialogPhase();
+  const [revealed, setRevealed] = useState(false);
+  useEffect(() => {
+    if (phase === "in") setRevealed(true);
+  }, [phase]);
+  return (
+    <div className={`${className} transition-opacity duration-200 ${revealed ? "opacity-100" : "opacity-0"}`}>
+      {children}
+    </div>
+  );
+}
+
+/** Grey tiles in the covers grid's own layout, filling the fixed body until
+ *  the real tiles are fetched and decoded — the swap moves nothing. */
+function SkeletonTiles({ count = 10, className = "" }: { count?: number; className?: string }) {
+  return (
+    <div className={`${COVER_GRID} ${className}`}>
+      {Array.from({ length: count }, (_, i) => (
+        <Skeleton key={i} className="aspect-square w-full rounded-[3px]" />
+      ))}
+    </div>
   );
 }
 
@@ -146,23 +261,23 @@ function CaaImageBrowserDialog({
   libraryId,
   albumId,
   releaseId,
+  releaseMatched,
   title,
   onDownloaded,
-  onReady,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   libraryId: string;
   albumId: number;
   releaseId: number | null;
+  /** The release is pinned to a MusicBrainz release (known before the
+   *  listing loads, so the frame is declared right from the first frame). */
+  releaseMatched: boolean;
   title: string;
   onDownloaded: () => void;
-  /** Fires when the modal is actually about to show (data + thumbs ready) —
-   *  the launching button shows its spinner until then. */
-  onReady: () => void;
 }) {
   const [data, setData] = useState<CaaBrowse | null>(null);
-  const [ready, setReady] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [picked, setPicked] = useState<Set<string>>(new Set());
   const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
   // "Other releases": explicit opt-in (a group can hold 100+ pressings).
@@ -208,38 +323,48 @@ function CaaImageBrowserDialog({
     }
   };
 
-  // Same no-resize rule as the covers dialog: stay unmounted until the CAA
-  // listing AND its thumbnails are fully loaded, then appear at final size.
+  // The dialog opens at once with skeleton tiles; the real tiles replace
+  // them only once the listing AND its thumbnails are decoded, so the swap
+  // reveals finished art instead of thumbs popping in one by one.
   useEffect(() => {
     if (!open) {
-      setData(null);
-      setReady(false);
-      setPicked(new Set());
-      setProgress(null);
-      setOthers(null);
-      setScans(new Map());
-      return;
+      // Reset AFTER the shell has faded this content out — clearing state
+      // at once unmounts the tiles mid-fade (they vanish while the text
+      // beside them is still fading). Reopening inside the window keeps it.
+      const t = setTimeout(() => {
+        setData(null);
+        setLoadError(null);
+        setPicked(new Set());
+        setProgress(null);
+        setOthers(null);
+        setScans(new Map());
+      }, CLOSE_RESET_MS);
+      return () => clearTimeout(t);
     }
     let cancelled = false;
     (async () => {
       try {
         const d = await invoke<CaaBrowse>("caa_release_images", { albumId, releaseId });
         if (cancelled) return;
-        setData(d);
-        await Promise.allSettled(
-          [...d.group, ...d.release].map((i) => {
-            const img = new Image();
-            img.src = i.thumb;
-            return img.decode().catch(() => {});
-          }),
-        );
-        if (!cancelled) {
-          setReady(true);
-          onReady();
-        }
+        // The thumbs are on archive.org and can dawdle — cap the wait so a
+        // slow one can't hold the whole listing.
+        const cap = new Promise<void>((r) => setTimeout(r, 2500));
+        await Promise.race([
+          Promise.allSettled(
+            [...d.group, ...d.release].map((i) => {
+              const img = new Image();
+              img.src = i.thumb;
+              return img.decode().catch(() => {});
+            }),
+          ),
+          cap,
+        ]);
+        if (!cancelled) setData(d);
       } catch (e) {
-        toast.error(String(e));
-        if (!cancelled) onOpenChange(false);
+        // In place, not a toast + bounce: the "match first" case can't
+        // reach here any more (the launch button is disabled), so what's
+        // left is a genuine fetch failure the user should read here.
+        if (!cancelled) setLoadError(String(e));
       }
     })();
     return () => {
@@ -283,11 +408,10 @@ function CaaImageBrowserDialog({
   // tile in its expanded scan set (the /front URL redirects to that image),
   // so both select under ONE key — picking either lights both, and the
   // download fetches it once.
+  // Same fixed five columns as the Covers grid, so the skeleton row and the
+  // real tiles land in exactly the same places.
   const tileGrid = (images: CaaImage[], frontKey?: string) => (
-    <div
-      className="grid items-start gap-3"
-      style={{ gridTemplateColumns: "repeat(auto-fill, minmax(140px, 1fr))" }}
-    >
+    <div className={COVER_GRID}>
       {images.map((img) => {
         const key = img.front && frontKey ? frontKey : img.url;
         const isPicked = picked.has(key);
@@ -305,7 +429,7 @@ function CaaImageBrowserDialog({
                   : "ring-1 ring-foreground/10 hover:ring-foreground/25"
               }`}
             >
-              <img src={img.thumb} alt="" loading="lazy" draggable={false} className="h-auto w-full" />
+              <LazyThumb src={img.thumb} />
               {isPicked && (
                 <span className="absolute left-1.5 top-1.5 rounded-full bg-primary p-1 text-primary-foreground shadow">
                   <Check size={11} />
@@ -322,68 +446,107 @@ function CaaImageBrowserDialog({
     </div>
   );
 
-  const empty = data && data.group.length === 0 && data.release.length === 0;
+  // Same hand-off as Covers: tiles mount invisible once the listing is in,
+  // their thumbs are waited on, the skeleton fades out, the tiles fade in.
+  // The ref covers the whole body so the release section's thumbs count.
+  const contentRef = useRef<HTMLDivElement | null>(null);
+  const { stage, skeletonSeen, shown, contentVisible } = useHandoff(!!data || !!loadError, contentRef);
+  const fade = `transition-opacity duration-200 will-change-[opacity] ${contentVisible ? "opacity-100" : "opacity-0"}`;
+  const skeletonFade = `transition-opacity duration-200 ${stage === "hidden" ? "" : "opacity-0"}`;
 
   return (
-    <Dialog open={open && ready} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-[min(760px,calc(100vw-3rem))]">
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      {/* Frame by content: one row when only the group is matched (its one
+          cover), Covers' two rows when the release is pinned too (its scan
+          set), and the tall frame while browsing the group's releases. Each
+          change is a shell morph (fade → resize → fade). */}
+      <DialogContent
+        size="2xl"
+        height={others !== null ? "xl" : releaseMatched ? COVERS_HEIGHT : CAA_ONE_ROW_HEIGHT}
+      >
         <DialogHeader>
           <DialogTitle className="truncate">MusicBrainz cover art — {title}</DialogTitle>
         </DialogHeader>
-        {data && (
-          <p className="-mt-2 text-xs text-muted-foreground">
-            {data.release_pinned
-              ? "Release group matched · this release is matched to its MusicBrainz release"
-              : "Release group matched · this release isn't matched to a MusicBrainz release yet — only the release group cover is available"}
-          </p>
-        )}
-        <div className="max-h-[60vh] overflow-y-auto px-1.5 pb-1.5 pt-3 [scrollbar-gutter:stable]">
-          {!data ? null : empty ? (
-            <p className="py-8 text-center text-sm text-muted-foreground">
-              No cover art on MusicBrainz for this release.
-            </p>
-          ) : (
-            <div className="flex flex-col gap-4">
-              {data.group.length > 0 && (
-                <div>
-                  <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                    Release group cover
-                  </p>
-                  {tileGrid(data.group)}
+        {/* Known before the listing loads (the release's pin state came with
+            the Covers fetch), so it's plain text from the first frame. */}
+        <p className="-mt-3 text-xs text-muted-foreground">
+          {releaseMatched
+            ? "release group matched · release matched"
+            : "release group matched · release unmatched"}
+        </p>
+        {/* -mt-0.5 / -mb-0.5 with no padding: 14px from the subtitle to the
+            section label, and the same 14px from the last caption to the
+            footer (the dialog's 16px gaps, each pulled up 2px). */}
+        <DialogBody
+          ref={contentRef}
+          // No scrollbar until the content is shown — the skeleton row (and
+          // the invisible content beneath it) must not summon one.
+          className={`relative isolate -mb-0.5 -mt-0.5 px-1.5 pb-0 pt-0 [scrollbar-gutter:stable] ${
+            shown ? "" : "overflow-hidden"
+          }`}
+        >
+          {/* Section labels are static (the sections are known up front);
+              only the tiles wait on the listing. The skeleton row overlays
+              the group section's (invisible) tiles until they're ready and
+              stays MOUNTED through its fade. */}
+          <div className="flex flex-col gap-4">
+            <div>
+              <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                Release group cover
+              </p>
+              <div className="relative isolate">
+                {!shown && skeletonSeen && (
+                  <div className={`absolute inset-x-0 top-0 z-10 ${COVER_GRID} ${skeletonFade}`}>
+                    {Array.from({ length: 5 }, (_, i) => (
+                      <div key={i}>
+                        <Skeleton className="aspect-square w-full rounded-[3px]" />
+                        <Skeleton className="mx-auto mt-1.5 h-3 w-2/3" />
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <div className={fade}>
+                  {loadError ? (
+                    <p className="py-8 text-center text-sm text-destructive">{loadError}</p>
+                  ) : !data ? (
+                    // Holds the row's height while invisible, so the
+                    // sections below don't jump when the tiles land.
+                    <div className={COVER_GRID}>
+                      <div className="aspect-square w-full" />
+                    </div>
+                  ) : data.group.length > 0 ? (
+                    tileGrid(data.group)
+                  ) : (
+                    <p className="py-8 text-center text-sm text-muted-foreground">
+                      No cover art on MusicBrainz for this release group.
+                    </p>
+                  )}
                 </div>
-              )}
-              {data.release.length > 0 && (
-                <div>
-                  <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                    This release
-                  </p>
-                  {tileGrid(data.release)}
-                </div>
-              )}
-              {data.release_pinned && data.release.length === 0 && (
-                <p className="text-sm text-muted-foreground">
-                  No scans for this release on Cover Art Archive.
-                </p>
-              )}
+              </div>
             </div>
-          )}
+            {releaseMatched && (
+              <div className={fade}>
+                <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                  This release
+                </p>
+                {!data ? null : data.release.length > 0 ? (
+                  tileGrid(data.release)
+                ) : (
+                  <p className="text-sm text-muted-foreground">
+                    No scans for this release on Cover Art Archive.
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
 
-          {/* Other pressings in the group — explicit opt-in, lazy row thumbs. */}
-          {data && (
-            <div className="mt-4 border-t pt-3">
-              {others === null ? (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={loadOthers}
-                  disabled={othersLoading || progress != null}
-                >
-                  <Globe size={14} />
-                  {data.release_pinned ? "Other releases…" : "Browse this group's releases…"}
-                  {othersSlow && <Spinner className="size-3.5" />}
-                </Button>
-              ) : (
-                <div>
+          {/* Other pressings in the group — explicit opt-in (the footer's
+              left button), lazy row thumbs. */}
+          {data && others !== null && (
+            // Mounts invisible; the frame grows with the content above
+            // riding along, then this fades in once the shell reports the
+            // resize is done.
+            <RevealAfterResize className="mt-4">
                   <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
                     {data.release_pinned ? "Other releases in this group" : "Releases in this group"}
                   </p>
@@ -484,12 +647,24 @@ function CaaImageBrowserDialog({
                       })}
                     </div>
                   )}
-                </div>
-              )}
-            </div>
+            </RevealAfterResize>
           )}
-        </div>
+        </DialogBody>
         <DialogFooter>
+          {/* Browse the group's releases: left of the footer until opened;
+              disabled until the group cover is actually on screen. */}
+          {others === null && (
+            <Button
+              variant="outline"
+              className="mr-auto"
+              onClick={loadOthers}
+              disabled={!shown || !data || othersLoading || progress != null}
+            >
+              <Globe size={14} />
+              {data?.release_pinned ? "Other releases…" : "Browse this group's releases…"}
+              {othersSlow && <Spinner className="size-3.5" />}
+            </Button>
+          )}
           <Button variant="outline" onClick={() => onOpenChange(false)} disabled={progress != null}>
             Cancel
           </Button>
@@ -593,22 +768,16 @@ export function CoversDialog({
   const [selected, setSelected] = useState<string | null>(null);
   /** Concrete release id once resolved (target may say "the default"). */
   const [releaseId, setReleaseId] = useState<number | null>(null);
-  const [loading, setLoading] = useState(false);
+  /** Album matched to a MusicBrainz release group (the CAA browser's
+   *  precondition) — its launch button is disabled with a tooltip otherwise. */
+  const [mbMatched, setMbMatched] = useState(false);
+  const [mbReleaseMatched, setMbReleaseMatched] = useState(false);
   const [busy, setBusy] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
-  // Remote pickers (each its own modal, TMDB-style). Both launch buttons show
-  // a right-side spinner past 500ms while their modal preps.
+  // Remote pickers (each its own modal, TMDB-style). The CAA browser opens
+  // at once; the TMDB one needs the entry's tmdb id first — that lookup is
+  // the button's own work, so the button spins past 500ms.
   const [caaOpen, setCaaOpen] = useState(false);
-  const [caaReady, setCaaReady] = useState(false);
-  const [caaSlow, setCaaSlow] = useState(false);
-  useEffect(() => {
-    if (!(caaOpen && !caaReady)) {
-      setCaaSlow(false);
-      return;
-    }
-    const t = setTimeout(() => setCaaSlow(true), 500);
-    return () => clearTimeout(t);
-  }, [caaOpen, caaReady]);
   const [tmdb, setTmdb] = useState<{ tmdbId: string; mediaType: "movie" | "tv" } | null>(null);
   const [tmdbPending, setTmdbPending] = useState(false);
   const [tmdbSlow, setTmdbSlow] = useState(false);
@@ -623,16 +792,20 @@ export function CoversDialog({
 
   const refetch = useCallback(async (): Promise<CoverInfo[]> => {
     if (!target) return [];
-    setLoading(true);
     try {
       if (target.kind === "release") {
-        const r = await invoke<{ release_id: number; covers: CoverInfo[]; selected: string | null }>(
-          "get_release_covers",
-          { albumId: target.albumId, releaseId: target.releaseId },
-        );
+        const r = await invoke<{
+          release_id: number;
+          covers: CoverInfo[];
+          selected: string | null;
+          mb_matched: boolean;
+          mb_release_matched: boolean;
+        }>("get_release_covers", { albumId: target.albumId, releaseId: target.releaseId });
         setCovers(r.covers);
         setSelected(r.selected);
         setReleaseId(r.release_id);
+        setMbMatched(r.mb_matched);
+        setMbReleaseMatched(r.mb_release_matched);
         return r.covers;
       } else {
         const r = await invoke<{ covers: CoverInfo[]; selected: string | null }>(
@@ -647,24 +820,27 @@ export function CoversDialog({
     } catch (e) {
       toast.error(String(e));
       return [];
-    } finally {
-      setLoading(false);
     }
   }, [target]);
 
-  // The dialog stays INVISIBLE until the covers are fetched AND decoded, so
-  // it appears at its final size in one shot — no reserved-height guessing,
-  // no resize as images pop in. Local files decode in a few ms; a cap keeps
-  // one slow/broken image from holding the dialog hostage.
-  const [ready, setReady] = useState(false);
+  // The dialog opens at once with skeleton tiles; the grid swaps to the real
+  // tiles only once they're fetched AND decoded, so the swap reveals
+  // finished art rather than images popping in one by one. Local files
+  // decode in a few ms.
+  const [settling, setSettling] = useState(true);
+  const gridRef = useRef<HTMLDivElement | null>(null);
+  const { stage, skeletonSeen, shown, contentVisible } = useHandoff(!settling, gridRef);
   useEffect(() => {
     if (!open) {
-      setReady(false);
-      setCovers([]);
-      setSelected(null);
-      setCaaOpen(false);
-      setConfirmDelete(null);
-      return;
+      // Same as the browser: reset once the shell's fade-out is over.
+      const t = setTimeout(() => {
+        setSettling(true);
+        setCovers([]);
+        setSelected(null);
+        setCaaOpen(false);
+        setConfirmDelete(null);
+      }, CLOSE_RESET_MS);
+      return () => clearTimeout(t);
     }
     let cancelled = false;
     (async () => {
@@ -676,12 +852,7 @@ export function CoversDialog({
           return img.decode().catch(() => {});
         }),
       );
-      if (!cancelled) {
-        // Tell the launching CoversMenuItem to stand down (it holds its
-        // context menu open, with a spinner past 500ms, until this moment).
-        window.dispatchEvent(new Event("waverunner:covers-dialog-ready"));
-        setReady(true);
-      }
+      if (!cancelled) setSettling(false);
     })();
     return () => {
       cancelled = true;
@@ -802,29 +973,35 @@ export function CoversDialog({
     target.kind === "entry" && (target.entryType === "movie" || target.entryType === "show");
 
   return (
-    <Dialog open={open && ready} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-[min(760px,calc(100vw-3rem))]">
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent size="2xl" height={COVERS_HEIGHT}>
         <DialogHeader>
           <DialogTitle className="truncate">Covers — {target.title}</DialogTitle>
         </DialogHeader>
-        {/* scrollbar-gutter reserves the bar's lane up front — hover-scale can
-            momentarily extend the scrollable area, and without the gutter the
-            appearing scrollbar reflowed the whole grid. */}
-        <div className="max-h-[60vh] overflow-y-auto px-1.5 pb-1.5 pt-4 [scrollbar-gutter:stable]">
-          {/* Pre-open loading never renders (the dialog waits for it); this
-              spinner only covers a post-mutation refetch that emptied out. */}
-          {loading && covers.length === 0 ? (
-            <div className="flex h-24 items-center justify-center text-muted-foreground">
-              <Spinner className="size-5" />
-            </div>
-          ) : covers.length === 0 ? (
+        {/* FIXED size: the dialog's height gives the body exactly two rows
+            of tiles (the cover count can't be known before the fetch, so
+            the box never sizes to it) — more scroll, fewer leave space. The
+            skeleton fills the same box, so the swap to real tiles moves
+            nothing. scrollbar-gutter reserves the bar's lane up front —
+            hover-scale can momentarily extend the scrollable area, and
+            without the gutter the appearing scrollbar reflowed the grid. */}
+        <DialogBody
+          // No scrollbar until the tiles are shown — a three-row grid
+          // painting invisibly must not summon one early.
+          className={`relative isolate px-1.5 pb-1.5 pt-4 [scrollbar-gutter:stable] ${
+            shown ? "" : "overflow-hidden"
+          }`}
+        >
+          {settling ? null : covers.length === 0 ? (
             <p className="py-8 text-center text-sm text-muted-foreground">
               No covers yet — add one below.
             </p>
           ) : (
             <div
-              className="grid items-start gap-3"
-              style={{ gridTemplateColumns: "repeat(auto-fill, minmax(140px, 1fr))" }}
+              ref={gridRef}
+              className={`${COVER_GRID} transition-opacity duration-200 will-change-[opacity] ${
+                contentVisible ? "opacity-100" : "opacity-0"
+              }`}
             >
               {covers.map((c) => {
                 const isSelected = c.path === effectiveSelected;
@@ -843,10 +1020,11 @@ export function CoversDialog({
                           : "ring-1 ring-foreground/10 group-hover:ring-foreground/25"
                       }`}
                     >
+                      {/* Not lazy: the reveal waits on these decoding, and a
+                          lazy image below the fold would never report. */}
                       <img
                         src={getCoverUrl(c.path)}
                         alt=""
-                        loading="lazy"
                         draggable={false}
                         className="h-auto w-full"
                       />
@@ -904,22 +1082,50 @@ export function CoversDialog({
               })}
             </div>
           )}
-
-        </div>
+          {/* The skeleton overlays the (invisible) grid from the moment it
+              appeared until the grid is shown — it stays MOUNTED through its
+              own fade-out, since an unmount/remount would skip it. */}
+          {!shown && skeletonSeen && (
+            <SkeletonTiles
+              className={`absolute inset-x-1.5 top-4 z-10 transition-opacity duration-200 ${
+                stage === "hidden" ? "" : "opacity-0"
+              }`}
+            />
+          )}
+        </DialogBody>
         <DialogFooter className="flex-wrap gap-2 sm:justify-start">
-          <Button variant="outline" size="sm" onClick={addLocal} disabled={busy}>
+          {/* All three wait for the covers to be shown — adding to a grid
+              that hasn't landed yet would race the initial fetch. */}
+          <Button variant="outline" size="sm" onClick={addLocal} disabled={busy || !shown}>
             <FolderOpen size={14} />
             Add local…
           </Button>
-          {target.kind === "release" && (
-            <Button variant="outline" size="sm" onClick={() => setCaaOpen(true)} disabled={busy || caaOpen}>
-              <Globe size={14} />
-              Add from MusicBrainz…
-              {caaSlow && <Spinner className="size-3.5" />}
-            </Button>
-          )}
+          {target.kind === "release" &&
+            (mbMatched ? (
+              <Button variant="outline" size="sm" onClick={() => setCaaOpen(true)} disabled={busy || caaOpen || !shown}>
+                <Globe size={14} />
+                Add from MusicBrainz…
+              </Button>
+            ) : (
+              // Disabled buttons don't fire hover — the tooltip hangs off a
+              // wrapping span. (Before the fetch lands, mbMatched is false
+              // and the button reads disabled; harmless for the moment.)
+              <TooltipProvider>
+                <Tooltip>
+                  <TooltipTrigger render={<span className="inline-flex" />}>
+                    <Button variant="outline" size="sm" disabled>
+                      <Globe size={14} />
+                      Add from MusicBrainz…
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>
+                    Match this album to a MusicBrainz release group first to browse its cover art.
+                  </TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+            ))}
           {videoRemote && (
-            <Button variant="outline" size="sm" onClick={openTmdb} disabled={busy || tmdbPending}>
+            <Button variant="outline" size="sm" onClick={openTmdb} disabled={busy || tmdbPending || !shown}>
               <Globe size={14} />
               Add from TMDB…
               {tmdbSlow && <Spinner className="size-3.5" />}
@@ -928,17 +1134,17 @@ export function CoversDialog({
         </DialogFooter>
       </DialogContent>
 
-      {target.kind === "release" && caaOpen && (
+      {/* Both child browsers stay MOUNTED while closed: the shell fades a
+          closing dialog's content out on the way back to this one, and an
+          unmounted child would leave it fading an empty frame. */}
+      {target.kind === "release" && (
         <CaaImageBrowserDialog
           open={caaOpen}
-          onOpenChange={(o) => {
-            setCaaOpen(o);
-            if (!o) setCaaReady(false);
-          }}
-          onReady={() => setCaaReady(true)}
+          onOpenChange={setCaaOpen}
           libraryId={target.libraryId}
           albumId={target.albumId}
           releaseId={releaseId}
+          releaseMatched={mbReleaseMatched}
           title={target.title}
           onDownloaded={() => {
             refetch();
@@ -947,7 +1153,7 @@ export function CoversDialog({
         />
       )}
 
-      {tmdb && target.kind === "entry" && (
+      {target.kind === "entry" && (
         <TmdbImageBrowserDialog
           open={!!tmdb}
           onOpenChange={(o) => {
@@ -955,8 +1161,8 @@ export function CoversDialog({
           }}
           libraryId={target.libraryId}
           entryId={target.entryId}
-          tmdbId={tmdb.tmdbId}
-          mediaType={tmdb.mediaType}
+          tmdbId={tmdb?.tmdbId ?? ""}
+          mediaType={tmdb?.mediaType ?? "movie"}
           initialTab="posters"
           onDownloaded={() => {
             refetch();

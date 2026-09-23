@@ -589,6 +589,7 @@ pub async fn split_artist(
     artist_id: i64,
     members: Vec<String>,
 ) -> Result<String, String> {
+    crate::music_mb::ensure_entity_not_matching(&state.app_db, artist_id).await?;
     split_artist_inner(&state.app_db, artist_id, members).await
 }
 
@@ -955,6 +956,7 @@ pub async fn link_credit_name(
     name: String,
     target_artist_id: i64,
 ) -> Result<(), String> {
+    crate::music_mb::ensure_not_matching(&state.app_db, &library_id).await?;
     let pool = &state.app_db;
     let name = name.trim().to_string();
     if name.is_empty() {
@@ -1002,6 +1004,7 @@ pub async fn set_release_label(
     release_id: i64,
     label: String,
 ) -> Result<(), String> {
+    crate::music_mb::ensure_release_not_matching(&state.app_db, release_id).await?;
     let pool = &state.app_db;
     let label = label.trim().to_string();
     if label.is_empty() {
@@ -1047,6 +1050,7 @@ pub async fn set_disc_title(
     disc_no: i64,
     title: String,
 ) -> Result<(), String> {
+    crate::music_mb::ensure_release_not_matching(&state.app_db, release_id).await?;
     let pool = &state.app_db;
     let row: Option<(i64, String)> =
         sqlx::query_as("SELECT album_id, folder_path FROM album_release WHERE id = ?")
@@ -1092,6 +1096,7 @@ pub async fn set_default_release(
     state: State<'_, AppState>,
     release_id: i64,
 ) -> Result<(), String> {
+    crate::music_mb::ensure_release_not_matching(&state.app_db, release_id).await?;
     let pool = &state.app_db;
     let row: Option<(i64, String)> =
         sqlx::query_as("SELECT album_id, folder_path FROM album_release WHERE id = ?")
@@ -1152,6 +1157,7 @@ pub async fn set_release_cover(
     release_id: i64,
     cover: Option<String>,
 ) -> Result<(), String> {
+    crate::music_mb::ensure_release_not_matching(&state.app_db, release_id).await?;
     let pool = &state.app_db;
     let row: Option<(i64, String, i64)> =
         sqlx::query_as("SELECT album_id, folder_path, is_default FROM album_release WHERE id = ?")
@@ -1327,6 +1333,7 @@ pub async fn set_track_fields(
     track_id: i64,
     fields: HashMap<String, serde_json::Value>,
 ) -> Result<(), String> {
+    crate::music_mb::ensure_entity_not_matching(&state.app_db, track_id).await?;
     let pool = &state.app_db;
     let (library_id, _rel) = track_context(pool, track_id).await?;
     let credits_before = track_credit_names(pool, track_id).await?;
@@ -1394,6 +1401,7 @@ pub async fn reset_track_fields(
     state: State<'_, AppState>,
     track_id: i64,
 ) -> Result<(), String> {
+    crate::music_mb::ensure_entity_not_matching(&state.app_db, track_id).await?;
     let pool = &state.app_db;
     let (library_id, rel) = track_context(pool, track_id).await?;
     let credits_before = track_credit_names(pool, track_id).await?;
@@ -2062,6 +2070,7 @@ pub async fn set_album_fields(
     album_id: i64,
     fields: HashMap<String, serde_json::Value>,
 ) -> Result<(), String> {
+    crate::music_mb::ensure_entity_not_matching(&state.app_db, album_id).await?;
     let pool = &state.app_db;
     ensure_not_staged(pool, album_id).await?;
     // Before-images so a save that leaves these untouched changes nothing
@@ -2185,6 +2194,7 @@ pub async fn set_artist_fields(
     artist_id: i64,
     fields: HashMap<String, serde_json::Value>,
 ) -> Result<(), String> {
+    crate::music_mb::ensure_entity_not_matching(&state.app_db, artist_id).await?;
     let pool = &state.app_db;
     ensure_not_staged(pool, artist_id).await?;
     let mut renamed = false;
@@ -2262,6 +2272,7 @@ pub async fn reset_artist_fields(
     state: State<'_, AppState>,
     artist_id: i64,
 ) -> Result<(), String> {
+    crate::music_mb::ensure_entity_not_matching(&state.app_db, artist_id).await?;
     let pool = &state.app_db;
     ensure_not_staged(pool, artist_id).await?;
     sqlx::query(&clear_user_edits_sql(ARTIST_FIELDS))
@@ -2283,6 +2294,7 @@ pub async fn reset_album_fields(
     state: State<'_, AppState>,
     album_id: i64,
 ) -> Result<(), String> {
+    crate::music_mb::ensure_entity_not_matching(&state.app_db, album_id).await?;
     let pool = &state.app_db;
     ensure_not_staged(pool, album_id).await?;
     sqlx::query(&clear_user_edits_sql(ALBUM_FIELDS))
@@ -2552,6 +2564,7 @@ pub async fn combine_albums_multi(
     // Which keeper edition a merge lands in (its folder). None = default.
     target_release_folder: Option<String>,
 ) -> Result<(), String> {
+    crate::music_mb::ensure_not_matching(&state.app_db, &library_id).await?;
     let pool = &state.app_db;
     if !matches!(mode.as_str(), "merge" | "versions") {
         return Err(format!("Invalid combine mode: {mode}"));
@@ -3437,6 +3450,7 @@ pub async fn split_album_release(
     state: State<'_, AppState>,
     release_id: i64,
 ) -> Result<String, String> {
+    crate::music_mb::ensure_release_not_matching(&state.app_db, release_id).await?;
     let pool = &state.app_db;
     let (album_id, folder_path): (i64, String) =
         sqlx::query_as("SELECT album_id, folder_path FROM album_release WHERE id = ?")
@@ -3533,6 +3547,7 @@ pub async fn merge_album_release(
     release_id: i64,
     into_release_id: i64,
 ) -> Result<String, String> {
+    crate::music_mb::ensure_release_not_matching(&state.app_db, release_id).await?;
     let pool = &state.app_db;
     if release_id == into_release_id {
         return Err("Pick a different release to merge into".to_string());
@@ -3645,6 +3660,7 @@ pub async fn separate_merged_folders(
     state: State<'_, AppState>,
     release_id: i64,
 ) -> Result<String, String> {
+    crate::music_mb::ensure_release_not_matching(&state.app_db, release_id).await?;
     let pool = &state.app_db;
     let (album_id, folder_path): (i64, String) =
         sqlx::query_as("SELECT album_id, folder_path FROM album_release WHERE id = ?")

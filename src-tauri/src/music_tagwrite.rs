@@ -1126,6 +1126,7 @@ pub async fn get_tag_write_plan(state: State<'_, AppState>, scope: String, id: i
 /// and its tiers brought in step.
 #[tauri::command]
 pub async fn apply_tag_write(state: State<'_, AppState>, scope: String, id: i64) -> Result<TagWriteOutcome, String> {
+    crate::music_mb::ensure_entity_not_matching(&state.app_db, id).await?;
     let pool = &state.app_db;
     let library_id = library_of(pool, id).await?;
     let (_, mut jobs, _) = prepare(pool, &scope, id).await?;

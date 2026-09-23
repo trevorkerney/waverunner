@@ -6,6 +6,8 @@ import "./App.css";
 import { Titlebar } from "@/components/Titlebar";
 import { Sidebar } from "@/components/Sidebar";
 import { MainContent } from "@/components/MainContent";
+import { useLibraryRunsHost } from "@/hooks/libraryRuns";
+import { LibraryRunBanner, LibraryScanView } from "@/components/LibraryRunUi";
 import { PlayerView } from "@/components/PlayerView";
 import { usePlayer } from "@/hooks/usePlayer";
 import { useMusicPlayer, currentMusicItem } from "@/hooks/useMusicPlayer";
@@ -1279,9 +1281,10 @@ function App() {
 
   const selectLibrary = useCallback(
     (library: Library) => {
-      // Unfinished imports aren't browsable — the sidebar routes their clicks
-      // into the wizard; this guards the launch-default path too.
-      if (library.setup_stage) return;
+      // A paused first-time import (scan incomplete) isn't browsable — the
+      // sidebar row resumes its scan instead. Libraries paused at the match
+      // question ARE browsable; the question rides their page as a banner.
+      if (library.setup_stage === "scan") return;
       // Sidebar library clicks land at the top like other sidebar switches.
       const view: ViewSpec = { kind: "library-root", libraryId: library.id };
       setActiveView(view);
@@ -1310,57 +1313,110 @@ function App() {
     setBreadcrumbs([{ id: null, title: "Home", view }]);
   }, [saveScrollPosition]);
 
-  // Libraries with a scan/rescan in flight. Mid-scan the DB is genuinely
-  // inconsistent (albums reconciling, tracks reparenting), so these libraries
-  // lock in the sidebar and anyone browsing one gets bounced to Home. Driven
-  // by backend scan-state beacons so EVERY scan entry point (wizard create,
-  // wizard rescan, grid context menu, combine-albums, manage-folders) counts.
-  const [scanningLibs, setScanningLibs] = useState<Set<string>>(new Set());
-  useEffect(() => {
-    const unlisten = listen<{ libraryId: string; state: string }>("scan-state", (event) => {
-      const { libraryId, state: scanState } = event.payload;
-      setScanningLibs((prev) => {
-        const next = new Set(prev);
-        if (scanState === "started") next.add(libraryId);
-        else next.delete(libraryId);
-        return next;
-      });
-      if (scanState === "started") {
-        const v = navStateRef.current.view;
-        if (v && "libraryId" in v && v.libraryId === libraryId) openHome();
-      }
-    });
-    return () => {
-      unlisten.then((fn) => fn());
-    };
-  }, [openHome]);
+  // Library runs (hooks/libraryRuns): scans lock their library and show the
+  // scan view in place of its page; the match question and the running pass
+  // are a banner over a browsable library (the backend refuses edits while a
+  // pass runs — no frontend lock). Registered further down, once the
+  // navigation helpers it calls exist.
+  const openScanning = useCallback((libraryId: string, name?: string) => {
+    saveScrollPosition();
+    const view: ViewSpec = { kind: "library-root", libraryId };
+    setActiveView(view);
+    setSelectedEntry(null);
+    setSearch("");
+    pushHistory();
+    const lib = libraries.find((l) => l.id === libraryId);
+    setBreadcrumbs([{ id: null, title: name ?? lib?.name ?? "New library", view }]);
+  }, [libraries, saveScrollPosition]);
 
-  // A matching pass rewrites albums, artists and credits as it runs, so the
-  // library it's working on is locked exactly like a scanning one: bounce out
-  // of it when a pass starts, and let the sidebar render it as busy. Without
-  // this, minimizing the match modal left the library fully browsable and
-  // editable underneath a live pass.
-  const [passLibs, setPassLibs] = useState<Set<string>>(new Set());
-  useEffect(() => {
-    const unIter = listen<{ libraryId: string }>("music-enrich-iteration", (e) => {
-      const { libraryId } = e.payload;
-      setPassLibs((prev) => (prev.has(libraryId) ? prev : new Set(prev).add(libraryId)));
+  /** A library's contents changed (scan landed, pass finished): drop its
+   *  caches and refresh whatever's showing, silently. */
+  const afterLibraryChanged = useCallback((lib: Library) => {
+    invalidateCache(lib.id);
+    // Silent in-place refresh — no loading flash; the grid (and any open
+    // detail page's backing grid) quietly picks up new metadata.
+    refreshGridInPlace();
+    // Self-fetching pages (Tracks, needs-attention) aren't backed by the
+    // grid caches above — they refetch on this event.
+    window.dispatchEvent(new Event("waverunner:library-rescanned"));
+    if (lib.format === "music") {
+      refreshMusicCountsFor(lib.id);
+      refreshGenresFor(lib.id);
+    } else {
+      refreshCountsFor(lib.id);
+      refreshGenresFor(lib.id);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshGridInPlace, refreshMusicCountsFor, refreshCountsFor, refreshGenresFor]);
+
+  const runs = useLibraryRunsHost(libraries, {
+    onLibrariesChanged: loadLibraries,
+    onScanStarted: (libraryId, name, isCreate) => {
+      // A new library opens on its scan view; a rescan of the library
+      // being browsed resets to its root (the page under it is being
+      // rewritten) — anywhere else, the sidebar row's spinner is enough.
       const v = navStateRef.current.view;
-      if (v && "libraryId" in v && v.libraryId === libraryId) openHome();
-    });
-    const unDone = listen<{ libraryId: string }>("music-enrich-done", (e) => {
-      setPassLibs((prev) => {
-        if (!prev.has(e.payload.libraryId)) return prev;
-        const next = new Set(prev);
-        next.delete(e.payload.libraryId);
-        return next;
-      });
-    });
-    return () => {
-      unIter.then((fn) => fn());
-      unDone.then((fn) => fn());
+      if (isCreate || (v && v.libraryId === libraryId)) openScanning(libraryId, name);
+    },
+    onScanFinished: async (libraryId) => {
+      invalidateCache(libraryId);
+      let libs: Library[] = [];
+      try {
+        libs = await invoke<Library[]>("get_libraries");
+        setLibraries(libs);
+      } catch (e) {
+        console.error(e);
+        return;
+      }
+      const lib = libs.find((l) => l.id === libraryId);
+      if (!lib) return;
+      const v = navStateRef.current.view;
+      if (v && v.libraryId === libraryId) {
+        // Land on the root grid, freshly loaded.
+        const view: ViewSpec = { kind: "library-root", libraryId };
+        setActiveView(view);
+        setSelectedEntry(null);
+        void loadView(view, null, [
+          { id: null, title: `${lib.name} - ${lib.format === "music" ? "Artists" : "All"}`, view },
+        ], false);
+      }
+      afterLibraryChanged(lib);
+    },
+    onRunFinished: (libraryId, _format, matched) => {
+      const lib = libraries.find((l) => l.id === libraryId);
+      if (lib) afterLibraryChanged(lib);
+      if (matched) {
+        toast.success("Matching finished", {
+          action: {
+            label: "Open Metadata",
+            onClick: () => selectView({ kind: "metadata", libraryId }),
+          },
+        });
+      }
+    },
+  });
+
+  // Rescan / "run a matching pass" requests from surfaces that can't reach
+  // the controller directly (the grid context menu, the Metadata page's
+  // strips and footer) arrive as window events.
+  useEffect(() => {
+    const onOpenRescan = (e: Event) => {
+      const libraryId = (e as CustomEvent).detail?.libraryId as string | undefined;
+      const lib = libraries.find((l) => l.id === libraryId);
+      if (lib) void runs.rescan(lib);
     };
-  }, [openHome]);
+    const onOpenMatch = (e: Event) => {
+      const libraryId = (e as CustomEvent).detail?.libraryId as string | undefined;
+      const lib = libraries.find((l) => l.id === libraryId);
+      if (lib) void runs.startMatch(lib);
+    };
+    window.addEventListener("waverunner:open-rescan", onOpenRescan);
+    window.addEventListener("waverunner:open-match", onOpenMatch);
+    return () => {
+      window.removeEventListener("waverunner:open-rescan", onOpenRescan);
+      window.removeEventListener("waverunner:open-match", onOpenMatch);
+    };
+  }, [libraries, runs]);
 
   // Pending "Needs a decision" entries do NOT lock the library — the user
   // decided metadata questions are the metadata center's business, not a
@@ -1375,10 +1431,10 @@ function App() {
   const openEntryFromHome = useCallback(
     (libraryId: string, entry: MediaEntry, focusTrackId?: number) => {
       const lib = libraries.find((l) => l.id === libraryId);
-      if (!lib || lib.setup_stage) return;
-      if (scanningLibs.has(libraryId) || passLibs.has(libraryId)) {
+      if (!lib || lib.setup_stage === "scan") return;
+      if (runs.isScanning(libraryId)) {
         // Say WHY the click did nothing — a silent no-op reads as broken.
-        toast.info(`“${lib.name}” is being updated — available again when it finishes.`);
+        toast.info(`“${lib.name}” is being scanned — available again when it finishes.`);
         return;
       }
       saveScrollPosition(); // Home's scroll, for the return trip
@@ -1405,7 +1461,7 @@ function App() {
         setMusicFocusRequest({ albumId: entry.id, trackId: focusTrackId, nonce: musicFocusNonceRef.current });
       }
     },
-    [libraries, saveScrollPosition, scanningLibs, passLibs]
+    [libraries, saveScrollPosition, runs]
   );
 
   // Album-less recently-played tiles land on the LOOSE TRACKS page (their
@@ -1414,10 +1470,10 @@ function App() {
   const openTrackFromHome = useCallback(
     (libraryId: string, trackId: number) => {
       const lib = libraries.find((l) => l.id === libraryId);
-      if (!lib || lib.setup_stage) return;
-      if (scanningLibs.has(libraryId) || passLibs.has(libraryId)) {
+      if (!lib || lib.setup_stage === "scan") return;
+      if (runs.isScanning(libraryId)) {
         // Say WHY the click did nothing — a silent no-op reads as broken.
-        toast.info(`“${lib.name}” is being updated — available again when it finishes.`);
+        toast.info(`“${lib.name}” is being scanned — available again when it finishes.`);
         return;
       }
       saveScrollPosition(); // Home's scroll, for the return trip
@@ -1438,7 +1494,7 @@ function App() {
       musicFocusNonceRef.current += 1;
       setTracksFocusRequest({ trackId, nonce: musicFocusNonceRef.current });
     },
-    [libraries, saveScrollPosition, scanningLibs, passLibs]
+    [libraries, saveScrollPosition, runs]
   );
 
   // Open the default library on launch, once libraries AND settings have both
@@ -1942,9 +1998,9 @@ function App() {
       // walk into a library mid-scan or mid-pass (its data is being
       // rewritten under the page it would open).
       const barLib = libraries.find((l) => l.id === libId);
-      if (barLib?.setup_stage) return;
-      if (scanningLibs.has(libId) || passLibs.has(libId)) {
-        toast.info(`“${barLib?.name ?? "Library"}” is being updated — available again when it finishes.`);
+      if (barLib?.setup_stage === "scan") return;
+      if (runs.isScanning(libId)) {
+        toast.info(`“${barLib?.name ?? "Library"}” is being scanned — available again when it finishes.`);
         return;
       }
       if (selectedLibrary?.id === libId) {
@@ -1965,7 +2021,7 @@ function App() {
       setSearch("");
       setBreadcrumbs([...canonicalPrefix(crumb, libId), crumb]);
     },
-    [selectedLibrary, navigateTo, canonicalPrefix, saveScrollPosition, pushHistory, libraries, scanningLibs, passLibs]
+    [selectedLibrary, navigateTo, canonicalPrefix, saveScrollPosition, pushHistory, libraries, runs]
   );
 
   const openMusicAlbumFromBar = useCallback(
@@ -2955,6 +3011,18 @@ function App() {
     return () => window.removeEventListener("keydown", handleKey, true);
   }, [playerState.isActive, playerState.volume, playerState.isFullscreen, playerState.context.kind, playerActions]);
 
+  // The run (scan / match question / running pass) of the library being
+  // looked at, if any — decides what the content area shows.
+  const activeRun = runs.runFor(activeView?.libraryId);
+
+  // A library left at its match question (setup row still says "match")
+  // with no run — the app was closed in between: re-ask when it's opened.
+  useEffect(() => {
+    if (!selectedLibrary || !selectedLibrary.setup_stage || selectedLibrary.setup_stage === "scan") return;
+    if (runs.runFor(selectedLibrary.id)) return;
+    void runs.resumePrompt(selectedLibrary);
+  }, [selectedLibrary, runs]);
+
   return (
     <div className="flex h-screen flex-col overflow-hidden">
       {!(playerState.isActive && playerState.isFullscreen) && <Titlebar />}
@@ -2996,7 +3064,6 @@ function App() {
           onSelectView={selectView}
           defaultLibraryId={defaultLibraryId ?? null}
           onSetDefaultLibrary={changeDefaultLibrary}
-          onLibraryCreated={loadLibraries}
           onLibraryDeleted={async (deletedId) => {
             invalidateCache();
             try {
@@ -3045,29 +3112,7 @@ function App() {
               );
             }
           }}
-          onLibraryRescanned={(libId) => {
-            // Prefer the wizard-reported library — the SELECTED one can be
-            // anything by completion time (rescans bounce the user to Home).
-            const lib = (libId && libraries.find((l) => l.id === libId)) || selectedLibrary;
-            if (lib) {
-              invalidateCache(lib.id);
-              // Silent in-place refresh — no loading flash; the grid (and any
-              // open detail page's backing grid) quietly picks up new metadata.
-              refreshGridInPlace();
-              // Self-fetching pages (Tracks, needs-attention) aren't backed by
-              // the grid caches above — they refetch on this event.
-              window.dispatchEvent(new Event("waverunner:library-rescanned"));
-              // Counts and genres may have changed after a rescan. Music
-              // libraries have their own counts shape.
-              if (lib.format === "music") {
-                refreshMusicCountsFor(lib.id);
-                refreshGenresFor(lib.id);
-              } else {
-                refreshCountsFor(lib.id);
-                refreshGenresFor(lib.id);
-              }
-            }
-          }}
+          onOpenScanning={(libraryId) => openScanning(libraryId)}
           onPlaylistChanged={handlePlaylistChanged}
           sidebarPlaylists={sidebarPlaylists}
           sidebarCounts={sidebarCounts}
@@ -3076,8 +3121,6 @@ function App() {
           playerActions={playerActions}
           onOpenHome={openHome}
           homeActive={activeView?.kind === "home"}
-          scanningLibs={scanningLibs}
-          passLibs={passLibs}
           backgroundJobs={backgroundJobs}
           onOpenJob={(job) => {
             // The preload has its own window; everything else lands on the
@@ -3096,121 +3139,132 @@ function App() {
               : null
           }
         />
-        <MainContent
-          entries={entries}
-          people={people}
-          playlists={playlists}
-          genres={genres}
-          activeView={activeView}
-          searchResults={searchResults}
-          selectedEntry={selectedEntry}
-          loading={loading}
-          breadcrumbs={breadcrumbs}
-          coverSize={coverSize}
-          onCoverSizeChange={changeCoverSize}
-          search={search}
-          onSearchChange={setSearch}
-          onNavigate={navigateTo}
-          musicFocusRequest={musicFocusRequest}
-          onNavigateToPerson={navigateToPerson}
-          onTogglePersonFavorite={togglePersonFavorite}
-          peopleMode={
-            activeView && (activeView.kind === "people-all" || activeView.kind === "people-list")
-              ? peopleModeRef.current.get(viewCacheKey(activeView)) ?? "all"
-              : "all"
-          }
-          onPeopleModeChange={(mode) => {
-            if (activeView && (activeView.kind === "people-all" || activeView.kind === "people-list")) {
-              const key = viewCacheKey(activeView);
-              peopleModeRef.current.set(key, mode);
-              invoke("set_setting", { key: `people_mode:${key}`, value: mode }).catch(() => {});
+        {/* The library's page — or, while its scan runs, the scan view in
+            its place; a match question / running pass rides above it. */}
+        {activeRun?.kind === "scan" ? (
+          <LibraryScanView run={activeRun} />
+        ) : (
+          <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
+            {activeRun?.kind === "prompt" && selectedLibrary && (
+              <LibraryRunBanner run={activeRun} library={selectedLibrary} />
+            )}
+          <MainContent
+            entries={entries}
+            people={people}
+            playlists={playlists}
+            genres={genres}
+            activeView={activeView}
+            searchResults={searchResults}
+            selectedEntry={selectedEntry}
+            loading={loading}
+            breadcrumbs={breadcrumbs}
+            coverSize={coverSize}
+            onCoverSizeChange={changeCoverSize}
+            search={search}
+            onSearchChange={setSearch}
+            onNavigate={navigateTo}
+            musicFocusRequest={musicFocusRequest}
+            onNavigateToPerson={navigateToPerson}
+            onTogglePersonFavorite={togglePersonFavorite}
+            peopleMode={
+              activeView && (activeView.kind === "people-all" || activeView.kind === "people-list")
+                ? peopleModeRef.current.get(viewCacheKey(activeView)) ?? "all"
+                : "all"
             }
-          }}
-          onNavigateToPlaylist={navigateToPlaylist}
-          onSelectGenre={navigateToGenre}
-          onPlaylistChanged={handlePlaylistChanged}
-          onSoundCollectionsChanged={(libId) => {
-            // Same recipe as a rescan landing: drop caches, refresh the grid
-            // silently, and let self-fetching surfaces (loose sections, open
-            // collection pages) refetch off the event.
-            invalidateCache(libId);
-            refreshGridInPlace();
-            window.dispatchEvent(new Event("waverunner:library-rescanned"));
-            refreshMusicCountsFor(libId);
-          }}
-          onOpenLooseTracks={openLooseTracks}
-          looseCount={looseCount}
-          selectedLibrary={selectedLibrary}
-          sortMode={sortMode}
-          onSortModeChange={changeSortMode}
-          presets={presets}
-          selectedPresetId={selectedPresetId}
-          onChangePreset={changePreset}
-          onSavePreset={savePreset}
-          onDeletePreset={deletePreset}
-          onSortOrderChange={updateSortOrder}
-          onRenameEntry={renameEntry}
-          onTitleChanged={applyTitleChange}
-          onSetCover={setCover}
-          onAddCover={addCover}
-          onDeleteCover={deleteCover}
-          onMoveEntry={moveEntry}
-          onCreateCollection={createCollection}
-          onDeleteEntry={deleteEntry}
-          onEntryChanged={() => {
-            if (selectedLibrary) {
-              // Invalidate all ancestor grids so going back shows fresh data (e.g. updated year ranges on collections)
-              for (let i = 0; i < breadcrumbs.length - 1; i++) {
-                invalidateCache(selectedLibrary.id, breadcrumbs[i]?.id ?? null);
+            onPeopleModeChange={(mode) => {
+              if (activeView && (activeView.kind === "people-all" || activeView.kind === "people-list")) {
+                const key = viewCacheKey(activeView);
+                peopleModeRef.current.set(key, mode);
+                invoke("set_setting", { key: `people_mode:${key}`, value: mode }).catch(() => {});
               }
-              // Aggregate views (movies-only, shows-only, playlists) also reference
-              // this entry and cache its cover pool, but they aren't ancestors — and
-              // a filtered-view detail page may have no ancestor crumb at all, so the
-              // loop above can skip them entirely. Explicitly drop the library's
-              // view-entry caches so a newly added cover/metadata shows up next time
-              // any of them is opened (e.g. the same movie referenced in a playlist).
-              invalidateCache(selectedLibrary.id, breadcrumbs[breadcrumbs.length - 1]?.id ?? null);
-              // Also refresh the in-memory grid entries behind the detail page so
-              // derived fields (year, end_year, covers, season_display) update when
-              // the user hits back — cache invalidation alone only helps on view-switch.
+            }}
+            onNavigateToPlaylist={navigateToPlaylist}
+            onSelectGenre={navigateToGenre}
+            onPlaylistChanged={handlePlaylistChanged}
+            onSoundCollectionsChanged={(libId) => {
+              // Same recipe as a rescan landing: drop caches, refresh the grid
+              // silently, and let self-fetching surfaces (loose sections, open
+              // collection pages) refetch off the event.
+              invalidateCache(libId);
               refreshGridInPlace();
+              window.dispatchEvent(new Event("waverunner:library-rescanned"));
+              refreshMusicCountsFor(libId);
+            }}
+            onOpenLooseTracks={openLooseTracks}
+            looseCount={looseCount}
+            selectedLibrary={selectedLibrary}
+            sortMode={sortMode}
+            onSortModeChange={changeSortMode}
+            presets={presets}
+            selectedPresetId={selectedPresetId}
+            onChangePreset={changePreset}
+            onSavePreset={savePreset}
+            onDeletePreset={deletePreset}
+            onSortOrderChange={updateSortOrder}
+            onRenameEntry={renameEntry}
+            onTitleChanged={applyTitleChange}
+            onSetCover={setCover}
+            onAddCover={addCover}
+            onDeleteCover={deleteCover}
+            onMoveEntry={moveEntry}
+            onCreateCollection={createCollection}
+            onDeleteEntry={deleteEntry}
+            onEntryChanged={() => {
+              if (selectedLibrary) {
+                // Invalidate all ancestor grids so going back shows fresh data (e.g. updated year ranges on collections)
+                for (let i = 0; i < breadcrumbs.length - 1; i++) {
+                  invalidateCache(selectedLibrary.id, breadcrumbs[i]?.id ?? null);
+                }
+                // Aggregate views (movies-only, shows-only, playlists) also reference
+                // this entry and cache its cover pool, but they aren't ancestors — and
+                // a filtered-view detail page may have no ancestor crumb at all, so the
+                // loop above can skip them entirely. Explicitly drop the library's
+                // view-entry caches so a newly added cover/metadata shows up next time
+                // any of them is opened (e.g. the same movie referenced in a playlist).
+                invalidateCache(selectedLibrary.id, breadcrumbs[breadcrumbs.length - 1]?.id ?? null);
+                // Also refresh the in-memory grid entries behind the detail page so
+                // derived fields (year, end_year, covers, season_display) update when
+                // the user hits back — cache invalidation alone only helps on view-switch.
+                refreshGridInPlace();
+              }
+            }}
+            getCoverUrl={getCoverUrl}
+            getCoverAspect={getCoverAspect}
+            getFullCoverUrl={getFullCoverUrl}
+            scrollContainerRef={scrollContainerRef}
+            onPlayFile={handlePlayFile}
+            onPlayInteractive={handlePlayInteractive}
+            onPlayEpisode={handlePlayEpisode}
+            onPlayMusicQueue={handlePlayMusicQueue}
+            onEnqueueMusic={handleEnqueueMusic}
+            onOpenMusicAlbum={openMusicAlbumFromBar}
+            onOpenMusicArtist={openMusicArtistFromBar}
+            onOpenLibraryEntry={openEntryFromHome}
+            onOpenLibraryTrack={openTrackFromHome}
+            musicTracksFocusRequest={tracksFocusRequest}
+            musicCurrentTrackId={
+              musicState.isActive ? currentMusicItem(musicState)?.trackId ?? null : null
             }
-          }}
-          getCoverUrl={getCoverUrl}
-          getCoverAspect={getCoverAspect}
-          getFullCoverUrl={getFullCoverUrl}
-          scrollContainerRef={scrollContainerRef}
-          onPlayFile={handlePlayFile}
-          onPlayInteractive={handlePlayInteractive}
-          onPlayEpisode={handlePlayEpisode}
-          onPlayMusicQueue={handlePlayMusicQueue}
-          onEnqueueMusic={handleEnqueueMusic}
-          onOpenMusicAlbum={openMusicAlbumFromBar}
-          onOpenMusicArtist={openMusicArtistFromBar}
-          onOpenLibraryEntry={openEntryFromHome}
-          onOpenLibraryTrack={openTrackFromHome}
-          musicTracksFocusRequest={tracksFocusRequest}
-          musicCurrentTrackId={
-            musicState.isActive ? currentMusicItem(musicState)?.trackId ?? null : null
-          }
-          musicPlaying={musicState.isActive && musicState.isPlaying}
-          metadataFocus={mbReviewFocus}
-          onOpenMusicAlbumFromMetadata={openMusicAlbumFromCenter}
-          hasLibraries={libraries.length > 0}
-          onMetadataChanged={(libraryId) => {
-            // A match/undo landed on the page — same recipe as a rescan:
-            // drop caches, silently refresh the grid, and let self-fetching
-            // pages (Tracks, open album/artist details) refetch off the
-            // event. Video libraries just drop caches.
-            invalidateCache(libraryId);
-            const lib = libraries.find((l) => l.id === libraryId);
-            if (lib?.format !== "music") return;
-            refreshGridInPlace();
-            window.dispatchEvent(new Event("waverunner:library-rescanned"));
-            refreshMusicCountsFor(libraryId);
-            refreshGenresFor(libraryId);
-          }}
-        />
+            musicPlaying={musicState.isActive && musicState.isPlaying}
+            metadataFocus={mbReviewFocus}
+            onOpenMusicAlbumFromMetadata={openMusicAlbumFromCenter}
+            hasLibraries={libraries.length > 0}
+            onMetadataChanged={(libraryId) => {
+              // A match/undo landed on the page — same recipe as a rescan:
+              // drop caches, silently refresh the grid, and let self-fetching
+              // pages (Tracks, open album/artist details) refetch off the
+              // event. Video libraries just drop caches.
+              invalidateCache(libraryId);
+              const lib = libraries.find((l) => l.id === libraryId);
+              if (lib?.format !== "music") return;
+              refreshGridInPlace();
+              window.dispatchEvent(new Event("waverunner:library-rescanned"));
+              refreshMusicCountsFor(libraryId);
+              refreshGenresFor(libraryId);
+            }}
+          />
+          </div>
+        )}
       </div>
       {/* Persistent music bar — spans under sidebar + content, survives every
           view switch. Suppressed while the video player takes the window. */}

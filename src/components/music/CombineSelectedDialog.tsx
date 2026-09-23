@@ -95,7 +95,7 @@ export function CombineSelectedDialog({
 
   return (
     <Dialog open={configuring} onOpenChange={(o) => !busy && onOpenChange(o)}>
-      <DialogContent className="sm:max-w-lg">
+      <DialogContent size="lg">
         <DialogHeader>
           <DialogTitle>Combine {picked.length} albums</DialogTitle>
           <DialogDescription>

@@ -50,7 +50,7 @@ export function BackdropSelectDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-h-[80vh] w-[720px] max-w-[90vw] overflow-y-auto">
+      <DialogContent width="720px" className="max-h-[80vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>Select Backdrop</DialogTitle>
         </DialogHeader>

@@ -36,6 +36,68 @@ pub(crate) fn pass_running() -> bool {
     RUNNING.load(Ordering::SeqCst)
 }
 
+/// Which library the running pass is working on (None = no pass).
+static PASS_LIBRARY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+pub(crate) fn pass_library() -> Option<String> {
+    PASS_LIBRARY.lock().ok().and_then(|g| g.clone())
+}
+
+fn set_pass_library(library_id: Option<&str>) {
+    if let Ok(mut g) = PASS_LIBRARY.lock() {
+        *g = library_id.map(|s| s.to_string());
+    }
+}
+
+/// The pass rewrites albums, artists and credits as it runs; a user edit
+/// racing it has no defined outcome. The library stays browsable and
+/// playable while a pass runs (2026-09-22, replacing the frontend lock that
+/// bounced the user out) — every WRITE command checks here instead and
+/// reports why it did nothing. Three keys: the library, an entity in it, or
+/// a release (album_release row) of an album in it.
+pub(crate) async fn ensure_not_matching(pool: &SqlitePool, library_id: &str) -> Result<(), String> {
+    if pass_library().as_deref() != Some(library_id) {
+        return Ok(());
+    }
+    let name: Option<(String,)> = sqlx::query_as("SELECT name FROM library WHERE id = ?")
+        .bind(library_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    let name = name.map(|(n,)| n).unwrap_or_else(|| "This library".to_string());
+    Err(format!(
+        "\u{201c}{name}\u{201d} is being matched \u{2014} edits are available again when the pass finishes"
+    ))
+}
+
+pub(crate) async fn ensure_entity_not_matching(pool: &SqlitePool, entity_id: i64) -> Result<(), String> {
+    let Some(lib) = pass_library() else { return Ok(()) };
+    let row: Option<(String,)> = sqlx::query_as("SELECT library_id FROM media_entry WHERE id = ?")
+        .bind(entity_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    match row {
+        Some((l,)) if l == lib => ensure_not_matching(pool, &l).await,
+        _ => Ok(()),
+    }
+}
+
+pub(crate) async fn ensure_release_not_matching(pool: &SqlitePool, release_id: i64) -> Result<(), String> {
+    if pass_library().is_none() {
+        return Ok(());
+    }
+    let row: Option<(i64,)> = sqlx::query_as("SELECT album_id FROM album_release WHERE id = ?")
+        .bind(release_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    match row {
+        Some((album_id,)) => ensure_entity_not_matching(pool, album_id).await,
+        None => Ok(()),
+    }
+}
+
 const MB_MIN_SCORE: i64 = 90;
 const REQUEST_GAP: std::time::Duration = std::time::Duration::from_millis(1100);
 
@@ -173,6 +235,7 @@ pub fn spawn_enrich(app: AppHandle, library_id: String) {
     if RUNNING.swap(true, Ordering::SeqCst) {
         return; // a pass is already running
     }
+    set_pass_library(Some(&library_id));
     CANCEL.store(false, Ordering::SeqCst);
     // Fresh pass, fresh cache — see the pass-wide fetch cache block.
     clear_pass_caches();
@@ -211,6 +274,7 @@ pub fn spawn_enrich(app: AppHandle, library_id: String) {
             Ok::<EnrichOutcome, String>(total)
         }
         .await;
+        set_pass_library(None);
         RUNNING.store(false, Ordering::SeqCst);
         match result {
             Ok(outcome) => {
@@ -994,6 +1058,7 @@ pub async fn mb_set_ignored(
     entity_id: i64,
     ignored: bool,
 ) -> Result<(), String> {
+    ensure_entity_not_matching(&state.app_db, entity_id).await?;
     let pool = &state.app_db;
     crate::music_edit::ensure_not_staged(pool, entity_id).await?;
     let library_id = library_of(pool, entity_id).await?;
@@ -1041,6 +1106,7 @@ pub async fn mb_set_partial(
     entity_id: i64,
     partial: bool,
 ) -> Result<(), String> {
+    ensure_entity_not_matching(&state.app_db, entity_id).await?;
     let pool = &state.app_db;
     crate::music_edit::ensure_not_staged(pool, entity_id).await?;
     let library_id = library_of(pool, entity_id).await?;
@@ -1093,6 +1159,7 @@ pub async fn mb_set_release_no_mb(
     release_db_id: Option<i64>,
     declared: bool,
 ) -> Result<(), String> {
+    ensure_entity_not_matching(&state.app_db, entity_id).await?;
     let pool = &state.app_db;
     crate::music_edit::ensure_not_staged(pool, entity_id).await?;
     let library_id = library_of(pool, entity_id).await?;
@@ -2119,6 +2186,7 @@ pub async fn set_artist_persona(
     persona_id: i64,
     parent_id: i64,
 ) -> Result<(), String> {
+    ensure_entity_not_matching(&state.app_db, persona_id).await?;
     let pool = &state.app_db;
     crate::music_edit::ensure_not_staged(pool, persona_id).await?;
     crate::music_edit::ensure_not_staged(pool, parent_id).await?;
@@ -2192,6 +2260,7 @@ pub async fn unset_artist_persona(
     state: State<'_, AppState>,
     persona_id: i64,
 ) -> Result<(), String> {
+    ensure_entity_not_matching(&state.app_db, persona_id).await?;
     let pool = &state.app_db;
     let library_id = library_of(pool, persona_id).await?;
     let Some((prev_parent,)): Option<(i64,)> =
@@ -4566,6 +4635,7 @@ pub async fn mb_resolve_cluster(
     merge_artist_ids: Vec<i64>,
     merge_names: Vec<String>,
 ) -> Result<(), String> {
+    ensure_not_matching(&state.app_db, &library_id).await?;
     let pool = &state.app_db;
     crate::music_edit::ensure_not_staged(pool, survivor_id).await?;
     for id in &merge_artist_ids {
@@ -4659,6 +4729,7 @@ pub async fn mb_keep_separate(
     library_id: String,
     name: String,
 ) -> Result<(), String> {
+    ensure_not_matching(&state.app_db, &library_id).await?;
     let pool = &state.app_db;
     let name = name.trim().to_string();
     if name.is_empty() {
@@ -5276,6 +5347,7 @@ pub async fn mb_undo_batch(
     library_id: String,
     batch_id: i64,
 ) -> Result<(), String> {
+    ensure_not_matching(&state.app_db, &library_id).await?;
     let rows: Vec<(i64,)> = sqlx::query_as(
         "SELECT id FROM mb_change_log
          WHERE library_id = ? AND COALESCE(batch_id, id) = ? AND undone = 0
@@ -5368,6 +5440,7 @@ pub async fn mb_accept_track(
     disc: i64,
     position: i64,
 ) -> Result<(), String> {
+    ensure_entity_not_matching(&state.app_db, album_id).await?;
     accept_slots(&state.app_db, album_id, &folder_path, &[(disc, position)]).await
 }
 
@@ -5380,6 +5453,7 @@ pub async fn mb_accept_tracks(
     folder_path: String,
     slots: Vec<(i64, i64)>,
 ) -> Result<(), String> {
+    ensure_entity_not_matching(&state.app_db, album_id).await?;
     accept_slots(&state.app_db, album_id, &folder_path, &slots).await
 }
 
@@ -6241,6 +6315,7 @@ pub async fn mb_apply_entity_match(
     // name is recorded as an alias so MB-authored credits still resolve.
     preferred_name: Option<String>,
 ) -> Result<(), String> {
+    ensure_entity_not_matching(&state.app_db, entity_id).await?;
     let pool = &state.app_db;
     // Staged = immutable: a match on an entity a staged rescan action will
     // dissolve would be silently discarded when it applies.
@@ -6597,6 +6672,7 @@ pub async fn mb_unmatch_entity(
     kind: String,
     entity_id: i64,
 ) -> Result<(), String> {
+    ensure_entity_not_matching(&state.app_db, entity_id).await?;
     let pool = &state.app_db;
     let library_id = library_of(pool, entity_id).await?;
     let field = mb_field_for(&kind)?;
@@ -6707,6 +6783,7 @@ pub async fn mb_unmatch_release(
     entity_id: i64,
     release_db_id: Option<i64>,
 ) -> Result<(), String> {
+    ensure_entity_not_matching(&state.app_db, entity_id).await?;
     let pool = &state.app_db;
     let library_id = library_of(pool, entity_id).await?;
     let folder: Option<String> = match release_db_id {
@@ -6761,6 +6838,7 @@ pub async fn mb_unmatch_release(
 /// or a fresh match brings it back if the two sides still disagree.
 #[tauri::command]
 pub async fn mb_dismiss_gaps(state: State<'_, AppState>, album_id: i64) -> Result<(), String> {
+    ensure_entity_not_matching(&state.app_db, album_id).await?;
     sqlx::query("DELETE FROM album_match_gap WHERE album_id = ?")
         .bind(album_id)
         .execute(&state.app_db)
@@ -7775,6 +7853,7 @@ pub async fn mb_apply_album_match(
     mb_release_id: String,
     release_db_id: Option<i64>,
 ) -> Result<(), String> {
+    ensure_not_matching(&state.app_db, &library_id).await?;
     let pool = &state.app_db;
     crate::music_edit::ensure_not_staged(pool, album_id).await?;
     clear_suppressions(pool, album_id).await?;
@@ -7853,6 +7932,7 @@ pub async fn mb_resolve_suggestion(
     suggestion_id: i64,
     accept: bool,
 ) -> Result<(), String> {
+    ensure_not_matching(&state.app_db, &library_id).await?;
     let pool = &state.app_db;
     let row: Option<(String, String, String)> = sqlx::query_as(
         "SELECT kind, payload, target_key FROM mb_suggestion WHERE id = ? AND library_id = ?",
@@ -7973,6 +8053,7 @@ pub async fn mb_undo_change(
     library_id: String,
     change_id: i64,
 ) -> Result<(), String> {
+    ensure_not_matching(&state.app_db, &library_id).await?;
     let pool = &state.app_db;
     let row: Option<(String, i64, Option<String>, i64)> = sqlx::query_as(
         "SELECT kind, target_id, before_json, undone FROM mb_change_log WHERE id = ? AND library_id = ?",

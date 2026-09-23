@@ -6094,6 +6094,14 @@ pub struct ReleaseCovers {
     pub release_id: i64,
     pub covers: Vec<crate::commands::CoverInfo>,
     pub selected: Option<String>,
+    /// The album is matched to a MusicBrainz release group — the Cover Art
+    /// Archive browser has something to browse. (The dialog disables its
+    /// launch button otherwise, instead of opening and bouncing.)
+    pub mb_matched: bool,
+    /// This release is pinned to a MusicBrainz release too: the browser
+    /// then shows the release's scan set as well as the group cover, and
+    /// declares its taller frame from the start.
+    pub mb_release_matched: bool,
 }
 
 /// The covers dialog's view of ONE release: strictly its own slice of the
@@ -6196,7 +6204,26 @@ pub async fn get_release_covers(
     .await
     .map_err(|e| e.to_string())?;
     let selected = selected.filter(|s| covers.iter().any(|c| &c.path == s));
-    Ok(ReleaseCovers { release_id: rid, covers, selected })
+    let mb_matched: Option<(String,)> = sqlx::query_as(
+        "SELECT value FROM field_override
+         WHERE entity_id = ? AND field = 'mb_release_group_id' AND value <> ''
+         LIMIT 1",
+    )
+    .bind(album_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let mb_release_matched = crate::music_mb::release_match_of(pool, album_id, &rfolder)
+        .await?
+        .map(|(v, _)| !v.is_empty())
+        .unwrap_or(false);
+    Ok(ReleaseCovers {
+        release_id: rid,
+        covers,
+        selected,
+        mb_matched: mb_matched.is_some(),
+        mb_release_matched,
+    })
 }
 
 /// "Remove from Recently listened to": hides the track's plays up to now from

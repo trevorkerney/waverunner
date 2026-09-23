@@ -5,7 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { Minus, Square, X, ZoomIn, ZoomOut, RotateCcw } from "lucide-react";
 import { ThemeToggle } from "@/components/ThemeToggle";
 import { SettingsDialog } from "@/components/SettingsDialog";
-import { isCreatingLibrary } from "@/components/CreateLibraryDialog";
+import { isCreatingLibrary } from "@/hooks/libraryRuns";
 import {
   Menubar,
   MenubarMenu,

@@ -3,6 +3,8 @@ import ReactDOM from "react-dom/client";
 import "@fontsource-variable/geist";
 import { polyfillCountryFlagEmojis } from "country-flag-emoji-polyfill";
 import App from "./App";
+import { ModalStackProvider } from "@/components/ui/dialog";
+import { LibraryRunsProvider } from "@/hooks/libraryRuns";
 
 // Windows renders flag emoji as bare letter pairs ("US") — this injects the
 // "Twemoji Country Flags" subset font so 🇺🇸-style codepoints actually draw
@@ -11,6 +13,13 @@ polyfillCountryFlagEmojis();
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
-    <App />
+    {/* One visible modal at a time (dialog.tsx) and the library run
+        controller (scan → match, in-page) sit above App so every surface
+        can reach them. */}
+    <ModalStackProvider>
+      <LibraryRunsProvider>
+        <App />
+      </LibraryRunsProvider>
+    </ModalStackProvider>
   </React.StrictMode>,
 );

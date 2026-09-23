@@ -7,10 +7,12 @@ import {
   DialogHeader,
   DialogTitle,
   DialogFooter,
+  DialogTransition,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Spinner } from "@/components/ui/spinner";
+import { Skeleton, useSkeletonDelay } from "@/components/ui/skeleton";
 import {
   Select,
   SelectTrigger,
@@ -70,6 +72,8 @@ export function TmdbImageBrowserDialog({
   initialTab = "posters",
 }: TmdbImageBrowserDialogProps) {
   const [loading, setLoading] = useState(false);
+  // Skeleton only past 500ms; the box keeps its size either way.
+  const showSkeleton = useSkeletonDelay(loading);
   const [downloading, setDownloading] = useState(false);
   const [posters, setPosters] = useState<TmdbImage[]>([]);
   const [backdrops, setBackdrops] = useState<TmdbImage[]>([]);
@@ -214,7 +218,7 @@ export function TmdbImageBrowserDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="flex max-h-[80vh] w-[800px] max-w-[90vw] flex-col gap-0 overflow-hidden p-0">
+      <DialogContent size="2xl" className="flex flex-col gap-0 overflow-hidden p-0">
         <DialogHeader className="shrink-0 border-b px-6 py-4">
           <DialogTitle>TMDB Images</DialogTitle>
         </DialogHeader>
@@ -259,11 +263,29 @@ export function TmdbImageBrowserDialog({
           </div>
         </div>
 
-        {/* Content */}
-        <div className="flex-1 overflow-y-auto p-4">
-          {loading && (
-            <div className="flex items-center justify-center py-12">
-              <Spinner className="size-6" />
+        {/* Content: opens on skeleton tiles in the current tab's layout and
+            transitions to the real grid (tab switches transition too). */}
+        <DialogTransition contentKey={loading ? "loading" : tab} className="flex-1 overflow-y-auto p-4">
+          {loading && tab === "posters" && (
+            <div className={`grid grid-cols-4 gap-3 ${showSkeleton ? "" : "invisible"}`}>
+              {Array.from({ length: 8 }, (_, i) => (
+                <div key={i} className="flex flex-col gap-1.5 p-2">
+                  <Skeleton className="aspect-[2/3] w-full rounded" />
+                  <Skeleton className="h-7 w-full" />
+                  <Skeleton className="h-3 w-2/3" />
+                </div>
+              ))}
+            </div>
+          )}
+          {loading && tab === "backdrops" && (
+            <div className={`grid grid-cols-2 gap-3 ${showSkeleton ? "" : "invisible"}`}>
+              {Array.from({ length: 4 }, (_, i) => (
+                <div key={i} className="flex flex-col gap-1.5 p-2">
+                  <Skeleton className="aspect-video w-full rounded" />
+                  <Skeleton className="h-7 w-full" />
+                  <Skeleton className="h-3 w-2/3" />
+                </div>
+              ))}
             </div>
           )}
 
@@ -378,7 +400,7 @@ export function TmdbImageBrowserDialog({
               )}
             </div>
           )}
-        </div>
+        </DialogTransition>
 
         <DialogFooter className="m-0 shrink-0 border-t p-0 px-4 py-3">
           <Button

@@ -38,6 +38,8 @@ import { SplitArtistDialog } from "./EditDialogs";
 import { CombineSelectedDialog, type AlbumSelection } from "./CombineSelectedDialog";
 import { notifyPendingWorkChanged } from "./PendingWork";
 import { IdentityDialog, type IdentityMode } from "./IdentityDialog";
+import { useLibraryRuns } from "@/hooks/libraryRuns";
+import { MatchRunStrip } from "@/components/LibraryRunUi";
 
 /** The metadata matching/cleaning center — the permanent home for a music
  *  library's external-source state. Two entrances: the import wizard's final
@@ -501,6 +503,7 @@ function ClusterCard({
   onMergeOnly,
   onMergeAndSplit,
   onDismiss,
+  tone,
 }: {
   cluster: IdentityCluster;
   busy: boolean;
@@ -514,6 +517,8 @@ function ClusterCard({
    *  cluster (user's call — no guessing from the text which ones are joint). */
   onMergeAndSplit: (cluster: IdentityCluster, survivorId: number) => void;
   onDismiss: (cluster: IdentityCluster) => void;
+  /** Section colour: owners (albums here) red, feature-only amber. */
+  tone: "owner" | "feature";
 }) {
   const pages = cluster.members.filter((m) => m.artist_id != null);
   const matchedPages = pages.filter((m) => m.mbid);
@@ -540,7 +545,10 @@ function ClusterCard({
   };
 
   return (
-    <div data-flip-id={`cluster-${cluster.key}`} className="rounded-md border p-3">
+    <div
+      data-flip-id={`cluster-${cluster.key}`}
+      className={`rounded-md border p-3 ${tone === "owner" ? "border-red-500/30" : "border-amber-500/30"}`}
+    >
       <div className="mb-2 flex items-center justify-between gap-3">
         <p className="min-w-0 text-sm font-medium">
           <GitMerge size={14} className="mr-1.5 inline text-muted-foreground" />
@@ -956,6 +964,7 @@ export function MetadataCenter({
     : undefined;
   const [review, setReview] = useState<MbReview | null>(null);
   const [matchState, setMatchState] = useState<MusicMatchState | null>(null);
+  const runs = useLibraryRuns();
   const [fallbacks, setFallbacks] = useState<TagFallbackRow[]>([]);
   const [issues, setIssues] = useState<ScanIssueRow[]>([]);
   const [unlinked, setUnlinked] = useState<UnlinkedCredit[]>([]);
@@ -1268,9 +1277,8 @@ export function MetadataCenter({
   const [partnerFilter, setPartnerFilter] = useState("");
   const [combineSelect, setCombineSelect] = useState<AlbumSelection | null>(null);
 
-  // The pass runs in the wizard modal (match-only mode), not in this rail:
-  // embedded hosts (the wizard's review step) jump their own stepper back,
-  // everyone else opens the modal through the window event App/Sidebar own.
+  // The pass runs under App's run controller (a banner over the library),
+  // not in this rail — the window event asks it to start.
   const rerunMatching = async () => {
     if (onRunPass) {
       onRunPass();
@@ -1340,6 +1348,14 @@ export function MetadataCenter({
   const albumSuggestions = review?.suggestions.filter((s) => s.kind === "album_match") ?? [];
   const artistSuggestions = review?.suggestions.filter((s) => s.kind === "artist_match") ?? [];
 
+  // Identity clusters split along the same owner/feature boundary as the
+  // artist lists: a cluster with any member owning albums is an owner
+  // question (red, up top — resolving it unlocks a discography); one whose
+  // members only appear as track credits is a feature question (amber,
+  // below the owners — usually settled once albums are matched).
+  const clusterOwners = clusters.filter((c) => c.members.some((m) => m.albums > 0));
+  const clusterFeatures = clusters.filter((c) => !c.members.some((m) => m.albums > 0));
+
   // No gate: decisions lead the nav and their count nags, but every pane
   // stays open — the user decided required-answering wasn't worth the wall.
   // Pairwise merge suggestions became identity clusters (live-computed, one
@@ -1403,7 +1419,10 @@ export function MetadataCenter({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [focus?.nonce, review]);
 
-  const running = matchState?.running ?? false;
+  // Live from the run controller (a pass started anywhere — the library
+  // banner, the sidebar, here — flips it the moment it starts), with the
+  // load-time snapshot as the fallback before the first event lands.
+  const running = runs.isMatching(libraryId) || (matchState?.running ?? false);
 
   // The matching-guide stages, derived from data every render — never stored.
   // 1: artists who own albums here (each Yes arid-unlocks their discography
@@ -1868,13 +1887,15 @@ export function MetadataCenter({
   // Banners above the tabs (opt-out notice, staged changes, pass queue).
   // With none showing, the tabs sit flush at the top: no spacer, no rule.
   const bannersAbove =
-    (!!review && !onlineEnabled) || pending.length > 0 || (onlineEnabled && pendingPass.length > 0);
+    (!!review && !onlineEnabled) ||
+    pending.length > 0 ||
+    (onlineEnabled && (running || pendingPass.length > 0));
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       {/* The recorded opt-out, visible and reversible where it bites. */}
       {review && !onlineEnabled && (
-        <div className="mb-3 mr-4 mt-2 flex items-center gap-3 rounded-md border px-3 py-2">
+        <div className="-ml-4 flex items-center gap-3 bg-muted/30 px-4 py-2">
           <p className="min-w-0 flex-1 text-sm text-muted-foreground">
             Online metadata is off for this library — nothing here talks to MusicBrainz, and
             albums and artists aren’t matched.
@@ -1906,38 +1927,24 @@ export function MetadataCenter({
           separates accumulate here instead of each forcing its own rescan.
           Any rescan applies (and clears) the whole batch. */}
       {pending.length > 0 && (
-        // mr-4: the host containers end at the modal edge (pr-0, so the pane
-        // scrollbar can sit flush) — right spacing is each block's own job.
-        <div className="mb-3 mr-4 mt-2 rounded-md border border-red-500/40 bg-red-500/5 px-3 py-2">
-          <div className="flex items-center gap-3">
-            <TriangleAlert size={14} className="shrink-0 text-red-400" />
-            <p className="min-w-0 flex-1 text-sm text-red-200/90">
+        // Full-bleed strip, like the running-pass one: backs out of the
+        // host's left padding, runs to the right edge, as tall as it needs.
+        // Three columns, top-aligned: icon (centered on the header's first
+        // line), the text column (header + the list under it), the button
+        // flush with the header's top. Nothing here measures anything else.
+        <div className="-ml-4 flex items-start gap-3 bg-red-500/5 px-4 py-3">
+          <TriangleAlert size={14} className="mt-[3px] shrink-0 text-red-400" />
+          <div className="min-w-0 flex-1">
+            <p className="text-sm text-red-200/90">
               {pending.length} staged {pending.length === 1 ? "change" : "changes"} — applied by the
               next rescan
             </p>
-            <Button
-              size="sm"
-              variant="outline"
-              className="shrink-0 gap-1.5"
-              disabled={busy || running}
-              onClick={() => {
-                if (onRescanNeeded) onRescanNeeded(libraryId);
-                else
-                  window.dispatchEvent(
-                    new CustomEvent("waverunner:open-rescan", { detail: { libraryId } }),
-                  );
-              }}
-            >
-              <RefreshCw size={13} />
-              Rescan now
-            </Button>
-          </div>
-          {/* One line per staged action; each truncates on its own instead of
-              the whole batch collapsing into one clipped run-on. Undo reverts
-              the directive itself — nothing has applied yet, so no rescan. */}
-          {/* Height-capped: a long batch scrolls inside the banner instead of
-              shoving the actual work below the fold. */}
-          <ul className="mt-1 max-h-40 space-y-0.5 overflow-y-auto pl-[26px]">
+            {/* One line per staged action; each truncates on its own instead of
+                the whole batch collapsing into one clipped run-on. Undo reverts
+                the directive itself — nothing has applied yet, so no rescan. */}
+            {/* Height-capped: a long batch scrolls inside the banner instead of
+                shoving the actual work below the fold. */}
+            <ul className="mt-1 max-h-40 space-y-0.5 overflow-y-auto">
             {pending.map((p) => (
               <li key={p.id} className="flex min-w-0 items-baseline gap-1.5 text-xs text-muted-foreground">
                 <span className="shrink-0">•</span>
@@ -1953,18 +1960,48 @@ export function MetadataCenter({
                 </button>
               </li>
             ))}
-          </ul>
+            </ul>
+          </div>
+          <Button
+            size="sm"
+            variant="outline"
+            className="shrink-0 gap-1.5"
+            disabled={busy || running}
+            onClick={() => {
+              if (onRescanNeeded) onRescanNeeded(libraryId);
+              else
+                window.dispatchEvent(
+                  new CustomEvent("waverunner:open-rescan", { detail: { libraryId } }),
+                );
+            }}
+          >
+            <RefreshCw size={13} />
+            Rescan now
+          </Button>
         </div>
+      )}
+      {/* A running pass takes the queue banner's slot: it's consuming that
+          queue, so the queue box would only repeat the question. */}
+      {/* Full-bleed: backs out of the host's left padding (like the panel
+          root below) and runs to the right edge, as tall as it needs. */}
+      {onlineEnabled && running && (
+        <MatchRunStrip libraryId={libraryId} className={`-ml-4 ${pending.length > 0 ? "border-t" : ""}`} />
       )}
       {/* Matches a pass has yet to cash in — the pass stamps the artists
           their credits prove. Staged changes gate it (same rule the backend
           enforces): rescan first, then pass. "Unmatch" per line rather than
           "Undo": nothing staged here, undoing means forgetting the match. */}
-      {onlineEnabled && pendingPass.length > 0 && (
-        <div className="mb-3 mr-4 mt-2 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2">
-          <div className="flex items-center gap-3">
-            <RefreshCw size={14} className="shrink-0 text-amber-300" />
-            <p className="min-w-0 flex-1 text-sm text-amber-200/90">
+      {onlineEnabled && !running && pendingPass.length > 0 && (
+        // Same three-column shape as the staged strip above; a 1px rule
+        // (the app's section border) separates the two when both show.
+        <div
+          className={`-ml-4 flex items-start gap-3 bg-amber-500/5 px-4 py-3 ${
+            pending.length > 0 ? "border-t" : ""
+          }`}
+        >
+          <RefreshCw size={14} className="mt-[3px] shrink-0 text-amber-300" />
+          <div className="min-w-0 flex-1">
+            <p className="text-sm text-amber-200/90">
               {pendingPass.length}{" "}
               {pendingPass.some((p) => !/^\d+$/.test(p.target))
                 ? pendingPass.length === 1
@@ -1975,21 +2012,9 @@ export function MetadataCenter({
                   : "matches"}{" "}
               waiting for a matching pass — it identifies the artists their credits prove
             </p>
-            <Button
-              size="sm"
-              variant="outline"
-              className="shrink-0 gap-1.5"
-              disabled={busy || running || pending.length > 0}
-              title={pending.length > 0 ? "Staged changes need a rescan first" : undefined}
-              onClick={rerunMatching}
-            >
-              <RefreshCw size={13} />
-              {pending.length > 0 ? "Rescan first" : running ? "Pass running…" : "Run pass now"}
-            </Button>
-          </div>
-          {/* Same height cap as the staged banner — the queue can hold every
-              match of a long session. */}
-          <ul className="mt-1 max-h-40 space-y-0.5 overflow-y-auto pl-[26px]">
+            {/* Same height cap as the staged strip — the queue can hold every
+                match of a long session. */}
+            <ul className="mt-1 max-h-40 space-y-0.5 overflow-y-auto">
             {pendingPass.map((p) => (
               <li
                 key={p.id}
@@ -2036,7 +2061,19 @@ export function MetadataCenter({
                 )}
               </li>
             ))}
-          </ul>
+            </ul>
+          </div>
+          <Button
+            size="sm"
+            variant="outline"
+            className="shrink-0 gap-1.5"
+            disabled={busy || running || pending.length > 0}
+            title={pending.length > 0 ? "Staged changes need a rescan first" : undefined}
+            onClick={rerunMatching}
+          >
+            <RefreshCw size={13} />
+            {pending.length > 0 ? "Rescan first" : running ? "Pass running…" : "Run pass now"}
+          </Button>
         </div>
       )}
     {/* Same border the nav/pane divider uses, closing the header (and the
@@ -2109,21 +2146,8 @@ export function MetadataCenter({
             )}
           </button>
         ))}
-        {/* Progress lives in the match modal, not here — this is just the
-            pointer to it. */}
-        {running && (
-          <button
-            onClick={() =>
-              window.dispatchEvent(
-                new CustomEvent("waverunner:open-match", { detail: { libraryId } }),
-              )
-            }
-            className="flex items-center gap-1.5 rounded-md px-2 py-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground"
-          >
-            <Spinner className="size-3" />
-            Matching pass running — open
-          </button>
-        )}
+        {/* A running pass's progress is the strip above this page (see
+            MetadataPage), not a rail item. */}
         <button
           onClick={() => goTo("history")}
           className={`ml-auto flex items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm transition-colors ${
@@ -2350,7 +2374,7 @@ export function MetadataCenter({
                     1,
                     "Match your artists",
                     guideOwnerLeft,
-                    clusters.length + artistSuggestionsOwners.length,
+                    clusterOwners.length + artistSuggestionsOwners.length,
                     "artists",
                     "Artists with albums in your library first — each one identified unlocks their whole discography for automatic matching on the next pass.",
                   ],
@@ -2374,7 +2398,7 @@ export function MetadataCenter({
                     4,
                     "Feature artists",
                     guideFeatureLeft,
-                    artistSuggestionsFeatures.length,
+                    clusterFeatures.length + artistSuggestionsFeatures.length,
                     "artists",
                     "Don't match these directly — matched releases identify them automatically. What's left once your albums are done are the genuine questions.",
                   ],
@@ -2912,21 +2936,23 @@ export function MetadataCenter({
               high-leverage answers, features usually resolve themselves once
               albums are matched. Matched ones are reference — below, cut
               short. */}
-          {clusters.length > 0 && (
+          {clusterOwners.length > 0 && (
             <div className="mb-8" id="sec-artists-clusters">
-              <h4 className="mb-0.5 flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-amber-300">
+              <h4 className="mb-0.5 flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-red-400">
                 <GitMerge size={14} />
-                Resolve identities ({clusters.length})
+                Resolve identities ({clusterOwners.length})
               </h4>
               <p className="mb-1.5 text-xs text-muted-foreground">
-                Names that look like one artist spelled differently. Match settles who they are,
-                merges every spelling, and adopts the MusicBrainz name — biggest unlocks first.
+                Names that look like one artist spelled differently, with albums here. Match settles
+                who they are, merges every spelling, and adopts the MusicBrainz name — biggest
+                unlocks first.
               </p>
               <div className="space-y-2">
-                {clusters.map((c) => (
+                {clusterOwners.map((c) => (
                   <ClusterCard
                     key={c.key}
                     cluster={c}
+                    tone="owner"
                     busy={busy}
                     busyKey={busyKey}
                     onMatch={(cluster, survivorId) => setClusterMatch({ cluster, survivorId })}
@@ -2968,6 +2994,33 @@ export function MetadataCenter({
                     </div>
                   );
                 })}
+              </div>
+            </div>
+          )}
+          {clusterFeatures.length > 0 && (
+            <div className="mb-8" id="sec-artists-clusters-features">
+              <h4 className="mb-0.5 flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-amber-300">
+                <GitMerge size={14} />
+                Resolve identities — features only ({clusterFeatures.length})
+              </h4>
+              <p className="mb-1.5 text-xs text-muted-foreground">
+                Lookalike spellings that only appear as track credits. Merging tidies them; matching
+                their albums usually settles who they are on its own.
+              </p>
+              <div className="space-y-2">
+                {clusterFeatures.map((c) => (
+                  <ClusterCard
+                    key={c.key}
+                    cluster={c}
+                    tone="feature"
+                    busy={busy}
+                    busyKey={busyKey}
+                    onMatch={(cluster, survivorId) => setClusterMatch({ cluster, survivorId })}
+                    onMergeOnly={mergeCluster}
+                    onMergeAndSplit={mergeAndSplitCluster}
+                    onDismiss={dismissCluster}
+                  />
+                ))}
               </div>
             </div>
           )}
@@ -3590,7 +3643,7 @@ export function MetadataCenter({
       )}
       {/* Ignore confirmation — the one row action that would otherwise fire
           on a bare click. Undoable from History regardless. */}
-      <Dialog open={confirmIgnore !== null} onOpenChange={(o) => !o && setConfirmIgnore(null)}>
+      <Dialog open={confirmIgnore !== null} onOpenChange={(o) => !o && setConfirmIgnore(null)} dismiss="self">
         <DialogContent>
           <DialogHeader>
             <DialogTitle>Ignore “{confirmIgnore?.name}”?</DialogTitle>
