@@ -1995,13 +1995,14 @@ export function MetadataCenter({
         // Same three-column shape as the staged strip above; a 1px rule
         // (the app's section border) separates the two when both show.
         <div
-          className={`-ml-4 flex items-start gap-3 bg-amber-500/5 px-4 py-3 ${
+          className={`-ml-4 flex items-start gap-3 bg-primary/5 px-4 py-3 ${
             pending.length > 0 ? "border-t" : ""
           }`}
         >
-          <RefreshCw size={14} className="mt-[3px] shrink-0 text-amber-300" />
+          {/* The running pass's palette (it takes this slot when it runs). */}
+          <RefreshCw size={14} className="mt-[3px] shrink-0 text-primary" />
           <div className="min-w-0 flex-1">
-            <p className="text-sm text-amber-200/90">
+            <p className="text-sm">
               {pendingPass.length}{" "}
               {pendingPass.some((p) => !/^\d+$/.test(p.target))
                 ? pendingPass.length === 1
@@ -3455,39 +3456,41 @@ export function MetadataCenter({
       </>
       )}
 
-      {splitArtist && (
-          <SplitArtistDialog
-            artistId={splitArtist.artist_id}
-            artistName={splitArtist.title}
-            open={splitArtist !== null}
-            onOpenChange={(o) => {
-              if (!o) {
-                setSplitArtist(null);
-                // A staged split changes the pending banner — refetch.
-                refresh();
-              }
-            }}
-          />
-        )}
-      {mergeSplit && (
-          <SplitArtistDialog
-            artistId={mergeSplit.survivorId}
-            artistName={
-              mergeSplit.cluster.members.find((m) => m.artist_id === mergeSplit.survivorId)?.name ?? ""
-            }
-            open
-            beforeSplit={() => runClusterMerge(mergeSplit.cluster, mergeSplit.survivorId)}
-            onOpenChange={(o) => {
-              if (!o) {
-                setMergeSplit(null);
-                // Confirmed: a merge happened and a split is staged; cancelled:
-                // nothing did. Refetch either way — cheap, and always right.
-                refresh();
-                onChanged?.();
-              }
-            }}
-          />
-        )}
+      {/* Both stay MOUNTED while closed (open=false) so the shell can play
+          their exit; the targets are read at confirm time. */}
+      <SplitArtistDialog
+        artistId={splitArtist?.artist_id ?? null}
+        artistName={splitArtist?.title ?? ""}
+        open={splitArtist !== null}
+        onOpenChange={(o) => {
+          if (!o) {
+            setSplitArtist(null);
+            // A staged split changes the pending banner — refetch.
+            refresh();
+          }
+        }}
+      />
+      <SplitArtistDialog
+        artistId={mergeSplit?.survivorId ?? null}
+        artistName={
+          mergeSplit
+            ? (mergeSplit.cluster.members.find((m) => m.artist_id === mergeSplit.survivorId)?.name ?? "")
+            : ""
+        }
+        open={mergeSplit !== null}
+        beforeSplit={
+          mergeSplit ? () => runClusterMerge(mergeSplit.cluster, mergeSplit.survivorId) : undefined
+        }
+        onOpenChange={(o) => {
+          if (!o) {
+            setMergeSplit(null);
+            // Confirmed: a merge happened and a split is staged; cancelled:
+            // nothing did. Refetch either way — cheap, and always right.
+            refresh();
+            onChanged?.();
+          }
+        }}
+      />
       {clusterMatch && (
           <ClusterMatchDialog
             libraryId={libraryId}

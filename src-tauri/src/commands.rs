@@ -170,6 +170,10 @@ pub struct MediaEntry {
     /// Only music album entries populate it; absent everywhere else.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sort_date: Option<String>,
+    /// How many releases (editions) the album has — Albums page only, and
+    /// only worth showing past 1. Absent everywhere else.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release_count: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -827,7 +831,7 @@ pub async fn create_library(
 
     // Lifecycle events drive the frontend's scanning state (sidebar lock +
     // bounce-to-Home) independent of any modal being open.
-    emit_scan_state(&app, &id, &name, "started");
+    emit_scan_state(&app, &id, &name, &format, true, "started");
 
     let scan_result: Result<(), String> = async {
         match format.as_str() {
@@ -858,7 +862,7 @@ pub async fn create_library(
         Ok(())
     }.await;
 
-    emit_scan_state(&app, &id, &name, if scan_result.is_ok() { "finished" } else { "failed" });
+    emit_scan_state(&app, &id, &name, &format, true, if scan_result.is_ok() { "finished" } else { "failed" });
 
     match scan_result {
         Ok(()) => {
@@ -929,16 +933,57 @@ pub(crate) fn emit_scan_progress_phased(
     );
 }
 
+/// A scan in flight, as `get_running_scans` reports it.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunningScan {
+    pub library_id: String,
+    pub name: String,
+    pub format: String,
+    /// First scan of a brand-new library (hidden from get_libraries until it
+    /// lands) vs a rescan of a listed one.
+    pub is_create: bool,
+}
+
+/// Scans currently running, keyed by library. The beacons are fire-and-
+/// forget, so a frontend that loads AFTER "started" (dev reload, restart of
+/// the webview) would never learn of the scan without this.
+static RUNNING_SCANS: std::sync::Mutex<Vec<RunningScan>> = std::sync::Mutex::new(Vec::new());
+
 /// Scan lifecycle beacon: `{ libraryId, name, state: "started"|"finished"|"failed" }`.
 /// The frontend uses it to lock the library's sidebar row while a scan runs
 /// and to bounce the user to Home if they're inside the library. `name` lets
 /// the sidebar label a mid-CREATION library (hidden from get_libraries until
-/// its scan lands) with its real name.
-pub(crate) fn emit_scan_state(app: &tauri::AppHandle, library_id: &str, name: &str, scan_state: &str) {
+/// its scan lands) with its real name. Also keeps RUNNING_SCANS current.
+pub(crate) fn emit_scan_state(
+    app: &tauri::AppHandle,
+    library_id: &str,
+    name: &str,
+    format: &str,
+    is_create: bool,
+    scan_state: &str,
+) {
+    if let Ok(mut running) = RUNNING_SCANS.lock() {
+        running.retain(|r| r.library_id != library_id);
+        if scan_state == "started" {
+            running.push(RunningScan {
+                library_id: library_id.to_string(),
+                name: name.to_string(),
+                format: format.to_string(),
+                is_create,
+            });
+        }
+    }
     let _ = app.emit(
         "scan-state",
         serde_json::json!({ "libraryId": library_id, "name": name, "state": scan_state }),
     );
+}
+
+/// Scans in flight right now — for a frontend that mounts mid-scan.
+#[tauri::command]
+pub async fn get_running_scans() -> Result<Vec<RunningScan>, String> {
+    Ok(RUNNING_SCANS.lock().map(|r| r.clone()).unwrap_or_default())
 }
 
 /// Sweep what a library deletion's FK cascade cannot reach. Most domain
@@ -1471,7 +1516,7 @@ pub async fn get_entries(
                         watch_progress: None,
                         unwatched: false,
                         has_progress: false,
-                        sort_date: None,
+                        sort_date: None, release_count: None,
                     }
                 })
                 .collect();
@@ -1598,6 +1643,19 @@ pub async fn get_entries(
                 for (aid, name) in credit_rows {
                     credits_by_album.entry(aid).or_default().push(name);
                 }
+                // Release (edition) counts — the card badges albums with
+                // more than one.
+                let release_rows: Vec<(i64, i64)> = sqlx::query_as(
+                    "SELECT ar.album_id, COUNT(*) FROM album_release ar \
+                     JOIN media_entry me ON me.id = ar.album_id \
+                     WHERE me.library_id = ? GROUP BY ar.album_id",
+                )
+                .bind(&library_id)
+                .fetch_all(&state.app_db)
+                .await
+                .map_err(|e| e.to_string())?;
+                let releases_by_album: std::collections::HashMap<i64, i64> =
+                    release_rows.into_iter().collect();
                 let entries: Vec<MediaEntry> = rows
                     .into_iter()
                     .map(|(id, title, release_date, folder_path, selected_cover)| {
@@ -1609,6 +1667,7 @@ pub async fn get_entries(
                             .remove(&id)
                             .filter(|names| !names.is_empty())
                             .map(|names| names.join(" · "));
+                        let release_count = releases_by_album.get(&id).copied();
                         MediaEntry {
                             id,
                             title,
@@ -1631,6 +1690,7 @@ pub async fn get_entries(
                             unwatched: false,
                             has_progress: false,
                             sort_date: release_date,
+                            release_count,
                         }
                     })
                     .collect();
@@ -1906,7 +1966,7 @@ pub async fn get_entries(
                         watch_progress: None,
                         unwatched: false,
                         has_progress: false,
-                        sort_date: None,
+                        sort_date: None, release_count: None,
                     }
                 })
                 .collect();
@@ -2050,7 +2110,7 @@ pub async fn search_entries(
             let mut entries: Vec<MediaEntry> = rows.into_iter()
                 .map(|(id, title, year, end_year, folder_path, parent_id, entry_type, selected_cover, tmdb_id, season_display)| {
                     let covers = covers_map.get(&folder_path).cloned().unwrap_or_default();
-                    MediaEntry { id, title, year, end_year, folder_path, parent_id, entry_type, covers, selected_cover, child_count: 0, season_display, collection_display: None, role_display: None, tmdb_id, link_id: None, interactive: false, watched: false, watch_progress: None, unwatched: false, has_progress: false, sort_date: None }
+                    MediaEntry { id, title, year, end_year, folder_path, parent_id, entry_type, covers, selected_cover, child_count: 0, season_display, collection_display: None, role_display: None, tmdb_id, link_id: None, interactive: false, watched: false, watch_progress: None, unwatched: false, has_progress: false, sort_date: None, release_count: None }
                 })
                 .collect();
 
@@ -2155,7 +2215,7 @@ pub async fn search_entries(
                             .cloned()
                             .unwrap_or_default(),
                     );
-                    MediaEntry { id, title, year: None, end_year: None, folder_path, parent_id: None, entry_type: "artist".to_string(), covers, selected_cover, child_count: 0, season_display: None, collection_display: None, role_display: None, tmdb_id: None, link_id: None, interactive: false, watched: false, watch_progress: None, unwatched: false, has_progress: false, sort_date: None }
+                    MediaEntry { id, title, year: None, end_year: None, folder_path, parent_id: None, entry_type: "artist".to_string(), covers, selected_cover, child_count: 0, season_display: None, collection_display: None, role_display: None, tmdb_id: None, link_id: None, interactive: false, watched: false, watch_progress: None, unwatched: false, has_progress: false, sort_date: None, release_count: None }
                 })
                 .collect();
             results.extend(album_rows.into_iter().map(
@@ -2186,7 +2246,7 @@ pub async fn search_entries(
                             watch_progress: None,
                             unwatched: false,
                             has_progress: false,
-                            sort_date: release_date,
+                            sort_date: release_date, release_count: None,
                         }
                     },
                 ));
@@ -2367,6 +2427,145 @@ pub async fn set_selected_backdrop(
     .execute(&state.app_db)
     .await
     .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// The backdrops dialog's view of one entry — the backdrop counterpart of
+/// get_entry_covers: every cached backdrop with its origin, plus the explicit
+/// pick (the display fallback to the first one is the caller's).
+#[tauri::command]
+pub async fn get_entry_backdrops(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    entry_id: i64,
+) -> Result<EntryCovers, String> {
+    let entry_row: Option<(String,)> =
+        sqlx::query_as("SELECT folder_path FROM media_entry_full WHERE id = ?")
+            .bind(entry_id)
+            .fetch_optional(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+    let (folder_path,) = entry_row.ok_or("Entry not found")?;
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT cached_path, origin FROM cached_images
+         WHERE library_id = ? AND entry_folder_path = ? AND image_type = 'backdrop'
+         ORDER BY id",
+    )
+    .bind(&library_id)
+    .bind(&folder_path)
+    .fetch_all(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    let selected: Option<String> =
+        sqlx::query_scalar("SELECT path FROM selected_backdrop WHERE entry_id = ?")
+            .bind(entry_id)
+            .fetch_optional(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+    Ok(EntryCovers {
+        covers: rows.into_iter().map(|(path, origin)| CoverInfo { path, origin }).collect(),
+        selected: selected.filter(|s| !s.is_empty()),
+    })
+}
+
+/// Add a local image as a backdrop — add_cover's twin: the original lands in
+/// app-data (media folders are never written), the cache is re-synced, and
+/// the new cached path comes back.
+#[tauri::command]
+pub async fn add_backdrop(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    entry_id: i64,
+    source_path: String,
+) -> Result<String, String> {
+    let entry_row: Option<(String,)> =
+        sqlx::query_as("SELECT folder_path FROM media_entry_full WHERE id = ?")
+            .bind(entry_id)
+            .fetch_optional(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+    let (folder_path,) = entry_row.ok_or("Entry not found")?;
+
+    let app_base = app_images_base(&state.app_data_dir, &library_id);
+    let target_dir = app_base.join(&folder_path).join("backdrops");
+    let target_abs = copy_cover_into_dir(&source_path, &target_dir, None)?;
+    let target_name = PathBuf::from(&target_abs)
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+
+    let cache_base = state.app_data_dir.join("cache").join(&library_id);
+    sync_cached_images_for_entry(
+        &state.app_db, &library_id, &cache_base, &app_base, &folder_path, "backdrops", "backdrop", "app",
+    )
+    .await?;
+
+    let cached_path: Option<(String,)> = sqlx::query_as(
+        "SELECT cached_path FROM cached_images WHERE library_id = ? AND entry_folder_path = ? AND image_type = 'backdrop' AND source_filename = ?",
+    )
+    .bind(&library_id)
+    .bind(&folder_path)
+    .bind(&target_name)
+    .fetch_optional(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    cached_path
+        .map(|(p,)| p)
+        .ok_or_else(|| "Backdrop added but cache path not found".into())
+}
+
+/// Remove an app-added backdrop (delete_cover's twin). Library files are
+/// refused the same way; a pick pointing at the deleted file is dropped so
+/// the hero falls back to the first remaining backdrop.
+#[tauri::command]
+pub async fn delete_backdrop(
+    state: tauri::State<'_, AppState>,
+    library_id: String,
+    entry_id: i64,
+    backdrop_path: String,
+) -> Result<(), String> {
+    let entry_row: Option<(String,)> =
+        sqlx::query_as("SELECT folder_path FROM media_entry_full WHERE id = ?")
+            .bind(entry_id)
+            .fetch_optional(&state.app_db)
+            .await
+            .map_err(|e| e.to_string())?;
+    let (folder_path,) = entry_row.ok_or("Entry not found")?;
+
+    let source_row: Option<(String, String)> = sqlx::query_as(
+        "SELECT source_filename, origin FROM cached_images WHERE library_id = ? AND entry_folder_path = ? AND image_type = 'backdrop' AND cached_path = ?",
+    )
+    .bind(&library_id)
+    .bind(&folder_path)
+    .bind(&backdrop_path)
+    .fetch_optional(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    let (source_filename, origin) = source_row.ok_or("Backdrop not found in cache")?;
+    if origin != "app" {
+        return Err(
+            "This backdrop is a file in your library folder. waverunner doesn't modify library folders — remove the file there and rescan instead.".into(),
+        );
+    }
+
+    let app_base = app_images_base(&state.app_data_dir, &library_id);
+    let source_file = app_base.join(&folder_path).join("backdrops").join(&source_filename);
+    if source_file.exists() {
+        std::fs::remove_file(&source_file)
+            .map_err(|e| format!("Failed to delete backdrop file: {e}"))?;
+    }
+    let cache_base = state.app_data_dir.join("cache").join(&library_id);
+    sync_cached_images_for_entry(
+        &state.app_db, &library_id, &cache_base, &app_base, &folder_path, "backdrops", "backdrop", "app",
+    )
+    .await?;
+    sqlx::query("DELETE FROM selected_backdrop WHERE entry_id = ? AND path = ?")
+        .bind(entry_id)
+        .bind(&backdrop_path)
+        .execute(&state.app_db)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -3734,7 +3933,7 @@ pub async fn get_entries_for_genre(
                     watch_progress: None,
                     unwatched: false,
                     has_progress: false,
-                    sort_date: release_date,
+                    sort_date: release_date, release_count: None,
                 }
             })
             .collect());
@@ -3805,7 +4004,7 @@ pub async fn get_entries_for_genre(
                 watch_progress: None,
                 unwatched: false,
                 has_progress: false,
-                sort_date: None,
+                sort_date: None, release_count: None,
             }
         })
         .collect();
@@ -4914,7 +5113,7 @@ pub async fn get_entries_for_person(
                 watch_progress: None,
                 unwatched: false,
                 has_progress: false,
-                sort_date: None,
+                sort_date: None, release_count: None,
             }
         })
         .collect();
@@ -5619,6 +5818,17 @@ pub async fn set_playlist_collection_sort_mode(
 
 // ── Playlist / playlist_collection custom covers ──────────────────────────────
 
+/// A playlist / playlist collection carries ONE cover: adding replaces
+/// whatever is there (the old file goes), and the new one is the pick.
+/// Nothing else ever deletes a playlist cover — deleting the playlist
+/// removes its whole covers folder.
+fn replace_single_cover(dir: &Path, source_path: &str) -> Result<String, String> {
+    for old in list_playlist_covers(dir) {
+        let _ = std::fs::remove_file(&old);
+    }
+    copy_cover_into_dir(source_path, dir, None)
+}
+
 #[tauri::command]
 pub async fn add_playlist_cover(
     state: tauri::State<'_, AppState>,
@@ -5626,20 +5836,10 @@ pub async fn add_playlist_cover(
     source_path: String,
 ) -> Result<String, String> {
     let dir = playlist_covers_dir(&state.app_data_dir, "playlist", playlist_id);
-    let added = copy_cover_into_dir(&source_path, &dir, None)?;
-    // Auto-select the first cover added so the UI updates immediately.
-    let current: Option<(Option<String>,)> = sqlx::query_as(
-        "SELECT selected_cover FROM media_playlist WHERE id = ?",
-    )
-    .bind(playlist_id)
-    .fetch_optional(&state.app_db)
-    .await
-    .map_err(|e| e.to_string())?;
-    if current.and_then(|(c,)| c).is_none() {
-        sqlx::query("UPDATE media_playlist SET selected_cover = ? WHERE id = ?")
-            .bind(&added).bind(playlist_id)
-            .execute(&state.app_db).await.map_err(|e| e.to_string())?;
-    }
+    let added = replace_single_cover(&dir, &source_path)?;
+    sqlx::query("UPDATE media_playlist SET selected_cover = ? WHERE id = ?")
+        .bind(&added).bind(playlist_id)
+        .execute(&state.app_db).await.map_err(|e| e.to_string())?;
     Ok(added)
 }
 
@@ -5650,19 +5850,10 @@ pub async fn add_playlist_collection_cover(
     source_path: String,
 ) -> Result<String, String> {
     let dir = playlist_covers_dir(&state.app_data_dir, "collection", collection_id);
-    let added = copy_cover_into_dir(&source_path, &dir, None)?;
-    let current: Option<(Option<String>,)> = sqlx::query_as(
-        "SELECT selected_cover FROM media_playlist_collection WHERE id = ?",
-    )
-    .bind(collection_id)
-    .fetch_optional(&state.app_db)
-    .await
-    .map_err(|e| e.to_string())?;
-    if current.and_then(|(c,)| c).is_none() {
-        sqlx::query("UPDATE media_playlist_collection SET selected_cover = ? WHERE id = ?")
-            .bind(&added).bind(collection_id)
-            .execute(&state.app_db).await.map_err(|e| e.to_string())?;
-    }
+    let added = replace_single_cover(&dir, &source_path)?;
+    sqlx::query("UPDATE media_playlist_collection SET selected_cover = ? WHERE id = ?")
+        .bind(&added).bind(collection_id)
+        .execute(&state.app_db).await.map_err(|e| e.to_string())?;
     Ok(added)
 }
 
@@ -6239,7 +6430,7 @@ pub async fn get_playlist_contents(
             watch_progress: None,
             unwatched: false,
             has_progress: false,
-            sort_date: None,
+            sort_date: None, release_count: None,
         };
         items.push((sort_order, sort_title.unwrap_or_default(), sort_date, entry));
     }
@@ -6347,7 +6538,7 @@ pub async fn get_playlist_contents(
             watch_progress: None,
             unwatched: false,
             has_progress: false,
-            sort_date: None,
+            sort_date: None, release_count: None,
         };
         items.push((sort_order, sort_title, min_date, entry));
     }
@@ -7745,7 +7936,7 @@ pub async fn rescan_library(
     // Shared with creation — a stale cancel from an earlier stopped run must
     // not abort this one at the first check.
     state.cancel_creation.store(false, Ordering::SeqCst);
-    emit_scan_state(&app, &library_id, &lib_name, "started");
+    emit_scan_state(&app, &library_id, &lib_name, &format, false, "started");
 
     // Returns per-item warnings (skipped episodes/seasons/shows). A bad item no
     // longer aborts the whole rescan — it's logged here and surfaced to the user.
@@ -7798,7 +7989,7 @@ pub async fn rescan_library(
             .map_err(|e| e.to_string())?;
     }
 
-    emit_scan_state(&app, &library_id, &lib_name, if rescan_result.is_ok() { "finished" } else { "failed" });
+    emit_scan_state(&app, &library_id, &lib_name, &format, false, if rescan_result.is_ok() { "finished" } else { "failed" });
     rescan_result
 }
 

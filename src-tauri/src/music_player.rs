@@ -252,11 +252,28 @@ pub async fn music_play_track(
     let presence_pool = state.app_db.clone();
     tauri::async_runtime::spawn(crate::discord_presence::music_started(presence_pool, track_id));
 
+    // CD pre-emphasis: a rip that kept it plays through mpv's de-emphasis
+    // filter (its release's cue sheet, or the user's word, says so).
+    let de_emphasize = crate::music::track_pre_emphasis(&state.app_db, track_id).await;
+
     // Flag BEFORE the loadfile so the event thread can't see the new file's
     // FileLoaded first. The unpause itself happens there — never here, where
     // it would resume the outgoing (possibly paused) track for a moment.
     inner.unpause_on_load.store(true, Ordering::SeqCst);
-    run_music(inner, move |mpv| mpv.command(&["loadfile", &path])).await
+    run_music(inner, move |mpv| {
+        set_de_emphasis(mpv, de_emphasize)?;
+        mpv.command(&["loadfile", &path])
+    })
+    .await
+}
+
+/// mpv's audio-filter chain for a pre-emphasized rip: FFmpeg's aemphasis in
+/// CD reproduction mode undoes the 50/15 µs boost the disc carried. An
+/// empty chain plays the file as is.
+const DE_EMPHASIS_AF: &str = "lavfi=[aemphasis=mode=reproduction:type=cd]";
+
+fn set_de_emphasis(mpv: &MpvHandle, on: bool) -> Result<(), String> {
+    mpv.set_property_string("af", if on { DE_EMPHASIS_AF } else { "" })
 }
 
 /// Append the NEXT queue track to mpv's internal playlist so the transition
@@ -320,7 +337,10 @@ pub async fn music_track_started(
     });
     let presence_pool = state.app_db.clone();
     tauri::async_runtime::spawn(crate::discord_presence::music_started(presence_pool, track_id));
-    Ok(())
+    // A gapless advance skipped music_play_track, so the filter chain still
+    // reflects the previous track — re-point it at this one's release.
+    let de_emphasize = crate::music::track_pre_emphasis(&state.app_db, track_id).await;
+    run_music(inner, move |mpv| set_de_emphasis(mpv, de_emphasize)).await
 }
 
 #[tauri::command]

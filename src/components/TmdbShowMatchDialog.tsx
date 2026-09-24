@@ -1,17 +1,20 @@
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
 import {
   Dialog,
+  DialogBody,
   DialogContent,
   DialogHeader,
   DialogTitle,
   DialogFooter,
+  useContentSwap,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Spinner } from "@/components/ui/spinner";
+import { Skeleton, useHandoff } from "@/components/ui/skeleton";
 import { Search, ArrowLeft } from "lucide-react";
 import type {
   ShowDetail,
@@ -205,7 +208,6 @@ export function TmdbShowMatchDialog({
   const [searching, setSearching] = useState(false);
   const [results, setResults] = useState<TmdbTvSearchResult[]>([]);
   const [selectedTmdb, setSelectedTmdb] = useState<TmdbTvDetail | null>(null);
-  const [loadingDetail, setLoadingDetail] = useState(false);
   const [fieldChecks, setFieldChecks] = useState<Record<string, FieldCheck>>({});
   const [applying, setApplying] = useState(false);
 
@@ -237,7 +239,6 @@ export function TmdbShowMatchDialog({
 
   const selectResult = useCallback(
     async (result: TmdbTvSearchResult) => {
-      setLoadingDetail(true);
       try {
         const detail = await invoke<TmdbTvDetail>("get_tmdb_show_detail", {
           tmdbId: result.id,
@@ -260,11 +261,9 @@ export function TmdbShowMatchDialog({
         setStep("review");
       } catch (e) {
         toast.error(String(e));
-      } finally {
-        setLoadingDetail(false);
       }
     },
-    [currentDetail, entryYear]
+    [currentDetail]
   );
 
   const applyMetadata = useCallback(async () => {
@@ -339,18 +338,33 @@ export function TmdbShowMatchDialog({
 
   const anyChecked = Object.values(fieldChecks).some((f) => f.checked);
 
+  // The search → review swap: everything fades out, the step changes,
+  // everything fades in. Both steps share one static frame, so no resize.
+  const { shown, visible } = useContentSwap(step);
+  // Search results: skeleton rows after 500ms, then the hand-off.
+  const bodyRef = useRef<HTMLDivElement | null>(null);
+  const handoff = useHandoff(!searching, bodyRef);
+  const [pickingId, setPickingId] = useState<number | null>(null);
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent width="720px" className="flex max-h-[80vh] flex-col gap-0 overflow-hidden p-0">
+      {/* Static, both steps: 720px wide, 34rem tall; the results and the
+          field list scroll. */}
+      <DialogContent width="45rem" height="34rem" className="gap-0 p-0">
+        <div
+          className={`flex h-full min-h-0 flex-col transition-opacity duration-200 ${
+            visible ? "opacity-100" : "opacity-0"
+          }`}
+        >
         <DialogHeader className="shrink-0 border-b px-6 py-4">
           <DialogTitle>
-            {step === "search" ? "Match with TMDB" : "Review TMDB Metadata"}
+            {shown === "search" ? "Match with TMDB" : "Review TMDB Metadata"}
           </DialogTitle>
         </DialogHeader>
 
-        {step === "search" && (
-          <div className="flex flex-1 flex-col overflow-hidden">
-            <div className="flex gap-2 border-b px-6 py-3">
+        {shown === "search" && (
+          <>
+            <div className="flex shrink-0 gap-2 border-b px-6 py-3">
               <Input
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
@@ -369,7 +383,7 @@ export function TmdbShowMatchDialog({
                   if (e.key === "Enter") doSearch();
                 }}
               />
-              <Button onClick={doSearch} disabled={searching || !query.trim()}>
+              <Button onClick={doSearch} disabled={searching || !query.trim() || !visible}>
                 {searching ? (
                   <Spinner className="size-3.5" />
                 ) : (
@@ -379,23 +393,30 @@ export function TmdbShowMatchDialog({
               </Button>
             </div>
 
-            <div className="flex-1 overflow-y-auto">
-              {loadingDetail && (
-                <div className="flex items-center justify-center py-12">
-                  <Spinner className="size-6" />
-                </div>
-              )}
-              {!loadingDetail && results.length === 0 && !searching && (
+            <DialogBody ref={bodyRef} className="relative">
+              {results.length === 0 && !searching && (
                 <p className="px-6 py-8 text-center text-sm text-muted-foreground">
                   Search for a TV show to match
                 </p>
               )}
-              {!loadingDetail &&
-                results.map((r) => (
+              <div
+                className={`transition-opacity duration-200 will-change-[opacity] ${
+                  handoff.contentVisible ? "opacity-100" : "opacity-0"
+                }`}
+              >
+                {results.map((r) => (
                   <button
                     key={r.id}
-                    onClick={() => selectResult(r)}
-                    className="flex w-full gap-3 border-b px-6 py-3 text-left transition-colors hover:bg-accent/50"
+                    disabled={pickingId !== null || !visible}
+                    onClick={async () => {
+                      setPickingId(r.id);
+                      try {
+                        await selectResult(r);
+                      } finally {
+                        setPickingId(null);
+                      }
+                    }}
+                    className="flex w-full gap-3 border-b px-6 py-3 text-left transition-colors hover:bg-accent/50 disabled:opacity-60"
                   >
                     {r.poster_path ? (
                       <img
@@ -428,18 +449,40 @@ export function TmdbShowMatchDialog({
                         </p>
                       )}
                     </div>
+                    {/* The row I clicked is working (its detail fetch). */}
+                    {pickingId === r.id && <Spinner className="size-4 shrink-0 self-center" />}
                   </button>
                 ))}
-            </div>
-          </div>
+              </div>
+              {!handoff.shown && handoff.skeletonSeen && (
+                <div
+                  className={`absolute inset-x-0 top-0 transition-opacity duration-200 ${
+                    handoff.stage === "hidden" ? "" : "opacity-0"
+                  }`}
+                >
+                  {Array.from({ length: 4 }, (_, i) => (
+                    <div key={i} className="flex w-full gap-3 border-b px-6 py-3">
+                      <Skeleton className="h-[84px] w-14 shrink-0 rounded" />
+                      <div className="flex flex-1 flex-col gap-2 pt-1">
+                        <Skeleton className="h-3.5 w-1/3" />
+                        <Skeleton className="h-3 w-full" />
+                        <Skeleton className="h-3 w-3/4" />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </DialogBody>
+          </>
         )}
 
-        {step === "review" && (
-          <div className="flex flex-1 flex-col overflow-hidden">
-            <div className="flex items-center gap-2 border-b px-6 py-3">
+        {shown === "review" && (
+          <>
+            <div className="flex shrink-0 items-center gap-2 border-b px-6 py-3">
               <Button
                 variant="ghost"
                 size="sm"
+                disabled={!visible}
                 onClick={() => setStep("search")}
               >
                 <ArrowLeft size={14} />
@@ -452,7 +495,7 @@ export function TmdbShowMatchDialog({
               </p>
             </div>
 
-            <div className="flex-1 overflow-y-auto">
+            <DialogBody>
               <div className="flex flex-col divide-y">
                 {reviewFields.map((field) => {
                   const check = fieldChecks[field.key];
@@ -505,19 +548,19 @@ export function TmdbShowMatchDialog({
                   );
                 })}
               </div>
-            </div>
+            </DialogBody>
 
             <DialogFooter className="m-0 shrink-0 border-t p-0 px-4 py-3">
               <Button
                 variant="outline"
                 onClick={() => onOpenChange(false)}
-                disabled={applying}
+                disabled={applying || !visible}
               >
                 Cancel
               </Button>
               <Button
                 onClick={applyMetadata}
-                disabled={applying || !anyChecked}
+                disabled={applying || !anyChecked || !visible}
               >
                 {applying ? (
                   <>
@@ -529,8 +572,9 @@ export function TmdbShowMatchDialog({
                 )}
               </Button>
             </DialogFooter>
-          </div>
+          </>
         )}
+        </div>
       </DialogContent>
     </Dialog>
   );

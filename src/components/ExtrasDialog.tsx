@@ -1,13 +1,15 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
 import {
   Dialog,
+  DialogBody,
   DialogContent,
   DialogHeader,
   DialogTitle,
   DialogFooter,
 } from "@/components/ui/dialog";
+import { Skeleton, useHandoff } from "@/components/ui/skeleton";
 import {
   ContextMenu,
   ContextMenuTrigger,
@@ -15,7 +17,6 @@ import {
   ContextMenuItem,
 } from "@/components/ui/context-menu";
 import { Button } from "@/components/ui/button";
-import { Spinner } from "@/components/ui/spinner";
 import { Play, ChevronDown, ChevronRight, Sparkles } from "lucide-react";
 import type { ExtraInfo } from "@/types";
 
@@ -51,6 +52,8 @@ export function ExtrasDialog({
   onPlayFile?: (path: string, title: string) => void;
 }) {
   const [extras, setExtras] = useState<ExtraInfo[] | null>(null);
+  const bodyRef = useRef<HTMLDivElement | null>(null);
+  const { stage, skeletonSeen, shown, contentVisible } = useHandoff(extras != null, bodyRef);
   const [expandedId, setExpandedId] = useState<number | null>(null);
   const [populating, setPopulating] = useState(false);
   // Kinds the user has expanded; groups default to collapsed.
@@ -134,32 +137,40 @@ export function ExtrasDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      {/* Fixed header/footer with only the body scrolling: keeps Close always
-          visible and the scrollbar inside the padding (clear of the rounded
-          corners). */}
-      <DialogContent
-        showCloseButton={false}
-        size="md"
-        className="grid grid-cols-[minmax(0,1fr)] grid-rows-[auto_minmax(0,1fr)_auto]"
-      >
+      {/* Static: the count of extras is unknowable before the fetch; the
+          body scrolls. Skeleton groups after 500ms, then the hand-off. */}
+      <DialogContent showCloseButton={false} size="md" height="30rem">
         <DialogHeader>
           <DialogTitle>Extras</DialogTitle>
         </DialogHeader>
 
-        <div className="flex min-h-0 min-w-0 flex-col gap-3 overflow-y-auto overflow-x-hidden">
-        {extras == null && (
-          <div className="flex items-center justify-center gap-2 py-8 text-sm text-muted-foreground">
-            <Spinner className="size-4" />
-            Loading…
-          </div>
-        )}
-
+        <DialogBody ref={bodyRef} className="relative flex min-w-0 flex-col gap-3 overflow-x-hidden">
         {extras != null && extras.length === 0 && (
           <p className="py-4 text-sm text-muted-foreground">No extras found for this {isShow ? "show" : "movie"}.</p>
         )}
 
+        {!shown && skeletonSeen && (
+          <div
+            className={`absolute inset-x-0 top-0 flex flex-col gap-3 transition-opacity duration-200 ${
+              stage === "hidden" ? "" : "opacity-0"
+            }`}
+          >
+            {Array.from({ length: 3 }, (_, i) => (
+              <div key={i} className="flex flex-col gap-1.5">
+                <Skeleton className="h-3 w-28" />
+                <Skeleton className="h-9 w-full rounded-md" />
+                <Skeleton className="h-9 w-full rounded-md" />
+              </div>
+            ))}
+          </div>
+        )}
+
         {extras != null && extras.length > 0 && (
-          <div className="flex min-w-0 flex-col gap-3">
+          <div
+            className={`flex min-w-0 flex-col gap-3 transition-opacity duration-200 will-change-[opacity] ${
+              contentVisible ? "opacity-100" : "opacity-0"
+            }`}
+          >
             {groups.map(([kind, items]) => {
               const collapsed = !expandedKinds.has(kind);
               return (
@@ -240,7 +251,7 @@ export function ExtrasDialog({
             })}
           </div>
         )}
-        </div>
+        </DialogBody>
 
         <DialogFooter>
           <Button onClick={() => onOpenChange(false)}>Close</Button>

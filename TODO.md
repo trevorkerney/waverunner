@@ -6,6 +6,25 @@
 
 ## bugs / needs fixing
 
+cover picker doesnt seem to be updating based on release picker on artist page in detail view
+
+on matching banner, add artist name at the beginning plus a long dash, and remove 'edits wait until the pass finishes'
+  - might as well make the banner stay visible and have 7 steps instead of 6 for when artist images are being fetched. right now it disappears and the progress display goes to the sidebar, but all the other stages are already in the sidebar AND displayed in the banner. Might as well just keep the banner up there for images, although editing needs to be enabled by then and maybe given this we should keep the edits message in the banner, or atleast just alter it instead of deleting.
+
+make 'scanning' in sidebar have n/m like building does
+
+look into toasts - some are unnecessary, needs better design overall
+
+deal with photo cropping, both manually and automatic, and how covers display alongside each other when differently sized
+
+add select (from grid) to video library and allow adding to playlists through it
+
+add ability to move backdrop positioning (on movies/shows) up and down
+
+add manual library sorting in sidebar
+
+movie/tv/album/whatever renames should cause re-sort immediately
+
 on albums page, put a little record-icon (same one used for albums in sidebar) + release-count on albums with multiple releases. start by trying it on the same line as the title (at the end if multiple lines) separated a bit from the end of the title. The last word ideally always wraps with it.
 
 the new metadata page acts weird when matching things. one time I match an album release group and then the page I'm on acts like its empty. another time i match an album release group and it takes me to the library map tab for some reason.
@@ -23,8 +42,6 @@ consider volume equalization methods like how Apple/Spotify match all tracks -14
 new breadcrumbs functionality. it should just follow the user always. even when creating duplicates in history. the only thing that should reset it is clicking an option in the sidebar. overflow should not create scroll but follow the most recent - when going back by breadcrumbs, and if the breadcrumbs are overflowing, only show the next forward history to the clicked breadcrumb. for instance, if the user has really been digging and there are 30 things in the breadcrumbs: for one, it would definitely be overflowing. the user should also see the most recent fitting ones, and the cut off on the left side of the breadcrumbs section would ideally begin with an ellipsis (still a button tho). Say the user clicks the breadcrumb 4 options back from the most recent. there were 3 in front, say the breadcrumbs were numbered like so: 5 - 4 - 3 - 2 - 1, and the user clicked 4. since the breadcrumbs are overflowing, only 3 should show in front of 4, and greyed out (STILL A BUTTON). I want to always focus on showing previous history over forward history, so when the breadcrumbs are overflowing and the user has forward breadcrumbs, always only show the 1 closes to where the user clicked. The user can nav all the way forward by continually clicking the 1 forward history button until there is no more. im somewhat spitballing here just to have something to record my idea before I forget. what do you think about this one?
 
 make play button on movies/shows (as well as episode specific play buttons) show a loader if it takes longer than .2 seconds to bring up the player. sometimes the drive has to spin up
-
-trying to close app mid scan causes native alert to appear. need to use waverunner style modal.
 
 i renamed a folder from my source library and went and tried to play the song in waverunner and it definitely isnt ready for that, although i thought it'd be worse. the song appears to start playing at first but its stuck at 0:00 and shows the pause button like its playing and wont switch to play by clicking - its just stuck there.
 
@@ -44,8 +61,6 @@ scanning libraries in sidebar should be limited to three lines and cut off with 
 
 consider per-album display-title choice: release group name vs default release's name (e.g. DAMN. vs DAMN. COLLECTORS EDITION.). needs MB release titles stored on album_release; choice as field_override; materialize on toggle and recompute on release apply / default-release switch / unmatch. manual rename is the stopgap.
 
-need better modal stacking system - its a little crazy right now. consider animations for size differences when switching between modals.
-
 find good hover tooltip styling and apply it everywhere
 
 less rounded previous, next, play/pause buttons on video player
@@ -62,7 +77,7 @@ any  way we could do a rough estimated total time on library creation/rescan (es
 
 dont allow user to click create button on create library menu until they have scrolled all the way down at least once
 
-i noticed navigating forward and back is working while metadata center is open. it shouldnt. it shouldnt work with any modal open unless the modal has its own nav.
+ensure navigation (forward and back in browser) is disabled with modals open
 
 consider who loved tracks apply to. it should (and I believe is) apply to all album artists the track comes from. this is the part that i think will take a change: I also want artists credited on the loved track to be credited with loves even if they are not an artist on the album, just a feature. Pretty sure loves dont yet apply to track features. this should line things up with how loose track loves work.
 
@@ -87,10 +102,6 @@ sometimes adding covers (for sure at least from the albums grid page) doesnt sti
 editing loose tracks to give them an artist doesn't seem to update the artist page with the new track. I can even click on the artist under the track to get to the page but it isn't there.
 
 i noticed an album rename didnt update its location until refresh OR go away and come back. it should visibly (animatedly) move to its new location immediately after rename. ACTUALLY, now I'm noticing that renaming albums through the context menu from right clicking albums on the albums page isnt working. it seems to work at first but eventually you come back and its back to the old name
-
-while combining an album I went to an album page (by clicking the album of the currently playing song), and the modal for selecting an album to combine with appeared. not sure why. i exited it and continued what I was doing. the albums seemed to merge properly. not sure what wouldve happened had i done something in that erroneous modal. plz fix. now that I think of it, I realize I wasnt supposed to be able to go there while rescanning. we need to consider what to do with whats currently playing while rescanning.
-
-WHOLE MUSIC SECTION NEEDS CONTEXT MENU IMPROVEMENTS
 
 
 ## changes / small new features

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Button } from "../ui/button";
+import { useLibraryRuns } from "@/hooks/libraryRuns";
 import { RefreshCw, Sparkles, TriangleAlert } from "lucide-react";
 
 /** The two deferred-work queues a music library carries:
@@ -88,9 +89,14 @@ export function LibraryAttentionBadge({
 }) {
   // Only music carries the deferred-work queues; other formats skip the fetch.
   const { rescan, pass } = usePendingWork(format === "music" ? libraryId : null);
-  if (rescan.length === 0 && pass.length === 0) return null;
+  // The match QUESTION after a scan waits on the Metadata page (its banner
+  // shows only there) — the badge is how the user finds it.
+  const { runs } = useLibraryRuns();
+  const asking = runs[libraryId]?.kind === "prompt";
+  if (rescan.length === 0 && pass.length === 0 && !asking) return null;
   const urgent = rescan.length > 0;
   const parts = [
+    asking && "Match question waiting",
     rescan.length > 0 &&
       `${rescan.length} change${rescan.length === 1 ? "" : "s"} staged for the next rescan`,
     pass.length > 0 &&
@@ -111,7 +117,7 @@ export function LibraryAttentionBadge({
       }}
       title={`${parts} — open Metadata`}
       className={`flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded transition-colors hover:bg-foreground/10 ${
-        urgent ? "text-red-400 hover:text-red-300" : "text-amber-300 hover:text-amber-200"
+        urgent ? "text-red-400 hover:text-red-300" : "text-primary hover:text-primary/80"
       }`}
     >
       <TriangleAlert size={13} />
@@ -147,16 +153,18 @@ export function PendingWorkStrip({ libraryId }: { libraryId: string }) {
   return (
     <div
       className={`flex items-center gap-3 border-b px-4 py-1.5 ${
-        urgent ? "border-red-500/30 bg-red-500/5" : "border-amber-500/30 bg-amber-500/5"
+        urgent ? "border-red-500/30 bg-red-500/5" : "border-primary/25 bg-primary/5"
       }`}
     >
+      {/* Pass-waiting = the running pass's palette (primary tint, primary
+          icon, plain text), so the two read as one thing. */}
       <TriangleAlert
         size={13}
-        className={`shrink-0 ${urgent ? "text-red-400" : "text-amber-300"}`}
+        className={`shrink-0 ${urgent ? "text-red-400" : "text-primary"}`}
       />
       <p
         className={`min-w-0 flex-1 truncate text-xs ${
-          urgent ? "text-red-200/90" : "text-amber-200/90"
+          urgent ? "text-red-200/90" : ""
         }`}
       >
         {message}

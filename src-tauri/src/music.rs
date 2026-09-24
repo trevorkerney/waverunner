@@ -113,6 +113,38 @@ pub struct ScannedRelease {
     /// Absolute folder, for cover lookups.
     pub folder_abs: PathBuf,
     pub tracks: Vec<ScannedTrack>,
+    /// A cue sheet in the folder flags its tracks PRE — the rip kept the
+    /// CD's pre-emphasis, so playback should de-emphasize.
+    pub cue_pre_emphasis: bool,
+}
+
+/// Does a .cue in `dir` mark any track with the PRE flag? Cue sheets write
+/// it as `FLAGS PRE` (possibly with other flags on the line: `FLAGS DCP
+/// PRE`). Only the release folder itself is read — disc subfolders share
+/// the parent's cue, if any.
+pub(crate) fn cue_flags_pre_emphasis(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else { return false };
+    for e in entries.flatten() {
+        let p = e.path();
+        let is_cue = p
+            .extension()
+            .and_then(|x| x.to_str())
+            .is_some_and(|x| x.eq_ignore_ascii_case("cue"));
+        if !is_cue {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&p) else { continue };
+        let text = String::from_utf8_lossy(&bytes);
+        for line in text.lines() {
+            let mut words = line.split_whitespace();
+            if words.next().is_some_and(|w| w.eq_ignore_ascii_case("FLAGS"))
+                && words.any(|w| w.eq_ignore_ascii_case("PRE"))
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone)]
@@ -614,6 +646,7 @@ fn assemble_albums(tracks: Vec<(ScannedTrack, String, PathBuf)>) -> ScanOutput {
             .or_insert_with(|| ScannedRelease {
                 label: None,
                 folder_rel,
+                cue_pre_emphasis: cue_flags_pre_emphasis(&folder_abs),
                 folder_abs,
                 tracks: Vec::new(),
             })
@@ -1565,8 +1598,8 @@ async fn insert_album(
 
     for (i, release) in album.releases.iter().enumerate() {
         let res = sqlx::query(
-            "INSERT INTO album_release (album_id, label, folder_path, release_date, mb_release_id, is_default, disc_count, title)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO album_release (album_id, label, folder_path, release_date, mb_release_id, is_default, disc_count, title, cue_pre_emphasis)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(album_entry_id)
         .bind(&release.label)
@@ -1576,6 +1609,7 @@ async fn insert_album(
         .bind((i == album.default_release) as i64)
         .bind(release_disc_count(release))
         .bind(release_title_of(release))
+        .bind(release.cue_pre_emphasis as i64)
         .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
@@ -1779,8 +1813,8 @@ async fn reconcile_album(
 
     for (i, release) in album.releases.iter().enumerate() {
         let res = sqlx::query(
-            "INSERT INTO album_release (album_id, label, folder_path, release_date, mb_release_id, is_default, disc_count, title)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO album_release (album_id, label, folder_path, release_date, mb_release_id, is_default, disc_count, title, cue_pre_emphasis)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(album_entry_id)
         .bind(&release.label)
@@ -1790,6 +1824,7 @@ async fn reconcile_album(
         .bind((i == album.default_release) as i64)
         .bind(release_disc_count(release))
         .bind(release_title_of(release))
+        .bind(release.cue_pre_emphasis as i64)
         .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
@@ -5240,6 +5275,43 @@ pub struct TrackView {
     pub bitrate_mode: Option<String>,
 }
 
+/// (the scanner's cue finding, the user's override) for one release.
+pub(crate) async fn release_pre_emphasis_facts(
+    pool: &SqlitePool,
+    release_id: i64,
+) -> Result<(bool, Option<bool>), String> {
+    let row: Option<(i64, Option<i64>)> = sqlx::query_as(
+        "SELECT ar.cue_pre_emphasis, p.pre_emphasis FROM album_release ar
+         LEFT JOIN album_release_pref p ON p.album_id = ar.album_id AND p.folder_path = ar.folder_path
+         WHERE ar.id = ?",
+    )
+    .bind(release_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(match row {
+        Some((cue, pref)) => (cue != 0, pref.map(|v| v != 0)),
+        None => (false, None),
+    })
+}
+
+/// Should this track play through the de-emphasis filter? Its release's
+/// effective answer; false for tracks outside any release.
+pub(crate) async fn track_pre_emphasis(pool: &SqlitePool, track_id: i64) -> bool {
+    let release: Option<(i64,)> =
+        sqlx::query_as("SELECT release_id FROM track_release WHERE track_id = ?")
+            .bind(track_id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+    let Some((rid,)) = release else { return false };
+    match release_pre_emphasis_facts(pool, rid).await {
+        Ok((cue, pref)) => pref.unwrap_or(cue),
+        Err(_) => false,
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct ReleaseView {
     pub id: i64,
@@ -5272,6 +5344,13 @@ pub struct ReleaseView {
     /// folders (bare names belong to the default release). Never empty when
     /// the album has any art — releases with none fall back to the full pool.
     pub covers: Vec<String>,
+    /// Play this release through the de-emphasis filter: the user's word
+    /// (pre_emphasis_pref) when given, else what the cue sheet said.
+    pub pre_emphasis: bool,
+    /// The scanner found FLAGS PRE in the release folder's cue sheet.
+    pub cue_pre_emphasis: bool,
+    /// The user's override (album_release_pref), None = defer to the cue.
+    pub pre_emphasis_pref: Option<bool>,
     /// The user's cover pick for this release (album_release_pref), when it
     /// still exists in the pool.
     pub selected_cover: Option<String>,
@@ -5630,11 +5709,15 @@ pub async fn get_album_detail(
         .map(|(f,)| f.rsplit(['\\', '/']).next().unwrap_or(&f).to_string())
         .collect();
 
+        let (cue_pre, pre_pref) = release_pre_emphasis_facts(pool, rid).await?;
         releases.push(ReleaseView {
             id: rid,
             label,
             is_default: is_default != 0,
             disc_count,
+            pre_emphasis: pre_pref.unwrap_or(cue_pre),
+            cue_pre_emphasis: cue_pre,
+            pre_emphasis_pref: pre_pref,
             year: rdate.map(|d| d.chars().take(4).collect()),
             folder: folder_path
                 .rsplit(['\\', '/'])
@@ -6581,6 +6664,7 @@ mod tests {
                 folder_rel: format!("Artist\\{folder}"),
                 folder_abs: PathBuf::from(format!(r"X:\m\Artist\{folder}")),
                 tracks: vec![track],
+                cue_pre_emphasis: false,
             }],
             default_release: 0,
         }
@@ -6685,6 +6769,7 @@ mod tests {
                 folder_rel: "Feature Test\\A1".to_string(),
                 folder_abs: PathBuf::from(r"X:\m\Feature Test\A1"),
                 tracks,
+                cue_pre_emphasis: false,
             }],
             default_release: 0,
         }
@@ -6745,6 +6830,7 @@ mod tests {
                 folder_rel: "Feature Test\\B2".to_string(),
                 folder_abs: PathBuf::from(r"X:\m\Feature Test\B2"),
                 tracks: vec![t2],
+                cue_pre_emphasis: false,
             }],
             default_release: 0,
             identity_override: None,

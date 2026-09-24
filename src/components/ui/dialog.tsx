@@ -40,7 +40,7 @@ import { XIcon } from "lucide-react"
 const FADE_MS = 200
 const RESIZE_MS = 200
 /** The shell's exit animation (see the popup's data-closed classes). */
-const EXIT_MS = 120
+const EXIT_MS = 150
 
 /** Width vocabulary. */
 const DIALOG_SIZES = {
@@ -126,6 +126,8 @@ function ModalStackProvider({ children }: { children: React.ReactNode }) {
   // it has usually popped from the stack by then (it closed), and the
   // shell still needs its node to fade it.
   const [outgoing, setOutgoing] = React.useState<StackEntry | null>(null)
+  // The last dialog, kept through the shell's exit animation.
+  const [closing, setClosing] = React.useState<StackEntry | null>(null)
   const [phase, setPhase] = React.useState<Phase>("idle")
   // In-place growth: the main slot stays visible through the resize.
   const [keep, setKeep] = React.useState(false)
@@ -218,6 +220,7 @@ function ModalStackProvider({ children }: { children: React.ReactNode }) {
     if (top !== null && closeTimerRef.current !== null) {
       window.clearTimeout(closeTimerRef.current)
       closeTimerRef.current = null
+      setClosing(null)
     }
     // Mid-clear: dialogs are popping one by one; hold the display where it
     // is until the stack is empty.
@@ -233,13 +236,19 @@ function ModalStackProvider({ children }: { children: React.ReactNode }) {
       return
     }
     if (top === null) {
+      // Last close: the shell exits NOW (the popup's reverse animation),
+      // and the closing dialog keeps its slot and the frame its size until
+      // that animation has run — otherwise the exit plays on an empty,
+      // zero-size box and reads as an instant disappearance.
+      setClosing(entriesRef.current.get(cur) ?? null)
+      displayedRef.current = null
+      setDisplayed(null)
+      setPhase("idle")
       closeTimerRef.current = window.setTimeout(() => {
         closeTimerRef.current = null
         if (gen !== generation.current) return
-        displayedRef.current = null
-        setDisplayed(null)
+        setClosing(null)
         setApplied(undefined)
-        setPhase("idle")
       }, EXIT_MS)
       return
     }
@@ -374,7 +383,10 @@ function ModalStackProvider({ children }: { children: React.ReactNode }) {
   //   leaving — an overlay fading out over the one arriving
   //   parked  — display:none (a parent behind its child); the node stays
   //             attached, so its images don't reload when it returns
-  const slots: StackEntry[] = outgoing && !stack.some((e) => e.id === outgoing.id) ? [...stack, outgoing] : stack
+  const slots: StackEntry[] = [...stack]
+  for (const extra of [outgoing, closing]) {
+    if (extra && !slots.some((e) => e.id === extra.id)) slots.push(extra)
+  }
   const hiddenMain = (phase === "out" || phase === "resize") && !keep
   return (
     <StackActionsContext.Provider value={actions}>
@@ -383,7 +395,16 @@ function ModalStackProvider({ children }: { children: React.ReactNode }) {
         <DialogPrimitive.Root
           open={shellOpen}
           onOpenChange={(o, details) => {
-            if (!o) dismissTop(details)
+            if (o) return
+            if (details.reason === "outside-press") {
+              // Content reaches the shell by DOM node, not the React tree,
+              // so a nested popup (a Select's list, a menu — portaled to
+              // the body) isn't in the dialog's floating tree and reads as
+              // outside. Only a press on the backdrop is a dismiss.
+              const t = details.event?.target
+              if (!(t instanceof Element) || !t.closest('[data-slot="dialog-overlay"]')) return
+            }
+            dismissTop(details)
           }}
         >
           <DialogPrimitive.Portal>
@@ -405,7 +426,12 @@ function ModalStackProvider({ children }: { children: React.ReactNode }) {
               }}
             >
               {slots.map((e) => {
-                const role = e.id === displayed ? "showing" : e.id === outgoing?.id ? "leaving" : "parked"
+                const role =
+                  e.id === displayed || e.id === closing?.id
+                    ? "showing"
+                    : e.id === outgoing?.id
+                      ? "leaving"
+                      : "parked"
                 return (
                   <div
                     key={e.id}
@@ -487,6 +513,49 @@ function useDialogPhase(): Phase {
   const entry = React.useContext(DialogEntryContext)
   if (!view || !entry || view.displayed !== entry.id) return "idle"
   return view.phase
+}
+
+/** A step swap inside a fixed frame (search → review, form → question):
+ *  everything the dialog shows fades out (200ms), the step on screen
+ *  changes, everything fades back in (200ms). Render from `shown`, wrap the
+ *  content in a div that fades on `visible`, and re-declare the frame's
+ *  height from `shown` if the steps differ in size — the shell resizes it
+ *  while the content is invisible. Buttons should disable on !visible. */
+function useContentSwap<T>(step: T, ms = 200): { shown: T; visible: boolean } {
+  const [shown, setShown] = React.useState(step)
+  const [visible, setVisible] = React.useState(true)
+  // Keyed on the requested step only: the swap itself changes `shown`, and
+  // re-running on that would cancel the fade-in timer.
+  const shownRef = React.useRef(shown)
+  shownRef.current = shown
+  React.useEffect(() => {
+    if (step === shownRef.current) return
+    setVisible(false)
+    const t1 = window.setTimeout(() => setShown(step), ms)
+    const t2 = window.setTimeout(() => setVisible(true), ms * 2)
+    return () => {
+      window.clearTimeout(t1)
+      window.clearTimeout(t2)
+    }
+  }, [step, ms])
+  return { shown, visible }
+}
+
+/** Content added to a dialog that grows in place for it: mounts invisible,
+ *  rides the frame's resize, and fades in (200ms) once the shell reports
+ *  the resize done. Must render INSIDE the dialog's own content — the phase
+ *  hook reads the nearest dialog's entry. */
+function RevealAfterResize({ className = "", children }: { className?: string; children: React.ReactNode }) {
+  const phase = useDialogPhase()
+  const [revealed, setRevealed] = React.useState(false)
+  React.useEffect(() => {
+    if (phase === "in") setRevealed(true)
+  }, [phase])
+  return (
+    <div className={`${className} transition-opacity duration-200 ${revealed ? "opacity-100" : "opacity-0"}`}>
+      {children}
+    </div>
+  )
 }
 
 interface DialogProps {
@@ -577,6 +646,13 @@ function Dialog({ open, onOpenChange, finishesParent = false, dismiss = "all", c
     [id, actions, requestClose],
   )
 
+  // What the dialog showed last while open. A closing dialog keeps
+  // portaling THIS, not the live children: callers typically open on a
+  // "target" state and null it in the same click that closes, so the live
+  // children would read `undefined` (or blank) for the whole exit fade.
+  const frozenChildren = React.useRef<React.ReactNode>(children)
+  if (isOpen) frozenChildren.current = children
+
   // wasOpen covers the render in which `open` just flipped false: `lingering`
   // is only set in the effect after it, and returning null here for that one
   // render unmounted the whole content and remounted it a frame later (the
@@ -584,7 +660,7 @@ function Dialog({ open, onOpenChange, finishesParent = false, dismiss = "all", c
   if (!(isOpen || lingering || wasOpen.current)) return null
   return (
     <DialogEntryContext.Provider value={entry}>
-      {createPortal(children, node)}
+      {createPortal(isOpen ? children : frozenChildren.current, node)}
     </DialogEntryContext.Provider>
   )
 }
@@ -639,10 +715,14 @@ function DialogContent({
 /** The scrolling middle of a fixed-size dialog: header and footer stay put,
  *  this takes the rest and scrolls when content is taller. */
 function DialogBody({ className, ...props }: React.ComponentProps<"div">) {
+  // No scrollbar mid-morph: content arriving for an in-place grow mounts
+  // (invisible) before the frame has grown, and would summon one for the
+  // 200ms resize. Scrolling resumes once the dialog is idle.
+  const phase = useDialogPhase()
   return (
     <div
       data-slot="dialog-body"
-      className={cn("min-h-0 flex-1 overflow-y-auto", className)}
+      className={cn("min-h-0 flex-1", phase === "idle" ? "overflow-y-auto" : "overflow-hidden", className)}
       {...props}
     />
   )
@@ -678,9 +758,11 @@ function DialogTransition({
   const innerRef = React.useRef<HTMLDivElement | null>(null)
   const [phase, setPhase] = React.useState<TPhase>("idle")
   const [shownKey, setShownKey] = React.useState(contentKey)
-  const [frozen, setFrozen] = React.useState<React.ReactNode>(null)
+  // The content last rendered under the shown key. While contentKey is
+  // ahead of shownKey (the render that changed it, and the fade-out) this is
+  // what paints — the new content must never show before the fade.
   const lastChildrenRef = React.useRef<React.ReactNode>(children)
-  if (phase !== "out") lastChildrenRef.current = children
+  if (contentKey === shownKey) lastChildrenRef.current = children
   const [height, setHeight] = React.useState<number | null>(null)
   const generation = React.useRef(0)
   const reduced =
@@ -702,11 +784,9 @@ function DialogTransition({
     // Layout height, not the bounding rect: an ancestor's scale animation
     // would make a rect read short and pin the box too small.
     if (outer) setHeight(outer.offsetHeight)
-    setFrozen(lastChildrenRef.current)
     setPhase("out")
     const t = window.setTimeout(() => {
       if (gen !== generation.current) return
-      setFrozen(null)
       setShownKey(contentKey)
       setPhase("resize")
     }, OUT_MS)
@@ -770,7 +850,7 @@ function DialogTransition({
                 : undefined,
         }}
       >
-        {phase === "out" ? frozen : children}
+        {contentKey === shownKey ? children : lastChildrenRef.current}
       </div>
     </div>
   )
@@ -850,6 +930,8 @@ export {
   DialogTitle,
   DialogTransition,
   ModalStackProvider,
+  RevealAfterResize,
+  useContentSwap,
   useDialogStack,
   useDialogPhase,
   DIALOG_SIZES,

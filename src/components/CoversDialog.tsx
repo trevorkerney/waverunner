@@ -6,14 +6,15 @@ import {
   Dialog,
   DialogBody,
   DialogContent,
+  DialogDescription,
   DialogHeader,
   DialogTitle,
   DialogFooter,
-  useDialogPhase,
+  RevealAfterResize,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
-import { Skeleton, useSkeletonDelay } from "@/components/ui/skeleton";
+import { Skeleton, useHandoff } from "@/components/ui/skeleton";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { Check, Download, FolderOpen, Globe, Image as ImageIcon, Lock, Trash2 } from "lucide-react";
 import { ContextMenuItem } from "@/components/ui/context-menu";
@@ -116,20 +117,24 @@ export function CoversMenuItem({ onOpen }: { onOpen: () => void }) {
   return (
     <ContextMenuItem onClick={onOpen}>
       <ImageIcon size={14} />
-      Covers…
+      Covers
     </ContextMenuItem>
   );
 }
 
 /** The covers grid: five fixed columns (a 2xl dialog's width), so a tile is
  *  always the same size and two rows are always the same height. */
-const COVER_GRID = "grid grid-cols-5 items-start gap-3";
+export const COVER_GRID = "grid grid-cols-5 items-start gap-3";
 /** The covers dialogs' fixed height: padding + title + gap + a body of
  *  exactly two rows of square tiles (the WIDEST tiles a 2xl dialog yields,
  *  ~135px, plus the gap and the body's padding, with a little slack so two
  *  rows never overflow by a pixel and summon a scrollbar) + gap + footer.
  *  16 + 20 + 16 + 312 + 16 + 60 = 440px. */
 const COVERS_HEIGHT = "27.5rem";
+/** The same for video: two rows of 2:3 posters at the same tile width
+ *  (~135 × 202). 16 + 20 + 16 + (405 + 12 gap + 22 padding + 8 slack) + 16
+ *  + 60 = 575px. */
+const VIDEO_COVERS_HEIGHT = "36rem";
 /** The cover art browser with only the group cover to show. 16 padding +
  *  20 title + 16 gap + 16 subtitle + 14 (gap less the body's 2px pull-up)
  *  + 24 section label + 135 tile + 20 caption + 14 (gap less 2px, matching
@@ -138,63 +143,7 @@ const CAA_ONE_ROW_HEIGHT = "20rem";
 /** How long a closed dialog keeps its content before resetting — longer
  *  than the shell's fade-out (200ms) plus its exit (120ms), so the content
  *  is still there to fade. */
-const CLOSE_RESET_MS = 400;
-
-/** The skeleton → content hand-off both covers dialogs use, in a fixed
- *  order on content that has already painted:
- *    1. `ready`: the content is mounted at opacity 0 — WITH will-change:
- *       opacity, so it's a composited layer whose contents are rasterised
- *       while invisible (a plain opacity-0 subtree is skipped by the
- *       renderer and would rasterise during the fade) — and every <img>
- *       under `contentRef` is waited on until decoded, plus a few frames.
- *    2. If a skeleton was ever shown (the 500ms delay elapsed), it fades
- *       out over 200ms, alone.
- *    3. The content fades in over 200ms, alone.
- *  Returns the stage, whether a skeleton was seen (keep it MOUNTED through
- *  its fade — an unmount/remount skips it), and the two derived flags. */
-function useHandoff(ready: boolean, contentRef: React.RefObject<HTMLElement | null>) {
-  const showSkeleton = useSkeletonDelay(!ready);
-  const [stage, setStage] = useState<"hidden" | "tiles-out" | "reveal" | "shown">("hidden");
-  const seenRef = useRef(false);
-  if (showSkeleton) seenRef.current = true;
-  useEffect(() => {
-    if (!ready) {
-      setStage("hidden");
-      seenRef.current = false;
-      return;
-    }
-    let cancelled = false;
-    (async () => {
-      const imgs = contentRef.current ? Array.from(contentRef.current.querySelectorAll("img")) : [];
-      // A broken image must not hold the reveal forever.
-      const cap = new Promise<void>((r) => setTimeout(r, 1500));
-      await Promise.race([Promise.allSettled(imgs.map((i) => i.decode())), cap]);
-      for (let i = 0; i < 4; i++) {
-        await new Promise<void>((r) => requestAnimationFrame(() => r()));
-      }
-      if (cancelled) return;
-      if (seenRef.current) {
-        setStage("tiles-out");
-        await new Promise<void>((r) => setTimeout(r, 200));
-        if (cancelled) return;
-      }
-      setStage("reveal");
-      await new Promise<void>((r) => setTimeout(r, 200));
-      if (cancelled) return;
-      setStage("shown");
-    })();
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ready]);
-  return {
-    stage,
-    skeletonSeen: seenRef.current,
-    shown: stage === "shown",
-    contentVisible: stage === "reveal" || stage === "shown",
-  };
-}
+export const CLOSE_RESET_MS = 400;
 
 /** A lazily loaded thumbnail: a square skeleton holds the spot until its
  *  own image has loaded — each tile independently, so a scan set fills in
@@ -221,30 +170,31 @@ function LazyThumb({ src }: { src: string }) {
   );
 }
 
-/** Content added to a dialog that grows in place for it: mounts invisible,
- *  rides the frame's resize, and fades in (200ms) once the shell reports
- *  the resize done. Must render INSIDE the dialog's own content — the phase
- *  hook reads the nearest dialog's entry. */
-function RevealAfterResize({ className = "", children }: { className?: string; children: React.ReactNode }) {
-  const phase = useDialogPhase();
-  const [revealed, setRevealed] = useState(false);
-  useEffect(() => {
-    if (phase === "in") setRevealed(true);
-  }, [phase]);
-  return (
-    <div className={`${className} transition-opacity duration-200 ${revealed ? "opacity-100" : "opacity-0"}`}>
-      {children}
-    </div>
-  );
-}
-
 /** Grey tiles in the covers grid's own layout, filling the fixed body until
  *  the real tiles are fetched and decoded — the swap moves nothing. */
-function SkeletonTiles({ count = 10, className = "" }: { count?: number; className?: string }) {
+export function SkeletonTiles({
+  count = 10,
+  className = "",
+  aspect = "square",
+  grid = COVER_GRID,
+}: {
+  count?: number;
+  className?: string;
+  /** Album art is square; video posters are 2:3 and backdrops 16:9 (same
+   *  width, taller / shorter). */
+  aspect?: "square" | "poster" | "wide";
+  /** The grid the real tiles use (Covers' five columns by default). */
+  grid?: string;
+}) {
   return (
-    <div className={`${COVER_GRID} ${className}`}>
+    <div className={`${grid} ${className}`}>
       {Array.from({ length: count }, (_, i) => (
-        <Skeleton key={i} className="aspect-square w-full rounded-[3px]" />
+        <Skeleton
+          key={i}
+          className={`w-full rounded-[3px] ${
+            aspect === "poster" ? "aspect-[2/3]" : aspect === "wide" ? "aspect-video" : "aspect-square"
+          }`}
+        />
       ))}
     </div>
   );
@@ -687,6 +637,15 @@ function CaaImageBrowserDialog({
   );
 }
 
+/** Opened from a playlist: the pool (add / delete) is the target's own, but
+ *  the PICK is the link's — a playlist's copy may show a different cover
+ *  than the library page, and setting it never touches the target. */
+export interface PlaylistLink {
+  linkId: number;
+  /** What the link shows now (its override, or the target's pick). */
+  selectedCover: string | null;
+}
+
 /** What the covers dialog manages.
  *  - "entry": one media_entry's covers (movies, shows, video collections,
  *    music artists) — the entry-level add/set/delete commands.
@@ -699,6 +658,7 @@ export type CoversTarget =
       entryId: number;
       entryType: string;
       title: string;
+      link?: PlaylistLink;
     }
   | {
       kind: "release";
@@ -706,6 +666,7 @@ export type CoversTarget =
       albumId: number;
       releaseId: number | null;
       title: string;
+      link?: PlaylistLink;
     };
 
 interface CoverInfo {
@@ -766,6 +727,9 @@ export function CoversDialog({
   };
   const [covers, setCovers] = useState<CoverInfo[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
+  /** For a playlist link: its own pick, kept here across refetches (the
+   *  fetch reports the TARGET's pick, which isn't the link's). */
+  const linkSelectedRef = useRef<string | null>(null);
   /** Concrete release id once resolved (target may say "the default"). */
   const [releaseId, setReleaseId] = useState<number | null>(null);
   /** Album matched to a MusicBrainz release group (the CAA browser's
@@ -802,7 +766,7 @@ export function CoversDialog({
           mb_release_matched: boolean;
         }>("get_release_covers", { albumId: target.albumId, releaseId: target.releaseId });
         setCovers(r.covers);
-        setSelected(r.selected);
+        setSelected(target.link ? linkSelectedRef.current : r.selected);
         setReleaseId(r.release_id);
         setMbMatched(r.mb_matched);
         setMbReleaseMatched(r.mb_release_matched);
@@ -813,7 +777,7 @@ export function CoversDialog({
           { libraryId: target.libraryId, entryId: target.entryId },
         );
         setCovers(r.covers);
-        setSelected(r.selected);
+        setSelected(target.link ? linkSelectedRef.current : r.selected);
         setReleaseId(null);
         return r.covers;
       }
@@ -843,6 +807,7 @@ export function CoversDialog({
       return () => clearTimeout(t);
     }
     let cancelled = false;
+    linkSelectedRef.current = target?.link?.selectedCover ?? null;
     (async () => {
       const list = await refetch();
       await Promise.allSettled(
@@ -857,7 +822,7 @@ export function CoversDialog({
     return () => {
       cancelled = true;
     };
-  }, [open, refetch, getCoverUrl]);
+  }, [open, target, refetch, getCoverUrl]);
 
   if (!target) return null;
   const entryId = target.kind === "release" ? target.albumId : target.entryId;
@@ -873,7 +838,11 @@ export function CoversDialog({
   const setCover = async (path: string) => {
     setBusy(true);
     try {
-      if (target.kind === "release") {
+      if (target.link) {
+        // The playlist's copy only — the target's own pick stays.
+        await invoke("set_link_cover", { linkId: target.link.linkId, coverPath: path });
+        linkSelectedRef.current = path;
+      } else if (target.kind === "release") {
         await invoke("set_release_cover", { releaseId, cover: path });
       } else {
         await invoke("set_cover", {
@@ -971,12 +940,20 @@ export function CoversDialog({
 
   const videoRemote =
     target.kind === "entry" && (target.entryType === "movie" || target.entryType === "show");
+  // Video covers are posters (2:3): taller tiles, taller frame, taller
+  // skeletons — album art is square.
+  const poster = target.kind === "entry";
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent size="2xl" height={COVERS_HEIGHT}>
+      <DialogContent size="2xl" height={poster ? VIDEO_COVERS_HEIGHT : COVERS_HEIGHT}>
         <DialogHeader>
           <DialogTitle className="truncate">Covers — {target.title}</DialogTitle>
+          {target.link && (
+            <DialogDescription>
+              The pick here is this playlist entry's own — the library's cover stays as it is.
+            </DialogDescription>
+          )}
         </DialogHeader>
         {/* FIXED size: the dialog's height gives the body exactly two rows
             of tiles (the cover count can't be known before the fetch, so
@@ -1087,6 +1064,7 @@ export function CoversDialog({
               own fade-out, since an unmount/remount would skip it. */}
           {!shown && skeletonSeen && (
             <SkeletonTiles
+              aspect={poster ? "poster" : "square"}
               className={`absolute inset-x-1.5 top-4 z-10 transition-opacity duration-200 ${
                 stage === "hidden" ? "" : "opacity-0"
               }`}
@@ -1163,7 +1141,7 @@ export function CoversDialog({
           entryId={target.entryId}
           tmdbId={tmdb?.tmdbId ?? ""}
           mediaType={tmdb?.mediaType ?? "movie"}
-          initialTab="posters"
+          kind="posters"
           onDownloaded={() => {
             refetch();
             notifyChanged();

@@ -1,9 +1,11 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { notifyPendingWorkChanged } from "./PendingWork";
 import { toast } from "sonner";
 import {
   Dialog,
+  DialogBody,
   DialogContent,
   DialogHeader,
   DialogTitle,
@@ -14,6 +16,8 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Spinner } from "@/components/ui/spinner";
+import { Switch } from "@/components/ui/switch";
+import { Skeleton, useHandoff } from "@/components/ui/skeleton";
 import {
   Select,
   SelectTrigger,
@@ -27,6 +31,178 @@ import { Undo2, X } from "lucide-react";
  *  as overrides in waverunner's database (files stay untouched) and survive
  *  rescans and MusicBrainz passes. Writing INTO the file's tags is a separate,
  *  explicit option that only appears when enabled in Settings → Audio Player. */
+
+// ---------------------------------------------------------------------------
+// Shared pieces
+// ---------------------------------------------------------------------------
+
+/** The fade-in class for a form once its data is in (see useHandoff). */
+const formFade = (visible: boolean) =>
+  `grid gap-4 transition-opacity duration-200 will-change-[opacity] ${visible ? "opacity-100" : "opacity-0"}`;
+/** The skeleton overlay: same layout as the form, fades out first. */
+const skeletonFade = (stage: string) =>
+  `absolute inset-x-1 top-0 grid gap-4 transition-opacity duration-200 ${stage === "hidden" ? "" : "opacity-0"}`;
+
+/** Grey stand-ins for a label + field. */
+function FieldSkeleton({ field = "h-9" }: { field?: string }) {
+  return (
+    <div className="grid gap-1.5">
+      <Skeleton className="h-3.5 w-24" />
+      <Skeleton className={`w-full ${field}`} />
+    </div>
+  );
+}
+
+/** Existing-artist suggestions under an artist row. Portaled at fixed
+ *  coordinates (like ArtistPicker's menu): the form body scrolls, and an
+ *  absolute menu inside it would be clipped by that box. */
+function SuggestMenu({
+  anchorEl,
+  options,
+  onPick,
+}: {
+  anchorEl: HTMLElement | null;
+  options: string[];
+  onPick: (option: string) => void;
+}) {
+  const [anchor, setAnchor] = useState<{ left: number; top: number; width: number } | null>(null);
+  useLayoutEffect(() => {
+    if (!anchorEl) {
+      setAnchor(null);
+      return;
+    }
+    const place = () => {
+      const r = anchorEl.getBoundingClientRect();
+      setAnchor({ left: r.left, top: r.bottom + 4, width: r.width });
+    };
+    place();
+    // Capture phase: the scroll happens on an ancestor, not on window.
+    window.addEventListener("scroll", place, true);
+    window.addEventListener("resize", place);
+    return () => {
+      window.removeEventListener("scroll", place, true);
+      window.removeEventListener("resize", place);
+    };
+  }, [anchorEl]);
+  if (!anchor || options.length === 0) return null;
+  return createPortal(
+    <div
+      style={{ position: "fixed", left: anchor.left, top: anchor.top, width: anchor.width }}
+      className="z-[60] max-h-56 overflow-y-auto rounded-md border border-border bg-popover p-1 shadow-md"
+    >
+      {options.map((option) => (
+        <button
+          key={option}
+          type="button"
+          onMouseDown={(e) => {
+            e.preventDefault();
+            onPick(option);
+          }}
+          className="flex w-full items-center rounded px-2 py-1 text-left text-sm hover:bg-accent"
+        >
+          <span className="truncate">{option}</span>
+        </button>
+      ))}
+    </div>,
+    document.body,
+  );
+}
+
+/** One artist per row (first is the main / primary one), each with
+ *  existing-artist suggestions as it's typed — the track and album editors
+ *  share this. `search` is the dialog's own lookup command. */
+function ArtistRows({
+  rows,
+  onChange,
+  placeholders,
+  search,
+}: {
+  rows: string[];
+  onChange: (rows: string[]) => void;
+  placeholders: [string, string];
+  search: (query: string) => Promise<string[]>;
+}) {
+  const [suggest, setSuggest] = useState<{ row: number; options: string[] } | null>(null);
+  const seq = useRef(0);
+  const timer = useRef<number | undefined>(undefined);
+  const rowEls = useRef<Map<number, HTMLDivElement>>(new Map());
+
+  const query = (row: number, q: string) => {
+    window.clearTimeout(timer.current);
+    const trimmed = q.trim();
+    if (trimmed.length < 2) {
+      setSuggest(null);
+      return;
+    }
+    const mine = ++seq.current;
+    timer.current = window.setTimeout(async () => {
+      try {
+        const options = await search(trimmed);
+        if (seq.current === mine) setSuggest(options.length > 0 ? { row, options } : null);
+      } catch {
+        /* suggestions are best-effort */
+      }
+    }, 150);
+  };
+  // Hide names already taken by OTHER rows — the row being typed in must keep
+  // its own match visible, or the suggestion vanishes the moment the name is
+  // fully typed out.
+  const visibleOptions = (row: number): string[] => {
+    if (!suggest || suggest.row !== row) return [];
+    const taken = new Set(
+      rows.filter((_, i) => i !== row).map((a) => a.trim().toLowerCase()).filter(Boolean),
+    );
+    return suggest.options.filter((name) => !taken.has(name.toLowerCase()));
+  };
+
+  return (
+    <div className="flex flex-col gap-1">
+      {rows.map((name, i) => (
+        <div key={i} className="flex gap-1">
+          <div
+            className="relative flex-1"
+            ref={(el) => {
+              if (el) rowEls.current.set(i, el);
+              else rowEls.current.delete(i);
+            }}
+          >
+            <input
+              value={name}
+              onChange={(e) => {
+                const next = rows.slice();
+                next[i] = e.target.value;
+                onChange(next);
+                query(i, e.target.value);
+              }}
+              // Delayed so a click on a suggestion (onMouseDown) wins the race.
+              onBlur={() => setTimeout(() => setSuggest((s) => (s?.row === i ? null : s)), 100)}
+              placeholder={i === 0 ? placeholders[0] : placeholders[1]}
+              className="w-full rounded border border-input bg-transparent px-2 py-1 text-sm outline-none"
+            />
+            <SuggestMenu
+              anchorEl={suggest?.row === i ? (rowEls.current.get(i) ?? null) : null}
+              options={visibleOptions(i)}
+              onPick={(option) => {
+                const next = rows.slice();
+                next[i] = option;
+                onChange(next);
+                setSuggest(null);
+              }}
+            />
+          </div>
+          {rows.length > 1 && (
+            <Button size="sm" variant="ghost" onClick={() => onChange(rows.filter((_, idx) => idx !== i))}>
+              <X size={14} />
+            </Button>
+          )}
+        </div>
+      ))}
+      <Button size="sm" variant="outline" className="w-fit" onClick={() => onChange([...rows, ""])}>
+        + Add artist
+      </Button>
+    </div>
+  );
+}
 
 interface TrackEditView {
   id: number;
@@ -61,48 +237,19 @@ export function TrackEditDialog({ trackId, open, onOpenChange, onSaved }: TrackE
   const [trackNo, setTrackNo] = useState("");
   const [discNo, setDiscNo] = useState("");
   const [busy, setBusy] = useState(false);
-
-  // Existing-artist suggestions for the row being typed in.
-  const [suggest, setSuggest] = useState<{ row: number; options: string[] } | null>(null);
-  const suggestSeq = useRef(0);
-  const suggestTimer = useRef<number | undefined>(undefined);
-  const queryArtists = (row: number, q: string) => {
-    window.clearTimeout(suggestTimer.current);
-    const trimmed = q.trim();
-    if (trimmed.length < 2 || trackId == null) {
-      setSuggest(null);
-      return;
-    }
-    const seq = ++suggestSeq.current;
-    suggestTimer.current = window.setTimeout(async () => {
-      try {
-        const options = await invoke<string[]>("search_track_artist_options", {
-          trackId,
-          query: trimmed,
-        });
-        if (suggestSeq.current === seq) {
-          setSuggest(options.length > 0 ? { row, options } : null);
-        }
-      } catch {
-        /* suggestions are best-effort */
-      }
-    }, 150);
-  };
-  // Hide names already taken by OTHER rows — the row being typed in must keep
-  // its own match visible, or the suggestion vanishes the moment the name is
-  // fully typed out.
-  const visibleOptions = (row: number): string[] => {
-    if (!suggest || suggest.row !== row) return [];
-    const taken = new Set(
-      artistRows.filter((_, i) => i !== row).map((a) => a.trim().toLowerCase()).filter(Boolean),
-    );
-    return suggest.options.filter((name) => !taken.has(name.toLowerCase()));
-  };
+  // Skeleton form after 500ms, then skeleton out / form in (the dialog
+  // portals its last-open content through the exit, so clearing `view` on
+  // close is safe and keeps a reopen from flashing the previous track).
+  const bodyRef = useRef<HTMLDivElement | null>(null);
+  const { stage, skeletonSeen, shown, contentVisible } = useHandoff(!!view, bodyRef);
 
   useEffect(() => {
-    if (!open || trackId == null) return;
+    if (!open) {
+      setView(null);
+      return;
+    }
+    if (trackId == null) return;
     setView(null);
-    setSuggest(null);
     (async () => {
       try {
         const v = await invoke<TrackEditView>("get_track_edit", { trackId });
@@ -166,16 +313,15 @@ export function TrackEditDialog({ trackId, open, onOpenChange, onSaved }: TrackE
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent size="md">
+      {/* Static: the usual track (one artist row + its file-tag line) plus
+          a little room; more rows scroll. (27.75rem scrolled by a hair.) */}
+      <DialogContent size="md" height="30rem">
         <DialogHeader>
           <DialogTitle>Edit track</DialogTitle>
         </DialogHeader>
-        {!view ? (
-          <div className="flex justify-center py-10">
-            <Spinner className="size-5" />
-          </div>
-        ) : (
-          <div className="grid gap-4">
+        <DialogBody ref={bodyRef} className="relative -mx-1 px-1">
+        {view && (
+          <div className={formFade(contentVisible)}>
             <p className="truncate font-mono text-xs text-muted-foreground" title={view.file_name}>
               {view.file_name}
             </p>
@@ -193,67 +339,14 @@ export function TrackEditDialog({ trackId, open, onOpenChange, onSaved }: TrackE
             </div>
             <div className="grid gap-1.5">
               <Label>Artists (main artist first)</Label>
-              <div className="flex flex-col gap-1">
-                {artistRows.map((name, i) => {
-                  const options = visibleOptions(i);
-                  return (
-                    <div key={i} className="flex gap-1">
-                      <div className="relative flex-1">
-                        <input
-                          value={name}
-                          onChange={(e) => {
-                            const next = artistRows.slice();
-                            next[i] = e.target.value;
-                            setArtistRows(next);
-                            queryArtists(i, e.target.value);
-                          }}
-                          // Delayed so a click on a suggestion (onMouseDown) wins the race.
-                          onBlur={() => setTimeout(() => setSuggest((s) => (s?.row === i ? null : s)), 100)}
-                          placeholder={i === 0 ? "Main artist" : "Additional artist"}
-                          className="w-full rounded border border-input bg-transparent px-2 py-1 text-sm outline-none"
-                        />
-                        {options.length > 0 && (
-                          <div className="absolute left-0 right-0 top-full z-20 mt-1 max-h-56 overflow-y-auto rounded-md border border-border bg-popover p-1 shadow-md">
-                            {options.map((option) => (
-                              <button
-                                key={option}
-                                type="button"
-                                onMouseDown={(e) => {
-                                  e.preventDefault();
-                                  const next = artistRows.slice();
-                                  next[i] = option;
-                                  setArtistRows(next);
-                                  setSuggest(null);
-                                }}
-                                className="flex w-full items-center rounded px-2 py-1 text-left text-sm hover:bg-accent"
-                              >
-                                <span className="truncate">{option}</span>
-                              </button>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                      {artistRows.length > 1 && (
-                        <Button
-                          size="sm"
-                          variant="ghost"
-                          onClick={() => setArtistRows(artistRows.filter((_, idx) => idx !== i))}
-                        >
-                          <X size={14} />
-                        </Button>
-                      )}
-                    </div>
-                  );
-                })}
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="w-fit"
-                  onClick={() => setArtistRows([...artistRows, ""])}
-                >
-                  + Add artist
-                </Button>
-              </div>
+              <ArtistRows
+                rows={artistRows}
+                onChange={setArtistRows}
+                placeholders={["Main artist", "Additional artist"]}
+                search={(query) =>
+                  invoke<string[]>("search_track_artist_options", { trackId, query })
+                }
+              />
               {ft && ft.artists.length > 0 && (
                 <p className="text-xs text-muted-foreground">File tag: {ft.artists.join(", ")}</p>
               )}
@@ -284,6 +377,23 @@ export function TrackEditDialog({ trackId, open, onOpenChange, onSaved }: TrackE
             </p>
           </div>
         )}
+        {!shown && skeletonSeen && (
+          <div className={skeletonFade(stage)}>
+            <Skeleton className="h-3 w-48" />
+            <FieldSkeleton />
+            <div className="grid gap-1.5">
+              <Skeleton className="h-3.5 w-40" />
+              <Skeleton className="h-[30px] w-full" />
+              <Skeleton className="h-[30px] w-full" />
+              <Skeleton className="h-8 w-24" />
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <FieldSkeleton />
+              <FieldSkeleton />
+            </div>
+          </div>
+        )}
+        </DialogBody>
         <DialogFooter>
           {view && view.overridden.length > 0 && (
             <Button variant="ghost" className="mr-auto gap-1.5" disabled={busy} onClick={reset}>
@@ -312,6 +422,17 @@ interface AlbumEditView {
   /** Current artist credit (multi-artist rows, else the owning artist). */
   artist_credits: string[];
   overridden: string[];
+  /** Every release, for the per-release pre-emphasis switch. */
+  releases: {
+    id: number;
+    label: string | null;
+    folder: string;
+    is_default: boolean;
+    /** The scanner found FLAGS PRE in the release folder's cue sheet. */
+    cue_pre_emphasis: boolean;
+    /** Your override; null = go by the cue. */
+    pre_emphasis_pref: boolean | null;
+  }[];
 }
 
 interface AlbumEditDialogProps {
@@ -337,47 +458,20 @@ export function AlbumEditDialog({ albumId, open, onOpenChange, onSaved }: AlbumE
   // Album-level artist credit rows — a joint album ("Drake & Future") lists
   // every owner here and shows in each of their discographies.
   const [artistRows, setArtistRows] = useState<string[]>([""]);
+  // Per-release pre-emphasis: the user's override per release id (null =
+  // defer to the cue sheet). Staged here, written on Save.
+  const [preEmphasis, setPreEmphasis] = useState<Map<number, boolean | null>>(new Map());
   const [busy, setBusy] = useState(false);
-
-  const [suggest, setSuggest] = useState<{ row: number; options: string[] } | null>(null);
-  const suggestSeq = useRef(0);
-  const suggestTimer = useRef<number | undefined>(undefined);
-  const queryArtists = (row: number, q: string) => {
-    window.clearTimeout(suggestTimer.current);
-    const trimmed = q.trim();
-    if (trimmed.length < 2 || albumId == null) {
-      setSuggest(null);
-      return;
-    }
-    const seq = ++suggestSeq.current;
-    suggestTimer.current = window.setTimeout(async () => {
-      try {
-        // Library-scoped artist suggestions; resolves via any entry id.
-        const options = await invoke<string[]>("search_artist_options", {
-          artistId: albumId,
-          query: trimmed,
-        });
-        if (suggestSeq.current === seq) {
-          setSuggest(options.length > 0 ? { row, options } : null);
-        }
-      } catch {
-        /* best-effort */
-      }
-    }, 150);
-  };
-  const visibleOptions = (row: number): string[] => {
-    if (!suggest || suggest.row !== row) return [];
-    // Other rows only — the typed row keeps its own exact match visible.
-    const taken = new Set(
-      artistRows.filter((_, i) => i !== row).map((a) => a.trim().toLowerCase()).filter(Boolean),
-    );
-    return suggest.options.filter((name) => !taken.has(name.toLowerCase()));
-  };
+  const bodyRef = useRef<HTMLDivElement | null>(null);
+  const { stage, skeletonSeen, shown, contentVisible } = useHandoff(!!view, bodyRef);
 
   useEffect(() => {
-    if (!open || albumId == null) return;
+    if (!open) {
+      setView(null);
+      return;
+    }
+    if (albumId == null) return;
     setView(null);
-    setSuggest(null);
     (async () => {
       try {
         const v = await invoke<AlbumEditView>("get_album_edit", { albumId });
@@ -387,6 +481,7 @@ export function AlbumEditDialog({ albumId, open, onOpenChange, onSaved }: AlbumE
         setType(v.album_type);
         setGenresText(v.genres.join("\n"));
         setArtistRows(v.artist_credits.length > 0 ? v.artist_credits : [""]);
+        setPreEmphasis(new Map(v.releases.map((r) => [r.id, r.pre_emphasis_pref])));
       } catch (e) {
         toast.error(String(e));
         onOpenChange(false);
@@ -415,6 +510,12 @@ export function AlbumEditDialog({ albumId, open, onOpenChange, onSaved }: AlbumE
       if (Object.keys(fields).length > 0) {
         await invoke("set_album_fields", { albumId, fields });
       }
+      for (const r of view.releases) {
+        const next = preEmphasis.get(r.id) ?? null;
+        if (next !== r.pre_emphasis_pref) {
+          await invoke("set_release_pre_emphasis", { releaseId: r.id, value: next });
+        }
+      }
       onSaved();
       onOpenChange(false);
     } catch (e) {
@@ -441,16 +542,20 @@ export function AlbumEditDialog({ albumId, open, onOpenChange, onSaved }: AlbumE
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent size="md">
+      {/* Static: 136 + 56 title + 16 + 56 date/type + 16 + 120 artists +
+          16 + 118 genres (4 rows) + 16 + 32 note = 582px, plus the playback
+          section once the releases are known: 16 + 20 label + 6 + 44 per
+          release (40 rows, 4 between). */}
+      <DialogContent
+        size="md"
+        height={`${(582 + (view && view.releases.length > 0 ? 42 + 44 * view.releases.length - 4 : 0)) / 16}rem`}
+      >
         <DialogHeader>
           <DialogTitle>Edit album</DialogTitle>
         </DialogHeader>
-        {!view ? (
-          <div className="flex justify-center py-10">
-            <Spinner className="size-5" />
-          </div>
-        ) : (
-          <div className="grid gap-4">
+        <DialogBody ref={bodyRef} className="relative -mx-1 px-1">
+        {view && (
+          <div className={formFade(contentVisible)}>
             <div className="grid gap-1.5">
               <Label htmlFor="ae-title">Title</Label>
               <Input id="ae-title" value={title} onChange={(e) => setTitle(e.target.value)} />
@@ -483,83 +588,93 @@ export function AlbumEditDialog({ albumId, open, onOpenChange, onSaved }: AlbumE
             </div>
             <div className="grid gap-1.5">
               <Label>Artists (all credited owners, first is primary)</Label>
-              <div className="flex flex-col gap-1">
-                {artistRows.map((name, i) => {
-                  const options = visibleOptions(i);
-                  return (
-                    <div key={i} className="flex gap-1">
-                      <div className="relative flex-1">
-                        <input
-                          value={name}
-                          onChange={(e) => {
-                            const next = artistRows.slice();
-                            next[i] = e.target.value;
-                            setArtistRows(next);
-                            queryArtists(i, e.target.value);
-                          }}
-                          onBlur={() => setTimeout(() => setSuggest((s) => (s?.row === i ? null : s)), 100)}
-                          placeholder={i === 0 ? "Primary artist" : "Co-artist"}
-                          className="w-full rounded border border-input bg-transparent px-2 py-1 text-sm outline-none"
-                        />
-                        {options.length > 0 && (
-                          <div className="absolute left-0 right-0 top-full z-20 mt-1 max-h-56 overflow-y-auto rounded-md border border-border bg-popover p-1 shadow-md">
-                            {options.map((option) => (
-                              <button
-                                key={option}
-                                type="button"
-                                onMouseDown={(e) => {
-                                  e.preventDefault();
-                                  const next = artistRows.slice();
-                                  next[i] = option;
-                                  setArtistRows(next);
-                                  setSuggest(null);
-                                }}
-                                className="flex w-full items-center rounded px-2 py-1 text-left text-sm hover:bg-accent"
-                              >
-                                <span className="truncate">{option}</span>
-                              </button>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                      {artistRows.length > 1 && (
-                        <Button
-                          size="sm"
-                          variant="ghost"
-                          onClick={() => setArtistRows(artistRows.filter((_, idx) => idx !== i))}
-                        >
-                          <X size={14} />
-                        </Button>
-                      )}
-                    </div>
-                  );
-                })}
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="w-fit"
-                  onClick={() => setArtistRows([...artistRows, ""])}
-                >
-                  + Add artist
-                </Button>
-              </div>
+              <ArtistRows
+                rows={artistRows}
+                onChange={setArtistRows}
+                placeholders={["Primary artist", "Co-artist"]}
+                // Library-scoped artist suggestions; resolves via any entry id.
+                search={(query) => invoke<string[]>("search_artist_options", { artistId: albumId, query })}
+              />
             </div>
             <div className="grid gap-1.5">
               <Label htmlFor="ae-genres">Genres (one per line)</Label>
+              {/* Fixed rows: the frame is static, so the field is too — a
+                  long list scrolls inside it. */}
               <textarea
                 id="ae-genres"
                 value={genresText}
                 onChange={(e) => setGenresText(e.target.value)}
-                rows={Math.min(6, Math.max(2, genresText.split("\n").length))}
-                className="w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-xs outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50"
+                rows={4}
+                className="w-full resize-none rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-xs outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50"
               />
             </div>
+            {view.releases.length > 0 && (
+              <div className="grid gap-1.5">
+                <Label>Playback</Label>
+                {view.releases.map((r) => {
+                  const pref = preEmphasis.get(r.id) ?? null;
+                  const effective = pref ?? r.cue_pre_emphasis;
+                  const name = `${r.label ?? "1"}${view.releases.length > 1 ? ` · ${r.folder}` : ""}`;
+                  return (
+                    <div key={r.id} className="flex h-10 items-center gap-3 rounded-md border px-3">
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-sm">
+                          De-emphasize
+                          {view.releases.length > 1 && (
+                            <span className="ml-1.5 text-xs text-muted-foreground">{name}</span>
+                          )}
+                        </p>
+                        <p className="truncate text-[11px] leading-none text-muted-foreground">
+                          {pref === null
+                            ? r.cue_pre_emphasis
+                              ? "cue sheet flags the rip pre-emphasized"
+                              : "no cue sheet flag — plays as is"
+                            : (
+                              <>
+                                your setting ·{" "}
+                                <button
+                                  type="button"
+                                  className="underline underline-offset-2 hover:text-foreground"
+                                  onClick={() => setPreEmphasis((m) => new Map(m).set(r.id, null))}
+                                >
+                                  use the cue sheet
+                                </button>
+                              </>
+                            )}
+                        </p>
+                      </div>
+                      <Switch
+                        checked={effective}
+                        onCheckedChange={(v) => setPreEmphasis((m) => new Map(m).set(r.id, v))}
+                      />
+                    </div>
+                  );
+                })}
+              </div>
+            )}
             <p className="text-xs text-muted-foreground">
               Edits are saved in waverunner, not your files, and outrank MusicBrainz. Retagging
               a field at the source replaces the edit on it.
             </p>
           </div>
         )}
+        {!shown && skeletonSeen && (
+          <div className={skeletonFade(stage)}>
+            <FieldSkeleton />
+            <div className="grid grid-cols-2 gap-3">
+              <FieldSkeleton />
+              <FieldSkeleton />
+            </div>
+            <div className="grid gap-1.5">
+              <Skeleton className="h-3.5 w-56" />
+              <Skeleton className="h-[30px] w-full" />
+              <Skeleton className="h-[30px] w-full" />
+              <Skeleton className="h-8 w-24" />
+            </div>
+            <FieldSkeleton field="h-[98px]" />
+          </div>
+        )}
+        </DialogBody>
         <DialogFooter>
           {view && view.overridden.length > 0 && (
             <Button variant="ghost" className="mr-auto gap-1.5" disabled={busy} onClick={reset}>
@@ -599,6 +714,8 @@ export function ArtistEditDialog({ artistId, open, onOpenChange, onSaved }: Arti
   const [bio, setBio] = useState("");
   const [busy, setBusy] = useState(false);
   const [fetching, setFetching] = useState(false);
+  const bodyRef = useRef<HTMLDivElement | null>(null);
+  const { stage, skeletonSeen, shown, contentVisible } = useHandoff(!!view, bodyRef);
 
   const fetchImage = async () => {
     if (artistId == null) return;
@@ -619,7 +736,11 @@ export function ArtistEditDialog({ artistId, open, onOpenChange, onSaved }: Arti
   };
 
   useEffect(() => {
-    if (!open || artistId == null) return;
+    if (!open) {
+      setView(null);
+      return;
+    }
+    if (artistId == null) return;
     setView(null);
     (async () => {
       try {
@@ -671,16 +792,15 @@ export function ArtistEditDialog({ artistId, open, onOpenChange, onSaved }: Arti
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent size="md">
+      {/* Static: 136 + 94 name (+ its two-line note) + 16 + 138 biography
+          (5 rows) + 16 + 32 fetch row = 432px. */}
+      <DialogContent size="md" height="27rem">
         <DialogHeader>
           <DialogTitle>Edit artist</DialogTitle>
         </DialogHeader>
-        {!view ? (
-          <div className="flex justify-center py-10">
-            <Spinner className="size-5" />
-          </div>
-        ) : (
-          <div className="grid gap-4">
+        <DialogBody ref={bodyRef} className="relative -mx-1 px-1">
+        {view && (
+          <div className={formFade(contentVisible)}>
             <div className="grid gap-1.5">
               <Label htmlFor="are-name">Name</Label>
               <Input id="are-name" value={name} onChange={(e) => setName(e.target.value)} />
@@ -696,7 +816,7 @@ export function ArtistEditDialog({ artistId, open, onOpenChange, onSaved }: Arti
                 value={bio}
                 onChange={(e) => setBio(e.target.value)}
                 rows={5}
-                className="w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-xs outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50"
+                className="w-full resize-none rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-xs outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50"
                 placeholder="Shown on the artist page."
               />
             </div>
@@ -710,6 +830,22 @@ export function ArtistEditDialog({ artistId, open, onOpenChange, onSaved }: Arti
             </div>
           </div>
         )}
+        {!shown && skeletonSeen && (
+          <div className={skeletonFade(stage)}>
+            <div className="grid gap-1.5">
+              <Skeleton className="h-3.5 w-16" />
+              <Skeleton className="h-9 w-full" />
+              <Skeleton className="h-3 w-full" />
+              <Skeleton className="h-3 w-2/3" />
+            </div>
+            <FieldSkeleton field="h-[118px]" />
+            <div className="flex items-center justify-between gap-4">
+              <Skeleton className="h-3 w-2/3" />
+              <Skeleton className="h-8 w-24" />
+            </div>
+          </div>
+        )}
+        </DialogBody>
         <DialogFooter>
           {view && view.overridden.length > 0 && (
             <Button variant="ghost" className="mr-auto gap-1.5" disabled={busy} onClick={reset}>
@@ -839,13 +975,21 @@ export function SplitArtistDialog({
     }
   };
 
+  // The frame follows the member count: 136 (frame) + 80 intro (four
+  // lines) + 12 + rows (38 each, 4 between) + 12 + 32 add = 268 + 42n px,
+  // up to six rows; past that the list scrolls in place.
+  const sizedRows = Math.min(members.length, 6);
+  const height = `${(268 + 42 * sizedRows) / 16}rem`;
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent size="md">
+      <DialogContent size="md" height={height}>
         <DialogHeader>
           <DialogTitle>Split artist</DialogTitle>
         </DialogHeader>
-        <div className="grid gap-3">
+        {/* A DialogBody: it holds overflow while the frame grows for a new
+            row, so the footer doesn't jump before the resize lands. */}
+        <DialogBody className="grid content-start gap-3">
           <p className="text-sm text-muted-foreground">
             <span className="font-medium text-foreground">{artistName}</span> is really these{" "}
             <span className="font-medium text-foreground">{members.length}</span> artists. Their
@@ -857,7 +1001,7 @@ export function SplitArtistDialog({
               scrollbar-gutter keeps that space reserved whether or not the bar
               is showing — otherwise adding the row that first overflows steals
               the width from every field and the whole stack jumps left. */}
-          <div className="flex max-h-72 flex-col gap-1 overflow-y-auto overflow-x-hidden pr-1 [scrollbar-gutter:stable]">
+          <div className="flex max-h-[248px] flex-col gap-1 overflow-y-auto overflow-x-hidden pr-1 [scrollbar-gutter:stable]">
             {members.map((picked, i) => {
               return (
                 <div key={i} className="flex items-center gap-1">
@@ -920,7 +1064,7 @@ export function SplitArtistDialog({
               + Add artist
             </Button>
           )}
-        </div>
+        </DialogBody>
         <DialogFooter>
           <Button variant="outline" disabled={busy} onClick={() => onOpenChange(false)}>
             Cancel

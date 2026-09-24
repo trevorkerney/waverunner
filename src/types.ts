@@ -48,6 +48,8 @@ export interface MediaEntry {
   /** Non-null only when this row represents a `media_link` inside a playlist view.
    *  Used to offer "Remove from playlist" from the context menu. */
   link_id: number | null;
+  /** Albums page only: how many releases (editions) the album has. */
+  release_count?: number | null;
   /** Movie with an interactive branch-graph pair next to its video — Play
    *  routes into the interactive engine instead of linear playback. */
   interactive: boolean;
@@ -286,6 +288,11 @@ export interface MusicRelease {
   covers: string[];
   /** Your cover pick for this release, when it still exists in the pool. */
   selected_cover: string | null;
+  /** Plays through the de-emphasis filter (the rip kept the CD's
+   *  pre-emphasis): your override when set, else the cue sheet's word. */
+  pre_emphasis: boolean;
+  cue_pre_emphasis: boolean;
+  pre_emphasis_pref: boolean | null;
 }
 
 export interface MusicAlbumDetail {

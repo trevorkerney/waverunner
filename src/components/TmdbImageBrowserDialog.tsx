@@ -1,18 +1,18 @@
-import { useState, useCallback, useEffect, useMemo } from "react";
+import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
 import {
   Dialog,
+  DialogBody,
   DialogContent,
   DialogHeader,
   DialogTitle,
   DialogFooter,
-  DialogTransition,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Spinner } from "@/components/ui/spinner";
-import { Skeleton, useSkeletonDelay } from "@/components/ui/skeleton";
+import { Skeleton, useHandoff } from "@/components/ui/skeleton";
 import {
   Select,
   SelectTrigger,
@@ -23,8 +23,71 @@ import {
 import { Download } from "lucide-react";
 import type { TmdbImage, TmdbImageDownload } from "@/types";
 
-const POSTER_SIZES = ["w342", "w500", "w780", "original"];
-const BACKDROP_SIZES = ["w780", "w1280", "original"];
+/** Everything that differs between the two pickers. One component, one
+ *  hand-off, one download path — only the shape of the art changes. */
+type ImageKind = "posters" | "backdrops";
+const KIND = {
+  posters: {
+    title: "TMDB Posters",
+    noun: "poster",
+    field: "posters" as const,
+    imageType: "cover",
+    sizes: ["w342", "w500", "w780", "original"],
+    defaultSize: "w780",
+    thumbSize: "w185",
+    cols: "grid-cols-4",
+    colSpan: "col-span-4",
+    skeletonCount: 8,
+    skeletonAspect: "aspect-[2/3]",
+  },
+  backdrops: {
+    title: "TMDB Backdrops",
+    noun: "backdrop",
+    field: "backdrops" as const,
+    imageType: "backdrop",
+    sizes: ["w780", "w1280", "original"],
+    defaultSize: "w1280",
+    thumbSize: "w300",
+    cols: "grid-cols-2",
+    colSpan: "col-span-2",
+    skeletonCount: 4,
+    skeletonAspect: "aspect-video",
+  },
+} as const;
+/** Fixed frame (the Settings dialog's height): header + filter bar + a
+ *  body of a row of posters and the top of the next — enough to show it
+ *  scrolls — + footer. The count of images can't be known before the
+ *  fetch, so the box never sizes to it. */
+const TMDB_IMAGES_HEIGHT = "36rem";
+/** How long a closed dialog keeps its content before resetting — longer
+ *  than the shell's fade-out (200ms) plus its exit (150ms). */
+const CLOSE_RESET_MS = 400;
+
+/** A thumbnail that holds its exact spot (TMDB reports every image's
+ *  dimensions) with a skeleton until its own file has loaded, then fades
+ *  in — tiles fill as TMDB delivers them, and nothing shifts. */
+function TmdbThumb({ src, img }: { src: string; img: TmdbImage }) {
+  const [loaded, setLoaded] = useState(false);
+  return (
+    <span
+      className="relative block w-full overflow-hidden rounded"
+      style={{ aspectRatio: img.width && img.height ? `${img.width} / ${img.height}` : undefined }}
+    >
+      {!loaded && <Skeleton className="absolute inset-0 rounded-none" />}
+      <img
+        src={src}
+        alt=""
+        loading="lazy"
+        draggable={false}
+        onLoad={() => setLoaded(true)}
+        onError={() => setLoaded(true)}
+        className={`absolute inset-0 h-full w-full object-cover transition-opacity duration-200 ${
+          loaded ? "opacity-100" : "opacity-0"
+        }`}
+      />
+    </span>
+  );
+}
 
 interface TmdbImageBrowserDialogProps {
   open: boolean;
@@ -34,18 +97,15 @@ interface TmdbImageBrowserDialogProps {
   tmdbId: string;
   /** Which TMDB endpoint the id belongs to — movie and TV ids overlap. */
   mediaType: "movie" | "tv";
+  /** Posters (2:3, saved as covers) or backdrops (16:9). */
+  kind: ImageKind;
   onDownloaded: () => void;
-  /** Tab the dialog opens on — "Add cover" entry points want posters,
-   *  "Add backdrop" wants backdrops. Defaults to posters. */
-  initialTab?: "posters" | "backdrops";
 }
 
 interface ImageSelection {
   checked: boolean;
   size: string;
 }
-
-type Tab = "posters" | "backdrops";
 
 /** TMDB marks textless art with a null language (occasionally "xx" = "No Language"). */
 function imageLang(iso: string | null | undefined): string | null {
@@ -68,56 +128,56 @@ export function TmdbImageBrowserDialog({
   entryId,
   tmdbId,
   mediaType,
+  kind,
   onDownloaded,
-  initialTab = "posters",
 }: TmdbImageBrowserDialogProps) {
+  const K = KIND[kind];
   const [loading, setLoading] = useState(false);
-  // Skeleton only past 500ms; the box keeps its size either way.
-  const showSkeleton = useSkeletonDelay(loading);
+  // Covers' hand-off: the grid mounts invisible once the listing is in, its
+  // first-screen thumbs are waited on, the skeleton (if it ever showed —
+  // 500ms) fades out, the grid fades in. The ref is the whole body.
+  const bodyRef = useRef<HTMLDivElement | null>(null);
+  const { stage, skeletonSeen, shown, contentVisible } = useHandoff(!loading, bodyRef);
   const [downloading, setDownloading] = useState(false);
   const [posters, setPosters] = useState<TmdbImage[]>([]);
-  const [backdrops, setBackdrops] = useState<TmdbImage[]>([]);
   const [posterSelections, setPosterSelections] = useState<Record<number, ImageSelection>>({});
-  const [backdropSelections, setBackdropSelections] = useState<Record<number, ImageSelection>>({});
-  const [tab, setTab] = useState<Tab>("posters");
   // Language filter: "all" | "textless" | an iso_639_1 code. Filters the grid
   // only — already-checked images stay selected (and download) even when hidden.
   const [language, setLanguage] = useState<string>("all");
 
   useEffect(() => {
-    if (!open) return;
+    if (!open) {
+      // Reset once the shell's fade-out is over (the content must still be
+      // there to fade), so a reopen never shows the previous title's grid
+      // for a frame before the load takes over.
+      const t = window.setTimeout(() => {
+        setLoading(true);
+        setPosters([]);
+        setPosterSelections({});
+      }, CLOSE_RESET_MS);
+      return () => window.clearTimeout(t);
+    }
     setLoading(true);
-    setTab(initialTab);
     setLanguage("all");
     setPosterSelections({});
-    setBackdropSelections({});
 
     invoke<{ images: { posters: TmdbImage[]; backdrops: TmdbImage[] } | null }>(
       mediaType === "tv" ? "get_tmdb_show_detail" : "get_tmdb_movie_detail",
       { tmdbId: Number(tmdbId) },
     )
       .then((detail) => {
-        const p = detail.images?.posters ?? [];
-        const b = detail.images?.backdrops ?? [];
+        const p = detail.images?.[K.field] ?? [];
         setPosters(p);
-        setBackdrops(b);
-
-        // Init selections — unchecked, default sizes
+        // Init selections — unchecked, default size
         const ps: Record<number, ImageSelection> = {};
         p.forEach((_, i) => {
-          ps[i] = { checked: false, size: "w780" };
+          ps[i] = { checked: false, size: K.defaultSize };
         });
         setPosterSelections(ps);
-
-        const bs: Record<number, ImageSelection> = {};
-        b.forEach((_, i) => {
-          bs[i] = { checked: false, size: "w1280" };
-        });
-        setBackdropSelections(bs);
       })
       .catch((e) => toast.error(String(e)))
       .finally(() => setLoading(false));
-  }, [open, tmdbId, mediaType, initialTab]);
+  }, [open, tmdbId, mediaType, K]);
 
   const togglePoster = (idx: number, checked: boolean) => {
     setPosterSelections((prev) => ({
@@ -133,35 +193,19 @@ export function TmdbImageBrowserDialog({
     }));
   };
 
-  const toggleBackdrop = (idx: number, checked: boolean) => {
-    setBackdropSelections((prev) => ({
-      ...prev,
-      [idx]: { ...prev[idx], checked },
-    }));
-  };
-
-  const setBackdropSize = (idx: number, size: string) => {
-    setBackdropSelections((prev) => ({
-      ...prev,
-      [idx]: { ...prev[idx], size },
-    }));
-  };
-
-  const selectedCount =
-    Object.values(posterSelections).filter((s) => s.checked).length +
-    Object.values(backdropSelections).filter((s) => s.checked).length;
+  const selectedCount = Object.values(posterSelections).filter((s) => s.checked).length;
 
   // Filter options come from the languages actually present in this title's art.
   const languages = useMemo(() => {
     const codes = new Set<string>();
     let hasTextless = false;
-    for (const img of [...posters, ...backdrops]) {
+    for (const img of posters) {
       const code = imageLang(img.iso_639_1);
       if (code) codes.add(code);
       else hasTextless = true;
     }
     return { codes: [...codes].sort(), hasTextless };
-  }, [posters, backdrops]);
+  }, [posters]);
 
   const matchesLanguage = useCallback(
     (img: TmdbImage) =>
@@ -173,7 +217,6 @@ export function TmdbImageBrowserDialog({
     [language],
   );
   const visiblePosters = posters.filter(matchesLanguage).length;
-  const visibleBackdrops = backdrops.filter(matchesLanguage).length;
 
   const doDownload = useCallback(async () => {
     setDownloading(true);
@@ -185,17 +228,7 @@ export function TmdbImageBrowserDialog({
           images.push({
             file_path: posters[Number(idx)].file_path,
             size: sel.size,
-            image_type: "cover",
-          });
-        }
-      }
-
-      for (const [idx, sel] of Object.entries(backdropSelections)) {
-        if (sel.checked) {
-          images.push({
-            file_path: backdrops[Number(idx)].file_path,
-            size: sel.size,
-            image_type: "backdrop",
+            image_type: K.imageType,
           });
         }
       }
@@ -214,37 +247,27 @@ export function TmdbImageBrowserDialog({
     } finally {
       setDownloading(false);
     }
-  }, [posterSelections, backdropSelections, posters, backdrops, libraryId, entryId, onDownloaded, onOpenChange]);
+  }, [posterSelections, posters, libraryId, entryId, onDownloaded, onOpenChange, K]);
+
+  // Hidden until the hand-off reveals it.
+  const gridFade = `transition-opacity duration-200 will-change-[opacity] ${
+    contentVisible ? "opacity-100" : "opacity-0"
+  }`;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent size="2xl" className="flex flex-col gap-0 overflow-hidden p-0">
+      <DialogContent size="2xl" height={TMDB_IMAGES_HEIGHT} className="gap-0 p-0">
         <DialogHeader className="shrink-0 border-b px-6 py-4">
-          <DialogTitle>TMDB Images</DialogTitle>
+          <DialogTitle>{K.title}</DialogTitle>
         </DialogHeader>
 
-        {/* Tabs + language filter */}
+        {/* Count + language filter */}
         <div className="flex shrink-0 items-center gap-1 border-b px-6 py-2">
-          <button
-            onClick={() => setTab("posters")}
-            className={`rounded-md px-3 py-1.5 text-sm ${
-              tab === "posters"
-                ? "bg-accent text-accent-foreground"
-                : "text-muted-foreground hover:bg-accent/50"
-            }`}
-          >
-            Posters ({visiblePosters})
-          </button>
-          <button
-            onClick={() => setTab("backdrops")}
-            className={`rounded-md px-3 py-1.5 text-sm ${
-              tab === "backdrops"
-                ? "bg-accent text-accent-foreground"
-                : "text-muted-foreground hover:bg-accent/50"
-            }`}
-          >
-            Backdrops ({visibleBackdrops})
-          </button>
+          <span className="py-1.5 text-sm text-muted-foreground">
+            {loading
+              ? `${K.noun.charAt(0).toUpperCase()}${K.noun.slice(1)}s`
+              : `${visiblePosters} ${K.noun}${visiblePosters === 1 ? "" : "s"}`}
+          </span>
           <div className="ml-auto">
             <Select value={language} onValueChange={(v) => v && setLanguage(v)}>
               <SelectTrigger className="h-8 w-44 text-xs">
@@ -263,25 +286,23 @@ export function TmdbImageBrowserDialog({
           </div>
         </div>
 
-        {/* Content: opens on skeleton tiles in the current tab's layout and
-            transitions to the real grid (tab switches transition too). */}
-        <DialogTransition contentKey={loading ? "loading" : tab} className="flex-1 overflow-y-auto p-4">
-          {loading && tab === "posters" && (
-            <div className={`grid grid-cols-4 gap-3 ${showSkeleton ? "" : "invisible"}`}>
-              {Array.from({ length: 8 }, (_, i) => (
+        {/* FIXED size: the body holds a little over a row of posters; the
+            rest scrolls. The skeleton overlays the (invisible) grid in the
+            same layout until the grid is shown, and stays MOUNTED through
+            its own fade-out — an unmount/remount would skip it. */}
+        <DialogBody
+          ref={bodyRef}
+          className={`relative isolate p-4 [scrollbar-gutter:stable] ${shown ? "" : "overflow-hidden"}`}
+        >
+          {!shown && skeletonSeen && (
+            <div
+              className={`absolute inset-x-4 top-4 z-10 grid ${K.cols} gap-3 transition-opacity duration-200 ${
+                stage === "hidden" ? "" : "opacity-0"
+              }`}
+            >
+              {Array.from({ length: K.skeletonCount }, (_, i) => (
                 <div key={i} className="flex flex-col gap-1.5 p-2">
-                  <Skeleton className="aspect-[2/3] w-full rounded" />
-                  <Skeleton className="h-7 w-full" />
-                  <Skeleton className="h-3 w-2/3" />
-                </div>
-              ))}
-            </div>
-          )}
-          {loading && tab === "backdrops" && (
-            <div className={`grid grid-cols-2 gap-3 ${showSkeleton ? "" : "invisible"}`}>
-              {Array.from({ length: 4 }, (_, i) => (
-                <div key={i} className="flex flex-col gap-1.5 p-2">
-                  <Skeleton className="aspect-video w-full rounded" />
+                  <Skeleton className={`${K.skeletonAspect} w-full rounded`} />
                   <Skeleton className="h-7 w-full" />
                   <Skeleton className="h-3 w-2/3" />
                 </div>
@@ -289,8 +310,7 @@ export function TmdbImageBrowserDialog({
             </div>
           )}
 
-          {!loading && tab === "posters" && (
-            <div className="grid grid-cols-4 gap-3">
+          <div className={`grid ${K.cols} gap-3 ${gridFade}`}>
               {posters.map((img, idx) => {
                 const sel = posterSelections[idx];
                 if (!sel || !matchesLanguage(img)) return null;
@@ -302,12 +322,7 @@ export function TmdbImageBrowserDialog({
                     }`}
                   >
                     <label className="cursor-pointer">
-                      <img
-                        src={`https://image.tmdb.org/t/p/w185${img.file_path}`}
-                        alt=""
-                        className="w-full rounded object-cover"
-                        loading="lazy"
-                      />
+                      <TmdbThumb src={`https://image.tmdb.org/t/p/${K.thumbSize}${img.file_path}`} img={img} />
                     </label>
                     <div className="flex items-center gap-1.5">
                       <Checkbox
@@ -322,7 +337,7 @@ export function TmdbImageBrowserDialog({
                           <SelectValue />
                         </SelectTrigger>
                         <SelectContent>
-                          {POSTER_SIZES.map((s) => (
+                          {K.sizes.map((s) => (
                             <SelectItem key={s} value={s}>
                               {s}
                             </SelectItem>
@@ -338,69 +353,12 @@ export function TmdbImageBrowserDialog({
                 );
               })}
               {visiblePosters === 0 && (
-                <p className="col-span-4 py-8 text-center text-sm text-muted-foreground">
-                  {posters.length === 0 ? "No posters available" : "No posters in this language"}
+                <p className={`${K.colSpan} py-8 text-center text-sm text-muted-foreground`}>
+                  {posters.length === 0 ? `No ${K.noun}s available` : `No ${K.noun}s in this language`}
                 </p>
               )}
-            </div>
-          )}
-
-          {!loading && tab === "backdrops" && (
-            <div className="grid grid-cols-2 gap-3">
-              {backdrops.map((img, idx) => {
-                const sel = backdropSelections[idx];
-                if (!sel || !matchesLanguage(img)) return null;
-                return (
-                  <div
-                    key={img.file_path}
-                    className={`flex flex-col gap-1.5 rounded-lg border p-2 transition-colors ${
-                      sel.checked ? "border-primary bg-accent/30" : "border-transparent"
-                    }`}
-                  >
-                    <label className="cursor-pointer">
-                      <img
-                        src={`https://image.tmdb.org/t/p/w300${img.file_path}`}
-                        alt=""
-                        className="w-full rounded object-cover"
-                        loading="lazy"
-                      />
-                    </label>
-                    <div className="flex items-center gap-1.5">
-                      <Checkbox
-                        checked={sel.checked}
-                        onCheckedChange={(c) => toggleBackdrop(idx, !!c)}
-                      />
-                      <Select
-                        value={sel.size}
-                        onValueChange={(v) => v && setBackdropSize(idx, v)}
-                      >
-                        <SelectTrigger className="h-7 flex-1 text-xs">
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {BACKDROP_SIZES.map((s) => (
-                            <SelectItem key={s} value={s}>
-                              {s}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                    </div>
-                    <p className="text-[10px] text-muted-foreground">
-                      {img.width}x{img.height}
-                      {img.iso_639_1 && ` (${img.iso_639_1})`}
-                    </p>
-                  </div>
-                );
-              })}
-              {visibleBackdrops === 0 && (
-                <p className="col-span-2 py-8 text-center text-sm text-muted-foreground">
-                  {backdrops.length === 0 ? "No backdrops available" : "No backdrops in this language"}
-                </p>
-              )}
-            </div>
-          )}
-        </DialogTransition>
+          </div>
+        </DialogBody>
 
         <DialogFooter className="m-0 shrink-0 border-t p-0 px-4 py-3">
           <Button

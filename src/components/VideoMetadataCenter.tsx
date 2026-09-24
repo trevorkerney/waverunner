@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
+import { Skeleton, useHandoff } from "@/components/ui/skeleton";
 import { TmdbMatchDialog } from "@/components/TmdbMatchDialog";
 import { TmdbShowMatchDialog } from "@/components/TmdbShowMatchDialog";
 import { fetchShowSeasons } from "@/components/tmdbMatchEngine";
@@ -52,6 +53,7 @@ export function VideoMetadataCenter({
 }) {
   const [report, setReport] = useState<VideoMatchReport | null>(null);
   const [loading, setLoading] = useState(true);
+  const bodyRef = useRef<HTMLDivElement | null>(null);
   const [reviewing, setReviewing] = useState<{ kind: "movie" | "show"; row: UnmatchedRow } | null>(null);
   const [reviewingDetail, setReviewingDetail] = useState<MovieDetail | ShowDetail | null>(null);
   // Row whose Match… button is fetching its detail — that button shows a spinner.
@@ -93,6 +95,8 @@ export function VideoMetadataCenter({
     void refresh();
   }, [onChanged, refresh]);
 
+  const { stage, skeletonSeen, shown, contentVisible } = useHandoff(!loading && !!report, bodyRef);
+
   const section = (kind: "movie" | "show", label: string, rows: UnmatchedRow[]) =>
     rows.length > 0 && (
       <div className="flex flex-col gap-1.5">
@@ -131,14 +135,31 @@ export function VideoMetadataCenter({
     );
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto overflow-x-hidden pb-4">
-      {loading || !report ? (
-        <div className="flex items-center justify-center gap-2 py-8 text-sm text-muted-foreground">
-          <Spinner className="size-4" />
-          Checking match status…
+    <div className="flex min-h-0 flex-1 flex-col overflow-y-auto overflow-x-hidden pb-4">
+      <div ref={bodyRef} className="relative">
+      {/* Skeleton after 500ms, then out / content in — the same hand-off as
+          the dialogs (a spinner-then-pop read as a double load). */}
+      {!shown && skeletonSeen && (
+        <div
+          className={`absolute inset-x-0 top-0 flex flex-col gap-4 transition-opacity duration-200 ${
+            stage === "hidden" ? "" : "opacity-0"
+          }`}
+        >
+          <Skeleton className="h-3.5 w-64" />
+          <div className="flex flex-col gap-1.5">
+            <Skeleton className="h-3 w-32" />
+            <Skeleton className="h-9 w-full rounded-md" />
+            <Skeleton className="h-9 w-full rounded-md" />
+            <Skeleton className="h-9 w-full rounded-md" />
+          </div>
         </div>
-      ) : (
-        <>
+      )}
+      {report && (
+        <div
+          className={`flex flex-col gap-4 transition-opacity duration-200 will-change-[opacity] ${
+            contentVisible ? "opacity-100" : "opacity-0"
+          }`}
+        >
           <p className="text-sm text-muted-foreground">
             {[
               report.total_movies > 0
@@ -161,40 +182,41 @@ export function VideoMetadataCenter({
 
           {section("movie", "Unmatched movies", report.movies)}
           {section("show", "Unmatched shows", report.shows)}
-        </>
+        </div>
       )}
+      </div>
 
-      {reviewing?.kind === "movie" && (
-        <TmdbMatchDialog
-          open
-          onOpenChange={(o) => {
-            if (!o) {
-              setReviewing(null);
-              setReviewingDetail(null);
-            }
-          }}
-          entryId={reviewing.row.id}
-          entryTitle={reviewing.row.title}
-          entryYear={reviewing.row.year}
-          currentDetail={reviewingDetail as MovieDetail | null}
-          onApplied={applied}
-        />
-      )}
-      {reviewing?.kind === "show" && (
-        <TmdbShowMatchDialog
-          open
-          onOpenChange={(o) => {
-            if (!o) {
-              setReviewing(null);
-              setReviewingDetail(null);
-            }
-          }}
-          entryId={reviewing.row.id}
-          entryTitle={reviewing.row.title}
-          entryYear={reviewing.row.year}
-          currentDetail={reviewingDetail as ShowDetail | null}
-          onApplied={() => {
-            const { id, title } = reviewing.row;
+      {/* Both stay MOUNTED while closed (open=false) so the shell can play
+          their exit; the row is read at apply time. */}
+      <TmdbMatchDialog
+        open={reviewing?.kind === "movie"}
+        onOpenChange={(o) => {
+          if (!o) {
+            setReviewing(null);
+            setReviewingDetail(null);
+          }
+        }}
+        entryId={reviewing?.row.id ?? 0}
+        entryTitle={reviewing?.row.title ?? ""}
+        entryYear={reviewing?.row.year ?? null}
+        currentDetail={reviewingDetail as MovieDetail | null}
+        onApplied={applied}
+      />
+      <TmdbShowMatchDialog
+        open={reviewing?.kind === "show"}
+        onOpenChange={(o) => {
+          if (!o) {
+            setReviewing(null);
+            setReviewingDetail(null);
+          }
+        }}
+        entryId={reviewing?.row.id ?? 0}
+        entryTitle={reviewing?.row.title ?? ""}
+        entryYear={reviewing?.row.year ?? null}
+        currentDetail={reviewingDetail as ShowDetail | null}
+        onApplied={() => {
+          if (!reviewing) return;
+          const { id, title } = reviewing.row;
             applied();
             // A confirmed show pulls its seasons/episodes — the bulk pass
             // deliberately skips them for unconfirmed shows.
@@ -217,8 +239,7 @@ export function VideoMetadataCenter({
               }
             })();
           }}
-        />
-      )}
+      />
     </div>
   );
 }

@@ -1,7 +1,8 @@
-import { useEffect, useState, type Dispatch, type SetStateAction } from "react";
+import { useEffect, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   Dialog,
+  DialogBody,
   DialogContent,
   DialogHeader,
   DialogTitle,
@@ -23,7 +24,7 @@ import {
 } from "@/components/ui/tooltip";
 import { Switch } from "@/components/ui/switch";
 import { useLibraryRuns } from "@/hooks/libraryRuns";
-import { FolderOpen, Film, Music, Server, HardDrive, Plus, X } from "lucide-react";
+import { BookOpen, FolderOpen, Film, Music, Server, HardDrive, Plus, Tv, X } from "lucide-react";
 
 /** Create a library: name, format, folders, online-metadata choice. Confirm
  *  hands off to the run controller (hooks/libraryRuns) and closes — the scan
@@ -54,6 +55,11 @@ export function CreateLibraryDialog({ open: isOpen, onOpenChange }: CreateLibrar
   // Per-library opt-out of online metadata (MusicBrainz / TMDB+OMDB),
   // recorded at creation. Default ON; "off" is the stored choice.
   const [onlineMetadata, setOnlineMetadata] = useState(true);
+  // Create stays locked until the user has seen the whole form: it unlocks
+  // once the body is scrolled to the bottom (or doesn't overflow at all),
+  // and locks again on a format change, since the fields below it change.
+  const bodyRef = useRef<HTMLDivElement | null>(null);
+  const [seenAll, setSeenAll] = useState(false);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -65,6 +71,43 @@ export function CreateLibraryDialog({ open: isOpen, onOpenChange }: CreateLibrar
     setFormat("video");
     setSource("local");
     setOnlineMetadata(true);
+    setSeenAll(false);
+  }, [isOpen]);
+
+  // A format change re-locks without moving the scroll. No immediate
+  // re-check here: the transition pins the old height while it fades, so
+  // the body would still read "at the bottom". The ResizeObserver below
+  // re-checks as the new content's height settles — if the user was at
+  // the bottom and it fits, it unlocks again on its own.
+  useEffect(() => {
+    setSeenAll(false);
+  }, [format]);
+
+  // Re-check on scroll and whenever the body's content changes height (the
+  // format swap animates, folder rows get added). Once seen, it stays seen
+  // until the next format change.
+  useEffect(() => {
+    if (!isOpen) return;
+    const el = bodyRef.current;
+    if (!el) return;
+    const check = () => {
+      // Not laid out yet (the shell hasn't shown the slot): 0 ≥ 0 would
+      // pass. The ResizeObserver re-checks once it has a size.
+      if (el.clientHeight === 0) return;
+      if (el.scrollTop + el.clientHeight >= el.scrollHeight - 2) setSeenAll(true);
+    };
+    // The dialog stays mounted between opens and keeps its scroll; a fresh
+    // open starts at the top.
+    el.scrollTop = 0;
+    check();
+    el.addEventListener("scroll", check, { passive: true });
+    const ro = new ResizeObserver(check);
+    ro.observe(el);
+    for (const child of Array.from(el.children)) ro.observe(child);
+    return () => {
+      el.removeEventListener("scroll", check);
+      ro.disconnect();
+    };
   }, [isOpen]);
 
   // Fill the name from the first browsed folder if the user hasn't named the library yet.
@@ -102,12 +145,12 @@ export function CreateLibraryDialog({ open: isOpen, onOpenChange }: CreateLibrar
 
   return (
     <Dialog open={isOpen} onOpenChange={onOpenChange}>
-      <DialogContent width="30rem" className="flex flex-col gap-0 overflow-hidden px-0">
+      <DialogContent width="30rem" height="xl" className="gap-0 px-0">
         <DialogHeader className="px-4 pb-2">
           <DialogTitle>Create Library</DialogTitle>
         </DialogHeader>
-        {/* Folder lists can outgrow a small window — the form scrolls. */}
-        <div className="min-h-0 overflow-y-auto overflow-x-hidden">
+        {/* Static frame: the form scrolls inside it (folder lists grow). */}
+        <DialogBody ref={bodyRef} className="overflow-x-hidden">
           {/* min-w-0 down the chain: long unbreakable paths must truncate
               with an ellipsis instead of widening the modal. */}
           <div className="grid min-w-0 gap-6 px-4 py-4">
@@ -117,7 +160,7 @@ export function CreateLibraryDialog({ open: isOpen, onOpenChange }: CreateLibrar
                 id="name"
                 value={name}
                 onChange={(e) => setName(e.target.value)}
-                placeholder={format === "video" ? "Videos" : "Music"}
+                placeholder={format === "video" ? "Movies/TV" : "Music"}
                 autoComplete="off"
               />
             </div>
@@ -130,24 +173,67 @@ export function CreateLibraryDialog({ open: isOpen, onOpenChange }: CreateLibrar
                   else if (v.includes("music")) setFormat("music");
                 }}
                 spacing={1}
-                className="grid w-full grid-cols-2 gap-3"
+                className="grid w-full grid-cols-4 gap-3"
               >
                 <ToggleGroupItem
                   value="video"
-                  className="flex h-auto flex-col items-center gap-2 rounded border border-border px-4 py-4 data-[state=on]:border-primary data-[state=on]:bg-accent"
+                  className="flex h-auto flex-col items-center gap-2 rounded border border-border px-2 py-4 data-[state=on]:border-primary data-[state=on]:bg-accent"
                 >
                   <Film size={28} />
                   <span className="text-sm font-medium">Video</span>
                 </ToggleGroupItem>
+                {/* The stored format is still "music" — only the label changed. */}
                 <ToggleGroupItem
                   value="music"
-                  className="flex h-auto flex-col items-center gap-2 rounded border border-border px-4 py-4 data-[state=on]:border-primary data-[state=on]:bg-accent"
+                  className="flex h-auto flex-col items-center gap-2 rounded border border-border px-2 py-4 data-[state=on]:border-primary data-[state=on]:bg-accent"
                 >
                   <Music size={28} />
-                  <span className="text-sm font-medium">Music</span>
+                  <span className="text-sm font-medium">Audio</span>
                 </ToggleGroupItem>
+                {/* Not implemented yet — shown disabled so the direction is
+                    visible, like the media-server source below. */}
+                <TooltipProvider>
+                  <Tooltip>
+                    <TooltipTrigger
+                      render={
+                        <ToggleGroupItem
+                          value="books"
+                          aria-disabled
+                          className="flex h-auto cursor-not-allowed flex-col items-center gap-2 rounded border border-border px-2 py-4 opacity-50"
+                        >
+                          <BookOpen size={28} />
+                          <span className="text-sm font-medium">Books</span>
+                        </ToggleGroupItem>
+                      }
+                    />
+                    <TooltipContent>Coming soon. Books and audiobooks.</TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
+                <TooltipProvider>
+                  <Tooltip>
+                    <TooltipTrigger
+                      render={
+                        <ToggleGroupItem
+                          value="livetv"
+                          aria-disabled
+                          className="flex h-auto cursor-not-allowed flex-col items-center gap-2 rounded border border-border px-2 py-4 opacity-50"
+                        >
+                          <Tv size={28} />
+                          <span className="text-sm font-medium">Live TV</span>
+                        </ToggleGroupItem>
+                      }
+                    />
+                    <TooltipContent>Coming soon. Live TV over IPTV.</TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
               </ToggleGroup>
             </div>
+            {/* Everything below the format tiles is per-format — source,
+                folders, online metadata — so the whole block fades out and
+                back in together on a format change. Video and audio happen
+                to share the source + toggle today; future formats won't. */}
+            <DialogTransition contentKey={format}>
+            <div className="grid gap-6">
             <div className="grid gap-3">
               <Label>Source</Label>
               <ToggleGroup
@@ -186,9 +272,6 @@ export function CreateLibraryDialog({ open: isOpen, onOpenChange }: CreateLibrar
                 </TooltipProvider>
               </ToggleGroup>
             </div>
-            {/* The folder sections change shape with the format — the swap
-                fades out, resizes, fades in (never a visible jump). */}
-            <DialogTransition contentKey={format} className="grid gap-6">
               {format === "music" ? (
                 <div className="grid gap-6">
                   <FolderSection
@@ -220,7 +303,6 @@ export function CreateLibraryDialog({ open: isOpen, onOpenChange }: CreateLibrar
                   />
                 </div>
               )}
-            </DialogTransition>
             <div className="flex items-center gap-3 rounded-md border px-3 py-2.5">
               <div className="min-w-0 flex-1">
                 <p className="text-sm font-medium">Online metadata</p>
@@ -234,14 +316,24 @@ export function CreateLibraryDialog({ open: isOpen, onOpenChange }: CreateLibrar
               </div>
               <Switch checked={onlineMetadata} onCheckedChange={setOnlineMetadata} />
             </div>
+            </div>
+            </DialogTransition>
           </div>
-        </div>
+        </DialogBody>
 
-        <DialogFooter className="mx-0 -mb-4 px-4">
+        <DialogFooter className="mx-0 -mb-4 items-center px-4">
+          {!seenAll && (
+            <p className="mr-auto text-xs text-yellow-500">
+              Scroll to the bottom to enable Create.
+            </p>
+          )}
           <Button variant="outline" onClick={() => onOpenChange(false)}>
             Cancel
           </Button>
-          <Button onClick={handleCreate} disabled={!name || totalValidPaths === 0}>
+          <Button
+            onClick={handleCreate}
+            disabled={!seenAll || !name || totalValidPaths === 0}
+          >
             Create
           </Button>
         </DialogFooter>

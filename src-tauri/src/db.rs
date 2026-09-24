@@ -686,6 +686,21 @@ const MIGRATIONS: &[Migration] = &[
         // "see History" fallback in the queue banner.
         statements: &["ALTER TABLE pending_pass ADD COLUMN batch_id INTEGER"],
     },
+    Migration {
+        id: 40,
+        app_version: "1.0.0-alpha.12.5",
+        description: "CD pre-emphasis — cue-sheet detection per release + the user's per-release override",
+        requires_table: Some("album_release"),
+        // album_release.cue_pre_emphasis: the scanner's finding (a cue in
+        // the release folder with FLAGS PRE), rebuilt with the rows.
+        // album_release_pref.pre_emphasis: the user's override, folder-keyed
+        // like the other prefs; NULL = defer to the cue. Playback applies
+        // mpv's de-emphasis filter when the effective answer is yes.
+        statements: &[
+            "ALTER TABLE album_release ADD COLUMN cue_pre_emphasis INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE album_release_pref ADD COLUMN pre_emphasis INTEGER",
+        ],
+    },
 ];
 
 /// Copy the database beside itself before the first migration of a run
@@ -1434,6 +1449,10 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             -- The release's OWN title: majority album tag of its tracks, so a
             -- combined-in source keeps its original name. NULL pre-rescan.
             title TEXT,
+            -- A cue sheet in the release folder flags its tracks PRE (CD
+            -- pre-emphasis left in the rip): playback de-emphasizes unless
+            -- the user's pref says otherwise. Stamped by the scanner.
+            cue_pre_emphasis INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY (album_id) REFERENCES album(id) ON DELETE CASCADE
         )",
     )
@@ -1453,6 +1472,9 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             -- The user's cover pick for THIS release (cached path), folder-
             -- keyed like label so it survives the release-row rebuild.
             cover TEXT,
+            -- The user's word on pre-emphasis: 1 = de-emphasize on play,
+            -- 0 = play as is, NULL = go by the cue sheet (cue_pre_emphasis).
+            pre_emphasis INTEGER,
             PRIMARY KEY (album_id, folder_path),
             FOREIGN KEY (album_id) REFERENCES album(id) ON DELETE CASCADE
         )",

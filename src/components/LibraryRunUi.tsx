@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
 import { Sparkles } from "lucide-react";
@@ -222,19 +222,32 @@ function VideoPrompt({ run, library }: { run: PromptRun; library: Library }) {
   const [doWebisodes, setDoWebisodes] = useState(false);
   const [doRatings, setDoRatings] = useState(false);
 
+  // The token and OMDB flags come from Settings — re-read on every save so
+  // adding a key while the banner is up clears the warning at once.
+  const readSettings = useCallback(async () => {
+    const settings = await invoke<Record<string, string>>("get_settings");
+    setHasToken(Boolean(settings["tmdb_api_token"]?.trim()));
+    setOmdbEnabled(settings["omdb_enabled"] === "true" && Boolean(settings["omdb_api_key"]?.trim()));
+    setRtEnabled(settings["rt_scraper_enabled"] === "true");
+  }, []);
+  useEffect(() => {
+    const onSaved = () => {
+      readSettings().catch((e) => toast.error(String(e)));
+    };
+    window.addEventListener("waverunner:settings-saved", onSaved);
+    return () => window.removeEventListener("waverunner:settings-saved", onSaved);
+  }, [readSettings]);
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const [t, settings] = await Promise.all([
+        const [t] = await Promise.all([
           invoke<TmdbBulkTargets>("get_tmdb_bulk_targets", { libraryId: run.libraryId }),
-          invoke<Record<string, string>>("get_settings"),
+          readSettings(),
         ]);
         if (cancelled) return;
         setTargets(t);
-        setHasToken(Boolean(settings["tmdb_api_token"]?.trim()));
-        setOmdbEnabled(settings["omdb_enabled"] === "true" && Boolean(settings["omdb_api_key"]?.trim()));
-        setRtEnabled(settings["rt_scraper_enabled"] === "true");
         const willDoShows = t.shows.some((s) => !s.tmdb_id);
         setDoMovies(t.movies.length > 0);
         setDoShows(willDoShows);
@@ -247,7 +260,7 @@ function VideoPrompt({ run, library }: { run: PromptRun; library: Library }) {
     return () => {
       cancelled = true;
     };
-  }, [run.libraryId]);
+  }, [run.libraryId, readSettings]);
 
   const unmatchedShows = targets?.shows.filter((s) => !s.tmdb_id) ?? [];
   const matchableShowIds = new Set(

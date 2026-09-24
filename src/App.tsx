@@ -759,9 +759,22 @@ function App() {
           if (alignFrames < 8 && Math.abs(c.scrollTop - before) > 1) requestAnimationFrame(settle);
           return;
         }
-        // Anchor not in the DOM (yet): fall through to the raw-offset wait —
-        // if the content is still loading the anchor may appear on a later
-        // frame and the branch above takes over.
+        // Anchor not in the DOM (yet). A windowed grid only mounts rows near
+        // the viewport, so first ask the grid to scroll that row in (it marks
+        // the event handled when the id is one of its entries); the branch
+        // above aligns against the real card on the next frame. Otherwise
+        // fall through to the raw-offset wait — if the content is still
+        // loading the anchor may appear on a later frame.
+        if (attempts < MAX_FRAMES) {
+          const ask = new CustomEvent("waverunner:scroll-to-anchor", {
+            detail: { id: saved.anchorId, delta: saved.anchorDelta, handled: false },
+          });
+          c.dispatchEvent(ask);
+          if (ask.detail.handled) {
+            requestAnimationFrame(settle);
+            return;
+          }
+        }
       }
       const reachable = c.scrollHeight - c.clientHeight >= saved.scrollTop - 1;
       if (reachable || attempts >= MAX_FRAMES) {
@@ -973,12 +986,27 @@ function App() {
 
       const cached = cache.get(cacheKey);
       if (cached) {
+        if (!inPlace) {
+          // Two commits, not one: the page switch paints first (blank grid,
+          // no spinner yet — MainContent gives a load 150ms before it earns
+          // one), the cards land on the next frame. Handing a big cached
+          // grid over in the click's own tick made the OLD page sit there
+          // until the whole new grid had mounted.
+          setBreadcrumbs(breadcrumb);
+          setEntries([]);
+          setLoading(true);
+          setLooseCount(null);
+          setSortMode("");
+          await new Promise<void>((r) => requestAnimationFrame(() => r()));
+          if (stale()) return;
+        }
         setEntries(cached.entries);
         setSortMode(cached.sort_mode);
         setSelectedPresetId(cached.selected_preset_id);
         setPresets(cached.presets);
         setLooseCount(cached.loose_count ?? null);
         setBreadcrumbs(breadcrumb);
+        setLoading(false);
         if (restoreScroll) restoreScrollPosition(view.libraryId, scrollKindFor(view), breadcrumb[breadcrumb.length - 1]?.id ?? null);
         else resetScrollToTop();
         return;
@@ -1382,17 +1410,11 @@ function App() {
       }
       afterLibraryChanged(lib);
     },
-    onRunFinished: (libraryId, _format, matched) => {
+    // No "Matching finished" toast: the sidebar line ending and the
+    // Metadata strip going away are the signal (user, 2026-09-23).
+    onRunFinished: (libraryId) => {
       const lib = libraries.find((l) => l.id === libraryId);
       if (lib) afterLibraryChanged(lib);
-      if (matched) {
-        toast.success("Matching finished", {
-          action: {
-            label: "Open Metadata",
-            onClick: () => selectView({ kind: "metadata", libraryId }),
-          },
-        });
-      }
     },
   });
 
@@ -2694,88 +2716,6 @@ function App() {
     [selectedLibrary, activeView, sortMode, updateCache, cacheSetMerging],
   );
 
-  const setCover = useCallback(
-    async (
-      entryId: number,
-      coverPath: string | null,
-      opts?: { linkId?: number | null; playlistCollection?: boolean },
-    ) => {
-      const linkId = opts?.linkId ?? null;
-      const isPlaylistCollection = opts?.playlistCollection === true;
-
-      // Playlist-collection cover: the id here is a media_playlist_collection.id. We patch
-      // the matching card in the current playlist view and invoke the collection-scoped command.
-      if (isPlaylistCollection) {
-        setEntries((prev) => {
-          const updated = prev.map((e) =>
-            e.id === entryId && e.entry_type === "playlist_collection"
-              ? { ...e, selected_cover: coverPath }
-              : e,
-          );
-          if (activeView?.kind === "playlist-detail") {
-            cacheSetMerging(viewEntriesCacheRef.current, viewCacheKey(activeView), updated, sortMode);
-          }
-          return updated;
-        });
-        try {
-          await invoke("set_playlist_collection_cover", { collectionId: entryId, coverPath });
-        } catch (e) {
-          console.error("Failed to set playlist-collection cover:", e);
-          if (activeView?.kind === "playlist-detail") {
-            viewEntriesCacheRef.current.delete(viewCacheKey(activeView));
-            loadView(activeView, null, breadcrumbs, true);
-          }
-        }
-        return;
-      }
-
-      if (!selectedLibrary) return;
-
-      // Playlist-link cover override: only mutates the specific media_link row, never the
-      // target entry. Optimistically patch the matching link in the current playlist view
-      // and its cached entries so other copies of the same media stay on their own covers.
-      if (linkId != null) {
-        setEntries((prev) => {
-          const updated = prev.map((e) => (e.link_id === linkId ? { ...e, selected_cover: coverPath } : e));
-          if (activeView?.kind === "playlist-detail") {
-            cacheSetMerging(viewEntriesCacheRef.current, viewCacheKey(activeView), updated, sortMode);
-          }
-          return updated;
-        });
-        try {
-          await invoke("set_link_cover", { linkId, coverPath });
-        } catch (e) {
-          console.error("Failed to set link cover:", e);
-          if (activeView?.kind === "playlist-detail") {
-            viewEntriesCacheRef.current.delete(viewCacheKey(activeView));
-            loadView(activeView, null, breadcrumbs, true);
-          }
-        }
-        return;
-      }
-
-      const last = breadcrumbs[breadcrumbs.length - 1];
-      const parentId = last?.id === entryId
-        ? (breadcrumbs[breadcrumbs.length - 2]?.id ?? null)
-        : (last?.id ?? null);
-      patchEntryEverywhere(parentId, (e) =>
-        e.id === entryId ? { ...e, selected_cover: coverPath } : e,
-      );
-      try {
-        await invoke("set_cover", {
-          libraryId: selectedLibrary.id,
-          entryId,
-          coverPath,
-        });
-      } catch (e) {
-        console.error("Failed to set cover:", e);
-        invalidateCache(selectedLibrary.id, parentId);
-        loadEntries(selectedLibrary, parentId, breadcrumbs);
-      }
-    },
-    [selectedLibrary, activeView, breadcrumbs, sortMode, loadEntries, loadView, invalidateCache, cacheSetMerging, patchEntryEverywhere]
-  );
-
   const addCover = useCallback(
     async (entryId: number, opts?: { playlistCollection?: boolean }) => {
       const isPlaylistCollection = opts?.playlistCollection === true;
@@ -2794,10 +2734,11 @@ function App() {
             collectionId: entryId,
             sourcePath: selected,
           });
+          // One cover per collection — the add REPLACED whatever was there.
           setEntries((prev) => {
             const updated = prev.map((e) =>
               e.id === entryId && e.entry_type === "playlist_collection"
-                ? { ...e, covers: [...e.covers, newCoverPath], selected_cover: newCoverPath }
+                ? { ...e, covers: [newCoverPath], selected_cover: newCoverPath }
                 : e,
             );
             if (activeView?.kind === "playlist-detail") {
@@ -2836,60 +2777,6 @@ function App() {
       }
     },
     [selectedLibrary, breadcrumbs, patchEntryEverywhere]
-  );
-
-  const deleteCover = useCallback(
-    async (entryId: number, coverPath: string, opts?: { playlistCollection?: boolean }) => {
-      const isPlaylistCollection = opts?.playlistCollection === true;
-
-      if (isPlaylistCollection) {
-        try {
-          const newSelected = await invoke<string | null>("delete_playlist_collection_cover", {
-            collectionId: entryId,
-            coverPath,
-          });
-          setEntries((prev) => {
-            const updated = prev.map((e) =>
-              e.id === entryId && e.entry_type === "playlist_collection"
-                ? {
-                    ...e,
-                    covers: e.covers.filter((c) => c !== coverPath),
-                    selected_cover: newSelected,
-                  }
-                : e,
-            );
-            if (activeView?.kind === "playlist-detail") {
-              cacheSetMerging(viewEntriesCacheRef.current, viewCacheKey(activeView), updated, sortMode);
-            }
-            return updated;
-          });
-        } catch (e) {
-          toast.error(String(e));
-        }
-        return;
-      }
-
-      if (!selectedLibrary) return;
-      try {
-        const newSelected = await invoke<string | null>("delete_cover", {
-          libraryId: selectedLibrary.id,
-          entryId,
-          coverPath,
-        });
-        const last = breadcrumbs[breadcrumbs.length - 1];
-        const parentId = last?.id === entryId
-          ? (breadcrumbs[breadcrumbs.length - 2]?.id ?? null)
-          : (last?.id ?? null);
-        patchEntryEverywhere(parentId, (e) =>
-          e.id === entryId
-            ? { ...e, covers: e.covers.filter((c) => c !== coverPath), selected_cover: newSelected }
-            : e,
-        );
-      } catch (e) {
-        toast.error(String(e));
-      }
-    },
-    [selectedLibrary, activeView, breadcrumbs, sortMode, patchEntryEverywhere]
   );
 
   useEffect(() => {
@@ -3140,12 +3027,14 @@ function App() {
           }
         />
         {/* The library's page — or, while its scan runs, the scan view in
-            its place; a match question / running pass rides above it. */}
+            its place. The match question rides above the Metadata page
+            only (where the sidebar's attention icon leads), not over the
+            library's browsing pages. */}
         {activeRun?.kind === "scan" ? (
           <LibraryScanView run={activeRun} />
         ) : (
           <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
-            {activeRun?.kind === "prompt" && selectedLibrary && (
+            {activeRun?.kind === "prompt" && selectedLibrary && activeView?.kind === "metadata" && (
               <LibraryRunBanner run={activeRun} library={selectedLibrary} />
             )}
           <MainContent
@@ -3203,9 +3092,7 @@ function App() {
             onSortOrderChange={updateSortOrder}
             onRenameEntry={renameEntry}
             onTitleChanged={applyTitleChange}
-            onSetCover={setCover}
             onAddCover={addCover}
-            onDeleteCover={deleteCover}
             onMoveEntry={moveEntry}
             onCreateCollection={createCollection}
             onDeleteEntry={deleteEntry}
@@ -3285,7 +3172,10 @@ function App() {
           if (!o) setWavePreloadOpen(false);
         }}
       >
-        <DialogContent>
+        {/* Static: 16 + 20 title + 8 + 20 count + 16 + 16 detail + 16 + 8
+            bar + 16 + 68 footer = 204px. The detail line keeps its slot
+            when empty so the bar never moves. */}
+        <DialogContent height="12.75rem">
           <DialogHeader>
             <DialogTitle>Preloading waveforms</DialogTitle>
             <DialogDescription>
@@ -3294,10 +3184,8 @@ function App() {
                 : "Starting…"}
             </DialogDescription>
           </DialogHeader>
-          {wavePreloadJob?.detail && (
-            <p className="-mt-2 truncate text-xs text-muted-foreground/80">{wavePreloadJob.detail}</p>
-          )}
-          <div className="h-2 overflow-hidden rounded bg-muted">
+          <p className="min-h-4 truncate text-xs text-muted-foreground/80">{wavePreloadJob?.detail ?? ""}</p>
+          <div className="h-2 shrink-0 overflow-hidden rounded bg-muted">
             <div
               className="h-full bg-primary transition-[width]"
               style={{
@@ -3311,17 +3199,16 @@ function App() {
           </div>
           {/* X / esc / backdrop minimize (the walk keeps going) — no button
               needed for that. Cancel is the only real action. */}
-          {wavePreloadJob && (
-            <DialogFooter>
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => void cancelBackgroundJob(wavePreloadJob.id).catch(() => {})}
-              >
-                Cancel
-              </Button>
-            </DialogFooter>
-          )}
+          <DialogFooter>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={!wavePreloadJob}
+              onClick={() => wavePreloadJob && void cancelBackgroundJob(wavePreloadJob.id).catch(() => {})}
+            >
+              Cancel
+            </Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
       <Toaster position="top-center" />

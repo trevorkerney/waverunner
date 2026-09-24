@@ -3,10 +3,12 @@ import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
 import {
   Dialog,
+  DialogBody,
   DialogContent,
   DialogHeader,
   DialogTitle,
   DialogFooter,
+  RevealAfterResize,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
@@ -92,11 +94,14 @@ export function EditCharacterNameDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange} dismiss="self">
-      <DialogContent size="sm">
+      {/* 136 (frame, see NameDialog) + 16 line + 8 + 36 input = 196px; the
+          two-line warning (8 + 32) is known only after the fetch, so the
+          frame grows to 236px for it and the warning fades in after. */}
+      <DialogContent size="sm" height={variantCount > 1 ? "14.75rem" : "12.25rem"}>
         <DialogHeader>
           <DialogTitle>{hadRole ? "Edit character name" : "Add character name"}</DialogTitle>
         </DialogHeader>
-        <div className="flex flex-col gap-2 py-2">
+        <DialogBody className="-mx-1 flex flex-col gap-2 px-1">
           <p className="text-xs text-muted-foreground">
             {personName} in <span className="font-medium text-foreground">{target?.title}</span>
           </p>
@@ -110,12 +115,14 @@ export function EditCharacterNameDialog({
             }}
           />
           {variantCount > 1 && (
-            <p className="text-xs text-amber-600 dark:text-amber-500">
-              This person currently has {variantCount} different character names across episodes.
-              Saving will replace all of them with the new name.
-            </p>
+            <RevealAfterResize>
+              <p className="text-xs text-amber-600 dark:text-amber-500">
+                This person currently has {variantCount} different character names across episodes.
+                Saving will replace all of them with the new name.
+              </p>
+            </RevealAfterResize>
           )}
-        </div>
+        </DialogBody>
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)} disabled={saving}>
             Cancel

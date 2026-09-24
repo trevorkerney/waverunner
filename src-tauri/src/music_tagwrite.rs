@@ -370,6 +370,8 @@ fn assemble(meta: &AlbumMeta, files: &[PreparedFile], reads: &HashMap<i64, Scann
             folder_rel: r.folder_rel.clone(),
             folder_abs: r.folder_abs.clone(),
             tracks: Vec::new(),
+            // Tag writing never touches cue sheets or the flag.
+            cue_pre_emphasis: false,
         })
         .collect();
     for f in files {

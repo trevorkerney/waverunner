@@ -1,9 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
 import { ChevronDown, ChevronRight, HardDriveDownload } from "lucide-react";
 import {
   Dialog,
+  DialogBody,
   DialogContent,
   DialogHeader,
   DialogTitle,
@@ -11,6 +12,7 @@ import {
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
+import { Skeleton, useHandoff } from "@/components/ui/skeleton";
 
 /** "Write to files" — the preview-then-commit dialog for pushing waverunner's
  *  resolved values (edits, else MusicBrainz, else tags) into the audio files.
@@ -56,8 +58,6 @@ interface TagWriteOutcome {
   edits_dropped: number;
 }
 
-const SCOPE_NOUN = { album: "album", track: "track", artist: "artist" } as const;
-
 export function TagWriteDialog({
   scope,
   onOpenChange,
@@ -72,9 +72,18 @@ export function TagWriteDialog({
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [open, setOpen] = useState<Set<number>>(new Set());
+  // Skeleton plan after 500ms (reading tags off disk takes a moment on a
+  // big album), then the hand-off. The dialog portals its last-open content
+  // through the exit, so clearing the plan on close is safe.
+  const bodyRef = useRef<HTMLDivElement | null>(null);
+  const { stage, skeletonSeen, shown, contentVisible } = useHandoff(!!plan || !!error, bodyRef);
 
   useEffect(() => {
-    if (!scope) return;
+    if (!scope) {
+      setPlan(null);
+      setError(null);
+      return;
+    }
     setPlan(null);
     setError(null);
     setOpen(new Set());
@@ -136,7 +145,9 @@ export function TagWriteDialog({
 
   return (
     <Dialog open={scope !== null} onOpenChange={(o) => { if (!o && !busy) onOpenChange(false); }}>
-      <DialogContent width="40rem" className="flex max-h-[85vh] flex-col overflow-hidden">
+      {/* Static: the file count is unknowable before the plan; the file
+          list scrolls under the pinned summary. */}
+      <DialogContent width="40rem" height="34rem">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <HardDriveDownload size={16} className="shrink-0 text-muted-foreground" />
@@ -146,16 +157,43 @@ export function TagWriteDialog({
           </DialogTitle>
         </DialogHeader>
 
-        {error ? (
-          <p className="text-sm text-destructive">{error}</p>
-        ) : !plan ? (
-          <div className="flex items-center justify-center gap-2 py-8 text-sm text-muted-foreground">
-            <Spinner className="size-4" />
-            Reading {scope ? SCOPE_NOUN[scope.kind] : ""} files…
+        <div ref={bodyRef} className="relative flex min-h-0 flex-1 flex-col gap-4">
+        {!shown && skeletonSeen && (
+          <div
+            className={`absolute inset-0 flex flex-col gap-4 transition-opacity duration-200 ${
+              stage === "hidden" ? "" : "opacity-0"
+            }`}
+          >
+            <div className="flex flex-col gap-1.5">
+              <Skeleton className="h-3 w-full" />
+              <Skeleton className="h-3 w-2/3" />
+            </div>
+            <div className="flex flex-col gap-1.5">
+              {Array.from({ length: 6 }, (_, i) => (
+                <div key={i} className="flex items-center gap-2 px-1.5 py-1">
+                  <Skeleton className="size-3.5 rounded-sm" />
+                  <Skeleton className="h-3.5 flex-1" />
+                  <Skeleton className="h-3 w-12" />
+                </div>
+              ))}
+            </div>
           </div>
-        ) : (
-          <>
-            <p className="text-xs text-muted-foreground">
+        )}
+        {error ? (
+          <p
+            className={`text-sm text-destructive transition-opacity duration-200 ${
+              contentVisible ? "opacity-100" : "opacity-0"
+            }`}
+          >
+            {error}
+          </p>
+        ) : plan && (
+          <div
+            className={`flex min-h-0 flex-1 flex-col gap-4 transition-opacity duration-200 will-change-[opacity] ${
+              contentVisible ? "opacity-100" : "opacity-0"
+            }`}
+          >
+            <p className="shrink-0 text-xs text-muted-foreground">
               {plan.writable === 0
                 ? "Every file already says what waverunner shows."
                 : `${plan.writable} ${plan.writable === 1 ? "file changes" : "files change"}`}
@@ -165,7 +203,7 @@ export function TagWriteDialog({
               MusicBrainz says otherwise.
             </p>
             {plan.notes.length > 0 && (
-              <ul className="flex flex-col gap-1 text-xs text-muted-foreground">
+              <ul className="flex shrink-0 flex-col gap-1 text-xs text-muted-foreground">
                 {plan.notes.map((n, i) => (
                   <li key={i} className="flex gap-1.5">
                     <span className="shrink-0">·</span>
@@ -174,7 +212,7 @@ export function TagWriteDialog({
                 ))}
               </ul>
             )}
-            <div className="-mx-1 min-h-0 flex-1 overflow-y-auto px-1">
+            <DialogBody className="-mx-1 px-1">
               <div className="flex flex-col gap-0.5">
                 {folders.map((folder) => (
                   <div key={folder} className="flex flex-col gap-0.5">
@@ -228,9 +266,10 @@ export function TagWriteDialog({
                   </div>
                 ))}
               </div>
-            </div>
-          </>
+            </DialogBody>
+          </div>
         )}
+        </div>
 
         <DialogFooter>
           <Button variant="outline" disabled={busy} onClick={() => onOpenChange(false)}>

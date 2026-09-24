@@ -214,6 +214,9 @@ export function LibraryRunsProvider({ children }: { children: ReactNode }) {
   // scan-state beacon fills the rest. `create` marks first-time imports.
   const pendingScanRef = useRef<Map<string, { isCreate: boolean; setup: boolean; format: string }>>(new Map());
   const pendingCreateRef = useRef<{ format: string } | null>(null);
+  // Scans picked up mid-flight from get_running_scans (no command await of
+  // ours will report their end — the finished beacon does, see below).
+  const rejoinedRef = useRef<Set<string>>(new Set());
 
   const update = useCallback((libraryId: string, f: (r: LibraryRun | undefined) => LibraryRun | undefined) => {
     setRuns((prev) => {
@@ -333,8 +336,21 @@ export function LibraryRunsProvider({ children }: { children: ReactNode }) {
       // e.g. a create's library becoming visible). A scan started elsewhere
       // just ends here.
       if (!pendingScanRef.current.has(libraryId)) {
+        const run = runsRef.current[libraryId];
         update(libraryId, (r) => (r?.kind === "scan" ? undefined : r));
         cbRef.current.onScanFinished(libraryId, state === "finished");
+        // A scan we REJOINED (see get_running_scans below) has no command
+        // await to carry on from — do what the await would have: refresh
+        // the list and, for a setup scan, ask the match question.
+        if (rejoinedRef.current.delete(libraryId) && run?.kind === "scan") {
+          void (async () => {
+            // The command's final writes (create: the library becoming
+            // visible) land a beat after this beacon.
+            await new Promise((r) => setTimeout(r, 300));
+            await cbRef.current.onLibrariesChanged();
+            if (state === "finished") await afterScan(libraryId, run.name, run.format, run.setup);
+          })();
+        }
       }
     });
     const unProgress = listen<{
@@ -350,6 +366,43 @@ export function LibraryRunsProvider({ children }: { children: ReactNode }) {
     return () => {
       unState.then((fn) => fn());
       unProgress.then((fn) => fn());
+    };
+  }, [afterScan, libMeta, update]);
+
+  // Rejoin scans already running when this controller mounts: the beacons
+  // are fire-and-forget, so after a page reload (dev) or webview restart the
+  // "started" is long gone and the scan would be invisible — its library
+  // hidden, its row absent — until it finished on its own.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      let running: { libraryId: string; name: string; format: string; isCreate: boolean }[];
+      try {
+        running = await invoke("get_running_scans");
+      } catch {
+        return;
+      }
+      if (cancelled) return;
+      for (const s of running) {
+        if (runsRef.current[s.libraryId] || pendingScanRef.current.has(s.libraryId)) continue;
+        const meta = libMeta(s.libraryId);
+        const run: ScanRun = {
+          kind: "scan",
+          libraryId: s.libraryId,
+          name: s.name || meta?.name || "New library",
+          format: s.format,
+          isCreate: s.isCreate,
+          setup: s.isCreate || (meta?.setup ?? false),
+          folder: null, phase: null, done: null, total: null, sub: {},
+          stopRequested: false,
+        };
+        rejoinedRef.current.add(s.libraryId);
+        update(s.libraryId, () => run);
+        cbRef.current.onScanStarted(s.libraryId, run.name, run.isCreate);
+      }
+    })();
+    return () => {
+      cancelled = true;
     };
   }, [libMeta, update]);
 

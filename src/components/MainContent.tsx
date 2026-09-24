@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef, useEffect, useLayoutEffect, useMemo, forwardRef, useImperativeHandle, type RefObject } from "react";
+import { useState, useCallback, useRef, useEffect, useLayoutEffect, useMemo, forwardRef, useImperativeHandle, type RefObject, type ReactNode, type CSSProperties, type MouseEvent as ReactMouseEvent } from "react";
 import {
   DndContext,
   closestCenter,
@@ -24,9 +24,9 @@ import {
 import { CSS } from "@dnd-kit/utilities";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
-import { Input } from "@/components/ui/input";
 import { ClearableInput } from "@/components/ui/clearable-input";
 import { useFlipList } from "@/hooks/useFlipList";
+import { useGridWindow } from "@/hooks/useGridWindow";
 import { Slider } from "@/components/ui/slider";
 import {
   DropdownMenu,
@@ -42,22 +42,7 @@ import {
   ContextMenuItem,
   ContextMenuSeparator,
 } from "@/components/ui/context-menu";
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogFooter,
-} from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import {
-  Carousel,
-  CarouselContent,
-  CarouselItem,
-  CarouselPrevious,
-  CarouselNext,
-  type CarouselApi,
-} from "@/components/ui/carousel";
 import { Spinner } from "@/components/ui/spinner";
 import {
   Search,
@@ -103,7 +88,6 @@ import { SortPresetSaveDialog } from "@/components/SortPresetSaveDialog";
 import { playDropIn } from "@/lib/dropIn";
 import { TmdbMatchDialog } from "@/components/TmdbMatchDialog";
 import { TmdbShowMatchDialog } from "@/components/TmdbShowMatchDialog";
-import { TmdbImageBrowserDialog } from "@/components/TmdbImageBrowserDialog";
 import { CoversDialog, CoversMenuItem, type CoversTarget } from "@/components/CoversDialog";
 import { TmdbEpisodeSourceDialog } from "@/components/TmdbEpisodeSourceDialog";
 import { BackdropSelectDialog } from "@/components/BackdropSelectDialog";
@@ -119,10 +103,21 @@ import { CreatePlaylistDialog } from "@/components/CreatePlaylistDialog";
 import { CreatePlaylistCollectionDialog } from "@/components/CreatePlaylistCollectionDialog";
 import { AddToPlaylistDialog } from "@/components/AddToPlaylistDialog";
 import { RenameDialog } from "@/components/RenameDialog";
+import { NameDialog } from "@/components/NameDialog";
 import { ArtistDetailPage } from "@/components/music/ArtistDetailPage";
 import { PlaylistTrackList } from "@/components/music/PlaylistTrackList";
 import { HomePage } from "@/components/HomePage";
 import { CombineSelectedDialog, type AlbumSelection } from "@/components/music/CombineSelectedDialog";
+
+/** What the combine dialog holds while no selection is in progress. */
+const EMPTY_ALBUM_SELECTION: AlbumSelection = {
+  libraryId: "",
+  picked: [],
+  keeperId: null,
+  mode: "merge",
+  busy: false,
+  configuring: false,
+};
 import { PendingWorkStrip, notifyPendingWorkChanged } from "@/components/music/PendingWork";
 import { EditCharacterNameDialog, type CharacterEditTarget } from "@/components/EditCharacterNameDialog";
 import { TmdbPersonSearchDialog } from "@/components/TmdbPersonSearchDialog";
@@ -246,17 +241,9 @@ interface MainContentProps {
   onSortOrderChange: (reordered: MediaEntry[]) => void;
   onRenameEntry: (entryId: number, newTitle: string) => Promise<string | null>;
   onTitleChanged: (entryId: number, newTitle: string) => void;
-  onSetCover: (
-    entryId: number,
-    coverPath: string | null,
-    opts?: { linkId?: number | null; playlistCollection?: boolean },
-  ) => void;
+  /** Playlist collections' one cover (add = replace). Library entries and
+   *  playlist links manage covers through the Covers dialog instead. */
   onAddCover: (entryId: number, opts?: { playlistCollection?: boolean }) => Promise<void>;
-  onDeleteCover: (
-    entryId: number,
-    coverPath: string,
-    opts?: { playlistCollection?: boolean },
-  ) => Promise<void>;
   onMoveEntry: (entryId: number, newParentId: number | null, insertBeforeId: number | null, anchor?: { id: number; viewportTop: number }) => Promise<void>;
   onCreateCollection: (name: string) => Promise<number | null>;
   onDeleteEntry: (entryId: number) => Promise<void>;
@@ -349,9 +336,7 @@ export function MainContent({
   onSortOrderChange,
   onRenameEntry,
   onTitleChanged,
-  onSetCover,
   onAddCover,
-  onDeleteCover,
   onMoveEntry,
   onCreateCollection,
   onDeleteEntry,
@@ -384,6 +369,23 @@ export function MainContent({
   // Built generic so other bulk actions can join later.
   const [albumSelect, setAlbumSelect] = useState<AlbumSelection | null>(null);
   const [gridMenuOpen, setGridMenuOpen] = useState(false);
+  // ONE context menu for the whole grid. Cards don't carry their own menu
+  // root (a menu root is a stack of floating-ui hooks — hundreds of them
+  // was a measurable slice of a big grid's mount); a right-click captures
+  // which card it landed on and the shared menu shows that card's items.
+  // The target sticks until the next right-click so the items don't swap
+  // under the close animation.
+  const [menuEntry, setMenuEntry] = useState<MediaEntry | null>(null);
+  // Inline-rename target (was per-card state; the menu that starts it is
+  // grid-level now). Keyed by sortable id, like the cards.
+  const [renamingId, setRenamingId] = useState<string | number | null>(null);
+  // Optimistic watched/unwatched from the menu: entry lists are cached
+  // upstream, so the card corrects itself locally until the next real fetch
+  // (a new entries array) replaces the flags.
+  const [watchOverrides, setWatchOverrides] = useState<Map<number, "watched" | "unwatched">>(() => new Map());
+  useEffect(() => {
+    setWatchOverrides((m) => (m.size ? new Map() : m));
+  }, [entries]);
   const toggleAlbumSelect = useCallback((entry: MediaEntry) => {
     setAlbumSelect((s) => {
       if (!s) return s;
@@ -455,16 +457,7 @@ export function MainContent({
     personName: string;
     target: CharacterEditTarget;
   } | null>(null);
-  const [coverDialogEntry, setCoverDialogEntry] = useState<MediaEntry | null>(
-    null
-  );
-  const [coverDialogMode, setCoverDialogMode] = useState<"select" | "delete">("select");
   const [savePresetOpen, setSavePresetOpen] = useState(false);
-
-  const openCoverDialog = useCallback((entry: MediaEntry, mode: "select" | "delete") => {
-    setCoverDialogMode(mode);
-    setCoverDialogEntry(entry);
-  }, []);
 
   // The unified covers menu. Music albums are release-scoped (grid = the
   // default release); everything else manages the entry's covers.
@@ -475,14 +468,27 @@ export function MainContent({
   const coversHostRef = useRef<CoversHostHandle | null>(null);
   const openCoversMenu = useCallback((entry: MediaEntry) => {
     if (!selectedLibrary) return;
+    // Inside a playlist the row is a link: same pool as the target, but the
+    // pick is the link's own (the grid shows the link's current cover).
+    const link = entry.link_id != null ? { linkId: entry.link_id, selectedCover: entry.selected_cover } : undefined;
+    // A track link's covers are its album's (releases pool the art).
+    const albumId =
+      selectedLibrary.format === "music"
+        ? entry.entry_type === "album"
+          ? entry.id
+          : entry.entry_type === "track"
+            ? entry.parent_id
+            : null
+        : null;
     coversHostRef.current?.open(
-      selectedLibrary.format === "music" && entry.entry_type === "album"
+      albumId != null
         ? {
             kind: "release",
             libraryId: selectedLibrary.id,
-            albumId: entry.id,
+            albumId,
             releaseId: null,
             title: entry.title,
+            link,
           }
         : {
             kind: "entry",
@@ -490,6 +496,7 @@ export function MainContent({
             entryId: entry.id,
             entryType: entry.entry_type,
             title: entry.title,
+            link,
           },
     );
   }, [selectedLibrary]);
@@ -503,14 +510,21 @@ export function MainContent({
     }
   }, [selectedLibrary, onPlaylistChanged]);
 
-  // Keep the dialog's entry in sync with the live entries/selectedEntry so covers list updates after delete
-  const liveCoverDialogEntry = useMemo(() => {
-    if (!coverDialogEntry) return null;
-    if (selectedEntry?.id === coverDialogEntry.id) return selectedEntry;
-    const found = entries.find((e) => e.id === coverDialogEntry.id);
-    return found ?? coverDialogEntry;
-  }, [coverDialogEntry, entries, selectedEntry]);
   const isSearching = searchResults != null;
+
+  // A spinner the instant loading starts flashes on every fast fetch, and
+  // on the one-frame yield App takes before committing a cached grid. A
+  // load has to last 150ms before it earns one; until then the region is
+  // simply blank.
+  const [spinnerDue, setSpinnerDue] = useState(false);
+  useEffect(() => {
+    if (!loading) {
+      setSpinnerDue(false);
+      return;
+    }
+    const t = window.setTimeout(() => setSpinnerDue(true), 150);
+    return () => window.clearTimeout(t);
+  }, [loading]);
 
   // The music Artists view mirrors People pages: its own two-mode sort
   // (alphabetical / most credited), letter sections, no presets, no size
@@ -599,6 +613,35 @@ export function MainContent({
     return false;
   }, [selectedEntry, loading, isSearching, filteredEntries]);
 
+  const [dragId, setDragId] = useState<string | number | null>(null);
+  const gridRef = useRef<HTMLDivElement | null>(null);
+  // Navigation (switching All/Movies/TV, entering/leaving collections, toggling
+  // search) shows the same entries at unrelated positions — FLIP would send them
+  // flying across the grid. Rebaseline without animating on those renders.
+  const navKey = `${activeView ? viewCacheKey(activeView) : "none"}|${breadcrumbs[breadcrumbs.length - 1]?.id ?? "root"}|${isSearching ? "s" : ""}`;
+
+  // Row windowing for the cover grid: only rows near the viewport mount
+  // (the grid pads itself to full height for the rows that don't). This is
+  // what makes an 800-album page mount like a 40-album one. Off for the
+  // lists that share gridRef but aren't card grids (artists, music
+  // playlists) and while a card is being dragged (it must stay mounted).
+  const gridWindow = useGridWindow({
+    scrollRef: scrollContainerRef,
+    gridRef,
+    count: filteredEntries.length,
+    minColumnWidth: coverSize,
+    // Square cover + two text lines; the first measured row replaces it.
+    estimateRowHeight: coverSize + 56,
+    overscan: 3,
+    resetKey: `${coverSize}|${navKey}`,
+    enabled:
+      !selectedEntry &&
+      !isArtistsView &&
+      !(selectedLibrary?.format === "music" && activeView?.kind === "playlist-detail"),
+    frozen: dragId != null,
+  });
+  const { scrollToIndex } = gridWindow;
+
   const jumpToGridEntry = useCallback(
     (label: string) => {
       const target = gridScrubber?.find(label);
@@ -615,16 +658,24 @@ export function MainContent({
       const offset = (el: Element) =>
         el.getBoundingClientRect().top - (container.getBoundingClientRect().top + padTop);
       const first = gridRef.current?.querySelector(sel);
-      if (!first) return;
-      container.scrollTop += offset(first);
-      // content-visibility makes offsets above the target ESTIMATES until that
-      // region renders, so the first jump can land off (worse at some zoom
-      // levels). Re-align over a few frames until the target stops moving —
+      if (first) {
+        container.scrollTop += offset(first);
+      } else {
+        // Not mounted (the window hasn't reached that row): scroll by the
+        // row arithmetic, then let the settle loop below find the real card.
+        scrollToIndex(filteredEntries.indexOf(target), padTop);
+      }
+      // Rows above the target are ESTIMATES until they render (windowing,
+      // and content-visibility inside the cards), so the first jump can land
+      // off. Re-align over a few frames until the target stops moving —
       // each pass renders the surroundings and tightens the layout.
       let attempts = 0;
       const settle = () => {
         const el = gridRef.current?.querySelector(sel);
-        if (!el) return;
+        if (!el) {
+          if (attempts++ < 8) requestAnimationFrame(settle);
+          return;
+        }
         const delta = offset(el);
         if (Math.abs(delta) > 1 && attempts < 8) {
           attempts++;
@@ -634,12 +685,27 @@ export function MainContent({
       };
       requestAnimationFrame(settle);
     },
-    [gridScrubber, scrollContainerRef],
+    [gridScrubber, scrollContainerRef, scrollToIndex, filteredEntries],
   );
 
-  const [dragId, setDragId] = useState<string | number | null>(null);
+  // Scroll restore (App) anchors on the card that sat at the top of the
+  // viewport. With windowing that card may not be mounted when the page
+  // comes back — App asks the grid to bring its row in first, then aligns
+  // against the real element once it exists.
+  useEffect(() => {
+    const c = scrollContainerRef.current;
+    if (!c) return;
+    const onAnchor = (e: Event) => {
+      const d = (e as CustomEvent<{ id: string; delta: number; handled: boolean }>).detail;
+      const idx = filteredEntries.findIndex((en) => String(sortableIdFor(en)) === d.id);
+      if (idx < 0) return;
+      scrollToIndex(idx, d.delta);
+      d.handled = true;
+    };
+    c.addEventListener("waverunner:scroll-to-anchor", onAnchor);
+    return () => c.removeEventListener("waverunner:scroll-to-anchor", onAnchor);
+  }, [scrollContainerRef, filteredEntries, scrollToIndex]);
   const [newCollectionOpen, setNewCollectionOpen] = useState(false);
-  const [newCollectionName, setNewCollectionName] = useState("");
   const [deleteTarget, setDeleteTarget] = useState<MediaEntry | null>(null);
   const [deletingId, setDeletingId] = useState<number | null>(null);
   // Confirm-before-delete targets (empty/cheap ones skip confirmation entirely).
@@ -732,9 +798,7 @@ export function MainContent({
   // instead of teleporting. Positions use offsetLeft/Top, which ignore both
   // scrolling and dnd-kit's live drag transforms. The render that ends a drag
   // is skipped so optimistic reorders don't double-animate.
-  const gridRef = useRef<HTMLDivElement | null>(null);
   const flipPositionsRef = useRef<Map<string, { x: number; y: number; w: number; h: number }>>(new Map());
-  const flipKeysRef = useRef<string[]>([]);
   const wasDraggingRef = useRef(false);
   // Tracks the view whose cards last played the page load-in, so it fires once per
   // navigation rather than on every in-view re-render.
@@ -742,11 +806,13 @@ export function MainContent({
   // Cover resizes are animated by CSS width transitions on the cards themselves;
   // FLIP sits those renders out (it would fight the transition).
   const prevCoverSizeRef = useRef(coverSize);
-  // Navigation (switching All/Movies/TV, entering/leaving collections, toggling
-  // search) shows the same entries at unrelated positions — FLIP would send them
-  // flying across the grid. Rebaseline without animating on those renders.
-  const navKey = `${activeView ? viewCacheKey(activeView) : "none"}|${breadcrumbs[breadcrumbs.length - 1]?.id ?? "root"}|${isSearching ? "s" : ""}`;
   const prevNavKeyRef = useRef(navKey);
+  // List identity comes from the FULL entry list, not the mounted cards: the
+  // window mounts and unmounts cards as you scroll, and that must never
+  // read as "the list changed" (it would animate every card that scrolled
+  // in as a newcomer).
+  const flipListKeys = useMemo(() => filteredEntries.map((e) => String(sortableIdFor(e))), [filteredEntries]);
+  const prevFlipListKeysRef = useRef<string[]>([]);
   // Page load-in key: changes when the view or parent collection changes (but NOT on search
   // toggle or in-place refreshes), so the "drop in" plays once per page you navigate to.
   const loadInKey = `${activeView ? viewCacheKey(activeView) : "none"}|${breadcrumbs[breadcrumbs.length - 1]?.id ?? "root"}`;
@@ -799,7 +865,7 @@ export function MainContent({
       !dragging && !justDropped && !resized
     ) {
       loadedInViewRef.current = loadInKey;
-      flipKeysRef.current = keys;
+      prevFlipListKeysRef.current = flipListKeys;
       flipPositionsRef.current = next;
       playDropIn(children);
       return;
@@ -807,12 +873,14 @@ export function MainContent({
 
     // Only animate when the list composition/order actually changed. Positions can
     // also drift between renders without any list change (cover images finish
-    // loading and grow their cards, window resizes) — the baseline is stale then,
-    // and animating against it makes cards jump on otherwise-benign re-renders.
-    const prevKeys = flipKeysRef.current;
-    flipKeysRef.current = keys;
+    // loading and grow their cards, window resizes, the window's padding
+    // re-estimating a row) — the baseline is stale then, and animating
+    // against it makes cards jump on otherwise-benign re-renders.
+    const prevKeys = prevFlipListKeysRef.current;
+    prevFlipListKeysRef.current = flipListKeys;
     const listChanged =
-      prevKeys.length !== keys.length || keys.some((k, i) => prevKeys[i] !== k);
+      prevKeys.length !== flipListKeys.length || flipListKeys.some((k, i) => prevKeys[i] !== k);
+    const prevKeySet = new Set(prevKeys);
     // Artists view: sort-mode switches snap instantly (People-page behavior) —
     // no FLIP choreography, just the new order.
     if (!dragging && !justDropped && !resized && !navigated && listChanged && !isArtistsView) {
@@ -854,14 +922,15 @@ export function MainContent({
           animated++;
         }
       }
-      // Brand-new cards (no prior position) fall into place: a brief slide-down
-      // + fade so an added collection reads as "dropping in" while the existing
-      // cards shift past it. Gated on a non-empty prior list so the initial
-      // populate of a view doesn't animate every card.
+      // Brand-new cards (not in the previous LIST — a card that merely
+      // scrolled into the window isn't new) fall into place: a brief
+      // slide-down + fade so an added collection reads as "dropping in"
+      // while the existing cards shift past it. Gated on a non-empty prior
+      // list so the initial populate of a view doesn't animate every card.
       if (prevKeys.length > 0) {
         for (const child of children) {
           const key = child.dataset.flipId;
-          if (!key || prev.has(key)) continue; // movers handled above; only new cards here
+          if (!key || prevKeySet.has(key)) continue; // movers handled above; only new cards here
           child.animate(
             [
               { transform: "translateY(-12px) scale(0.96)", opacity: 0 },
@@ -886,13 +955,19 @@ export function MainContent({
   }, [onCreateCollection]);
   useEffect(() => {
     if (pendingNewCollectionId == null) return;
-    if (!filteredEntries.some((e) => e.id === pendingNewCollectionId)) return;
+    const idx = filteredEntries.findIndex((e) => e.id === pendingNewCollectionId);
+    if (idx < 0) return;
     setPendingNewCollectionId(null);
     const container = scrollContainerRef.current;
     const el = gridRef.current?.querySelector<HTMLElement>(
       `[data-flip-id="${window.CSS.escape(String(pendingNewCollectionId))}"]`,
     );
-    if (!container || !el) return;
+    if (!container) return;
+    if (!el) {
+      // Below the window: bring its row to the middle of the viewport.
+      scrollToIndex(idx, container.clientHeight / 2);
+      return;
+    }
     // Only scroll when it's not already fully in view — no jolt when the new
     // collection sorts into the visible region.
     const elRect = el.getBoundingClientRect();
@@ -900,7 +975,7 @@ export function MainContent({
     if (elRect.top < cRect.top || elRect.bottom > cRect.bottom) {
       el.scrollIntoView({ behavior: "smooth", block: "center" });
     }
-  }, [pendingNewCollectionId, filteredEntries, scrollContainerRef]);
+  }, [pendingNewCollectionId, filteredEntries, scrollContainerRef, scrollToIndex]);
 
   const handleDragEnd = useCallback(
     async (event: DragEndEvent) => {
@@ -1112,6 +1187,239 @@ export function MainContent({
     activeView?.kind === "playlist-detail"
       ? activeView.collectionId !== null
       : breadcrumbs.length > 1;
+
+  // Drag only where a drop or reorder can land: custom-sort reorders,
+  // playlists (links move between collections), and a video library's root
+  // grid (cards drop into collections / the move-up zone). Everything else
+  // — the Albums page above all — renders static cards and no drag context
+  // at all.
+  const dragEnabled =
+    sortMode === "custom" ||
+    activeView?.kind === "playlist-detail" ||
+    (activeView?.kind === "library-root" && selectedLibrary?.format === "video");
+  const Card = dragEnabled ? SortableCoverCard : CoverCard;
+
+  // Which card a right-click landed on, for the shared grid menu. Captured
+  // on the way down so it's known before the menu opens. Music playlists
+  // are a track list with its own row menus — nothing to capture there.
+  const entryBySortableId = useMemo(
+    () => new Map(filteredEntries.map((e) => [String(sortableIdFor(e)), e] as const)),
+    [filteredEntries],
+  );
+  const cardSelectMode = (entry: MediaEntry) =>
+    !!albumSelect &&
+    entry.entry_type === "album" &&
+    entry.link_id == null &&
+    selectedLibrary?.id === albumSelect.libraryId;
+  const cardSelected = (entry: MediaEntry) => !!albumSelect?.picked.some((p) => p.id === entry.id);
+  const captureMenuTarget = (e: ReactMouseEvent) => {
+    if (isMusicPlaylist) return;
+    const el = (e.target as Element).closest?.("[data-flip-id]") as HTMLElement | null;
+    const entry = el?.dataset.flipId != null ? entryBySortableId.get(el.dataset.flipId) ?? null : null;
+    // File-manager behavior: right-clicking an UNSELECTED card while
+    // selecting adds it first, so the menu can't act on a set that
+    // excludes what the pointer is on.
+    if (entry && cardSelectMode(entry) && !cardSelected(entry)) toggleAlbumSelect(entry);
+    setMenuEntry(entry);
+  };
+
+  // The per-card items of the shared menu (selection mode is handled by
+  // the caller — it acts on the selection, not the card).
+  const cardMenuItems = (entry: MediaEntry) => {
+    const inPlaylist = activeView?.kind === "playlist-detail";
+    if (entry.entry_type === "playlist_collection") {
+      return (
+        <>
+          {inPlaylist && (
+            <ContextMenuItem onClick={() => setRenameCollectionFor(entry)}>
+              <Pencil size={14} />
+              Rename
+            </ContextMenuItem>
+          )}
+          {/* One cover per collection, like a playlist: adding replaces
+              it; it goes with the collection. */}
+          <ContextMenuItem onClick={() => onAddCover(entry.id, { playlistCollection: true })}>
+            <ImageIcon size={14} />
+            {entry.covers.length > 0 ? "Change cover" : "Add cover"}
+          </ContextMenuItem>
+          {inPlaylist && (
+            <ContextMenuItem
+              onClick={() => {
+                // Empty groups delete straight away; ones with content confirm first.
+                if (entry.child_count === 0) {
+                  void deletePlaylistCollection(entry.id);
+                } else {
+                  setDeletePlaylistCollectionTarget(entry);
+                }
+              }}
+              className="text-destructive focus:text-destructive"
+            >
+              <Trash2 size={14} />
+              Delete collection
+            </ContextMenuItem>
+          )}
+        </>
+      );
+    }
+    const isVideoItem = entry.entry_type === "movie" || entry.entry_type === "show";
+    const watchOverride = watchOverrides.get(entry.id) ?? null;
+    // In-progress counts as unwatched for the menu pivot (offer Mark watched),
+    // but only the explicit no-progress flag ever badges.
+    const offerMarkWatched = watchOverride
+      ? watchOverride === "unwatched"
+      : entry.unwatched || entry.has_progress;
+    return (
+      <>
+        {entry.link_id == null && (
+          <ContextMenuItem onClick={() => setRenamingId(sortableIdFor(entry))}>
+            <Pencil size={14} />
+            Rename
+          </ContextMenuItem>
+        )}
+        {/* One covers menu — add (local/remote), set, and delete live in
+            the dialog. For a playlist link the dialog works the same
+            pool but sets the link's own pick (see openCoversMenu). */}
+        <CoversMenuItem onOpen={() => openCoversMenu(entry)} />
+        {selectedLibrary && entry.link_id == null && isVideoItem && (
+          <ContextMenuItem onClick={() => setAddToPlaylistFor(entry)}>
+            <ListPlus size={14} />
+            Add to playlist
+          </ContextMenuItem>
+        )}
+        {selectedLibrary?.format === "music" && onEnqueueMusic && entry.link_id == null && entry.entry_type === "album" && (
+          <>
+            <ContextMenuItem onClick={() => void enqueueAlbum(entry, "next")}>
+              <ListStart size={14} />
+              Play next
+            </ContextMenuItem>
+            <ContextMenuItem onClick={() => void enqueueAlbum(entry, "last")}>
+              <ListEnd size={14} />
+              Add to queue
+            </ContextMenuItem>
+          </>
+        )}
+        {selectedLibrary?.format === "music" && entry.link_id == null && entry.entry_type === "album" && (
+          <ContextMenuItem onClick={() => startAlbumSelect(entry)}>
+            <ListChecks size={14} />
+            Select
+          </ContextMenuItem>
+        )}
+        {activeView?.kind === "person-detail" && activeView.role === "actor" && isVideoItem && (
+          <ContextMenuItem
+            onClick={() =>
+              setCharacterEdit({
+                personId: activeView.personId,
+                personName: activeView.personName,
+                target: { entryId: entry.id, entryType: entry.entry_type as "movie" | "show", title: entry.title },
+              })
+            }
+          >
+            <UserIcon size={14} />
+            Edit character name
+          </ContextMenuItem>
+        )}
+        {isVideoItem && (
+          // Watched is the default; flagged-unwatched and in-progress
+          // items offer Mark watched. Shows flip every episode at once.
+          <ContextMenuItem
+            onClick={async () => {
+              try {
+                if (entry.entry_type === "show") {
+                  await invoke("mark_show_watched", { showId: entry.id, watched: offerMarkWatched });
+                } else {
+                  await invoke("mark_watched", { kind: "movie", id: entry.id, watched: offerMarkWatched });
+                }
+                setWatchOverrides((m) => new Map(m).set(entry.id, offerMarkWatched ? "watched" : "unwatched"));
+              } catch (e) {
+                toast.error(String(e));
+              }
+            }}
+          >
+            {offerMarkWatched ? <Eye size={14} /> : <EyeOff size={14} />}
+            {offerMarkWatched ? "Mark watched" : "Mark unwatched"}
+          </ContextMenuItem>
+        )}
+        {inPlaylist && entry.link_id != null && (
+          <ContextMenuItem
+            onClick={async () => {
+              try {
+                await invoke("remove_media_link", { linkId: entry.link_id });
+                if (selectedLibrary) onPlaylistChanged(selectedLibrary.id);
+              } catch (err) {
+                toast.error(String(err));
+              }
+            }}
+            className="text-destructive focus:text-destructive"
+          >
+            <Trash2 size={14} />
+            Remove from playlist
+          </ContextMenuItem>
+        )}
+        {/* Only collections are deletable — movies/shows mirror the filesystem
+            and leave the library via rescan. */}
+        {entry.link_id == null && entry.entry_type === "collection" && (
+          <ContextMenuItem
+            onClick={() => {
+              // Empty collections delete immediately; non-empty ones confirm
+              // (their items move back to the parent, nothing touches disk).
+              if (entry.child_count === 0) {
+                void handleDelete(entry.id);
+              } else {
+                setDeleteTarget(entry);
+              }
+            }}
+            className="text-destructive focus:text-destructive"
+          >
+            <Trash2 size={14} />
+            Delete collection
+          </ContextMenuItem>
+        )}
+        {/* Sound collections are virtual — deleting one demotes its tracks
+            to the loose pool; nothing touches disk. */}
+        {activeView?.kind === "sounds" && entry.link_id == null && entry.entry_type === "album" && (
+          <ContextMenuItem
+            onClick={() => void deleteSoundCollection(entry)}
+            className="text-destructive focus:text-destructive"
+          >
+            <Trash2 size={14} />
+            Delete collection
+          </ContextMenuItem>
+        )}
+      </>
+    );
+  };
+
+  // The drag context only exists on grids that can drag (see dragEnabled).
+  const withDnd = (body: ReactNode) =>
+    dragEnabled ? (
+      <DndContext
+        sensors={sensors}
+        collisionDetection={collisionDetection}
+        onDragStart={handleDragStart}
+        onDragEnd={handleDragEnd}
+        onDragCancel={() => setDragId(null)}
+      >
+        {isInsideCollection && <MoveUpDropZone isActive={dragId != null} />}
+        <SortableContext
+          items={filteredEntries.map(sortableIdFor)}
+          strategy={isMusicPlaylist ? verticalListSortingStrategy : rectSortingStrategy}
+        >
+          {body}
+        </SortableContext>
+        <DragOverlay dropAnimation={dropAnimation}>
+          {dragEntry &&
+            (isMusicPlaylist ? (
+              <div className="rounded-md border bg-background px-3 py-1.5 text-sm shadow-lg">
+                {dragEntry.title}
+              </div>
+            ) : (
+              <DragOverlayCard entry={dragEntry} size={coverSize} getCoverUrl={getCoverUrl} />
+            ))}
+        </DragOverlay>
+      </DndContext>
+    ) : (
+      body
+    );
 
   // No breadcrumb bar (removed 2026-09-20). The `breadcrumbs` path still
   // drives navigation state — parent ids for drill-ins, view keys, history
@@ -1342,7 +1650,6 @@ export function MainContent({
         scrollContainerRef={scrollContainerRef}
         onNavigateToPlaylist={onNavigateToPlaylist}
         onPlaylistChanged={onPlaylistChanged}
-        getFullCoverUrl={getFullCoverUrl}
         search={search}
         onSearchChange={onSearchChange}
         coverSize={coverSize}
@@ -1733,9 +2040,11 @@ export function MainContent({
           // Anchored to the content region's `relative` wrapper — flex-1 does
           // nothing inside the block scroll container, so absolute centering
           // is what actually matches the People pages visually.
-          <div className="absolute inset-0 flex items-center justify-center">
-            <Spinner className="size-6" />
-          </div>
+          spinnerDue ? (
+            <div className="absolute inset-0 flex items-center justify-center">
+              <Spinner className="size-6" />
+            </div>
+          ) : null
         ) : (
           <ArtistsGrid
             entries={filteredEntries}
@@ -1751,7 +2060,7 @@ export function MainContent({
       // (toggling open between false and undefined breaks it permanently);
       // selection mode swaps its contents rather than silencing it.
       <ContextMenu open={gridMenuOpen} onOpenChange={setGridMenuOpen}>
-        <ContextMenuTrigger render={<div className="flex min-h-full flex-col" />}>
+        <ContextMenuTrigger render={<div className="flex min-h-full flex-col" onContextMenuCapture={captureMenuTarget} />}>
         {/* Albums page: album-less tracks get a header button above the grid —
             their hidden containers never surface as cards, so this is their
             only album-side entrance. The Sounds page gets the same button for
@@ -1775,27 +2084,20 @@ export function MainContent({
           // would flash.
           <div className="min-h-full" />
         ) : loading ? (
-          <div className="flex flex-1 items-center justify-center">
-            <Spinner className="size-6" />
-          </div>
+          spinnerDue ? (
+            <div className="flex flex-1 items-center justify-center">
+              <Spinner className="size-6" />
+            </div>
+          ) : (
+            <div className="min-h-full" />
+          )
         ) : filteredEntries.length === 0 ? (
           <p className="text-sm text-muted-foreground">
             {search ? "No results" : "Empty"}
           </p>
         ) : (
-          <DndContext
-            sensors={sensors}
-            collisionDetection={collisionDetection}
-            onDragStart={handleDragStart}
-            onDragEnd={handleDragEnd}
-            onDragCancel={() => setDragId(null)}
-          >
-            {isInsideCollection && <MoveUpDropZone isActive={dragId != null} />}
-            <SortableContext
-              items={filteredEntries.map(sortableIdFor)}
-              strategy={isMusicPlaylist ? verticalListSortingStrategy : rectSortingStrategy}
-            >
-              {isMusicPlaylist ? (
+          withDnd(
+              isMusicPlaylist ? (
                 <div ref={gridRef}>
                   <PlaylistTrackList
                     entries={filteredEntries}
@@ -1840,110 +2142,36 @@ export function MainContent({
                 style={{
                   gridTemplateColumns: `repeat(auto-fill, minmax(${coverSize}px, 1fr))`,
                   justifyItems: "center",
+                  // Windowing: the rows that aren't mounted are this padding.
+                  paddingTop: gridWindow.padTop,
+                  paddingBottom: gridWindow.padBottom,
                 }}
               >
-                {filteredEntries.map((entry) => (
-                  <SortableCoverCard
+                {filteredEntries.slice(gridWindow.start, gridWindow.end).map((entry) => (
+                  <Card
                     key={sortableIdFor(entry)}
                     sortableId={sortableIdFor(entry)}
                     entry={entry}
                     size={coverSize}
                     onNavigate={onNavigate}
                     onRename={onRenameEntry}
-                    selectMode={
-                      !!albumSelect &&
-                      entry.entry_type === "album" &&
-                      entry.link_id == null &&
-                      selectedLibrary?.id === albumSelect.libraryId
-                    }
-                    selected={!!albumSelect?.picked.some((p) => p.id === entry.id)}
+                    isRenaming={renamingId != null && renamingId === sortableIdFor(entry)}
+                    onRenameEnd={() => setRenamingId(null)}
+                    watchOverride={watchOverrides.get(entry.id) ?? null}
+                    selectMode={cardSelectMode(entry)}
+                    selected={cardSelected(entry)}
                     onToggleSelect={toggleAlbumSelect}
-                    onStartSelect={
-                      selectedLibrary?.format === "music" ? startAlbumSelect : undefined
-                    }
-                    selectionCount={albumSelect?.picked.length ?? 0}
-                    onSelectionCombine={() =>
-                      setAlbumSelect((s) => (s ? { ...s, configuring: true } : s))
-                    }
-                    onSelectionClear={() =>
-                      setAlbumSelect((s) => (s ? { ...s, picked: [], keeperId: null } : s))
-                    }
-                    onSelectionDone={() => setAlbumSelect(null)}
-                    onEnqueueAlbum={
-                      selectedLibrary?.format === "music" && onEnqueueMusic
-                        ? (e, mode) => void enqueueAlbum(e, mode)
-                        : undefined
-                    }
-                    onChangeCover={() => openCoverDialog(entry, "select")}
-                    onAddCover={() => onAddCover(entry.id, {
-                      playlistCollection: entry.entry_type === "playlist_collection",
-                    })}
-                    onOpenCovers={() => openCoversMenu(entry)}
-                    onDeleteCover={() => openCoverDialog(entry, "delete")}
-                    onDelete={async (entry) => {
-                      // Empty collections delete immediately; non-empty ones confirm
-                      // (their items move back to the parent, nothing touches disk).
-                      if (entry.child_count === 0) {
-                        handleDelete(entry.id);
-                      } else {
-                        setDeleteTarget(entry);
-                      }
-                    }}
                     deletingId={deletingId}
                     getCoverUrl={getCoverUrl}
                     getCoverAspect={getCoverAspect}
                     isDragActive={dragId != null}
                     pendingRemoval={pendingRemovalId != null && pendingRemovalId === sortableIdFor(entry)}
                     sortMode={sortMode}
-                    onAddToPlaylist={selectedLibrary ? (e) => setAddToPlaylistFor(e) : undefined}
-                    onRemoveLink={activeView?.kind === "playlist-detail" ? async (linkId) => {
-                      try {
-                        await invoke("remove_media_link", { linkId });
-                        if (selectedLibrary) onPlaylistChanged(selectedLibrary.id);
-                      } catch (err) {
-                        toast.error(String(err));
-                      }
-                    } : undefined}
-                    onRenamePlaylistCollection={activeView?.kind === "playlist-detail" ? (e) => setRenameCollectionFor(e) : undefined}
-                    onDeletePlaylistCollection={activeView?.kind === "playlist-detail" ? (e) => {
-                      // Empty groups delete straight away; ones with content confirm first.
-                      if (e.child_count === 0) {
-                        void deletePlaylistCollection(e.id);
-                      } else {
-                        setDeletePlaylistCollectionTarget(e);
-                      }
-                    } : undefined}
-                    onEditCharacterName={
-                      activeView?.kind === "person-detail" && activeView.role === "actor"
-                        ? (e) =>
-                            setCharacterEdit({
-                              personId: activeView.personId,
-                              personName: activeView.personName,
-                              target: { entryId: e.id, entryType: e.entry_type as "movie" | "show", title: e.title },
-                            })
-                        : undefined
-                    }
-                    onDeleteSoundCollection={
-                      activeView?.kind === "sounds"
-                        ? (e) => void deleteSoundCollection(e)
-                        : undefined
-                    }
                   />
                 ))}
               </div>
-              )}
-            </SortableContext>
-            <DragOverlay dropAnimation={dropAnimation}>
-              {dragEntry &&
-                (isMusicPlaylist ? (
-                  <div className="rounded-md border bg-background px-3 py-1.5 text-sm shadow-lg">
-                    {dragEntry.title}
-                  </div>
-                ) : (
-                  <DragOverlayCard entry={dragEntry} size={coverSize} getCoverUrl={getCoverUrl} />
-                ))}
-            </DragOverlay>
-          </DndContext>
+              ),
+          )
         )}
         </ContextMenuTrigger>
           <ContextMenuContent>
@@ -1971,6 +2199,9 @@ export function MainContent({
                   Done selecting
                 </ContextMenuItem>
               </>
+            ) : menuEntry ? (
+              // A card: its items (one shared menu for the grid — see menuEntry).
+              cardMenuItems(menuEntry)
             ) : (
               <>
             {activeView?.kind === "playlist-detail" && (
@@ -1980,7 +2211,7 @@ export function MainContent({
               </ContextMenuItem>
             )}
             {activeView?.kind === "library-root" && selectedLibrary?.format === "video" && (
-              <ContextMenuItem onClick={() => { setNewCollectionName(""); setNewCollectionOpen(true); }}>
+              <ContextMenuItem onClick={() => setNewCollectionOpen(true)}>
                 <FolderPlus size={14} />
                 New Collection
               </ContextMenuItem>
@@ -2009,75 +2240,33 @@ export function MainContent({
       {gridScrubber && <ScrubberRail labels={gridScrubber.labels} onJump={jumpToGridEntry} />}
       </div>
 
-      {/* New Collection Dialog */}
-      <Dialog open={newCollectionOpen} onOpenChange={setNewCollectionOpen}>
-        <DialogContent size="sm">
-          <DialogHeader>
-            <DialogTitle>New Collection</DialogTitle>
-          </DialogHeader>
-          <div className="grid gap-3 py-2">
-            <Input
-              value={newCollectionName}
-              onChange={(e) => setNewCollectionName(e.target.value)}
-              placeholder="Collection name"
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && newCollectionName.trim()) {
-                  handleCreateCollection(newCollectionName.trim());
-                  setNewCollectionOpen(false);
-                }
-              }}
-              autoFocus
-            />
-          </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setNewCollectionOpen(false)}>
-              Cancel
-            </Button>
-            <Button
-              disabled={!newCollectionName.trim()}
-              onClick={() => {
-                handleCreateCollection(newCollectionName.trim());
-                setNewCollectionOpen(false);
-              }}
-            >
-              Create
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      {/* New (video) collection — the one name form. */}
+      <NameDialog
+        open={newCollectionOpen}
+        onOpenChange={setNewCollectionOpen}
+        title="New Collection"
+        placeholder="Collection name"
+        submitLabel="Create"
+        onSubmit={(name) => handleCreateCollection(name)}
+      />
 
-      {/* Delete Collection Confirmation Dialog (collections are virtual — nothing
-          on disk is touched; the items inside move back to the parent) */}
-      <Dialog open={deleteTarget != null} onOpenChange={(open) => { if (!open) setDeleteTarget(null); }} dismiss="self">
-        <DialogContent size="sm">
-          <DialogHeader>
-            <DialogTitle>Delete Collection</DialogTitle>
-          </DialogHeader>
-          <p className="text-sm text-muted-foreground">
-            Delete &ldquo;{deleteTarget?.title}&rdquo;? The {deleteTarget?.child_count === 1 ? "item" : "items"} inside will move out of the collection. Nothing is deleted from disk.
-          </p>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setDeleteTarget(null)}>
-              Cancel
-            </Button>
-            <Button
-              variant="destructive"
-              onClick={() => {
-                if (deleteTarget) handleDelete(deleteTarget.id);
-                setDeleteTarget(null);
-              }}
-            >
-              Delete
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      {/* Delete collection (collections are virtual — nothing on disk is
+          touched; the items inside move back to the parent). */}
+      <ConfirmDialog
+        open={deleteTarget != null}
+        onOpenChange={(open) => { if (!open) setDeleteTarget(null); }}
+        title="Delete Collection"
+        message={<>Delete &ldquo;{deleteTarget?.title}&rdquo;? The {deleteTarget?.child_count === 1 ? "item" : "items"} inside will move out of the collection. Nothing is deleted from disk.</>}
+        lines={3}
+        onConfirm={() => { if (deleteTarget) handleDelete(deleteTarget.id); }}
+      />
 
       <ConfirmDialog
         open={deletePlaylistCollectionTarget != null}
         onOpenChange={(open) => { if (!open) setDeletePlaylistCollectionTarget(null); }}
         title="Delete Collection"
         message={<>Delete &ldquo;{deletePlaylistCollectionTarget?.title}&rdquo;? Its links and nested collections will be removed from the playlist.</>}
+        lines={3}
         onConfirm={() => { if (deletePlaylistCollectionTarget) void deletePlaylistCollection(deletePlaylistCollectionTarget.id); }}
       />
       <ConfirmDialog
@@ -2085,6 +2274,7 @@ export function MainContent({
         onOpenChange={(open) => { if (!open) setDeletePresetTarget(null); }}
         title="Delete Preset"
         message={<>Delete preset &ldquo;{deletePresetTarget?.name}&rdquo;?</>}
+        lines={1}
         onConfirm={() => { if (deletePresetTarget) onDeletePreset(deletePresetTarget.id); }}
       />
 
@@ -2094,15 +2284,16 @@ export function MainContent({
         onSave={onSavePreset}
       />
 
-      {albumSelect && (
-        <CombineSelectedDialog
-          selection={albumSelect}
-          onKeeper={(id) => setAlbumSelect((s) => (s ? { ...s, keeperId: id } : s))}
-          onMode={(mode) => setAlbumSelect((s) => (s ? { ...s, mode } : s))}
-          onOpenChange={(o) => setAlbumSelect((s) => (s ? { ...s, configuring: o } : s))}
-          onConfirm={(targetReleaseFolder) => void combineSelected(targetReleaseFolder)}
-        />
-      )}
+      {/* Always mounted (a closed selection is an empty, non-configuring
+          one) so the shell can play its exit when the combine lands and
+          the selection clears. */}
+      <CombineSelectedDialog
+        selection={albumSelect ?? EMPTY_ALBUM_SELECTION}
+        onKeeper={(id) => setAlbumSelect((s) => (s ? { ...s, keeperId: id } : s))}
+        onMode={(mode) => setAlbumSelect((s) => (s ? { ...s, mode } : s))}
+        onOpenChange={(o) => setAlbumSelect((s) => (s ? { ...s, configuring: o } : s))}
+        onConfirm={(targetReleaseFolder) => void combineSelected(targetReleaseFolder)}
+      />
 
       <EditCharacterNameDialog
         open={characterEdit !== null}
@@ -2114,33 +2305,6 @@ export function MainContent({
         target={characterEdit?.target ?? null}
         onSaved={onEntryChanged}
       />
-
-      {/* Cover Carousel Dialog */}
-      {liveCoverDialogEntry && (
-        <CoverCarouselDialog
-          entry={liveCoverDialogEntry}
-          mode={coverDialogMode}
-          open={!!coverDialogEntry}
-          onOpenChange={(open) => {
-            if (!open) setCoverDialogEntry(null);
-          }}
-          onSelect={(coverPath) => {
-            onSetCover(liveCoverDialogEntry.id, coverPath, {
-              linkId: liveCoverDialogEntry.link_id,
-              playlistCollection: liveCoverDialogEntry.entry_type === "playlist_collection",
-            });
-            setCoverDialogEntry(null);
-          }}
-          onDelete={async (coverPath) => {
-            const wasLast = liveCoverDialogEntry.covers.length <= 1;
-            await onDeleteCover(liveCoverDialogEntry.id, coverPath, {
-              playlistCollection: liveCoverDialogEntry.entry_type === "playlist_collection",
-            });
-            if (wasLast) setCoverDialogEntry(null);
-          }}
-          getCoverUrl={getFullCoverUrl}
-        />
-      )}
 
       {/* The unified covers menu (grid entry point). */}
       <CoversHost ref={coversHostRef} getCoverUrl={getFullCoverUrl} onChanged={onEntryChanged} />
@@ -2232,72 +2396,22 @@ const CoversHost = forwardRef<
   );
 });
 
-function SortableCoverCard({
-  entry,
-  size,
-  onNavigate,
-  onRename,
-  onChangeCover,
-  onAddCover,
-  onOpenCovers,
-  onDeleteCover,
-  onDelete,
-  onAddToPlaylist,
-  onRemoveLink,
-  onRenamePlaylistCollection,
-  onDeletePlaylistCollection,
-  onEnqueueAlbum,
-  onEditCharacterName,
-  onDeleteSoundCollection,
-  selectMode,
-  selected,
-  onToggleSelect,
-  onStartSelect,
-  selectionCount = 0,
-  onSelectionCombine,
-  onSelectionClear,
-  onSelectionDone,
-  sortableId,
-  getCoverUrl,
-  getCoverAspect,
-  isDragActive,
-  sortMode,
-  deletingId,
-  pendingRemoval,
-}: {
+interface CoverCardProps {
   entry: MediaEntry;
   size: number;
   onNavigate: (entry: MediaEntry) => void;
   onRename: (entryId: number, newTitle: string) => Promise<string | null>;
-  onChangeCover: () => void;
-  onAddCover: () => void;
-  /** The unified covers menu (add local/remote, set, delete in one place). */
-  onOpenCovers: () => void;
-  onDeleteCover: () => void;
-  onDelete: (entry: MediaEntry) => Promise<void>;
-  onAddToPlaylist?: (entry: MediaEntry) => void;
-  onRemoveLink?: (linkId: number) => void;
-  onRenamePlaylistCollection?: (entry: MediaEntry) => void;
-  onDeletePlaylistCollection?: (entry: MediaEntry) => void;
-  /** Music albums: queue the whole album ("Play next" / "Add to queue"). */
-  onEnqueueAlbum?: (entry: MediaEntry, mode: "next" | "last") => void;
+  /** Inline rename is live on this card (the grid menu starts it). */
+  isRenaming: boolean;
+  onRenameEnd: () => void;
+  /** Optimistic watched/unwatched from the grid menu (see watchOverrides). */
+  watchOverride?: "watched" | "unwatched" | null;
   /** Selection mode (bulk actions): the card grows a checkbox, and clicking
    *  toggles selection instead of navigating. */
   selectMode?: boolean;
   selected?: boolean;
   onToggleSelect?: (entry: MediaEntry) => void;
-  /** Context-menu "Select": enters selection mode with this entry picked. */
-  onStartSelect?: (entry: MediaEntry) => void;
-  /** Selection-mode context menu (the accelerator beside the toolbar strip). */
-  selectionCount?: number;
-  onSelectionCombine?: () => void;
-  onSelectionClear?: () => void;
-  onSelectionDone?: () => void;
-  /** Person filmography (actor pages): edit the character this person plays here. */
-  onEditCharacterName?: (entry: MediaEntry) => void;
-  /** Sounds grid: delete this virtual collection (its tracks demote to loose). */
-  onDeleteSoundCollection?: (entry: MediaEntry) => void;
-  /** Overrides the useSortable id. Playlist views need string ids so links and
+  /** Overrides the sortable id. Playlist views need string ids so links and
    *  nested playlist_collections don't collide with each other or with real
    *  media_entry ids. Library views can omit this and the card falls back to entry.id. */
   sortableId?: string | number;
@@ -2309,7 +2423,25 @@ function SortableCoverCard({
   /** True while this card's drop-into-container move is settling — keeps it
    *  hidden so it doesn't pop back at its old spot before the grid refreshes. */
   pendingRemoval?: boolean;
-}) {
+  /** Present when the grid can drag (SortableCoverCard wires it); a static
+   *  grid renders the same card with none of dnd-kit's per-card cost. */
+  drag?: {
+    setRef: (node: HTMLElement | null) => void;
+    attributes: ReturnType<typeof useSortable>["attributes"];
+    listeners: ReturnType<typeof useSortable>["listeners"];
+    style: CSSProperties | undefined;
+    isDragging: boolean;
+    isOver: boolean;
+  };
+}
+
+/** The draggable card: dnd-kit's sortable + droppable registration on top of
+ *  CoverCard. Only rendered where a drag can DO something (custom sort,
+ *  playlists, a video library's collections) — every registration is a
+ *  node the drag context measures, and a thousand of them for grids that
+ *  can't reorder was a big slice of the mount. */
+function SortableCoverCard(props: CoverCardProps) {
+  const { entry, sortableId, sortMode } = props;
   const {
     attributes,
     listeners,
@@ -2319,21 +2451,8 @@ function SortableCoverCard({
     isDragging,
   } = useSortable({ id: sortableId ?? entry.id });
 
-  const isCollection = entry.entry_type === "collection";
   const isPlaylistCollection = entry.entry_type === "playlist_collection";
-  const isDropTarget = isCollection || isPlaylistCollection;
-
-  // Optimistic watch state: entry lists are cached upstream, so after
-  // mark-watched/unwatched from this card's menu the card corrects itself
-  // locally and the caches catch up on their next reload.
-  const [watchOverride, setWatchOverride] = useState<"watched" | "unwatched" | null>(null);
-  useEffect(() => setWatchOverride(null), [entry.id, entry.watched, entry.unwatched]);
-  const isUnwatched = watchOverride ? watchOverride === "unwatched" : entry.unwatched;
-  // In-progress counts as unwatched for the menu pivot (offer Mark watched),
-  // but only the explicit no-progress flag ever badges.
-  const offerMarkWatched = watchOverride
-    ? watchOverride === "unwatched"
-    : entry.unwatched || entry.has_progress;
+  const isDropTarget = entry.entry_type === "collection" || isPlaylistCollection;
   // Different prefixes so the drag-end handler knows which backend to call.
   const dropId = isPlaylistCollection
     ? `pc-drop-${entry.id}`
@@ -2352,52 +2471,69 @@ function SortableCoverCard({
   );
 
   // Only show sort shift animation in custom sort mode
-  const style = {
-    transform: sortMode === "custom" ? CSS.Transform.toString(transform) : undefined,
-    transition: sortMode === "custom" ? transition : undefined,
-  };
+  const style =
+    sortMode === "custom"
+      ? { transform: CSS.Transform.toString(transform), transition }
+      : undefined;
 
-  const [isRenaming, setIsRenaming] = useState(false);
-  const [renameLoading, setRenameLoading] = useState(false);
-  const [renameValue, setRenameValue] = useState("");
+  return (
+    <CoverCard
+      {...props}
+      drag={{ setRef, attributes, listeners, style, isDragging, isOver }}
+    />
+  );
+}
+
+function CoverCard({
+  entry,
+  size,
+  onNavigate,
+  onRename,
+  isRenaming,
+  onRenameEnd,
+  watchOverride,
+  selectMode,
+  selected,
+  onToggleSelect,
+  sortableId,
+  getCoverUrl,
+  getCoverAspect,
+  isDragActive,
+  deletingId,
+  pendingRemoval,
+  drag,
+}: CoverCardProps) {
+  const isCollection = entry.entry_type === "collection";
+  const isDragging = drag?.isDragging ?? false;
+  const isUnwatched = watchOverride ? watchOverride === "unwatched" : entry.unwatched;
+
+  // Inline rename: the input owns its text (defaultValue + select-on-focus)
+  // so the card renders nothing rename-related until the grid menu turns it
+  // on. `renamePending` shows the submitted title under a spinner.
+  const [renamePending, setRenamePending] = useState<string | null>(null);
   const isDeleting = deletingId === entry.id;
   const renameInputRef = useRef<HTMLInputElement>(null);
   const submittedRef = useRef(false);
-
   useEffect(() => {
-    if (isRenaming) {
-      submittedRef.current = false;
-      renameInputRef.current?.focus();
-      renameInputRef.current?.select();
-    }
+    if (isRenaming) submittedRef.current = false;
   }, [isRenaming]);
-
-  const startRename = () => {
-    setRenameValue(entry.title);
-    setIsRenaming(true);
-  };
 
   const submitRename = async () => {
     if (submittedRef.current) return;
-    const trimmed = renameValue.trim();
+    const trimmed = (renameInputRef.current?.value ?? "").trim();
     if (!trimmed || trimmed === entry.title) {
-      setIsRenaming(false);
+      onRenameEnd();
       return;
     }
     submittedRef.current = true;
-    setRenameLoading(true);
+    setRenamePending(trimmed);
     const error = await onRename(entry.id, trimmed);
-    setRenameLoading(false);
-    setIsRenaming(false);
+    setRenamePending(null);
+    onRenameEnd();
     if (error) {
       toast.error(error);
     }
   };
-
-  // Card context menu, held controlled: swapping `open` between a boolean and
-  // undefined leaves the menu stuck in controlled mode and it never opens
-  // again. Selection mode keeps the menu but swaps its CONTENTS.
-  const [menuOpen, setMenuOpen] = useState(false);
 
   const coverPath = getDisplayCover(entry);
   const coverSrc = coverPath ? getCoverUrl(coverPath) : null;
@@ -2406,31 +2542,20 @@ function SortableCoverCard({
   const coverAspect = coverPath ? getCoverAspect(coverPath) : undefined;
 
   return (
-    <ContextMenu open={menuOpen} onOpenChange={setMenuOpen}>
-      <ContextMenuTrigger
-        render={
-          <div
-            ref={setRef}
-            {...attributes}
-            {...listeners}
-            data-flip-id={String(sortableId ?? entry.id)}
-            onClick={() =>
-              !isRenaming &&
-              !isDragging &&
-              (selectMode && onToggleSelect ? onToggleSelect(entry) : onNavigate(entry))
-            }
-            // File-manager behavior: right-clicking an UNSELECTED card while
-            // selecting adds it first, so the menu can't act on a set that
-            // excludes what the pointer is on.
-            onContextMenu={() => {
-              if (selectMode && !selected && onToggleSelect) onToggleSelect(entry);
-            }}
-          />
+      <div
+        ref={drag?.setRef}
+        {...drag?.attributes}
+        {...drag?.listeners}
+        data-flip-id={String(sortableId ?? entry.id)}
+        onClick={() =>
+          !isRenaming &&
+          !isDragging &&
+          (selectMode && onToggleSelect ? onToggleSelect(entry) : onNavigate(entry))
         }
         className={`group grid justify-items-center rounded-md p-2 text-left ${
           isDragging || pendingRemoval ? "pointer-events-none opacity-0" : ""
-        } ${isOver && isDragActive ? "ring-2 ring-primary ring-offset-2 ring-offset-background" : ""}`}
-        style={{ ...style, maxWidth: size, gridRow: "span 2", gridTemplateRows: "subgrid" }}
+        } ${drag?.isOver && isDragActive ? "ring-2 ring-primary ring-offset-2 ring-offset-background" : ""}`}
+        style={{ ...drag?.style, maxWidth: size, gridRow: "span 2", gridTemplateRows: "subgrid" }}
       >
         {/* content-visibility lives on the cover box, NOT the card root: it brings
             paint containment, and on the root it would clip the hover lift (the
@@ -2567,21 +2692,22 @@ function SortableCoverCard({
               <Spinner className="size-3" />
               <span className="truncate text-sm text-muted-foreground">{entry.title}</span>
             </div>
-          ) : renameLoading ? (
+          ) : renamePending != null ? (
             <div className="flex items-center gap-1.5 px-1">
               <Spinner className="size-3" />
-              <span className="truncate text-sm text-muted-foreground">{renameValue}</span>
+              <span className="truncate text-sm text-muted-foreground">{renamePending}</span>
             </div>
           ) : isRenaming ? (
             <input
               ref={renameInputRef}
-              value={renameValue}
-              onChange={(e) => setRenameValue(e.target.value)}
+              defaultValue={entry.title}
+              autoFocus
+              onFocus={(e) => e.currentTarget.select()}
               onKeyDown={(e) => {
                 if (e.key === "Enter") submitRename();
                 if (e.key === "Escape") {
                   submittedRef.current = true;
-                  setIsRenaming(false);
+                  onRenameEnd();
                 }
               }}
               onBlur={submitRename}
@@ -2591,7 +2717,7 @@ function SortableCoverCard({
             />
           ) : (
             <>
-              <p className="text-sm font-medium">{entry.title}</p>
+              <p className="text-sm font-medium"><CardTitle entry={entry} /></p>
               {/* Person-page filmography shows the character ("as …") instead of the usual subtitle */}
               {entry.role_display ? (
                 <p className="text-xs text-muted-foreground">{entry.role_display}</p>
@@ -2607,160 +2733,7 @@ function SortableCoverCard({
             </>
           )}
         </div>
-      </ContextMenuTrigger>
-      <ContextMenuContent>
-        {selectMode ? (
-          // Selection mode: the menu acts on the SELECTION, not this card.
-          <>
-            <ContextMenuItem
-              disabled={selectionCount < 2}
-              onClick={() => onSelectionCombine?.()}
-            >
-              <Layers size={14} />
-              Combine {selectionCount} albums…
-            </ContextMenuItem>
-            <ContextMenuSeparator />
-            <ContextMenuItem onClick={() => onSelectionClear?.()}>
-              <RotateCcw size={14} />
-              Clear selection
-            </ContextMenuItem>
-            <ContextMenuItem onClick={() => onSelectionDone?.()}>
-              <Check size={14} />
-              Done selecting
-            </ContextMenuItem>
-          </>
-        ) : entry.entry_type === "playlist_collection" ? (
-          <>
-            {onRenamePlaylistCollection && (
-              <ContextMenuItem onClick={() => onRenamePlaylistCollection(entry)}>
-                <Pencil size={14} />
-                Rename
-              </ContextMenuItem>
-            )}
-            <ContextMenuItem onClick={onAddCover}>
-              <ImageIcon size={14} />
-              Add local cover
-            </ContextMenuItem>
-            <ContextMenuItem onClick={onChangeCover} disabled={entry.covers.length <= 1}>
-              <ImageIcon size={14} />
-              Change cover
-            </ContextMenuItem>
-            <ContextMenuItem onClick={onDeleteCover} disabled={entry.covers.length < 1}>
-              <Trash2 size={14} />
-              Delete cover
-            </ContextMenuItem>
-            {onDeletePlaylistCollection && (
-              <ContextMenuItem
-                onClick={() => onDeletePlaylistCollection(entry)}
-                className="text-destructive focus:text-destructive"
-              >
-                <Trash2 size={14} />
-                Delete collection
-              </ContextMenuItem>
-            )}
-          </>
-        ) : (
-          <>
-            {entry.link_id == null && (
-              <ContextMenuItem onClick={startRename}>
-                <Pencil size={14} />
-                Rename
-              </ContextMenuItem>
-            )}
-            {/* One covers menu — add (local/remote), set, and delete live in
-                the dialog. Playlist links keep the per-link override only:
-                mutating the shared target from inside a playlist stays out. */}
-            {entry.link_id == null ? (
-              <CoversMenuItem onOpen={onOpenCovers} />
-            ) : (
-              <ContextMenuItem onClick={onChangeCover} disabled={entry.covers.length <= 1}>
-                <ImageIcon size={14} />
-                Change cover
-              </ContextMenuItem>
-            )}
-            {onAddToPlaylist && entry.link_id == null && (entry.entry_type === "movie" || entry.entry_type === "show") && (
-              <ContextMenuItem onClick={() => onAddToPlaylist(entry)}>
-                <ListPlus size={14} />
-                Add to playlist
-              </ContextMenuItem>
-            )}
-            {onEnqueueAlbum && entry.link_id == null && entry.entry_type === "album" && (
-              <>
-                <ContextMenuItem onClick={() => onEnqueueAlbum(entry, "next")}>
-                  <ListStart size={14} />
-                  Play next
-                </ContextMenuItem>
-                <ContextMenuItem onClick={() => onEnqueueAlbum(entry, "last")}>
-                  <ListEnd size={14} />
-                  Add to queue
-                </ContextMenuItem>
-              </>
-            )}
-            {onStartSelect && entry.link_id == null && entry.entry_type === "album" && (
-              <ContextMenuItem onClick={() => onStartSelect(entry)}>
-                <ListChecks size={14} />
-                Select
-              </ContextMenuItem>
-            )}
-            {onEditCharacterName && (entry.entry_type === "movie" || entry.entry_type === "show") && (
-              <ContextMenuItem onClick={() => onEditCharacterName(entry)}>
-                <UserIcon size={14} />
-                Edit character name
-              </ContextMenuItem>
-            )}
-            {(entry.entry_type === "movie" || entry.entry_type === "show") && (
-              // Watched is the default; flagged-unwatched and in-progress
-              // items offer Mark watched. Shows flip every episode at once.
-              <ContextMenuItem
-                onClick={async () => {
-                  try {
-                    if (entry.entry_type === "show") {
-                      await invoke("mark_show_watched", { showId: entry.id, watched: offerMarkWatched });
-                    } else {
-                      await invoke("mark_watched", { kind: "movie", id: entry.id, watched: offerMarkWatched });
-                    }
-                    setWatchOverride(offerMarkWatched ? "watched" : "unwatched");
-                  } catch (e) {
-                    toast.error(String(e));
-                  }
-                }}
-              >
-                {offerMarkWatched ? <Eye size={14} /> : <EyeOff size={14} />}
-                {offerMarkWatched ? "Mark watched" : "Mark unwatched"}
-              </ContextMenuItem>
-            )}
-            {onRemoveLink && entry.link_id != null && (
-              <ContextMenuItem
-                onClick={() => onRemoveLink(entry.link_id!)}
-                className="text-destructive focus:text-destructive"
-              >
-                <Trash2 size={14} />
-                Remove from playlist
-              </ContextMenuItem>
-            )}
-            {/* Only collections are deletable — movies/shows mirror the filesystem
-                and leave the library via rescan. */}
-            {entry.link_id == null && entry.entry_type === "collection" && (
-              <ContextMenuItem onClick={() => onDelete(entry)} className="text-destructive focus:text-destructive">
-                <Trash2 size={14} />
-                Delete collection
-              </ContextMenuItem>
-            )}
-            {/* Sound collections are virtual — deleting one demotes its tracks
-                to the loose pool; nothing touches disk. */}
-            {onDeleteSoundCollection && entry.link_id == null && entry.entry_type === "album" && (
-              <ContextMenuItem
-                onClick={() => onDeleteSoundCollection(entry)}
-                className="text-destructive focus:text-destructive"
-              >
-                <Trash2 size={14} />
-                Delete collection
-              </ContextMenuItem>
-            )}
-          </>
-        )}
-      </ContextMenuContent>
-    </ContextMenu>
+      </div>
   );
 }
 
@@ -2793,6 +2766,34 @@ function MoveUpDropZone({ isActive }: { isActive: boolean }) {
         </div>
       </div>
     </div>
+  );
+}
+
+/** A card's title. An album with several releases gets the sidebar's
+ *  record icon + the count after it, glued to the title's last word so the
+ *  badge always wraps WITH that word instead of dangling alone on a line. */
+function CardTitle({ entry }: { entry: MediaEntry }) {
+  const n = entry.release_count ?? 0;
+  if (entry.entry_type !== "album" || n <= 1) return <>{entry.title}</>;
+  const cut = entry.title.lastIndexOf(" ");
+  const head = cut === -1 ? "" : entry.title.slice(0, cut + 1);
+  const last = cut === -1 ? entry.title : entry.title.slice(cut + 1);
+  return (
+    <>
+      {head}
+      <span className="whitespace-nowrap">
+        {last}
+        <span
+          // align-middle + a slight lift: centres the badge on the title's
+          // x-height instead of sitting on its baseline.
+          className="ml-1.5 inline-flex -translate-y-px items-center gap-0.5 align-middle text-xs font-normal text-muted-foreground"
+          title={`${n} releases`}
+        >
+          <Disc3 size={12} />
+          {n}
+        </span>
+      </span>
+    </>
   );
 }
 
@@ -2841,7 +2842,7 @@ function DragOverlayCard({
         )}
       </div>
       <div className="w-full" style={{ maxWidth: size }}>
-        <p className="text-sm font-medium">{entry.title}</p>
+        <p className="text-sm font-medium"><CardTitle entry={entry} /></p>
         {entry.entry_type === "album" && (entry.collection_display || entry.year) ? (
           <p className="text-xs text-muted-foreground">
             {entry.collection_display && <span className="block break-words">{entry.collection_display}</span>}
@@ -2852,152 +2853,6 @@ function DragOverlayCard({
         )}
       </div>
     </div>
-  );
-}
-
-function CoverCarouselDialog({
-  entry,
-  mode,
-  open,
-  onOpenChange,
-  onSelect,
-  onDelete,
-  getCoverUrl,
-}: {
-  entry: MediaEntry;
-  mode: "select" | "delete";
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  onSelect: (coverPath: string) => void;
-  onDelete: (coverPath: string) => Promise<void>;
-  getCoverUrl: (filePath: string) => string;
-}) {
-  const currentCover = getDisplayCover(entry);
-  const startIndex = currentCover
-    ? Math.max(0, entry.covers.indexOf(currentCover))
-    : 0;
-  const [selectedIndex, setSelectedIndex] = useState(startIndex);
-  const [api, setApi] = useState<CarouselApi>();
-  const [dims, setDims] = useState<Map<number, { w: number; h: number }>>(new Map());
-  const [sizes, setSizes] = useState<Map<number, number>>(new Map());
-  const [confirmingDelete, setConfirmingDelete] = useState(false);
-  const [deleting, setDeleting] = useState(false);
-
-  useEffect(() => {
-    if (!api) return;
-    const onSelectSlide = () => setSelectedIndex(api.selectedScrollSnap());
-    api.on("select", onSelectSlide);
-    return () => {
-      api.off("select", onSelectSlide);
-    };
-  }, [api]);
-
-  useEffect(() => {
-    entry.covers.forEach((cover, i) => {
-      if (sizes.has(i)) return;
-      invoke<number>("get_file_size", { path: cover })
-        .then((n) => setSizes((prev) => new Map(prev).set(i, n)))
-        .catch(() => {});
-    });
-  }, [entry.covers, sizes]);
-
-  const fmtSize = (bytes: number) => {
-    if (bytes < 1024) return `${bytes} B`;
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  };
-
-  const selDim = dims.get(selectedIndex);
-  const selSize = sizes.get(selectedIndex);
-
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent size="lg">
-        <DialogHeader>
-          <DialogTitle>Choose Cover</DialogTitle>
-        </DialogHeader>
-        <div className="px-12">
-          <Carousel setApi={setApi} opts={{ startIndex }}>
-            <CarouselContent>
-              {entry.covers.map((cover, i) => (
-                <CarouselItem key={i}>
-                  <div className="flex items-center justify-center">
-                    <img
-                      src={getCoverUrl(cover)}
-                      alt={`Cover ${i + 1}`}
-                      className="max-h-[400px] rounded-md object-contain"
-                      onLoad={(e) => {
-                        const img = e.currentTarget;
-                        setDims((prev) => {
-                          if (prev.has(i)) return prev;
-                          return new Map(prev).set(i, { w: img.naturalWidth, h: img.naturalHeight });
-                        });
-                      }}
-                    />
-                  </div>
-                </CarouselItem>
-              ))}
-            </CarouselContent>
-            <CarouselPrevious />
-            <CarouselNext />
-          </Carousel>
-          <p className="mt-2 text-center text-sm text-muted-foreground">
-            {selectedIndex + 1} / {entry.covers.length}
-            {selDim && ` · ${selDim.w}×${selDim.h}`}
-            {selSize != null && ` · ${fmtSize(selSize)}`}
-          </p>
-        </div>
-        <DialogFooter>
-          <Button variant="outline" onClick={() => onOpenChange(false)}>
-            {mode === "delete" ? "Close" : "Cancel"}
-          </Button>
-          {mode === "delete" ? (
-            <Button variant="destructive" onClick={() => setConfirmingDelete(true)}>
-              Delete
-            </Button>
-          ) : (
-            <Button onClick={() => onSelect(entry.covers[selectedIndex])}>
-              Select
-            </Button>
-          )}
-        </DialogFooter>
-      </DialogContent>
-
-      {/* Confirmation for the destructive path */}
-      <Dialog open={confirmingDelete} onOpenChange={(o) => { if (!o) setConfirmingDelete(false); }} dismiss="self">
-        <DialogContent size="sm">
-          <DialogHeader>
-            <DialogTitle>Delete Cover</DialogTitle>
-          </DialogHeader>
-          <p className="text-sm text-muted-foreground">
-            Permanently delete this cover image? This cannot be undone.
-          </p>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setConfirmingDelete(false)} disabled={deleting}>
-              Cancel
-            </Button>
-            <Button
-              variant="destructive"
-              disabled={deleting}
-              onClick={async () => {
-                const cover = entry.covers[selectedIndex];
-                if (!cover) return;
-                setDeleting(true);
-                try {
-                  await onDelete(cover);
-                  setSelectedIndex((prev) => Math.max(0, Math.min(prev, entry.covers.length - 2)));
-                } finally {
-                  setDeleting(false);
-                  setConfirmingDelete(false);
-                }
-              }}
-            >
-              {deleting ? "Deleting…" : "Delete"}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-    </Dialog>
   );
 }
 
@@ -3263,9 +3118,6 @@ function EntryDetailPage({
   const [draft, setDraft] = useState<MovieDetailUpdate>({});
   const [saving, setSaving] = useState(false);
   const [tmdbDialogOpen, setTmdbDialogOpen] = useState(false);
-  // Which tab the TMDB image browser opens on, or null when closed — the cover
-  // menu opens posters, the backdrop menu opens backdrops.
-  const [tmdbImagesTab, setTmdbImagesTab] = useState<"posters" | "backdrops" | null>(null);
   const [coversOpen, setCoversOpen] = useState(false);
   const [backdropDialogOpen, setBackdropDialogOpen] = useState(false);
   const [extrasOpen, setExtrasOpen] = useState(false);
@@ -3410,9 +3262,8 @@ function EntryDetailPage({
   };
 
   // One menu shared by the cover image and the hero/content area — identical
-  // items; only the tab the TMDB image browser lands on differs by surface.
-  // Grouped: watch → artwork → metadata → destructive.
-  const detailMenuItems = (tmdbTab: "posters" | "backdrops") => (
+  // items. Grouped: watch → artwork → metadata → destructive.
+  const detailMenuItems = () => (
     <>
       {extrasCount > 0 && (
         <>
@@ -3426,11 +3277,7 @@ function EntryDetailPage({
       <CoversMenuItem onOpen={() => setCoversOpen(true)} />
       <ContextMenuItem onClick={() => setBackdropDialogOpen(true)}>
         <ImageIcon size={14} />
-        Change backdrop
-      </ContextMenuItem>
-      <ContextMenuItem onClick={() => setTmdbImagesTab(tmdbTab)} disabled={!detail?.tmdb_id}>
-        <ImageIcon size={14} />
-        Add backdrop from TMDB
+        Backdrops
       </ContextMenuItem>
       <ContextMenuSeparator />
       <ContextMenuItem onClick={startEditing}>
@@ -3524,7 +3371,7 @@ function EntryDetailPage({
               />
             }
           />
-          <ContextMenuContent>{detailMenuItems("posters")}</ContextMenuContent>
+          <ContextMenuContent>{detailMenuItems()}</ContextMenuContent>
         </ContextMenu>
       )}
       <ContextMenu>
@@ -3729,7 +3576,7 @@ function EntryDetailPage({
           </div>
         )}
         </ContextMenuTrigger>
-        <ContextMenuContent>{detailMenuItems("backdrops")}</ContextMenuContent>
+        <ContextMenuContent>{detailMenuItems()}</ContextMenuContent>
       </ContextMenu>
       {/* Full-width band below the hero row (w-full forces the wrap) */}
       {detail && !editing && (detail.cast.length > 0 || detail.studios.length > 0 || detail.tmdb_id || detail.imdb_id || detail.rotten_tomatoes_id) && (
@@ -3770,18 +3617,6 @@ function EntryDetailPage({
         currentDetail={detail}
         onApplied={() => { loadDetail(); onEntryChanged(); }}
       />
-      {detail?.tmdb_id && (
-        <TmdbImageBrowserDialog
-          open={tmdbImagesTab !== null}
-          onOpenChange={(open) => { if (!open) setTmdbImagesTab(null); }}
-          initialTab={tmdbImagesTab ?? "posters"}
-          libraryId={selectedLibrary.id}
-          entryId={entry.id}
-          tmdbId={detail.tmdb_id}
-          mediaType="movie"
-          onDownloaded={() => { loadDetail(); onEntryChanged(); }}
-        />
-      )}
       <CoversDialog
         open={coversOpen}
         onOpenChange={setCoversOpen}
@@ -3792,8 +3627,11 @@ function EntryDetailPage({
       <BackdropSelectDialog
         open={backdropDialogOpen}
         onOpenChange={setBackdropDialogOpen}
+        libraryId={selectedLibrary.id}
         entryId={entry.id}
-        current={detail?.backdrop ?? null}
+        entryType="movie"
+        title={entry.title}
+        getCoverUrl={getFullCoverUrl}
         onChanged={loadDetail}
       />
       <EditCharacterNameDialog
@@ -3839,9 +3677,6 @@ function ShowDetailPage({
   const [selectedSeasonId, setSelectedSeasonId] = useState<number | null>(null);
   const [episodes, setEpisodes] = useState<EpisodeInfo[]>([]);
   const [tmdbDialogOpen, setTmdbDialogOpen] = useState(false);
-  // Which tab the TMDB image browser opens on, or null when closed — the cover
-  // menu opens posters, the backdrop menu opens backdrops.
-  const [tmdbImagesTab, setTmdbImagesTab] = useState<"posters" | "backdrops" | null>(null);
   const [coversOpen, setCoversOpen] = useState(false);
   const [backdropDialogOpen, setBackdropDialogOpen] = useState(false);
   const [ratings, setRatings] = useState<RatingInfo[]>([]);
@@ -4288,9 +4123,8 @@ function ShowDetailPage({
   const canSeasonTmdb = hasTmdb && selectedSeason?.season_number != null;
 
   // One menu shared by the cover image and the hero/content area — identical
-  // items; only the tab the TMDB image browser lands on differs by surface.
-  // Grouped: watch → artwork → metadata → destructive.
-  const detailMenuItems = (tmdbTab: "posters" | "backdrops") => (
+  // items. Grouped: watch → artwork → metadata → destructive.
+  const detailMenuItems = () => (
     <>
       {extrasCount > 0 && (
         <>
@@ -4304,11 +4138,7 @@ function ShowDetailPage({
       <CoversMenuItem onOpen={() => setCoversOpen(true)} />
       <ContextMenuItem onClick={() => setBackdropDialogOpen(true)}>
         <ImageIcon size={14} />
-        Change backdrop
-      </ContextMenuItem>
-      <ContextMenuItem onClick={() => setTmdbImagesTab(tmdbTab)} disabled={!detail?.tmdb_id}>
-        <ImageIcon size={14} />
-        Add backdrop from TMDB
+        Backdrops
       </ContextMenuItem>
       <ContextMenuSeparator />
       <ContextMenuItem onClick={startEditShow} disabled={!detail}>
@@ -4397,7 +4227,7 @@ function ShowDetailPage({
               />
             }
           />
-          <ContextMenuContent>{detailMenuItems("posters")}</ContextMenuContent>
+          <ContextMenuContent>{detailMenuItems()}</ContextMenuContent>
         </ContextMenu>
       )}
       <ContextMenu>
@@ -4576,7 +4406,7 @@ function ShowDetailPage({
         )}
 
         </ContextMenuTrigger>
-        <ContextMenuContent>{detailMenuItems("backdrops")}</ContextMenuContent>
+        <ContextMenuContent>{detailMenuItems()}</ContextMenuContent>
       </ContextMenu>
 
       {/* Seasons + episodes — full-width band below the hero (w-full forces the wrap) */}
@@ -4939,18 +4769,6 @@ function ShowDetailPage({
         onSaved={() => { loadDetail(); onEntryChanged(); }}
       />
 
-      {detail?.tmdb_id && (
-        <TmdbImageBrowserDialog
-          open={tmdbImagesTab !== null}
-          onOpenChange={(open) => { if (!open) setTmdbImagesTab(null); }}
-          initialTab={tmdbImagesTab ?? "posters"}
-          libraryId={selectedLibrary.id}
-          entryId={entry.id}
-          tmdbId={detail.tmdb_id}
-          mediaType="tv"
-          onDownloaded={() => { loadDetail(); onEntryChanged(); }}
-        />
-      )}
       <CoversDialog
         open={coversOpen}
         onOpenChange={setCoversOpen}
@@ -4961,27 +4779,25 @@ function ShowDetailPage({
       <BackdropSelectDialog
         open={backdropDialogOpen}
         onOpenChange={setBackdropDialogOpen}
+        libraryId={selectedLibrary.id}
         entryId={entry.id}
-        current={detail?.backdrop ?? null}
+        entryType="show"
+        title={entry.title}
+        getCoverUrl={getFullCoverUrl}
         onChanged={loadDetail}
       />
 
       {/* Bulk episode fetch confirmation */}
-      <Dialog open={bulkConfirmOpen} onOpenChange={setBulkConfirmOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Fetch Episode Details</DialogTitle>
-          </DialogHeader>
-          <p className="text-sm">
-            This will fetch metadata (plot, runtime, guest stars, crew) for all episodes in this season from TMDB.
-            Only empty fields will be populated. Doing this multiple times in quick succession may cause you to hit TMDB's rate limit.
-          </p>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setBulkConfirmOpen(false)}>Cancel</Button>
-            <Button onClick={handleBulkEpisodes}>Fetch All Episodes</Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <ConfirmDialog
+        open={bulkConfirmOpen}
+        onOpenChange={setBulkConfirmOpen}
+        title="Fetch Episode Details"
+        message="This will fetch metadata (plot, runtime, guest stars, crew) for all episodes in this season from TMDB. Only empty fields will be populated. Doing this multiple times in quick succession may cause you to hit TMDB's rate limit."
+        confirmLabel="Fetch All Episodes"
+        destructive={false}
+        lines={5}
+        onConfirm={handleBulkEpisodes}
+      />
 
       <TmdbEpisodeSourceDialog
         open={tmdbSourceFor != null}
@@ -5345,7 +5161,6 @@ function PlaylistsView({
   scrollContainerRef,
   onNavigateToPlaylist,
   onPlaylistChanged,
-  getFullCoverUrl,
   search,
   onSearchChange,
   coverSize,
@@ -5364,7 +5179,6 @@ function PlaylistsView({
   scrollContainerRef: RefObject<HTMLDivElement | null>;
   onNavigateToPlaylist: (p: PlaylistSummary) => void;
   onPlaylistChanged: (libraryId: string) => void;
-  getFullCoverUrl: (filePath: string) => string;
   search: string;
   onSearchChange: (search: string) => void;
   coverSize: number;
@@ -5379,7 +5193,6 @@ function PlaylistsView({
 }) {
   const [createOpen, setCreateOpen] = useState(false);
   const [renameTarget, setRenameTarget] = useState<PlaylistSummary | null>(null);
-  const [coverDialog, setCoverDialog] = useState<{ playlist: PlaylistSummary; mode: "select" | "delete" } | null>(null);
   const [savePresetOpen, setSavePresetOpen] = useState(false);
   // Confirm-before-delete targets (empty playlists skip confirmation entirely).
   const [deletePlaylistTarget, setDeletePlaylistTarget] = useState<PlaylistSummary | null>(null);
@@ -5429,32 +5242,6 @@ function PlaylistsView({
       toast.error(String(e));
     }
   }
-
-  // Synthesized MediaEntry passed to CoverCarouselDialog — only the fields it reads
-  // (title, covers, selected_cover) need to be set.
-  const dialogEntry: MediaEntry | null = coverDialog
-    ? {
-        id: coverDialog.playlist.id,
-        title: coverDialog.playlist.title,
-        year: null,
-        end_year: null,
-        folder_path: "",
-        parent_id: null,
-        entry_type: "playlist",
-        covers: coverDialog.playlist.covers,
-        selected_cover: coverDialog.playlist.selected_cover,
-        child_count: 0,
-        season_display: null,
-        collection_display: null,
-        tmdb_id: null,
-        link_id: null,
-        interactive: false,
-        watched: false,
-        watch_progress: null,
-        unwatched: false,
-        has_progress: false,
-      }
-    : null;
 
   // Optimistic local order during a drag-reorder; reset whenever a fresh list
   // arrives from the backend (which will already reflect the persisted order).
@@ -5595,8 +5382,6 @@ function PlaylistsView({
                   onDelete={() => handleDelete(pl)}
                   onCreatePeer={() => setCreateOpen(true)}
                   onAddCover={() => handleAddCover(pl)}
-                      onChangeCover={() => setCoverDialog({ playlist: pl, mode: "select" })}
-                      onDeleteCover={() => setCoverDialog({ playlist: pl, mode: "delete" })}
                     />
                   ))}
                 </div>
@@ -5644,36 +5429,9 @@ function PlaylistsView({
         onOpenChange={(o) => { if (!o) setDeletePresetTarget(null); }}
         title="Delete Preset"
         message={<>Delete preset &ldquo;{deletePresetTarget?.name}&rdquo;?</>}
+        lines={1}
         onConfirm={() => { if (deletePresetTarget) onDeletePreset(deletePresetTarget.id); }}
       />
-      {dialogEntry && coverDialog && (
-        <CoverCarouselDialog
-          entry={dialogEntry}
-          mode={coverDialog.mode}
-          open={coverDialog !== null}
-          onOpenChange={(open) => { if (!open) setCoverDialog(null); }}
-          onSelect={async (coverPath) => {
-            try {
-              await invoke("set_playlist_cover", { playlistId: coverDialog.playlist.id, coverPath });
-              onPlaylistChanged(libraryId);
-            } catch (e) {
-              toast.error(String(e));
-            }
-            setCoverDialog(null);
-          }}
-          onDelete={async (coverPath) => {
-            const wasLast = coverDialog.playlist.covers.length <= 1;
-            try {
-              await invoke("delete_playlist_cover", { playlistId: coverDialog.playlist.id, coverPath });
-              onPlaylistChanged(libraryId);
-            } catch (e) {
-              toast.error(String(e));
-            }
-            if (wasLast) setCoverDialog(null);
-          }}
-          getCoverUrl={getFullCoverUrl}
-        />
-      )}
       <SortPresetSaveDialog
         open={savePresetOpen}
         onOpenChange={setSavePresetOpen}
@@ -5692,8 +5450,6 @@ function PlaylistCard({
   onDelete,
   onCreatePeer,
   onAddCover,
-  onChangeCover,
-  onDeleteCover,
 }: {
   playlist: PlaylistSummary;
   coverSize: number;
@@ -5703,8 +5459,6 @@ function PlaylistCard({
   onDelete: () => void;
   onCreatePeer: () => void;
   onAddCover: () => void;
-  onChangeCover: () => void;
-  onDeleteCover: () => void;
 }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: playlist.id, disabled: !sortable });
   const coverSrc = playlist.selected_cover ? convertFileSrc(playlist.selected_cover) : null;
@@ -5751,17 +5505,11 @@ function PlaylistCard({
           <Pencil size={14} />
           Rename
         </ContextMenuItem>
+        {/* One cover per playlist: adding replaces it, and it goes with the
+            playlist — no delete. */}
         <ContextMenuItem onClick={onAddCover}>
           <ImageIcon size={14} />
-          Add local cover
-        </ContextMenuItem>
-        <ContextMenuItem onClick={onChangeCover} disabled={playlist.covers.length <= 1}>
-          <ImageIcon size={14} />
-          Change cover
-        </ContextMenuItem>
-        <ContextMenuItem onClick={onDeleteCover} disabled={playlist.covers.length < 1}>
-          <Trash2 size={14} />
-          Delete cover
+          {playlist.covers.length > 0 ? "Change cover" : "Add cover"}
         </ContextMenuItem>
         <ContextMenuItem onClick={onCreatePeer}>
           <FolderPlus size={14} />

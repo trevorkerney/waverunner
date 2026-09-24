@@ -1,5 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { useListWindow } from "@/hooks/useListWindow";
 import { Play, Music, Music2, Pencil, ListPlus, ListStart, ListEnd, Disc3 } from "lucide-react";
 import { Spinner } from "../ui/spinner";
 import { ClearableInput } from "../ui/clearable-input";
@@ -82,9 +83,6 @@ export const TrackRow = memo(function TrackRow({
       data-track-row
       data-music-track-id={t.id}
       className={`group/track flex cursor-default items-center gap-3 rounded-md px-2 py-1.5 text-sm ${isSelected ? "bg-accent" : "hover:bg-accent/50"}`}
-      // Offscreen rows skip layout/paint; ~44px estimates a row (32px thumb +
-      // padding) so the scrollbar stays honest until real heights replace it.
-      style={{ contentVisibility: "auto", containIntrinsicSize: "auto 44px" }}
       onClick={() => onSelect(t.id)}
       onDoubleClick={() => onPlayAt(index)}
       onContextMenu={() => onMenuTarget(t.id)}
@@ -296,18 +294,27 @@ export function TracksPage({ libraryId, onPlayQueue, currentTrackId, playing, on
     [onNavigateToAlbum]
   );
 
-  // Scroll-to-track request (album-page pattern): consumed once per nonce,
-  // waits for the rows to be in the DOM.
+  // Windowing: a 10K-row library mounts ~50 rows instead of all of them
+  // (mounting every row froze the app for seconds on arrival, and kept
+  // scrolling and filtering heavy after). Rows are uniform height, so the
+  // slice is plain arithmetic on the scroll offset.
+  const listRef = useRef<HTMLDivElement | null>(null);
+  const listWindow = useListWindow({ listRef, count: filtered.length, estimateRowHeight: 44 });
+  const { scrollToIndex } = listWindow;
+
+  // Scroll-to-track request (album-page pattern): consumed once per nonce.
+  // The row may not be mounted (windowing) — scroll its slot into the
+  // middle first, then select it once the rows have caught up.
   const focusConsumedRef = useRef(0);
   useEffect(() => {
     if (!focusRequest || rows == null) return;
     if (focusConsumedRef.current === focusRequest.nonce) return;
-    const el = document.querySelector(`[data-music-track-id="${focusRequest.trackId}"]`);
-    if (!el) return;
+    const idx = filtered.findIndex((r) => r.id === focusRequest.trackId);
+    if (idx < 0) return;
     focusConsumedRef.current = focusRequest.nonce;
-    el.scrollIntoView({ block: "center", behavior: "smooth" });
+    scrollToIndex(idx, "center");
     setSelectedTrackId(focusRequest.trackId);
-  }, [focusRequest, rows]);
+  }, [focusRequest, rows, filtered, scrollToIndex]);
 
   if (rows === null) {
     return (
@@ -341,8 +348,17 @@ export function TracksPage({ libraryId, onPlayQueue, currentTrackId, playing, on
         </p>
       ) : (
         <ContextMenu>
-          <ContextMenuTrigger render={<div />}>
-            {filtered.map((t, i) => {
+          <ContextMenuTrigger
+            render={
+              <div
+                ref={listRef}
+                // The rows that aren't mounted are this padding.
+                style={{ paddingTop: listWindow.padTop, paddingBottom: listWindow.padBottom }}
+              />
+            }
+          >
+            {filtered.slice(listWindow.start, listWindow.end).map((t, offset) => {
+              const i = listWindow.start + offset;
               const isCurrent = currentTrackId === t.id;
               return (
                 <TrackRow

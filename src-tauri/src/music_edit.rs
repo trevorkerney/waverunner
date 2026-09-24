@@ -1039,6 +1039,39 @@ pub async fn set_release_label(
     Ok(())
 }
 
+/// The user's word on a release's CD pre-emphasis: Some(true) = play through
+/// the de-emphasis filter, Some(false) = play as is, None = go by the cue
+/// sheet. Folder-keyed pref like labels — survives the release-row rebuild.
+#[tauri::command]
+pub async fn set_release_pre_emphasis(
+    state: State<'_, AppState>,
+    release_id: i64,
+    value: Option<bool>,
+) -> Result<(), String> {
+    let pool = &state.app_db;
+    let row: Option<(i64, String)> =
+        sqlx::query_as("SELECT album_id, folder_path FROM album_release WHERE id = ?")
+            .bind(release_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    let Some((album_id, folder)) = row else {
+        return Err("Release not found".to_string());
+    };
+    sqlx::query(
+        "INSERT INTO album_release_pref (album_id, folder_path, pre_emphasis)
+         VALUES (?, ?, ?)
+         ON CONFLICT(album_id, folder_path) DO UPDATE SET pre_emphasis = excluded.pre_emphasis",
+    )
+    .bind(album_id)
+    .bind(&folder)
+    .bind(value.map(|v| v as i64))
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Name (or clear the name of) one disc of a release — "Disc 2 — Mars".
 /// Folder-keyed pref overlaying the tag-derived subtitle; empty clears back
 /// to whatever the tags say. Instant and unlogged, same contract as release
@@ -2004,6 +2037,21 @@ pub struct AlbumEditView {
     /// else the owning artist alone. The editor's artist rows start here.
     pub artist_credits: Vec<String>,
     pub overridden: Vec<String>,
+    /// Every release, for the per-release pre-emphasis switch.
+    pub releases: Vec<ReleaseEditRow>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReleaseEditRow {
+    pub id: i64,
+    pub label: Option<String>,
+    /// Folder leaf — tells copies apart when labels don't.
+    pub folder: String,
+    pub is_default: bool,
+    /// The scanner's finding: a cue sheet with FLAGS PRE.
+    pub cue_pre_emphasis: bool,
+    /// The user's override; None = defer to the cue.
+    pub pre_emphasis_pref: Option<bool>,
 }
 
 #[tauri::command]
@@ -2051,6 +2099,26 @@ pub async fn get_album_edit(
         }
     }
     let overrides = user_overrides(pool, album_id).await?;
+    let release_rows: Vec<(i64, Option<String>, String, i64)> = sqlx::query_as(
+        "SELECT id, label, folder_path, is_default FROM album_release WHERE album_id = ? ORDER BY is_default DESC, id",
+    )
+    .bind(album_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let mut releases = Vec::with_capacity(release_rows.len());
+    for (id, label, folder_path, is_default) in release_rows {
+        let (cue_pre_emphasis, pre_emphasis_pref) =
+            crate::music::release_pre_emphasis_facts(pool, id).await?;
+        releases.push(ReleaseEditRow {
+            id,
+            label,
+            folder: folder_path.rsplit(['\\', '/']).next().unwrap_or(&folder_path).to_string(),
+            is_default: is_default != 0,
+            cue_pre_emphasis,
+            pre_emphasis_pref,
+        });
+    }
     Ok(AlbumEditView {
         id: album_id,
         title,
@@ -2059,6 +2127,7 @@ pub async fn get_album_edit(
         genres: genres.into_iter().map(|(g,)| g).collect(),
         artist_credits,
         overridden: edited_fields(&overrides, ALBUM_FIELDS),
+        releases,
     })
 }
 

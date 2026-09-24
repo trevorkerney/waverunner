@@ -4,12 +4,15 @@ import { toast } from "sonner";
 import { ListMusic, FolderPlus } from "lucide-react";
 import {
   Dialog,
+  DialogBody,
   DialogContent,
   DialogHeader,
   DialogTitle,
   DialogFooter,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
+import { Skeleton, useSkeletonDelay } from "@/components/ui/skeleton";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { CreatePlaylistDialog } from "@/components/CreatePlaylistDialog";
 import type { PlaylistSummary, PlaylistsResponse } from "@/types";
 
@@ -32,6 +35,8 @@ export function AddToPlaylistDialog({
 }: AddToPlaylistDialogProps) {
   const [playlists, setPlaylists] = useState<PlaylistSummary[] | null>(null);
   const [loading, setLoading] = useState(false);
+  // Skeleton rows only past 500ms — the list is local and usually instant.
+  const showSkeleton = useSkeletonDelay(loading);
   const [createOpen, setCreateOpen] = useState(false);
   const [submitting, setSubmitting] = useState<number | null>(null);
   // When non-null, we're showing the "already in playlist" confirmation for this playlist.
@@ -70,7 +75,6 @@ export function AddToPlaylistDialog({
       toast.error(String(e));
     } finally {
       setSubmitting(null);
-      setConfirmDup(null);
     }
   }
 
@@ -99,14 +103,24 @@ export function AddToPlaylistDialog({
   return (
     <>
       <Dialog open={open} onOpenChange={onOpenChange}>
-        <DialogContent size="sm" className="flex max-h-[70vh] flex-col">
+        {/* Static: eight rows of playlists; more scroll. */}
+        <DialogContent size="sm" height="md">
           <DialogHeader>
-            <DialogTitle>
+            <DialogTitle className="truncate">
               {entryTitle ? `Add "${entryTitle}" to playlist` : "Add to playlist"}
             </DialogTitle>
           </DialogHeader>
-          <div className="flex-1 overflow-y-auto py-2">
-            {loading && <p className="p-4 text-sm text-muted-foreground">Loading…</p>}
+          <DialogBody className="py-2">
+            {loading && showSkeleton && (
+              <ul className="flex flex-col gap-0.5">
+                {Array.from({ length: 5 }, (_, i) => (
+                  <li key={i} className="flex items-center gap-2 px-3 py-2">
+                    <Skeleton className="size-3.5 rounded-sm" />
+                    <Skeleton className="h-3.5 w-2/3" />
+                  </li>
+                ))}
+              </ul>
+            )}
             {!loading && playlists && playlists.length === 0 && (
               <div className="flex flex-col items-center gap-3 p-4 text-sm text-muted-foreground">
                 <p>No playlists yet.</p>
@@ -132,7 +146,7 @@ export function AddToPlaylistDialog({
                 ))}
               </ul>
             )}
-          </div>
+          </DialogBody>
           <DialogFooter className="justify-between">
             <Button variant="outline" size="sm" onClick={() => setCreateOpen(true)}>
               <FolderPlus size={14} />
@@ -150,27 +164,24 @@ export function AddToPlaylistDialog({
           // list reloads via `createOpen` dep in useEffect
         }}
       />
-      <Dialog open={confirmDup != null} onOpenChange={(o) => { if (!o) setConfirmDup(null); }} dismiss="self">
-        <DialogContent size="sm">
-          <DialogHeader>
-            <DialogTitle>Already in playlist</DialogTitle>
-          </DialogHeader>
-          <p className="text-sm text-muted-foreground">
+      <ConfirmDialog
+        open={confirmDup != null}
+        onOpenChange={(o) => { if (!o) setConfirmDup(null); }}
+        title="Already in playlist"
+        message={
+          <>
             {entryTitle ? `"${entryTitle}" is already in "${confirmDup?.title}".` : `This is already in "${confirmDup?.title}".`} Add it again?
-          </p>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setConfirmDup(null)} disabled={submitting != null}>
-              Don't add
-            </Button>
-            <Button
-              onClick={() => confirmDup && performAdd(confirmDup.id)}
-              disabled={submitting != null}
-            >
-              Add anyways
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+          </>
+        }
+        cancelLabel="Don't add"
+        confirmLabel="Add anyways"
+        destructive={false}
+        lines={1}
+        onConfirm={() => {
+          const id = confirmDup?.id;
+          if (id != null) void performAdd(id);
+        }}
+      />
     </>
   );
 }

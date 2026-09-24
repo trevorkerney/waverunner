@@ -1,9 +1,10 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
 
 import {
   Dialog,
+  DialogBody,
   DialogContent,
   DialogHeader,
   DialogTitle,
@@ -16,7 +17,7 @@ import {
   SelectContent,
   SelectItem,
 } from "@/components/ui/select";
-import { Spinner } from "@/components/ui/spinner";
+import { Skeleton, useHandoff, useSkeletonDelay } from "@/components/ui/skeleton";
 import type { TmdbTvDetail, TmdbSeasonDetail, TmdbSeasonStub, TmdbEpisodeSummary } from "@/types";
 
 interface Props {
@@ -56,6 +57,12 @@ export function TmdbEpisodeSourceDialog({ open, onOpenChange, tmdbId, defaultSea
   // Manual-mode fields (only used when the season list can't be fetched).
   const [manSeason, setManSeason] = useState("");
   const [manEpisode, setManEpisode] = useState("");
+
+  // The season list is the dialog's content: skeleton selects after 500ms,
+  // then the hand-off. The episode select has its own small skeleton.
+  const bodyRef = useRef<HTMLDivElement | null>(null);
+  const { stage, skeletonSeen, shown, contentVisible } = useHandoff(!seasonsLoading, bodyRef);
+  const episodeSkeleton = useSkeletonDelay(episodesLoading);
 
   // Load the show's TMDB season list when the dialog opens.
   useEffect(() => {
@@ -158,89 +165,108 @@ export function TmdbEpisodeSourceDialog({ open, onOpenChange, tmdbId, defaultSea
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
+      {/* Static: 136 + 100 five-line intro + 16 + 56 season + 12 + 56
+          episode = 376px; the manual fallback fits the same frame. */}
+      <DialogContent height="23.5rem">
         <DialogHeader>
           <DialogTitle>Fetch from a specific TMDB episode</DialogTitle>
         </DialogHeader>
-        <p className="text-sm text-muted-foreground">
-          Pull this episode&rsquo;s metadata from a different TMDB season/episode — useful when TMDB
-          files content inline that you keep as a special (e.g. Black Mirror&rsquo;s &ldquo;White
-          Christmas&rdquo; is in Season&nbsp;2 on TMDB, not a special). Your file stays where it is;
-          only the metadata is copied in.
-        </p>
+        <DialogBody ref={bodyRef} className="relative flex flex-col gap-4">
+          <p className="text-sm text-muted-foreground">
+            Pull this episode&rsquo;s metadata from a different TMDB season/episode — useful when TMDB
+            files content inline that you keep as a special (e.g. Black Mirror&rsquo;s &ldquo;White
+            Christmas&rdquo; is in Season&nbsp;2 on TMDB, not a special). Your file stays where it is;
+            only the metadata is copied in.
+          </p>
 
-        {seasonsLoading ? (
-          <div className="flex items-center gap-2 py-2 text-sm text-muted-foreground">
-            <Spinner className="h-4 w-4" /> Loading seasons…
-          </div>
-        ) : manual ? (
-          <div className="flex justify-center gap-4">
-            <label className="flex flex-col gap-1">
-              <span className="text-xs font-medium text-muted-foreground">TMDB Season</span>
-              <input
-                value={manSeason}
-                onChange={(e) => setManSeason(e.target.value)}
-                inputMode="numeric"
-                className="w-24 rounded border border-input bg-transparent px-2 py-1 text-sm outline-none"
-              />
-            </label>
-            <label className="flex flex-col gap-1">
-              <span className="text-xs font-medium text-muted-foreground">TMDB Episode</span>
-              <input
-                value={manEpisode}
-                onChange={(e) => setManEpisode(e.target.value)}
-                inputMode="numeric"
-                className="w-24 rounded border border-input bg-transparent px-2 py-1 text-sm outline-none"
-              />
-            </label>
-          </div>
-        ) : (
-          <div className="flex flex-col gap-3">
-            <div className="flex flex-col gap-1">
-              <span className="text-xs font-medium text-muted-foreground">Season</span>
-              <Select value={selSeason} onValueChange={(v) => v && setSelSeason(v)}>
-                <SelectTrigger className="w-full">
-                  <span className="line-clamp-1 text-left">
-                    {selectedSeasonObj ? seasonLabel(selectedSeasonObj) : "Select a season"}
-                  </span>
-                </SelectTrigger>
-                <SelectContent>
-                  {seasons.map((s) => (
-                    <SelectItem key={s.season_number} value={String(s.season_number)}>
-                      {seasonLabel(s)}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-
-            <div className="flex flex-col gap-1">
-              <span className="text-xs font-medium text-muted-foreground">Episode</span>
-              {episodesLoading ? (
-                <div className="flex items-center gap-2 py-1.5 text-sm text-muted-foreground">
-                  <Spinner className="h-4 w-4" /> Loading episodes…
+          <div
+            className={`transition-opacity duration-200 will-change-[opacity] ${contentVisible ? "opacity-100" : "opacity-0"}`}
+          >
+            {manual ? (
+              <div className="flex justify-center gap-4">
+                <label className="flex flex-col gap-1">
+                  <span className="text-xs font-medium text-muted-foreground">TMDB Season</span>
+                  <input
+                    value={manSeason}
+                    onChange={(e) => setManSeason(e.target.value)}
+                    inputMode="numeric"
+                    className="w-24 rounded border border-input bg-transparent px-2 py-1 text-sm outline-none"
+                  />
+                </label>
+                <label className="flex flex-col gap-1">
+                  <span className="text-xs font-medium text-muted-foreground">TMDB Episode</span>
+                  <input
+                    value={manEpisode}
+                    onChange={(e) => setManEpisode(e.target.value)}
+                    inputMode="numeric"
+                    className="w-24 rounded border border-input bg-transparent px-2 py-1 text-sm outline-none"
+                  />
+                </label>
+              </div>
+            ) : (
+              <div className="flex flex-col gap-3">
+                <div className="flex flex-col gap-1">
+                  <span className="text-xs font-medium text-muted-foreground">Season</span>
+                  <Select value={selSeason} onValueChange={(v) => v && setSelSeason(v)}>
+                    <SelectTrigger className="w-full">
+                      <span className="line-clamp-1 text-left">
+                        {selectedSeasonObj ? seasonLabel(selectedSeasonObj) : "Select a season"}
+                      </span>
+                    </SelectTrigger>
+                    <SelectContent>
+                      {seasons.map((s) => (
+                        <SelectItem key={s.season_number} value={String(s.season_number)}>
+                          {seasonLabel(s)}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
                 </div>
-              ) : episodes.length === 0 ? (
-                <p className="py-1.5 text-sm text-muted-foreground">No episodes in this season.</p>
-              ) : (
-                <Select value={selEpisode} onValueChange={(v) => v && setSelEpisode(v)}>
-                  <SelectTrigger className="w-full">
-                    <span className="line-clamp-1 text-left">
-                      {selectedEpisodeObj ? episodeLabel(selectedEpisodeObj) : "Select an episode"}
-                    </span>
-                  </SelectTrigger>
-                  <SelectContent>
-                    {episodes.map((e) => (
-                      <SelectItem key={e.episode_number} value={String(e.episode_number)}>
-                        {episodeLabel(e)}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              )}
-            </div>
+
+                <div className="flex flex-col gap-1">
+                  <span className="text-xs font-medium text-muted-foreground">Episode</span>
+                  {episodesLoading ? (
+                    // The select's own stand-in while a season's episodes load.
+                    <Skeleton className={`h-9 w-full ${episodeSkeleton ? "" : "invisible"}`} />
+                  ) : episodes.length === 0 ? (
+                    <p className="py-1.5 text-sm text-muted-foreground">No episodes in this season.</p>
+                  ) : (
+                    <Select value={selEpisode} onValueChange={(v) => v && setSelEpisode(v)}>
+                      <SelectTrigger className="w-full">
+                        <span className="line-clamp-1 text-left">
+                          {selectedEpisodeObj ? episodeLabel(selectedEpisodeObj) : "Select an episode"}
+                        </span>
+                      </SelectTrigger>
+                      <SelectContent>
+                        {episodes.map((e) => (
+                          <SelectItem key={e.episode_number} value={String(e.episode_number)}>
+                            {episodeLabel(e)}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  )}
+                </div>
+              </div>
+            )}
           </div>
-        )}
+          {!shown && skeletonSeen && (
+            <div
+              className={`absolute inset-x-0 bottom-0 flex flex-col gap-3 transition-opacity duration-200 ${
+                stage === "hidden" ? "" : "opacity-0"
+              }`}
+            >
+              <div className="flex flex-col gap-1">
+                <Skeleton className="h-3 w-14" />
+                <Skeleton className="h-9 w-full" />
+              </div>
+              <div className="flex flex-col gap-1">
+                <Skeleton className="h-3 w-14" />
+                <Skeleton className="h-9 w-full" />
+              </div>
+            </div>
+          )}
+        </DialogBody>
 
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)}>Cancel</Button>

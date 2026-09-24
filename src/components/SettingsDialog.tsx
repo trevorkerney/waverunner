@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { toast } from "sonner";
 import {
   Dialog,
   DialogContent,
+  useContentSwap,
 } from "@/components/ui/dialog";
 import { Switch } from "@/components/ui/switch";
 import { Button } from "@/components/ui/button";
@@ -47,6 +48,13 @@ const categories = [
 
 export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
   const [activeCategory, setActiveCategory] = useState<string>("general");
+  // The pane on screen lags the sidebar's pick through the fade; the pane
+  // scrolls back to the top as the new category lands.
+  const { shown: shownCategory, visible: paneVisible } = useContentSwap(activeCategory);
+  const paneRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (paneRef.current) paneRef.current.scrollTop = 0;
+  }, [shownCategory]);
   const [settings, setSettings] = useState<SettingsMap>({});
   const [appVersion, setAppVersion] = useState("");
   const [updateStatus, setUpdateStatus] = useState<
@@ -203,10 +211,9 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
         onOpenChange(o);
       }}
     >
-      {/* Rows: sidebar+content, then a full-width Save/Cancel footer. */}
-      {/* max-w override is load-bearing: the base DialogContent pins max-w-md
-          (384px), which silently clamped the w-[1024px] below it. */}
-      <DialogContent width="1024px" height="576px" className="grid grid-cols-[11rem_1fr] grid-rows-[minmax(0,1fr)_auto] gap-0 overflow-hidden p-0">
+      {/* Static 1024 × 576: sidebar + content pane, then a full-width
+          Save/Cancel footer. The pane scrolls; nothing else moves. */}
+      <DialogContent width="64rem" height="36rem" className="grid grid-cols-[11rem_1fr] grid-rows-[minmax(0,1fr)_auto] gap-0 overflow-hidden p-0">
         {/* Sidebar */}
         <div className="flex w-44 shrink-0 flex-col border-r bg-muted/30 p-2">
           <p className="mb-2 px-2 pt-1 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
@@ -236,9 +243,15 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
           )}
         </div>
 
-        {/* Content */}
-        <div className="overflow-y-auto p-6">
-          {activeCategory === "general" && (
+        {/* Content — a category switch fades the pane out and in (the
+            frame, sidebar and footer stay put). */}
+        <div
+          ref={paneRef}
+          className={`overflow-y-auto p-6 transition-opacity duration-200 will-change-[opacity] ${
+            paneVisible ? "opacity-100" : "opacity-0"
+          }`}
+        >
+          {shownCategory === "general" && (
             <div className="flex flex-col gap-6">
               <div>
                 <h3 className="mb-4 text-sm font-semibold">Updates</h3>
@@ -334,7 +347,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
               </div>
             </div>
           )}
-          {activeCategory === "tmdb" && (
+          {shownCategory === "tmdb" && (
             <div className="flex flex-col gap-6">
               <div>
                 <h3 className="mb-4 text-sm font-semibold">TMDB</h3>
@@ -439,7 +452,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
               </div>
             </div>
           )}
-          {activeCategory === "audio" && (
+          {shownCategory === "audio" && (
             <div className="flex flex-col gap-6">
               <div>
                 <h3 className="mb-4 text-sm font-semibold">Playback</h3>
@@ -482,7 +495,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
               </div>
             </div>
           )}
-          {activeCategory === "player" && (
+          {shownCategory === "player" && (
             <div className="flex flex-col gap-6">
               <div>
                 <h3 className="mb-4 text-sm font-semibold">Playback</h3>
@@ -656,7 +669,7 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
               </div>
             </div>
           )}
-          {activeCategory === "keybinds" && (
+          {shownCategory === "keybinds" && (
             <div className="flex flex-col gap-6">
               <div>
                 <div className="mb-4 flex items-center justify-between">

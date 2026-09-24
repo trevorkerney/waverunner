@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Play, Music2, Pencil, Scissors, LayoutGrid, List, ArrowUpDown, Disc3, ListPlus, ListStart, ListEnd, VenetianMask, HardDriveDownload } from "lucide-react";
 import { CoversDialog, CoversMenuItem } from "../CoversDialog";
+import { RenameDialog } from "../RenameDialog";
+import { ReleasePicker } from "./ReleasePicker";
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -26,7 +28,7 @@ import { useTagWriting } from "@/lib/tagWriting";
 import { TagWriteDialog, TagWriteScope } from "./TagWriteDialog";
 import type { LoveLevel } from "../../types";
 import { CodecBadge } from "./CodecBadge";
-import { MusicArtistDetail, MusicAlbumCard, MusicAlbumDetail, MusicQueueItem, MusicTrack } from "../../types";
+import { MusicArtistDetail, MusicAlbumCard, MusicAlbumDetail, MusicQueueItem, MusicRelease, MusicTrack } from "../../types";
 import { queueFromRelease, defaultRelease, releaseCover, releaseTitle, trackDisplayTitle, fmtTrackTime, fmtAlbumRuntime } from "./musicQueue";
 import { useDeselectOnBackgroundClick } from "./useTrackSelection";
 
@@ -137,6 +139,12 @@ export function ArtistDetailPage({
   // List view: per-release full details (tracks, type, genres), fetched when
   // the view is first shown and rebuilt after edits (detail changes).
   const [releaseDetails, setReleaseDetails] = useState<Map<number, MusicAlbumDetail> | null>(null);
+  // Detail view: which release each multi-release album's block shows —
+  // the album page's picker, per block. Unpicked = the default release.
+  // (Hooks live up here, ABOVE the loading early-return.)
+  const [pickedRelease, setPickedRelease] = useState<Map<number, number>>(new Map());
+  // The picker's "rename label" target (the album page's dialog, here).
+  const [renameRelease, setRenameRelease] = useState<{ albumId: number; release: MusicRelease } | null>(null);
   // One context menu serves every list-view track row (TracksPage pattern);
   // the row under the pointer records itself here as the event bubbles up.
   const menuTrackRef = useRef<{
@@ -322,9 +330,13 @@ export function ArtistDetailPage({
     !heartOn || (heartFilter === "loved" ? t.loved === "loved" : t.loved != null);
   // Rows a release block shows: appears-on blocks list only the tracks this
   // artist is credited on, own releases list everything — then the hearts.
+  const shownRelease = (d: MusicAlbumDetail) => {
+    const picked = pickedRelease.get(d.id);
+    return (picked != null ? d.releases.find((r) => r.id === picked) : null) ?? defaultRelease(d);
+  };
   const blockTracks = (album: MusicAlbumCard, onlyCredited: boolean): MusicTrack[] => {
     const d = releaseDetails?.get(album.id);
-    const release = d ? defaultRelease(d) : null;
+    const release = d ? shownRelease(d) : null;
     if (!release) return [];
     const base = onlyCredited
       ? release.tracks.filter((t) => t.credits.some((c) => c.artist_id === entryId))
@@ -347,9 +359,10 @@ export function ArtistDetailPage({
   // rows. Shared between own releases and (credit-filtered) appears-on.
   const renderReleaseBlock = (album: MusicAlbumCard, onlyCredited: boolean) => {
               const d = releaseDetails?.get(album.id) ?? null;
-              const release = d ? defaultRelease(d) : null;
-              // Detail view pins the DEFAULT release — show ITS cover/title/
-              // year once loaded; the card's album-level look until then.
+              const release = d ? shownRelease(d) : null;
+              // The block shows its picked release (default until picked) —
+              // ITS cover/title/year once loaded; the card's album-level
+              // look until then.
               const albumCoverPath =
                 d && release ? releaseCover(d, release) : displayCover(album.covers, album.selected_cover);
               const queue = d && release ? queueFromRelease(d, release) : [];
@@ -441,7 +454,6 @@ export function ArtistDetailPage({
                             ? `${release.tracks.length} ${release.tracks.length === 1 ? "track" : "tracks"}`
                             : null,
                           totalSecs > 0 ? fmtAlbumRuntime(totalSecs) : null,
-                          album.release_count > 1 ? `${album.release_count} versions` : null,
                         ]
                           .filter(Boolean)
                           .join(" · ")}
@@ -450,6 +462,28 @@ export function ArtistDetailPage({
                         <p className="mt-0.5 truncate text-xs text-muted-foreground">
                           {d.genres.join(", ")}
                         </p>
+                      )}
+                      {/* Album-page parity: the release picker on albums
+                          with more than one release — pick swaps this
+                          block's cover, title, year and tracks. */}
+                      {d && release && d.releases.length > 1 && (
+                        <div className="mt-1.5">
+                          <ReleasePicker
+                            detail={d}
+                            releaseId={release.id}
+                            onPick={(id) =>
+                              setPickedRelease((m) => {
+                                const next = new Map(m);
+                                next.set(d.id, id);
+                                return next;
+                              })
+                            }
+                            getFullCoverUrl={getFullCoverUrl}
+                            onRename={(r) => setRenameRelease({ albumId: d.id, release: r })}
+                            onChanged={() => setReloadKey((k) => k + 1)}
+                            mbHidden={mbHidden}
+                          />
+                        </div>
                       )}
                       {/* Album-page parity: the MusicBrainz status chip for
                           the release this block shows, opening its matcher. */}
@@ -855,12 +889,20 @@ export function ArtistDetailPage({
               <button
                 onClick={() => onOpenAlbum(album)}
                 className="mt-1.5 block w-full truncate text-left text-sm font-medium hover:underline"
-                title={album.title}
+                title={album.release_count > 1 ? `${album.title} · ${album.release_count} releases` : album.title}
               >
                 {album.title}
+                {/* Albums-page parity: the record icon + count on
+                    multi-release albums, after the title. */}
+                {album.release_count > 1 && (
+                  <span className="ml-1.5 inline-flex -translate-y-px items-center gap-0.5 align-middle text-xs font-normal text-muted-foreground">
+                    <Disc3 size={12} />
+                    {album.release_count}
+                  </span>
+                )}
               </button>
               <p className="truncate text-xs text-muted-foreground">
-                {[album.year, album.release_count > 1 ? `${album.release_count} versions` : null]
+                {[album.year]
                   .filter(Boolean)
                   .join(" · ") || " "}
               </p>
@@ -1232,6 +1274,19 @@ export function ArtistDetailPage({
           if (!o) setWriteScope(null);
         }}
         onDone={handleSaved}
+      />
+      <RenameDialog
+        open={renameRelease !== null}
+        onOpenChange={(o) => {
+          if (!o) setRenameRelease(null);
+        }}
+        title="Rename release label"
+        initialValue={renameRelease?.release.label ?? "1"}
+        onSubmit={async (v) => {
+          if (!renameRelease) return;
+          await invoke("set_release_label", { releaseId: renameRelease.release.id, label: v });
+          setReloadKey((k) => k + 1);
+        }}
       />
       <SplitArtistDialog
         artistId={splitArtistOpen ? entryId : null}

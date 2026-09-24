@@ -14,12 +14,14 @@ import {
 } from "@/components/ui/context-menu";
 import {
   Dialog,
+  DialogBody,
   DialogContent,
   DialogHeader,
   DialogTitle,
   DialogDescription,
   DialogFooter,
 } from "@/components/ui/dialog";
+import { Skeleton, useHandoff } from "@/components/ui/skeleton";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { CreateLibraryDialog } from "@/components/CreateLibraryDialog";
@@ -107,6 +109,11 @@ export function Sidebar({
   const [dragging, setDragging] = useState(false);
   // Library runs (scan / prompt / match) — progress lines and locked rows.
   const { runs, rescan } = useLibraryRuns();
+  // Libraries mid-CREATION: hidden from get_libraries until their scan
+  // lands, so they render from the run (a scanning row below the list).
+  const creatingRuns = Object.values(runs).filter(
+    (r) => r.kind === "scan" && !libraries.some((l) => l.id === r.libraryId),
+  );
   const [createOpen, setCreateOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Library | null>(null);
   // Typed-name gate for the delete dialog — must equal the library's name.
@@ -141,14 +148,16 @@ export function Sidebar({
     const run = runs[libraryId];
     if (!run) return null;
     if (run.kind === "scan") {
-      const folder = run.folder ?? "";
+      // Counts only, no path: a path wraps to two or three lines and
+      // everything below the row jumps as it changes (the scan view has
+      // the detail).
       if (run.phase === "read-tags" && run.total) {
-        return `reading tags ${Math.min((run.done ?? 0) + 1, run.total)}/${run.total} — ${folder}`;
+        return `reading tags ${Math.min((run.done ?? 0) + 1, run.total)}/${run.total}`;
       }
       if (run.phase === "build" && run.total) {
-        return `building ${Math.min((run.done ?? 0) + 1, run.total)}/${run.total} — ${folder}`;
+        return `building ${Math.min((run.done ?? 0) + 1, run.total)}/${run.total}`;
       }
-      return folder ? `scanning — ${folder}` : "scanning…";
+      return "scanning";
     }
     if (run.kind === "match") {
       const p = run.progress;
@@ -160,7 +169,9 @@ export function Sidebar({
           ? `reading album credits ${n}`
           : p.phase === "artist-search"
             ? `searching artists ${n}`
-            : `matching ${n} — ${p.name}`;
+            // No item name: it wrapped to a second line on and off, and
+            // everything below the row jumped with it.
+            : `matching ${n}`;
     }
     return null;
   };
@@ -230,10 +241,11 @@ export function Sidebar({
             <span className="flex h-5 w-4 flex-shrink-0" />
             <span className="min-w-0 flex-1 break-words">Home</span>
           </button>
-          {libraries.length === 0 ? (
+          {libraries.length === 0 && creatingRuns.length === 0 ? (
             // The empty sidebar's one job: the same "Create library" the
             // background context menu offers — a quiet inline link, not a
-            // row that pretends to be a library.
+            // row that pretends to be a library. A library mid-creation
+            // (scanning, not yet listed) counts as one — the link hides.
             <button
               onClick={() => setCreateOpen(true)}
               className="group/create mt-1 flex items-center gap-1 py-1 pl-3 pr-2 text-left text-xs text-sidebar-foreground"
@@ -455,9 +467,7 @@ export function Sidebar({
           {/* A library mid-CREATION is hidden from get_libraries until its
               scan lands — its scanning row renders from the run so it has
               a face in the sidebar (and a page: the scan view). */}
-          {Object.values(runs)
-            .filter((r) => r.kind === "scan" && !libraries.some((l) => l.id === r.libraryId))
-            .map((r) => (
+          {creatingRuns.map((r) => (
               <button
                 key={r.libraryId}
                 onClick={() => onOpenScanning(r.libraryId)}
@@ -581,7 +591,9 @@ export function Sidebar({
         }}
         dismiss="self"
       >
-        <DialogContent size="sm">
+        {/* 16 pad + 20 title + 8 + 60 three-line description + 16 + 36
+            input + 16 + 68 footer = 240px. */}
+        <DialogContent size="sm" height="15rem">
           <DialogHeader>
             <DialogTitle>Delete library?</DialogTitle>
             <DialogDescription>
@@ -647,6 +659,14 @@ function ManageFoldersDialog({
   // Two-click remove confirmation: the path currently armed.
   const [confirmRemove, setConfirmRemove] = useState<string | null>(null);
   const open = library !== null;
+  // Skeleton rows after 500ms, then the hand-off.
+  const foldersRef = useRef<HTMLDivElement | null>(null);
+  const {
+    stage: foldersStage,
+    skeletonSeen: foldersSkeletonSeen,
+    shown: foldersShown,
+    contentVisible: foldersVisible,
+  } = useHandoff(folders !== null, foldersRef);
 
   const reload = useCallback(async () => {
     if (!library) return;
@@ -710,21 +730,39 @@ function ManageFoldersDialog({
 
   return (
     <Dialog open={open} onOpenChange={(o) => { if (!o) close(); }}>
-      <DialogContent size="lg">
+      {/* Static: four folder rows (40 + 4 between) plus the header, the
+          add row and the footer — measured live at 348px; more folders
+          scroll, the add row stays put. */}
+      <DialogContent size="lg" height="21.75rem">
         <DialogHeader>
-          <DialogTitle>Manage folders{library ? ` — ${library.name}` : ""}</DialogTitle>
+          <DialogTitle className="truncate">Manage folders{library ? ` — ${library.name}` : ""}</DialogTitle>
           <DialogDescription>
             Removing a folder deletes its media from the library on the next rescan (including watch
             and play history).
           </DialogDescription>
         </DialogHeader>
-        <div className="grid gap-1 py-1">
-          {folders === null ? (
-            <div className="flex justify-center py-6">
-              <Spinner className="size-5" />
+        <DialogBody ref={foldersRef} className="relative grid content-start gap-1">
+          {!foldersShown && foldersSkeletonSeen && (
+            <div
+              className={`absolute inset-x-0 top-0 grid gap-1 transition-opacity duration-200 ${
+                foldersStage === "hidden" ? "" : "opacity-0"
+              }`}
+            >
+              {Array.from({ length: 3 }, (_, i) => (
+                <div key={i} className="flex items-center gap-2 rounded-md border px-2 py-1.5">
+                  <Skeleton className="h-4 w-12 rounded" />
+                  <Skeleton className="h-3 flex-1" />
+                  <Skeleton className="size-4 rounded" />
+                </div>
+              ))}
             </div>
-          ) : (
-            folders.map((f) => (
+          )}
+          <div
+            className={`grid gap-1 transition-opacity duration-200 will-change-[opacity] ${
+              foldersVisible ? "opacity-100" : "opacity-0"
+            }`}
+          >
+            {(folders ?? []).map((f) => (
               <div key={f.path} className="flex items-center gap-2 rounded-md border px-2 py-1.5">
                 <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
                   {kindLabel(f.kind)}
@@ -752,9 +790,10 @@ function ManageFoldersDialog({
                   </button>
                 )}
               </div>
-            ))
-          )}
-          <div className="mt-1 flex gap-2">
+            ))}
+          </div>
+        </DialogBody>
+        <div className="flex shrink-0 gap-2">
             {addKinds.map((k) => (
               <Button
                 key={k}
@@ -768,7 +807,6 @@ function ManageFoldersDialog({
                 Add {kindLabel(k).toLowerCase()} folder
               </Button>
             ))}
-          </div>
         </div>
         <DialogFooter>
           <Button onClick={close} disabled={busy}>

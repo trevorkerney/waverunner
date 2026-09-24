@@ -3,6 +3,7 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { Disc3 } from "lucide-react";
 import {
   Dialog,
+  DialogBody,
   DialogContent,
   DialogHeader,
   DialogTitle,
@@ -93,9 +94,21 @@ export function CombineSelectedDialog({
   );
   const blocked = mode === "merge" && multiEditionOthers.length > 0;
 
+  // The frame follows the content: 264px of header, list label, mode
+  // picker and footer, plus 58 per picked album (56px rows, 2 between; up
+  // to six, then the body scrolls), plus the edition pick and the warning
+  // when they show. Measured live.
+  const editionRows = mode === "merge" && keeperEditions.length > 1 ? keeperEditions.length : 0;
+  const px =
+    264 +
+    58 * Math.min(picked.length, 6) +
+    (editionRows > 0 ? 34 + 30 * editionRows : 0) +
+    (blocked ? 76 : 0);
+  const height = `${Math.min(px, 640) / 16}rem`;
+
   return (
     <Dialog open={configuring} onOpenChange={(o) => !busy && onOpenChange(o)}>
-      <DialogContent size="lg">
+      <DialogContent size="lg" height={height}>
         <DialogHeader>
           <DialogTitle>Combine {picked.length} albums</DialogTitle>
           <DialogDescription>
@@ -104,15 +117,15 @@ export function CombineSelectedDialog({
           </DialogDescription>
         </DialogHeader>
 
-        {/* min-w-0 everywhere down the chain: DialogContent is a grid, and a
-            grid item's default min-width:auto lets one unbreakable title
-            widen the whole dialog past its max-w instead of truncating. */}
-        <div className="flex min-w-0 flex-col gap-3">
+        {/* min-w-0 everywhere down the chain: a flex/grid item's default
+            min-width:auto lets one unbreakable title widen the whole dialog
+            past its max-w instead of truncating. */}
+        <DialogBody className="-mx-1 flex min-w-0 flex-col gap-3 px-1">
           <div className="min-w-0">
             <p className="mb-1 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
               Keep the info of
             </p>
-            <div className="flex max-h-56 min-w-0 flex-col gap-0.5 overflow-y-auto">
+            <div className="flex min-w-0 flex-col gap-0.5">
               {picked.map((a) => {
                 const meta = byId(a.id);
                 // Everything the surviving card would take from this pick:
@@ -134,7 +147,10 @@ export function CombineSelectedDialog({
                     type="button"
                     onClick={() => onKeeper(a.id)}
                     disabled={busy}
-                    className="flex min-w-0 items-center gap-2 rounded px-1 py-1 text-left hover:bg-accent/50"
+                    // Fixed row height (three lines' worth) so the frame's
+                    // per-row arithmetic is exact; the lines a row does have
+                    // centre against the cover.
+                    className="flex h-14 min-w-0 items-center gap-2 rounded px-1 text-left hover:bg-accent/50"
                   >
                     <input
                       type="radio"
@@ -149,12 +165,13 @@ export function CombineSelectedDialog({
                       <img
                         src={convertFileSrc(meta.cover)}
                         alt=""
-                        className="size-9 shrink-0 rounded-[2px] object-cover"
+                        // As tall as a three-line row's text.
+                        className="size-12 shrink-0 rounded-[2px] object-cover"
                         draggable={false}
                       />
                     ) : (
                       // Coverless: the same disc placeholder the album grids use.
-                      <span className="flex size-9 shrink-0 items-center justify-center rounded-[2px] bg-muted">
+                      <span className="flex size-12 shrink-0 items-center justify-center rounded-[2px] bg-muted">
                         <Disc3 size={16} className="text-muted-foreground" />
                       </span>
                     )}
@@ -249,7 +266,7 @@ export function CombineSelectedDialog({
               releases.
             </p>
           )}
-        </div>
+        </DialogBody>
 
         <DialogFooter>
           <Button size="sm" variant="outline" disabled={busy} onClick={() => onOpenChange(false)}>
