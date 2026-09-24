@@ -1430,10 +1430,13 @@ pub async fn get_entries(
                 END");
 
             let order_clause: String = match sort_mode.as_str() {
-                // "date" = oldest first (undated lead, SQL NULLs-ASC);
-                // "date-desc" = newest first (undated sink to the bottom).
-                "year" | "date" => format!("ORDER BY {sort_date_expr} ASC, mef.sort_title COLLATE NOCASE ASC"),
-                "date-desc" => format!("ORDER BY {sort_date_expr} DESC, mef.sort_title COLLATE NOCASE ASC"),
+                // "date" = oldest first, "date-desc" = newest first. Undated
+                // entries LEAD in both directions (user rule 2026-09-09, same
+                // as the Albums page): they're the ones needing a look, and
+                // the bottom of a big grid is where nobody scrolls. SQL's
+                // NULLs-first only holds for ASC, hence the explicit key.
+                "year" | "date" => format!("ORDER BY ({sort_date_expr}) IS NULL DESC, {sort_date_expr} ASC, mef.sort_title COLLATE NOCASE ASC"),
+                "date-desc" => format!("ORDER BY ({sort_date_expr}) IS NULL DESC, {sort_date_expr} DESC, mef.sort_title COLLATE NOCASE ASC"),
                 "custom" => "ORDER BY mef.sort_order ASC, mef.sort_title COLLATE NOCASE ASC".to_string(),
                 _ => "ORDER BY mef.sort_title COLLATE NOCASE ASC".to_string(),
             };

@@ -1,6 +1,7 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useListWindow } from "@/hooks/useListWindow";
+import { playDropIn } from "@/lib/dropIn";
 import { Play, Music, Music2, Pencil, ListPlus, ListStart, ListEnd, Disc3 } from "lucide-react";
 import { Spinner } from "../ui/spinner";
 import { ClearableInput } from "../ui/clearable-input";
@@ -82,7 +83,11 @@ export const TrackRow = memo(function TrackRow({
     <div
       data-track-row
       data-music-track-id={t.id}
-      className={`group/track flex cursor-default items-center gap-3 rounded-md px-2 py-1.5 text-sm ${isSelected ? "bg-accent" : "hover:bg-accent/50"}`}
+      // will-change: keeps the row on its own compositor layer so the
+      // load-in's transform animation has no layer to drop (and re-raster)
+      // at the end — the same end-of-landing jump the grids had. Windowed,
+      // so this is ~50 layers, not 10K.
+      className={`group/track flex will-change-transform cursor-default items-center gap-3 rounded-md px-2 py-1.5 text-sm ${isSelected ? "bg-accent" : "hover:bg-accent/50"}`}
       onClick={() => onSelect(t.id)}
       onDoubleClick={() => onPlayAt(index)}
       onContextMenu={() => onMenuTarget(t.id)}
@@ -197,12 +202,24 @@ export const TrackRow = memo(function TrackRow({
   );
 });
 
+// Rows outlive the page: a 10K-track library's fetch is the whole arrival
+// wait, and the Albums page (cached by App's view loader) has taught the
+// user that coming back is instant. Keyed by library; dropped whenever
+// anything that changes a row could have happened while the page was away
+// (the same events the mounted page refetches on, plus hearts, which any
+// page can toggle). A mounted page keeps refetching silently on those
+// events and rewrites its entry.
+const tracksCache = new Map<string, LibraryTrackRow[]>();
+for (const ev of ["waverunner:library-rescanned", "waverunner:track-scrobbled", "waverunner:loved-changed"]) {
+  window.addEventListener(ev, () => tracksCache.clear());
+}
+
 /** Library-wide flat track list. Loose tracks (no album, possibly no artist)
  *  appear like any other row with those columns simply empty — the home for
  *  files that would previously have been excluded. Double-click plays from
  *  that row through the (filtered) list. */
 export function TracksPage({ libraryId, onPlayQueue, currentTrackId, playing, onPlaylistsChanged, onEnqueue, getCoverUrl, onNavigateToArtist, onNavigateToAlbum, focusRequest }: TracksPageProps) {
-  const [rows, setRows] = useState<LibraryTrackRow[] | null>(null);
+  const [rows, setRows] = useState<LibraryTrackRow[] | null>(() => tracksCache.get(libraryId) ?? null);
   const [filter, setFilter] = useState("");
   // Per-library "hide MusicBrainz outside the center" (center map toggle).
   const mbHidden = useMbHidden(libraryId);
@@ -221,9 +238,18 @@ export function TracksPage({ libraryId, onPlayQueue, currentTrackId, playing, on
 
   useEffect(() => {
     let cancelled = false;
-    if (reloadKey === 0) setRows(null); // silent refetch after edits
+    if (reloadKey === 0) {
+      // Fresh arrival: cached rows are current (see tracksCache) — no fetch.
+      const cached = tracksCache.get(libraryId);
+      if (cached) {
+        setRows(cached);
+        return;
+      }
+      setRows(null); // later keys are silent refetches — rows stay visible
+    }
     invoke<LibraryTrackRow[]>("get_music_tracks", { libraryId })
       .then((r) => {
+        tracksCache.set(libraryId, r);
         if (!cancelled) setRows(r);
       })
       .catch((e) => console.error("Failed to load tracks:", e));
@@ -301,6 +327,18 @@ export function TracksPage({ libraryId, onPlayQueue, currentTrackId, playing, on
   const listRef = useRef<HTMLDivElement | null>(null);
   const listWindow = useListWindow({ listRef, count: filtered.length, estimateRowHeight: 44 });
   const { scrollToIndex } = listWindow;
+
+  // Page load-in (the grids' drop-in), once per arrival: the first render
+  // that has rows mounted. Silent refetches and window shifts don't replay
+  // it. Only the mounted slice animates — that IS the visible page.
+  const didLoadInRef = useRef(false);
+  useLayoutEffect(() => {
+    if (didLoadInRef.current) return;
+    const list = listRef.current;
+    if (!list || list.children.length === 0) return;
+    didLoadInRef.current = true;
+    playDropIn(list.children, { list: true });
+  });
 
   // Scroll-to-track request (album-page pattern): consumed once per nonce.
   // The row may not be mounted (windowing) — scroll its slot into the

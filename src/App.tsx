@@ -1307,6 +1307,19 @@ function App() {
     }
   }, [selectedLibrary, activeView, breadcrumbs, sortMode, preloadCovers, selectedEntry]);
 
+  // Sidebar click on the page you're already on: a no-op — not a reload with
+  // the load-in playing again. "Already on" means the ROOT of that page:
+  // not a detail page opened from it, not inside a collection, not with a
+  // search narrowing it — those all still return you to the grid.
+  const alreadyAtRoot = useCallback((view: ViewSpec) => {
+    const cur = navStateRef.current;
+    if (!cur.view || cur.entry || cur.search) return false;
+    if (viewCacheKey(cur.view) !== viewCacheKey(view)) return false;
+    // library-root keeps its kind inside collections — the chain tells.
+    if (view.kind === "library-root" && cur.crumbs.length > 1) return false;
+    return true;
+  }, []);
+
   const selectLibrary = useCallback(
     (library: Library) => {
       // A paused first-time import (scan incomplete) isn't browsable — the
@@ -1315,6 +1328,7 @@ function App() {
       if (library.setup_stage === "scan") return;
       // Sidebar library clicks land at the top like other sidebar switches.
       const view: ViewSpec = { kind: "library-root", libraryId: library.id };
+      if (alreadyAtRoot(view)) return;
       setActiveView(view);
       setSelectedEntry(null);
       setSearch("");
@@ -1326,7 +1340,7 @@ function App() {
         { id: null, title: `${library.name} - ${library.format === "music" ? "Artists" : "All"}`, view: libRoot },
       ], false);
     },
-    [loadView]
+    [loadView, alreadyAtRoot]
   );
 
   // The Home hub — a pseudo-library pinned above the real ones. Renders its
@@ -1548,6 +1562,7 @@ function App() {
       // Sidebar view switches intentionally discard scroll — they always land at the top.
       // Don't save outgoing scroll; pass restoreScroll=false so loadView resets to 0.
       // Also clear the forward stack so mouse-forward can't cross into a stale view's history.
+      if (alreadyAtRoot(view)) return;
       setActiveView(view);
       setSelectedEntry(null);
       setSearch("");
@@ -1606,7 +1621,7 @@ function App() {
 
       loadView(view, null, chain, false);
     },
-    [libraries, loadView]
+    [libraries, loadView, alreadyAtRoot]
   );
   // The open-music-center listener (declared above selectView) navigates
   // through this ref — assigned every render so it always sees the latest.
@@ -2345,11 +2360,13 @@ function App() {
           sortTitleKey(a.title).localeCompare(sortTitleKey(b.title));
         const cmp = (a: MediaEntry, b: MediaEntry): number => {
           if (next === "alpha") return byTitle(a, b);
-          const ad = a.sort_date ?? null;
-          const bd = b.sort_date ?? null;
+          const ad = a.sort_date || null;
+          const bd = b.sort_date || null;
           if (ad === null || bd === null) {
-            // Undated albums sink to the bottom in both directions.
-            return ad === bd ? byTitle(a, b) : ad === null ? 1 : -1;
+            // Undated albums LEAD in both directions (user rule 2026-09-09,
+            // same as the backend's order clause): they're the ones needing
+            // a look, and the bottom of a big grid is where nobody scrolls.
+            return ad === bd ? byTitle(a, b) : ad === null ? -1 : 1;
           }
           if (ad !== bd) {
             return next === "date" ? (ad < bd ? -1 : 1) : ad < bd ? 1 : -1;

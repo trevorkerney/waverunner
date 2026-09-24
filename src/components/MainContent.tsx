@@ -159,6 +159,8 @@ function letterForTitle(title: string): string {
 // Granularity of the date jump rail. Smaller = finer markers (1 = every year,
 // 5 = half-decades). Buckets a 4-digit year string to its group's start year.
 const YEAR_RAIL_STEP = 5;
+// The rail's entry for the undated group that leads a date sort.
+const UNDATED_RAIL_LABEL = "—";
 function yearBucket(year: string | null | undefined): string | null {
   if (!year || year.length < 4) return null;
   const y = parseInt(year.slice(0, 4), 10);
@@ -574,18 +576,33 @@ export function MainContent({
       return { labels, find: (l: string) => filteredEntries.find((e) => letterForTitle(e.title) === l) };
     }
     if (sortMode === "date" || sortMode === "date-desc" || sortMode === "year") {
-      // Year buckets (YEAR_RAIL_STEP) in encounter order so the rail follows the sort direction.
+      // Year buckets (YEAR_RAIL_STEP) in encounter order so the rail follows
+      // the sort direction. Undated entries lead the grid in both
+      // directions, so when there are any the rail starts with a dash for
+      // them.
       const labels: string[] = [];
       const seen = new Set<string>();
+      let undated = false;
       for (const e of filteredEntries) {
         const b = yearBucket(e.year);
-        if (b && !seen.has(b)) {
+        if (!b) {
+          undated = true;
+          continue;
+        }
+        if (!seen.has(b)) {
           seen.add(b);
           labels.push(b);
         }
       }
+      if (undated) labels.unshift(UNDATED_RAIL_LABEL);
       if (labels.length < 2) return null;
-      return { labels, find: (l: string) => filteredEntries.find((e) => yearBucket(e.year) === l) };
+      return {
+        labels,
+        find: (l: string) =>
+          l === UNDATED_RAIL_LABEL
+            ? filteredEntries.find((e) => !yearBucket(e.year))
+            : filteredEntries.find((e) => yearBucket(e.year) === l),
+      };
     }
     return null;
   }, [selectedEntry, loading, isSearching, filteredEntries, sortMode]);
@@ -2552,7 +2569,13 @@ function CoverCard({
           !isDragging &&
           (selectMode && onToggleSelect ? onToggleSelect(entry) : onNavigate(entry))
         }
-        className={`group grid justify-items-center rounded-md p-2 text-left ${
+        // will-change: the load-in animates transform per card, which
+        // promotes each card to a compositor layer and drops it at the end —
+        // the drop re-rasterizes text at its true subpixel offset (cards sit
+        // at fractional x in centered 1fr columns), a visible end-of-landing
+        // jump. A permanent layer has nothing to snap back to. Affordable
+        // now that the grid is windowed (~50 cards, not the library).
+        className={`group grid will-change-transform justify-items-center rounded-md p-2 text-left ${
           isDragging || pendingRemoval ? "pointer-events-none opacity-0" : ""
         } ${drag?.isOver && isDragActive ? "ring-2 ring-primary ring-offset-2 ring-offset-background" : ""}`}
         style={{ ...drag?.style, maxWidth: size, gridRow: "span 2", gridTemplateRows: "subgrid" }}

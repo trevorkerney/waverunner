@@ -306,14 +306,15 @@ export function ArtistDetailPage({
 
   const cover = displayCover(detail.covers, detail.selected_cover);
 
-  // Date sort, mirroring the grid pages' order clauses: undated releases sink
-  // to the bottom in both directions, title breaks ties.
+  // Date sort, mirroring the grid pages' order clauses: undated releases LEAD
+  // in both directions (user rule — they're the ones needing a look), title
+  // breaks ties.
   const sortCards = (cards: MusicAlbumCard[]): MusicAlbumCard[] =>
     [...cards].sort((a, b) => {
       const ad = a.release_date;
       const bd = b.release_date;
       if (!ad || !bd) {
-        if (ad !== bd) return !ad ? 1 : -1;
+        if (!ad !== !bd) return !ad ? -1 : 1;
       } else if (ad !== bd) {
         return sortDir === "date-desc" ? (ad < bd ? 1 : -1) : ad < bd ? -1 : 1;
       }
