@@ -379,8 +379,11 @@ export function ArtistDetailPage({
                     <ContextMenu>
                       <ContextMenuTrigger
                         render={
+                          // Fixed width, natural height (grid-page rule) —
+                          // a non-square cover shows whole; the empty box
+                          // stays square.
                           <div
-                            className="group/cover relative h-56 w-56 shrink-0 cursor-pointer overflow-hidden rounded-[3px] bg-muted shadow-sm"
+                            className="group/cover relative w-56 shrink-0 cursor-pointer overflow-hidden rounded-[3px] bg-muted shadow-sm"
                             onClick={() => onOpenAlbum(album)}
                           />
                         }
@@ -389,12 +392,12 @@ export function ArtistDetailPage({
                         <img
                           src={getCoverUrl(albumCoverPath)}
                           alt=""
-                          className="h-full w-full object-cover"
+                          className="block h-auto w-full"
                           loading="lazy"
                           draggable={false}
                         />
                       ) : (
-                        <div className="flex h-full w-full items-center justify-center text-muted-foreground">
+                        <div className="flex aspect-square w-full items-center justify-center text-muted-foreground">
                           <Disc3 size={40} />
                         </div>
                       )}
@@ -838,9 +841,15 @@ export function ArtistDetailPage({
       )}
       {viewMode === "grid" ? (
       <div
-        className="grid gap-4"
-        // 224px floor = the detail view's h-56 cover, so switching views
-        // doesn't resize the artwork.
+        className="grid gap-x-4 gap-y-1.5"
+        // 224px floor = the detail view's w-56 cover, so switching views
+        // doesn't resize the artwork. Cards span two rows and subgrid onto
+        // them (the Albums-page recipe): every cover in a row shares one
+        // bottom-aligned track and every title the next, so a taller cover
+        // grows its row without pushing its neighbours' titles out of line.
+        // The row gap is what separates cover from title (subgrid rows
+        // inherit it), so it's the small one; the title block's bottom
+        // padding makes up the distance to the next row of covers.
         style={{ gridTemplateColumns: "repeat(auto-fill, minmax(224px, 1fr))" }}
       >
         {/* albumsSorted, NOT detail.albums — the date sort toggle was being
@@ -848,12 +857,16 @@ export function ArtistDetailPage({
         {albumsSorted.map((album) => {
           const albumCoverPath = displayCover(album.covers, album.selected_cover);
           return (
-            <div key={album.id} className="group min-w-0">
+            <div
+              key={album.id}
+              className="group grid min-w-0"
+              style={{ gridRow: "span 2", gridTemplateRows: "subgrid" }}
+            >
               <ContextMenu>
                 <ContextMenuTrigger
                   render={
                     <div
-                      className="relative aspect-square cursor-pointer overflow-hidden rounded-[3px] bg-muted shadow-sm"
+                      className="relative cursor-pointer self-end overflow-hidden rounded-[3px] bg-muted shadow-sm"
                       onClick={() => onOpenAlbum(album)}
                     />
                   }
@@ -862,12 +875,12 @@ export function ArtistDetailPage({
                   <img
                     src={getCoverUrl(albumCoverPath)}
                     alt=""
-                    className="h-full w-full object-cover"
+                    className="block h-auto w-full"
                     loading="lazy"
                     draggable={false}
                   />
                 ) : (
-                  <div className="flex h-full w-full items-center justify-center text-muted-foreground">
+                  <div className="flex aspect-square w-full items-center justify-center text-muted-foreground">
                     <Disc3 size={40} />
                   </div>
                 )}
@@ -887,9 +900,11 @@ export function ArtistDetailPage({
                   <CoversMenuItem onOpen={() => setCoversFor({ id: album.id, title: album.title })} />
                 </ContextMenuContent>
               </ContextMenu>
+              {/* One element for the title track (the subgrid has two rows). */}
+              <div className="min-w-0 pb-2.5">
               <button
                 onClick={() => onOpenAlbum(album)}
-                className="mt-1.5 block w-full truncate text-left text-sm font-medium hover:underline"
+                className="block w-full truncate text-left text-sm font-medium hover:underline"
                 title={album.release_count > 1 ? `${album.title} · ${album.release_count} releases` : album.title}
               >
                 {album.title}
@@ -907,6 +922,7 @@ export function ArtistDetailPage({
                   .filter(Boolean)
                   .join(" · ") || " "}
               </p>
+              </div>
             </div>
           );
         })}
@@ -1128,27 +1144,32 @@ export function ArtistDetailPage({
           </p>
           {viewMode === "grid" ? (
           <div
-            className="grid gap-4"
+            className="grid gap-x-4 gap-y-1.5"
+            // Same subgrid rows and spacing as the Releases grid above.
             style={{ gridTemplateColumns: "repeat(auto-fill, minmax(224px, 1fr))" }}
           >
             {appearsSorted.map((album) => {
               const albumCoverPath = displayCover(album.covers, album.selected_cover);
               return (
-                <div key={album.id} className="group min-w-0">
+                <div
+                  key={album.id}
+                  className="group grid min-w-0"
+                  style={{ gridRow: "span 2", gridTemplateRows: "subgrid" }}
+                >
                   <div
-                    className="relative aspect-square cursor-pointer overflow-hidden rounded-[3px] bg-muted shadow-sm"
+                    className="relative cursor-pointer self-end overflow-hidden rounded-[3px] bg-muted shadow-sm"
                     onClick={() => onOpenAlbum(album)}
                   >
                     {albumCoverPath ? (
                       <img
                         src={getCoverUrl(albumCoverPath)}
                         alt=""
-                        className="h-full w-full object-cover"
+                        className="block h-auto w-full"
                         loading="lazy"
                         draggable={false}
                       />
                     ) : (
-                      <div className="flex h-full w-full items-center justify-center text-muted-foreground">
+                      <div className="flex aspect-square w-full items-center justify-center text-muted-foreground">
                         <Disc3 size={40} />
                       </div>
                     )}
@@ -1163,16 +1184,18 @@ export function ArtistDetailPage({
                       <Play size={16} className="translate-x-px" />
                     </button>
                   </div>
-                  <button
-                    onClick={() => onOpenAlbum(album)}
-                    className="mt-1.5 block w-full truncate text-left text-sm font-medium hover:underline"
-                    title={album.title}
-                  >
-                    {album.title}
-                  </button>
-                  <p className="truncate text-xs text-muted-foreground">
-                    {[album.artist_title, album.year].filter(Boolean).join(", ") || " "}
-                  </p>
+                  <div className="min-w-0 pb-2.5">
+                    <button
+                      onClick={() => onOpenAlbum(album)}
+                      className="block w-full truncate text-left text-sm font-medium hover:underline"
+                      title={album.title}
+                    >
+                      {album.title}
+                    </button>
+                    <p className="truncate text-xs text-muted-foreground">
+                      {[album.artist_title, album.year].filter(Boolean).join(", ") || " "}
+                    </p>
+                  </div>
                 </div>
               );
             })}

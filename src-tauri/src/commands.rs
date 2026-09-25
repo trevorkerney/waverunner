@@ -8951,13 +8951,36 @@ pub(crate) async fn get_all_cached_covers(pool: &sqlx::SqlitePool, library_id: &
     .fetch_all(pool)
     .await?;
     let mut excluded: HashMap<String, Vec<String>> = HashMap::new();
+    let leaf_of = |p: &str| p.rsplit(['\\', '/']).next().unwrap_or(p).to_lowercase();
     for (album_folder, release_folder) in nd_rows {
-        let leaf = release_folder
-            .rsplit(['\\', '/'])
-            .next()
-            .unwrap_or(&release_folder)
-            .to_lowercase();
-        excluded.entry(album_folder.to_lowercase()).or_default().push(format!("{leaf}_"));
+        excluded
+            .entry(album_folder.to_lowercase())
+            .or_default()
+            .push(format!("{}_", leaf_of(&release_folder)));
+    }
+    // A non-default release's art can also sit beside its tracks in disc
+    // subfolders ("CD1\cover.jpg" pools as "CD1_cover.jpg" — prefixed with
+    // the DISC folder, not the release folder). Those leaves are the
+    // release's too (the album page attributes them the same way); without
+    // them a box set's disc art read as the default release's.
+    let nd_track_rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT al.folder_path, t.file_path FROM track t
+         JOIN track_release tr ON tr.track_id = t.id
+         JOIN album_release ar ON ar.id = tr.release_id
+         JOIN album al ON al.id = ar.album_id
+         JOIN media_entry me ON me.id = al.id
+         WHERE me.library_id = ? AND ar.is_default = 0",
+    )
+    .bind(library_id)
+    .fetch_all(pool)
+    .await?;
+    for (album_folder, file_path) in nd_track_rows {
+        let Some((parent, _)) = file_path.rsplit_once(['\\', '/']) else { continue };
+        let prefix = format!("{}_", leaf_of(parent));
+        let list = excluded.entry(album_folder.to_lowercase()).or_default();
+        if !list.contains(&prefix) {
+            list.push(prefix);
+        }
     }
 
     let mut map: HashMap<String, Vec<String>> = HashMap::new();

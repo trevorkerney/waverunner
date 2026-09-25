@@ -6,6 +6,10 @@
 
 ## bugs / needs fixing
 
+when rescan finishes, open to metadata page.
+
+hide musicbrainz button needs large rework. it currently doesnt work at all.
+
 cover picker doesnt seem to be updating based on release picker on artist page in detail view
 
 on matching banner, add artist name at the beginning plus a long dash, and remove 'edits wait until the pass finishes'
@@ -29,9 +33,7 @@ on albums page, put a little record-icon (same one used for albums in sidebar) +
 
 the new metadata page acts weird when matching things. one time I match an album release group and then the page I'm on acts like its empty. another time i match an album release group and it takes me to the library map tab for some reason.
 
-NEED a way to tell waverunner that two tracks are the same so their likes, plays, etc can be mirrored. For instance I have 'Arsonist's Lullaby' on both Hozier's self titled album as well as From Eden.
-
-do a pass ensuring pages don't show their content until content is loaded or shows a loader. I've always thought it was ugly when you see a page quickly grow at the beginning due to things loading in separately without loaders
+NEED a way to tell waverunner that two tracks are the same so their likes, plays, etc can be mirrored. For instance I have 'Arsonist's Lullaby' on both Hozier's self titled album as well as From Eden. There are tons of examples in my library.
 
 does the building portion of rescanning truly have an indeterminate ETA? I get why reading the tags would (sorta) but building?
 
@@ -106,6 +108,8 @@ i noticed an album rename didnt update its location until refresh OR go away and
 
 ## changes / small new features
 
+LISTENBRAINZ
+
 exclusive audio mode setting
 
 error boundaries: right now any render error unmounts the whole React tree and the window goes black with no message (happened when a hook landed after an early return in the now-playing bar). Add regional boundaries (main content, sidebar, now-playing bar, video player, each dialog) with a root one underneath as the last resort. Region fallback = small waverunner-styled panel: what broke, error + component stack in a scrollable box, Retry (re-mounts the region), Copy details. Root fallback adds Reload. Boundary should also log the error through a backend command so prod builds (no console) leave a trace. mpv is native so music survives a reload; F5 rehydration picks the session back up.
@@ -130,8 +134,6 @@ display images (png, jpg, webp, gif, etc) in extras, alongside the video extras 
 
 
 ## new features
-
-new system for modals - animation, minimizable sometimes
 
 allow users to create edited variants of tracks (diff speed, cropped, etc, nothing additive)
 

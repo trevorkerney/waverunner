@@ -64,12 +64,7 @@ export function ArtistsGrid({ entries, getCoverUrl, onNavigate, gridRef, sortMod
             key={artist.id}
             data-flip-id={String(artist.id)}
             onClick={() => onNavigate(artist)}
-            // will-change: same reason as PersonCard — the load-in's per-card
-            // transform animation would otherwise promote and then drop a
-            // compositor layer per card, and the drop re-rasterizes the
-            // centered text/ring at subpixel offsets (a tiny end-of-landing
-            // jump). A permanent layer has nothing to snap back to.
-            className="group flex will-change-transform flex-col items-center gap-2 overflow-hidden rounded-md p-2 text-center transition-colors hover:bg-accent/40 focus:bg-accent/60 focus:outline-none"
+            className="group flex flex-col items-center gap-2 overflow-hidden rounded-md p-2 text-center transition-colors hover:bg-accent/40 focus:bg-accent/60 focus:outline-none"
           >
             {/* content-visibility on the (fixed-size, overflow-hidden) cover box —
                 not the card root, where paint containment would clip the hover

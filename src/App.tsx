@@ -1307,8 +1307,8 @@ function App() {
     }
   }, [selectedLibrary, activeView, breadcrumbs, sortMode, preloadCovers, selectedEntry]);
 
-  // Sidebar click on the page you're already on: a no-op — not a reload with
-  // the load-in playing again. "Already on" means the ROOT of that page:
+  // Sidebar click on the page you're already on: a no-op, not a reload.
+  // "Already on" means the ROOT of that page:
   // not a detail page opened from it, not inside a collection, not with a
   // search narrowing it — those all still return you to the grid.
   const alreadyAtRoot = useCallback((view: ViewSpec) => {
@@ -2239,8 +2239,8 @@ function App() {
     ) {
       // playlist-detail refreshes IN PLACE: dropping a link into a collection
       // (or removing/moving one) must just shift the grid like the library
-      // grids do — a full reload unmounts the grid and replays the page
-      // drop-in, which reads as a flash.
+      // grids do — a full reload unmounts and remounts the grid, which
+      // reads as a flash.
       loadView(activeView, null, breadcrumbs, true, activeView.kind === "playlist-detail");
     }
   }, [activeView, breadcrumbs, invalidateCache, loadView]);

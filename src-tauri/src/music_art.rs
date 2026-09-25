@@ -378,6 +378,11 @@ pub struct CaaBrowse {
     /// The pinned release's full scan set (front/back/booklet/…); empty when
     /// unpinned or CAA holds nothing for that release.
     pub release: Vec<CaaImage>,
+    /// The two listings are fetched independently: each section reports its
+    /// own failure (the archive item behind ONE release can be broken while
+    /// the group's is fine) instead of one failure blanking both.
+    pub group_error: Option<String>,
+    pub release_error: Option<String>,
 }
 
 async fn caa_fetch(client: &reqwest::Client, path: &str) -> Result<Vec<CaaImage>, String> {
@@ -595,14 +600,26 @@ pub async fn caa_release_images(
     }
 
     let client = art_client()?;
-    let release = match &release_mbid {
-        Some(mbid) => caa_fetch(&client, &format!("release/{mbid}")).await?,
-        None => Vec::new(),
+    // Independent fetches, each keeping its own error: the Archive item
+    // behind one release can 500 while the group's front is fine.
+    let (release, release_error) = match &release_mbid {
+        Some(mbid) => match caa_fetch(&client, &format!("release/{mbid}")).await {
+            Ok(v) => (v, None),
+            Err(e) => (Vec::new(), Some(e)),
+        },
+        None => (Vec::new(), None),
     };
-    let mut group = match &group_id {
-        Some(id) => caa_fetch(&client, &format!("release-group/{id}")).await?,
-        None => Vec::new(),
+    let (mut group, group_error) = match &group_id {
+        Some(id) => match caa_fetch(&client, &format!("release-group/{id}")).await {
+            Ok(v) => (v, None),
+            Err(e) => (Vec::new(), Some(e)),
+        },
+        None => (Vec::new(), None),
     };
+    // Both sides failed: nothing to show, so the whole listing is the error.
+    if let (Some(g), Some(_)) = (&group_error, &release_error) {
+        return Err(g.clone());
+    }
     // The group's chosen front is often literally one of the pinned
     // release's scans — don't show the same file twice.
     group.retain(|g| !release.iter().any(|r| r.url == g.url));
@@ -612,6 +629,8 @@ pub async fn caa_release_images(
         release_pinned: release_mbid.is_some(),
         group,
         release,
+        group_error,
+        release_error,
     })
 }
 

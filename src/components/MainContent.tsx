@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef, useEffect, useLayoutEffect, useMemo, forwardRef, useImperativeHandle, type RefObject, type ReactNode, type CSSProperties, type MouseEvent as ReactMouseEvent } from "react";
+import { useState, useCallback, useRef, useEffect, useLayoutEffect, useMemo, forwardRef, useImperativeHandle, memo, type RefObject, type ReactNode, type CSSProperties, type MouseEvent as ReactMouseEvent } from "react";
 import {
   DndContext,
   closestCenter,
@@ -85,7 +85,6 @@ import { queueFromRelease, defaultRelease } from "@/components/music/musicQueue"
 import { scopeKeyFor, viewCacheKey } from "@/lib/complications";
 import { ExtrasDialog } from "@/components/ExtrasDialog";
 import { SortPresetSaveDialog } from "@/components/SortPresetSaveDialog";
-import { playDropIn } from "@/lib/dropIn";
 import { TmdbMatchDialog } from "@/components/TmdbMatchDialog";
 import { TmdbShowMatchDialog } from "@/components/TmdbShowMatchDialog";
 import { CoversDialog, CoversMenuItem, type CoversTarget } from "@/components/CoversDialog";
@@ -381,6 +380,7 @@ export function MainContent({
   // Inline-rename target (was per-card state; the menu that starts it is
   // grid-level now). Keyed by sortable id, like the cards.
   const [renamingId, setRenamingId] = useState<string | number | null>(null);
+  const endRename = useCallback(() => setRenamingId(null), []);
   // Optimistic watched/unwatched from the menu: entry lists are cached
   // upstream, so the card corrects itself locally until the next real fetch
   // (a new entries array) replaces the flags.
@@ -817,9 +817,6 @@ export function MainContent({
   // is skipped so optimistic reorders don't double-animate.
   const flipPositionsRef = useRef<Map<string, { x: number; y: number; w: number; h: number }>>(new Map());
   const wasDraggingRef = useRef(false);
-  // Tracks the view whose cards last played the page load-in, so it fires once per
-  // navigation rather than on every in-view re-render.
-  const loadedInViewRef = useRef<string | null>(null);
   // Cover resizes are animated by CSS width transitions on the cards themselves;
   // FLIP sits those renders out (it would fight the transition).
   const prevCoverSizeRef = useRef(coverSize);
@@ -830,9 +827,6 @@ export function MainContent({
   // in as a newcomer).
   const flipListKeys = useMemo(() => filteredEntries.map((e) => String(sortableIdFor(e))), [filteredEntries]);
   const prevFlipListKeysRef = useRef<string[]>([]);
-  // Page load-in key: changes when the view or parent collection changes (but NOT on search
-  // toggle or in-place refreshes), so the "drop in" plays once per page you navigate to.
-  const loadInKey = `${activeView ? viewCacheKey(activeView) : "none"}|${breadcrumbs[breadcrumbs.length - 1]?.id ?? "root"}`;
 
   useLayoutEffect(() => {
     const grid = gridRef.current;
@@ -844,48 +838,26 @@ export function MainContent({
     const navigated = prevNavKeyRef.current !== navKey;
     prevNavKeyRef.current = navKey;
     if (!grid) {
+      // No grid mounted (spinner, detail page, a non-grid view): forget the
+      // baseline, so the next grid to appear populates without animating —
+      // its cards have no prior positions to move from and no prior list to
+      // be new against.
       flipPositionsRef.current = new Map();
-      // The grid isn't mounted. On a non-grid VIEW (people / genres list / playlists
-      // list) — not a detail page — forget the last loaded-in grid so returning to
-      // ANY grid, including the one we left, replays the drop-in. A detail page keeps
-      // a grid-kind activeView + selectedEntry, so we leave the marker intact and
-      // back-from-detail stays still, as before.
-      if (!selectedEntry) loadedInViewRef.current = null;
+      prevFlipListKeysRef.current = [];
       return;
     }
     // Query by [data-flip-id] rather than direct children: ArtistsGrid nests its
     // cards under letter-section wrappers, and direct-children scanning finds
-    // zero cards there — which silently skipped the page load-in on Artists.
-    // For flat grids this matches grid.children exactly.
+    // zero cards there. For flat grids this matches grid.children exactly.
     const children = Array.from(grid.querySelectorAll<HTMLElement>("[data-flip-id]"));
 
     // ── List-change FLIP (drops, deletes, reorders): layout positions ──
     const prev = flipPositionsRef.current;
     const next = new Map<string, { x: number; y: number; w: number; h: number }>();
-    const keys: string[] = [];
     for (const child of children) {
       const key = child.dataset.flipId;
       if (!key) continue;
-      keys.push(key);
       next.set(key, { x: child.offsetLeft, y: child.offsetTop, w: child.offsetWidth, h: child.offsetHeight });
-    }
-
-    // ── Page load-in ──────────────────────────────────────────────────
-    // The first time a view shows its cards (you navigated here, cache hit or miss),
-    // every card drops in — slide-down + scale + fade. This is the look the first
-    // spinner→grid reveal has; here it's made to fire consistently on every navigation
-    // instead of only when the FLIP timing happened to line up. Rebaseline + bail so the
-    // list-change FLIP below doesn't also run on this render.
-    if (
-      keys.length > 0 &&
-      loadedInViewRef.current !== loadInKey &&
-      !dragging && !justDropped && !resized
-    ) {
-      loadedInViewRef.current = loadInKey;
-      prevFlipListKeysRef.current = flipListKeys;
-      flipPositionsRef.current = next;
-      playDropIn(children);
-      return;
     }
 
     // Only animate when the list composition/order actually changed. Positions can
@@ -2173,7 +2145,7 @@ export function MainContent({
                     onNavigate={onNavigate}
                     onRename={onRenameEntry}
                     isRenaming={renamingId != null && renamingId === sortableIdFor(entry)}
-                    onRenameEnd={() => setRenamingId(null)}
+                    onRenameEnd={endRename}
                     watchOverride={watchOverrides.get(entry.id) ?? null}
                     selectMode={cardSelectMode(entry)}
                     selected={cardSelected(entry)}
@@ -2501,7 +2473,10 @@ function SortableCoverCard(props: CoverCardProps) {
   );
 }
 
-function CoverCard({
+/** Memoized: a window slice move re-renders only the cards entering the
+ *  grid; the cards staying keep their elements. Holds as long as the
+ *  callbacks passed in are stable (see onRenameEnd in the grid). */
+const CoverCard = memo(function CoverCard({
   entry,
   size,
   onNavigate,
@@ -2569,12 +2544,13 @@ function CoverCard({
           !isDragging &&
           (selectMode && onToggleSelect ? onToggleSelect(entry) : onNavigate(entry))
         }
-        // will-change: the load-in animates transform per card, which
-        // promotes each card to a compositor layer and drops it at the end —
-        // the drop re-rasterizes text at its true subpixel offset (cards sit
-        // at fractional x in centered 1fr columns), a visible end-of-landing
-        // jump. A permanent layer has nothing to snap back to. Affordable
-        // now that the grid is windowed (~50 cards, not the library).
+        // will-change: the list-change FLIP animates transform per card
+        // (sort switches, drops, deletes), which promotes each card to a
+        // compositor layer and drops it at the end — the drop re-rasterizes
+        // text at its true subpixel offset (cards sit at fractional x in
+        // centered 1fr columns), a visible end-of-landing jump. A permanent
+        // layer has nothing to snap back to. Affordable now that the grid is
+        // windowed (~50 cards, not the library).
         className={`group grid will-change-transform justify-items-center rounded-md p-2 text-left ${
           isDragging || pendingRemoval ? "pointer-events-none opacity-0" : ""
         } ${drag?.isOver && isDragActive ? "ring-2 ring-primary ring-offset-2 ring-offset-background" : ""}`}
@@ -2758,7 +2734,7 @@ function CoverCard({
         </div>
       </div>
   );
-}
+});
 
 function MoveUpDropZone({ isActive }: { isActive: boolean }) {
   const { setNodeRef, isOver } = useDroppable({
@@ -5220,17 +5196,7 @@ function PlaylistsView({
   // Confirm-before-delete targets (empty playlists skip confirmation entirely).
   const [deletePlaylistTarget, setDeletePlaylistTarget] = useState<PlaylistSummary | null>(null);
   const [deletePresetTarget, setDeletePresetTarget] = useState<SortPreset | null>(null);
-  // Play the page load-in (drop-in) on the cards the first time they appear, matching the
-  // library grid. Fires once per mount (i.e. per navigation to the playlists list).
   const gridRef = useRef<HTMLDivElement | null>(null);
-  const didLoadInRef = useRef(false);
-  useLayoutEffect(() => {
-    if (didLoadInRef.current) return;
-    const grid = gridRef.current;
-    if (!grid || grid.children.length === 0) return;
-    didLoadInRef.current = true;
-    playDropIn(grid.children);
-  });
 
   async function deletePlaylist(p: PlaylistSummary) {
     try {

@@ -15,7 +15,7 @@ import type { Library, TmdbBulkTargets } from "@/types";
 /** The matching pass's phases, in the order the backend runs them (see
  *  music_mb::enrich). Artist images are NOT a phase any more — they're a
  *  background job the pass hands off to at its end. */
-const MATCH_STAGES = [
+export const MATCH_STAGES = [
   ["albums", "Matching albums"],
   ["titles", "Applying track titles"],
   ["artist-ids", "Identifying artists"],

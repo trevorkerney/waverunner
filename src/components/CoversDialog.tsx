@@ -16,7 +16,7 @@ import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { Skeleton, useHandoff } from "@/components/ui/skeleton";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { Check, Download, FolderOpen, Globe, Image as ImageIcon, Lock, Trash2 } from "lucide-react";
+import { Check, Download, FolderOpen, Globe, Image as ImageIcon, Lock, RefreshCw, Trash2 } from "lucide-react";
 import { ContextMenuItem } from "@/components/ui/context-menu";
 import { TmdbImageBrowserDialog } from "./TmdbImageBrowserDialog";
 
@@ -47,6 +47,24 @@ function pumpDims() {
         pumpDims();
       });
   }
+}
+
+/** "1400 × 1400" for a LOCAL cover: read off the decoded image itself (the
+ *  tile has already loaded it, so this resolves from the browser's cache). */
+function LocalImageSize({ src }: { src: string }) {
+  const [dims, setDims] = useState<ImageDims | null>(null);
+  useEffect(() => {
+    let live = true;
+    const img = new Image();
+    img.onload = () => {
+      if (live && img.naturalWidth && img.naturalHeight) setDims([img.naturalWidth, img.naturalHeight]);
+    };
+    img.src = src;
+    return () => {
+      live = false;
+    };
+  }, [src]);
+  return dims ? <>{`${dims[0]} × ${dims[1]}`}</> : <Skeleton className="inline-block h-2.5 w-16 align-middle" />;
 }
 
 /** "1400 × 1400" for a CAA image URL, once known; nothing while loading or
@@ -128,18 +146,14 @@ export const COVER_GRID = "grid grid-cols-5 items-start gap-3";
 /** The covers dialogs' fixed height: padding + title + gap + a body of
  *  exactly two rows of square tiles (the WIDEST tiles a 2xl dialog yields,
  *  ~135px, plus the gap and the body's padding, with a little slack so two
- *  rows never overflow by a pixel and summon a scrollbar) + gap + footer.
- *  16 + 20 + 16 + 312 + 16 + 60 = 440px. */
-const COVERS_HEIGHT = "27.5rem";
+ *  rows never overflow by a pixel and summon a scrollbar) + gap + footer,
+ *  and now a caption line (4px + ~16px) under each row.
+ *  16 + 20 + 16 + (312 + 40) + 16 + 60 = 480px. */
+const COVERS_HEIGHT = "30rem";
 /** The same for video: two rows of 2:3 posters at the same tile width
- *  (~135 × 202). 16 + 20 + 16 + (405 + 12 gap + 22 padding + 8 slack) + 16
- *  + 60 = 575px. */
-const VIDEO_COVERS_HEIGHT = "36rem";
-/** The cover art browser with only the group cover to show. 16 padding +
- *  20 title + 16 gap + 16 subtitle + 14 (gap less the body's 2px pull-up)
- *  + 24 section label + 135 tile + 20 caption + 14 (gap less 2px, matching
- *  the space above the label) + 60 footer = 335px, plus a pixel of slack. */
-const CAA_ONE_ROW_HEIGHT = "20rem";
+ *  (~135 × 202) plus their captions. 16 + 20 + 16 + (405 + 12 gap + 22
+ *  padding + 8 slack + 40 captions) + 16 + 60 = 615px. */
+const VIDEO_COVERS_HEIGHT = "38.5rem";
 /** How long a closed dialog keeps its content before resetting — longer
  *  than the shell's fade-out (200ms) plus its exit (120ms), so the content
  *  is still there to fade. */
@@ -177,6 +191,7 @@ export function SkeletonTiles({
   className = "",
   aspect = "square",
   grid = COVER_GRID,
+  caption = false,
 }: {
   count?: number;
   className?: string;
@@ -185,16 +200,21 @@ export function SkeletonTiles({
   aspect?: "square" | "poster" | "wide";
   /** The grid the real tiles use (Covers' five columns by default). */
   grid?: string;
+  /** A text-sized line under each tile, where the real tiles carry their
+   *  resolution — keeps the skeleton's row pitch equal to the tiles'. */
+  caption?: boolean;
 }) {
   return (
     <div className={`${grid} ${className}`}>
       {Array.from({ length: count }, (_, i) => (
-        <Skeleton
-          key={i}
-          className={`w-full rounded-[3px] ${
-            aspect === "poster" ? "aspect-[2/3]" : aspect === "wide" ? "aspect-video" : "aspect-square"
-          }`}
-        />
+        <div key={i}>
+          <Skeleton
+            className={`w-full rounded-[3px] ${
+              aspect === "poster" ? "aspect-[2/3]" : aspect === "wide" ? "aspect-video" : "aspect-square"
+            }`}
+          />
+          {caption && <Skeleton className="mx-auto mt-1.5 h-3 w-2/3" />}
+        </div>
       ))}
     </div>
   );
@@ -208,28 +228,36 @@ export function SkeletonTiles({
 function CaaImageBrowserDialog({
   open,
   onOpenChange,
-  libraryId,
   albumId,
   releaseId,
   releaseMatched,
   title,
-  onDownloaded,
+  onDownload,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  libraryId: string;
   albumId: number;
   releaseId: number | null;
   /** The release is pinned to a MusicBrainz release (known before the
    *  listing loads, so the frame is declared right from the first frame). */
   releaseMatched: boolean;
   title: string;
-  onDownloaded: () => void;
+  /** Download: the picked image URLs go UP to the Covers dialog, which
+   *  fetches them behind skeleton tiles in its own grid — this browser just
+   *  closes. (It used to download here, behind a spinner on the button.) */
+  onDownload: (urls: string[]) => void;
 }) {
   const [data, setData] = useState<CaaBrowse | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  // Bumped by Retry: the Cover Art Archive 500s now and then, and the
+  // listing effect keys on this to run again.
+  const [loadAttempt, setLoadAttempt] = useState(0);
+  const retry = () => {
+    setLoadError(null);
+    setData(null);
+    setLoadAttempt((n) => n + 1);
+  };
   const [picked, setPicked] = useState<Set<string>>(new Set());
-  const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
   // "Other releases": explicit opt-in (a group can hold 100+ pressings).
   // Rows render with fixed-size thumb boxes and lazy front-250 images —
   // browsing them costs one gated MB call plus only what scrolls into view;
@@ -285,7 +313,6 @@ function CaaImageBrowserDialog({
         setData(null);
         setLoadError(null);
         setPicked(new Set());
-        setProgress(null);
         setOthers(null);
         setScans(new Map());
       }, CLOSE_RESET_MS);
@@ -321,7 +348,7 @@ function CaaImageBrowserDialog({
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, albumId, releaseId]);
+  }, [open, albumId, releaseId, loadAttempt]);
 
   const toggle = (url: string) =>
     setPicked((prev) => {
@@ -331,27 +358,10 @@ function CaaImageBrowserDialog({
       return next;
     });
 
-  const download = async () => {
-    const urls = [...picked];
-    setProgress({ done: 0, total: urls.length });
-    try {
-      for (let i = 0; i < urls.length; i++) {
-        const name = urls[i].split("/").pop() || "caa-cover.jpg";
-        await invoke("add_cover_from_url", {
-          libraryId,
-          entryId: albumId,
-          url: urls[i],
-          filename: `caa-${name}`,
-          releaseId,
-        });
-        setProgress({ done: i + 1, total: urls.length });
-      }
-      onDownloaded();
-      onOpenChange(false);
-    } catch (e) {
-      toast.error(String(e));
-      setProgress(null);
-    }
+  const download = () => {
+    onDownload([...picked]);
+    setPicked(new Set());
+    onOpenChange(false);
   };
 
   // `frontKey`: a release row's own thumb is the same file as the "Front"
@@ -368,7 +378,6 @@ function CaaImageBrowserDialog({
         return (
           <div key={img.url}>
             <button
-              disabled={progress != null}
               onClick={() => toggle(key)}
               title={[img.types.join(", ") || null, img.comment || null]
                 .filter(Boolean)
@@ -386,9 +395,15 @@ function CaaImageBrowserDialog({
                 </span>
               )}
             </button>
-            <p className="mt-1 truncate text-center text-[11px] text-muted-foreground">
-              {img.types.join(", ")}
-              <ImageSize url={img.url} prefix={img.types.length > 0 ? " · " : ""} />
+            {/* Types give way (ellipsis) before the resolution does — the
+                numbers are the part worth reading whole. */}
+            <p className="mt-1 flex justify-center gap-1 text-[11px] text-muted-foreground">
+              <span className="min-w-0 truncate">{img.types.join(", ")}</span>
+              <span className="shrink-0">
+                {/* "· " not " · ": a flex item's leading space collapses, and
+                    the gap supplies the space before the dot. */}
+                <ImageSize url={img.url} prefix={img.types.length > 0 ? "· " : ""} />
+              </span>
             </p>
           </div>
         );
@@ -406,13 +421,14 @@ function CaaImageBrowserDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      {/* Frame by content: one row when only the group is matched (its one
-          cover), Covers' two rows when the release is pinned too (its scan
-          set), and the tall frame while browsing the group's releases. Each
-          change is a shell morph (fade → resize → fade). */}
+      {/* Frame by content: Covers' two rows whether only the group is
+          matched (its front, plus scans when the designated release has
+          them) or the release is pinned too, and the tall frame while
+          browsing the group's releases. Each change is a shell morph
+          (fade → resize → fade). */}
       <DialogContent
         size="2xl"
-        height={others !== null ? "xl" : releaseMatched ? COVERS_HEIGHT : CAA_ONE_ROW_HEIGHT}
+        height={others !== null ? "xl" : COVERS_HEIGHT}
       >
         <DialogHeader>
           <DialogTitle className="truncate">MusicBrainz cover art — {title}</DialogTitle>
@@ -456,8 +472,14 @@ function CaaImageBrowserDialog({
                   </div>
                 )}
                 <div className={fade}>
-                  {loadError ? (
-                    <p className="py-8 text-center text-sm text-destructive">{loadError}</p>
+                  {loadError || data?.group_error ? (
+                    <p className="flex items-center justify-center gap-3 py-8 text-center text-sm text-destructive">
+                      <span>{loadError ?? data?.group_error}</span>
+                      <Button variant="outline" size="sm" onClick={retry}>
+                        <RefreshCw size={13} />
+                        Retry
+                      </Button>
+                    </p>
                   ) : !data ? (
                     // Holds the row's height while invisible, so the
                     // sections below don't jump when the tiles land.
@@ -479,7 +501,17 @@ function CaaImageBrowserDialog({
                 <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
                   This release
                 </p>
-                {!data ? null : data.release.length > 0 ? (
+                {!data ? null : data.release_error ? (
+                  // This release's Archive item failed on its own (the
+                  // group above still shows) — say so here, with the retry.
+                  <p className="flex items-center gap-3 text-sm text-destructive">
+                    <span>{data.release_error}</span>
+                    <Button variant="outline" size="sm" onClick={retry}>
+                      <RefreshCw size={13} />
+                      Retry
+                    </Button>
+                  </p>
+                ) : data.release.length > 0 ? (
                   tileGrid(data.release)
                 ) : (
                   <p className="text-sm text-muted-foreground">
@@ -522,7 +554,6 @@ function CaaImageBrowserDialog({
                             <div className="flex items-start gap-3">
                               {r.has_front ? (
                                 <button
-                                  disabled={progress != null}
                                   onClick={() => toggle(frontFull)}
                                   title="Front cover — click to select"
                                   className={`relative block h-28 w-28 shrink-0 overflow-hidden rounded-[3px] bg-muted shadow-sm transition-shadow ${
@@ -608,28 +639,19 @@ function CaaImageBrowserDialog({
               variant="outline"
               className="mr-auto"
               onClick={loadOthers}
-              disabled={!shown || !data || othersLoading || progress != null}
+              disabled={!shown || !data || othersLoading}
             >
               <Globe size={14} />
               {data?.release_pinned ? "Other releases…" : "Browse this group's releases…"}
               {othersSlow && <Spinner className="size-3.5" />}
             </Button>
           )}
-          <Button variant="outline" onClick={() => onOpenChange(false)} disabled={progress != null}>
+          <Button variant="outline" onClick={() => onOpenChange(false)}>
             Cancel
           </Button>
-          <Button onClick={download} disabled={picked.size === 0 || progress != null}>
-            {progress != null ? (
-              <>
-                <Spinner className="size-3.5" />
-                Downloading {progress.done}/{progress.total}…
-              </>
-            ) : (
-              <>
-                <Download size={14} />
-                Download {picked.size > 0 ? picked.size : ""}
-              </>
-            )}
+          <Button onClick={download} disabled={picked.size === 0}>
+            <Download size={14} />
+            Download {picked.size > 0 ? picked.size : ""}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -687,6 +709,9 @@ interface CaaBrowse {
   release_pinned: boolean;
   group: CaaImage[];
   release: CaaImage[];
+  /** Per-section fetch failures (the other section still shows). */
+  group_error: string | null;
+  release_error: string | null;
 }
 
 interface GroupArtRelease {
@@ -794,6 +819,50 @@ export function CoversDialog({
   const [settling, setSettling] = useState(true);
   const gridRef = useRef<HTMLDivElement | null>(null);
   const { stage, skeletonSeen, shown, contentVisible } = useHandoff(!settling, gridRef);
+
+  // Remote downloads in flight: one square skeleton tile per picked image,
+  // appended after the existing covers, each replaced by the real tile as
+  // its file lands (and decodes). The remote browser closes the moment
+  // Download is clicked — the wait happens here, in the grid, where the
+  // result will appear. Slots persist until the dialog closes, so the grid
+  // never re-flows under the user once a tile has landed.
+  const [incoming, setIncoming] = useState<{ id: number; path: string | null }[]>([]);
+  const incomingSeq = useRef(0);
+  const startDownloads = (urls: string[]) => {
+    if (!target || target.kind !== "release") return;
+    const { libraryId, albumId } = target;
+    const slots = urls.map(() => ({ id: ++incomingSeq.current, path: null as string | null }));
+    setIncoming((s) => [...s, ...slots]);
+    void (async () => {
+      for (let i = 0; i < urls.length; i++) {
+        const slot = slots[i];
+        try {
+          const name = urls[i].split("/").pop() || "caa-cover.jpg";
+          const path = await invoke<string>("add_cover_from_url", {
+            libraryId,
+            entryId: albumId,
+            url: urls[i],
+            filename: `caa-${name}`,
+            releaseId,
+          });
+          // Decode before the swap so the tile arrives painted, not popping
+          // in a beat after the skeleton leaves.
+          const img = new Image();
+          img.src = getCoverUrl(path);
+          await img.decode().catch(() => {});
+          await refetch();
+          setIncoming((s) => s.map((x) => (x.id === slot.id ? { ...x, path } : x)));
+          // Each landed cover is a complete change on its own: the page
+          // behind (and the bar) pick it up now, not when the batch ends —
+          // the first download is often the one that becomes the cover.
+          notifyChanged();
+        } catch (e) {
+          toast.error(String(e));
+          setIncoming((s) => s.filter((x) => x.id !== slot.id));
+        }
+      }
+    })();
+  };
   useEffect(() => {
     if (!open) {
       // Same as the browser: reset once the shell's fade-out is over.
@@ -803,6 +872,7 @@ export function CoversDialog({
         setSelected(null);
         setCaaOpen(false);
         setConfirmDelete(null);
+        setIncoming([]);
       }, CLOSE_RESET_MS);
       return () => clearTimeout(t);
     }
@@ -834,6 +904,12 @@ export function CoversDialog({
     (selected && covers.some((c) => c.path === selected) ? selected : null) ??
     covers[0]?.path ??
     null;
+
+  // Download slots that have landed render their cover IN the slot's
+  // position (not where the refetched list would sort it), so the grid
+  // stays put; the main list skips those paths.
+  const incomingPaths = new Set(incoming.flatMap((s) => (s.path ? [s.path] : [])));
+  const coverByPath = new Map(covers.map((c) => [c.path, c] as const));
 
   const setCover = async (path: string) => {
     setBusy(true);
@@ -944,6 +1020,89 @@ export function CoversDialog({
   // skeletons — album art is square.
   const poster = target.kind === "entry";
 
+  /** One grid tile. `extraClass` lets a landed download slot fade in. */
+  const renderTile = (c: CoverInfo, extraClass = "") => {
+    const isSelected = c.path === effectiveSelected;
+    return (
+      <div key={c.path} className={`group relative ${extraClass}`}>
+        {/* Natural aspect — posters, squares, and odd scans all
+            display WHOLE; rows align to the tallest tile. */}
+        {/* Same hover treatment as grid-page cover cards. */}
+        <button
+          disabled={busy}
+          onClick={() => setCover(c.path)}
+          title={isSelected ? "Current cover" : "Use this cover"}
+          className={`block w-full overflow-hidden rounded-[3px] bg-muted shadow-md transition-[translate,scale] duration-200 group-hover:-translate-y-1 group-hover:scale-[1.04] group-hover:shadow-xl ${
+            isSelected
+              ? "ring-2 ring-primary"
+              : "ring-1 ring-foreground/10 group-hover:ring-foreground/25"
+          }`}
+        >
+          {/* Not lazy: the reveal waits on these decoding, and a
+              lazy image below the fold would never report. */}
+          <img
+            src={getCoverUrl(c.path)}
+            alt=""
+            draggable={false}
+            className="h-auto w-full"
+          />
+        </button>
+        {/* Resolution under the tile, like the MusicBrainz browser's. */}
+        <p className="mt-1 text-center text-[11px] text-muted-foreground">
+          <LocalImageSize src={getCoverUrl(c.path)} />
+        </p>
+        {/* Badges sit OUTSIDE the transformed button (the trash
+            must stay clickable, and buttons can't nest), so they
+            mimic the tile's hover lift/growth themselves. */}
+        {isSelected && (
+          <span className="absolute left-1.5 top-1.5 rounded-full bg-primary p-1 text-primary-foreground shadow transition-all duration-200 group-hover:-translate-y-1.5 group-hover:scale-110">
+            <Check size={11} />
+          </span>
+        )}
+        {c.origin !== "app" ? (
+          <span
+            className="absolute right-1.5 top-1.5 rounded-md border border-border bg-popover p-1 text-popover-foreground shadow-md opacity-0 transition-all duration-200 group-hover:-translate-y-1.5 group-hover:scale-110 group-hover:opacity-100"
+            title={
+              c.origin === "fetched"
+                ? "Auto-fetched image — replaced by re-fetching, never deleted here"
+                : "A file in your library folder — waverunner doesn't modify library folders"
+            }
+          >
+            <Lock size={11} />
+          </span>
+        ) : confirmDelete === c.path ? (
+          // Same lift/growth as the icons, anchored top-right so
+          // the pair rides up and out with the tile.
+          <span className="absolute right-1.5 top-1.5 flex origin-top-right gap-1 transition-all duration-200 group-hover:-translate-y-1.5 group-hover:scale-110">
+            <Button
+              size="sm"
+              className="h-6 rounded-md bg-destructive px-2 text-[11px] font-semibold text-white shadow-md hover:bg-destructive/90"
+              disabled={busy}
+              onClick={() => deleteCover(c.path)}
+            >
+              Delete
+            </Button>
+            <Button
+              size="sm"
+              className="h-6 rounded-md border-border bg-popover px-2 text-[11px] font-semibold text-popover-foreground shadow-md hover:bg-muted"
+              onClick={() => setConfirmDelete(null)}
+            >
+              Keep
+            </Button>
+          </span>
+        ) : (
+          <button
+            title="Delete this cover"
+            onClick={() => setConfirmDelete(c.path)}
+            className="absolute right-1.5 top-1.5 rounded-md border border-border bg-popover p-1 text-popover-foreground shadow-md opacity-0 transition-all duration-200 hover:bg-muted group-hover:-translate-y-1.5 group-hover:scale-110 group-hover:opacity-100"
+          >
+            <Trash2 size={11} />
+          </button>
+        )}
+      </div>
+    );
+  };
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent size="2xl" height={poster ? VIDEO_COVERS_HEIGHT : COVERS_HEIGHT}>
@@ -969,7 +1128,7 @@ export function CoversDialog({
             shown ? "" : "overflow-hidden"
           }`}
         >
-          {settling ? null : covers.length === 0 ? (
+          {settling ? null : covers.length === 0 && incoming.length === 0 ? (
             <p className="py-8 text-center text-sm text-muted-foreground">
               No covers yet — add one below.
             </p>
@@ -980,81 +1139,17 @@ export function CoversDialog({
                 contentVisible ? "opacity-100" : "opacity-0"
               }`}
             >
-              {covers.map((c) => {
-                const isSelected = c.path === effectiveSelected;
-                return (
-                  <div key={c.path} className="group relative">
-                    {/* Natural aspect — posters, squares, and odd scans all
-                        display WHOLE; rows align to the tallest tile. */}
-                    {/* Same hover treatment as grid-page cover cards. */}
-                    <button
-                      disabled={busy}
-                      onClick={() => setCover(c.path)}
-                      title={isSelected ? "Current cover" : "Use this cover"}
-                      className={`block w-full overflow-hidden rounded-[3px] bg-muted shadow-md transition-[translate,scale] duration-200 group-hover:-translate-y-1 group-hover:scale-[1.04] group-hover:shadow-xl ${
-                        isSelected
-                          ? "ring-2 ring-primary"
-                          : "ring-1 ring-foreground/10 group-hover:ring-foreground/25"
-                      }`}
-                    >
-                      {/* Not lazy: the reveal waits on these decoding, and a
-                          lazy image below the fold would never report. */}
-                      <img
-                        src={getCoverUrl(c.path)}
-                        alt=""
-                        draggable={false}
-                        className="h-auto w-full"
-                      />
-                    </button>
-                    {/* Badges sit OUTSIDE the transformed button (the trash
-                        must stay clickable, and buttons can't nest), so they
-                        mimic the tile's hover lift/growth themselves. */}
-                    {isSelected && (
-                      <span className="absolute left-1.5 top-1.5 rounded-full bg-primary p-1 text-primary-foreground shadow transition-all duration-200 group-hover:-translate-y-1.5 group-hover:scale-110">
-                        <Check size={11} />
-                      </span>
-                    )}
-                    {c.origin !== "app" ? (
-                      <span
-                        className="absolute right-1.5 top-1.5 rounded-md border border-border bg-popover p-1 text-popover-foreground shadow-md opacity-0 transition-all duration-200 group-hover:-translate-y-1.5 group-hover:scale-110 group-hover:opacity-100"
-                        title={
-                          c.origin === "fetched"
-                            ? "Auto-fetched image — replaced by re-fetching, never deleted here"
-                            : "A file in your library folder — waverunner doesn't modify library folders"
-                        }
-                      >
-                        <Lock size={11} />
-                      </span>
-                    ) : confirmDelete === c.path ? (
-                      // Same lift/growth as the icons, anchored top-right so
-                      // the pair rides up and out with the tile.
-                      <span className="absolute right-1.5 top-1.5 flex origin-top-right gap-1 transition-all duration-200 group-hover:-translate-y-1.5 group-hover:scale-110">
-                        <Button
-                          size="sm"
-                          className="h-6 rounded-md bg-destructive px-2 text-[11px] font-semibold text-white shadow-md hover:bg-destructive/90"
-                          disabled={busy}
-                          onClick={() => deleteCover(c.path)}
-                        >
-                          Delete
-                        </Button>
-                        <Button
-                          size="sm"
-                          className="h-6 rounded-md border-border bg-popover px-2 text-[11px] font-semibold text-popover-foreground shadow-md hover:bg-muted"
-                          onClick={() => setConfirmDelete(null)}
-                        >
-                          Keep
-                        </Button>
-                      </span>
-                    ) : (
-                      <button
-                        title="Delete this cover"
-                        onClick={() => setConfirmDelete(c.path)}
-                        className="absolute right-1.5 top-1.5 rounded-md border border-border bg-popover p-1 text-popover-foreground shadow-md opacity-0 transition-all duration-200 hover:bg-muted group-hover:-translate-y-1.5 group-hover:scale-110 group-hover:opacity-100"
-                      >
-                        <Trash2 size={11} />
-                      </button>
-                    )}
-                  </div>
+              {/* Existing covers first, then the download slots in the order
+                  they were picked: a landed slot renders its cover's tile
+                  (fading in over the skeleton's spot), a pending one the
+                  square skeleton. */}
+              {covers.filter((c) => !incomingPaths.has(c.path)).map((c) => renderTile(c))}
+              {incoming.map((slot) => {
+                const c = slot.path ? coverByPath.get(slot.path) : undefined;
+                return c ? (
+                  renderTile(c, "animate-in fade-in duration-300")
+                ) : (
+                  <Skeleton key={`incoming-${slot.id}`} className="aspect-square w-full rounded-[3px]" />
                 );
               })}
             </div>
@@ -1065,6 +1160,7 @@ export function CoversDialog({
           {!shown && skeletonSeen && (
             <SkeletonTiles
               aspect={poster ? "poster" : "square"}
+              caption
               className={`absolute inset-x-1.5 top-4 z-10 transition-opacity duration-200 ${
                 stage === "hidden" ? "" : "opacity-0"
               }`}
@@ -1119,15 +1215,11 @@ export function CoversDialog({
         <CaaImageBrowserDialog
           open={caaOpen}
           onOpenChange={setCaaOpen}
-          libraryId={target.libraryId}
           albumId={target.albumId}
           releaseId={releaseId}
           releaseMatched={mbReleaseMatched}
           title={target.title}
-          onDownloaded={() => {
-            refetch();
-            notifyChanged();
-          }}
+          onDownload={startDownloads}
         />
       )}
 
@@ -1151,3 +1243,4 @@ export function CoversDialog({
     </Dialog>
   );
 }
+

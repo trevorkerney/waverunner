@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
 import { useLibraryRuns } from "@/hooks/libraryRuns";
+import { MATCH_STAGES } from "@/components/LibraryRunUi";
 import { LibraryAttentionBadge } from "@/components/music/PendingWork";
 import { Trash2, RefreshCw, FolderPlus, FolderCog, ChevronRight, Sparkles, Pencil, Home, CircleAlert, Music2, Settings2, Plus } from "lucide-react";
 import { open as openFolderPicker } from "@tauri-apps/plugin-dialog";
@@ -160,18 +161,11 @@ export function Sidebar({
       return "scanning";
     }
     if (run.kind === "match") {
-      const p = run.progress;
-      if (!p) return "matching…";
-      const n = `${Math.min(p.done + 1, p.total)}/${p.total}`;
-      return p.phase === "artist-ids"
-        ? `identifying artists ${n}`
-        : p.phase === "artist-credits"
-          ? `reading album credits ${n}`
-          : p.phase === "artist-search"
-            ? `searching artists ${n}`
-            // No item name: it wrapped to a second line on and off, and
-            // everything below the row jumped with it.
-            : `matching ${n}`;
+      // Just the stage, "matching stage 3/6" — the per-item count and the
+      // stage's name live on the Metadata page's strip (a click away). Short
+      // and fixed-width, so the row never wraps as the pass moves.
+      const idx = MATCH_STAGES.findIndex(([k]) => k === run.progress?.phase);
+      return idx === -1 ? "matching…" : `matching stage ${idx + 1}/${MATCH_STAGES.length}`;
     }
     return null;
   };

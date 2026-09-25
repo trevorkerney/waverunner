@@ -1,7 +1,8 @@
-import { Fragment, useCallback, useEffect, useRef, useState, useTransition } from "react";
+import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState, useTransition } from "react";
 import { useBackgroundJobs, cancelBackgroundJob } from "@/lib/backgroundJobs";
 import { SourcesPage } from "./SourcesPage";
 import { useFlipList } from "@/hooks/useFlipList";
+import { useGridWindow } from "@/hooks/useGridWindow";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -19,14 +20,8 @@ import { ClearableInput } from "@/components/ui/clearable-input";
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import { useMbBusy } from "./MbBusy";
-import { setMbHiddenLocal } from "@/lib/mbVisibility";
+import { setMbHidden, useMbHidden } from "@/lib/mbVisibility";
 import { Search, Undo2, GitMerge, Equal, CircleAlert, CircleCheck, CircleSlash, Combine, RefreshCw, FileWarning, TriangleAlert, ChevronRight, Scissors, VenetianMask } from "lucide-react";
-import {
-  ContextMenu,
-  ContextMenuTrigger,
-  ContextMenuContent,
-  ContextMenuItem,
-} from "@/components/ui/context-menu";
 import {
   Tooltip,
   TooltipTrigger,
@@ -36,7 +31,7 @@ import {
 import { MatchDialog } from "./MatchDialog";
 import { SplitArtistDialog } from "./EditDialogs";
 import { CombineSelectedDialog, type AlbumSelection } from "./CombineSelectedDialog";
-import { notifyPendingWorkChanged } from "./PendingWork";
+import { notifyPendingWorkChanged, usePendingWork } from "./PendingWork";
 import { IdentityDialog, type IdentityMode } from "./IdentityDialog";
 import { useLibraryRuns } from "@/hooks/libraryRuns";
 import { MatchRunStrip } from "@/components/LibraryRunUi";
@@ -211,6 +206,209 @@ interface ScanIssueRow {
   file_path: string;
   reason: string;
 }
+
+/** Everything one refresh fetches, kept per library after the page unmounts.
+ *  Arriving again paints the last picture at once and refetches behind it
+ *  (the fetch is seven calls, the review alone walking every artist and
+ *  album — the whole arrival wait). Nothing invalidates it: the silent
+ *  refetch on every arrival, and the refreshes every mutation already
+ *  triggers, keep it honest. The two work queues (staged changes, pending
+ *  pass) are NOT in here: they come live from usePendingWork, so the
+ *  banners never show a stale queue while the review reloads. */
+interface CenterSnapshot {
+  review: MbReview;
+  matchState: MusicMatchState;
+  fallbacks: TagFallbackRow[];
+  issues: ScanIssueRow[];
+  unlinked: UnlinkedCredit[];
+  clusters: IdentityCluster[];
+  onlineEnabled: boolean;
+}
+const centerCache = new Map<string, CenterSnapshot>();
+
+// Map nodes are plain buttons: a click opens the match dialog, which
+// carries Ignore / Un-ignore itself. (Each node used to wrap its own
+// context menu for the same two actions — 2.3K menu roots on arrival.)
+const STAGED_HINT = "Staged for rescan — undo the staged change to edit";
+
+function AlbumChip({
+  al,
+  locked,
+  onOpen,
+}: {
+  al: MbAlbumRow;
+  locked: boolean;
+  onOpen: (albumId: number) => void;
+}) {
+  return (
+    <button
+      onClick={() => !locked && onOpen(al.album_id)}
+      title={locked ? `${al.title} · ${STAGED_HINT}` : al.title}
+      className={`max-w-48 truncate rounded border px-1.5 py-0.5 text-[11px] transition-colors hover:brightness-125 ${
+        al.ignored
+          ? "border-transparent bg-muted text-muted-foreground"
+          : al.state === "release"
+            ? "border-emerald-500/60 bg-emerald-500/20 text-emerald-200"
+            : al.state === "album"
+              ? "border-amber-500/60 bg-amber-500/10 text-amber-200"
+              : "border-red-500/60 bg-transparent text-red-300"
+      }`}
+    >
+      {al.title}
+      {/* Multi-version cards say how much of the release stage is done —
+          amber with 1/3 instead of a green that rounds up. */}
+      {al.releases > 1 && !al.ignored && (
+        <span className="opacity-75"> · {al.resolved_releases}/{al.releases}</span>
+      )}
+    </button>
+  );
+}
+
+/** One wall row: the artist, then its album chips wrapping beside it.
+ *  Memoized so a slice move re-renders only the rows entering the window;
+ *  the rows staying keep their elements (the album list per artist is the
+ *  same array across the wall's own re-renders). */
+const MapRow = memo(function MapRow({
+  artist,
+  albums,
+  locked,
+  lockedIds,
+  onMatchArtist,
+  onMatchAlbum,
+}: {
+  artist: MbArtistRow;
+  albums: MbAlbumRow[];
+  locked: boolean;
+  lockedIds: Set<number>;
+  onMatchArtist: (artistId: number) => void;
+  onMatchAlbum: (albumId: number) => void;
+}) {
+  const a = artist;
+  return (
+    <div className="flex items-start gap-2">
+      <button
+        onClick={() => !locked && onMatchArtist(a.artist_id)}
+        title={locked ? `${a.title} · ${STAGED_HINT}` : a.title}
+        className={`flex w-44 shrink-0 items-center gap-1.5 rounded px-1.5 py-0.5 text-left text-xs transition-colors hover:bg-accent/50 ${
+          a.ignored ? "text-muted-foreground" : ""
+        }`}
+      >
+        <span
+          className={`inline-block size-2 shrink-0 rounded-full border ${
+            a.ignored
+              ? "border-transparent bg-muted-foreground/40"
+              : a.state === "matched"
+                ? "border-emerald-500 bg-emerald-500"
+                : "border-red-500 bg-transparent"
+          }`}
+        />
+        <span className="min-w-0 truncate">{a.title}</span>
+      </button>
+      <div className="flex min-w-0 flex-1 flex-wrap gap-1">
+        {albums.map((al) => (
+          <AlbumChip key={al.album_id} al={al} locked={lockedIds.has(al.album_id)} onOpen={onMatchAlbum} />
+        ))}
+      </div>
+    </div>
+  );
+});
+
+const NO_ALBUMS: MbAlbumRow[] = [];
+const NO_ARTISTS: MbArtistRow[] = [];
+
+/** Artists with no albums here — features and loose-track credits. No
+ *  children to branch, so they cluster as their own strip. Its own memoized
+ *  component: hundreds of chips built inline in the center's render made
+ *  every center render pay for them (React's dev build captures a stack per
+ *  element — the whole arrival wait on a cached visit). */
+const FeatureStrip = memo(function FeatureStrip({
+  artists,
+  lockedIds,
+  onMatchArtist,
+}: {
+  artists: MbArtistRow[];
+  lockedIds: Set<number>;
+  onMatchArtist: (artistId: number) => void;
+}) {
+  return (
+    <div>
+      <h4 className="mb-1.5 mt-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+        Feature artists
+      </h4>
+      <div className="flex flex-wrap gap-1">
+        {artists.map((a) => {
+          const locked = lockedIds.has(a.artist_id);
+          return (
+            <button
+              key={a.artist_id}
+              onClick={() => !locked && onMatchArtist(a.artist_id)}
+              title={locked ? `${a.title} · ${STAGED_HINT}` : a.title}
+              className={`flex max-w-48 items-center gap-1.5 rounded border px-1.5 py-0.5 text-[11px] transition-colors hover:brightness-125 ${
+                a.ignored
+                  ? "border-transparent bg-muted text-muted-foreground"
+                  : a.state === "matched"
+                    ? "border-emerald-500/60 bg-emerald-500/20 text-emerald-200"
+                    : "border-red-500/60 bg-transparent text-red-300"
+              }`}
+            >
+              <span className="min-w-0 truncate">{a.title}</span>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+});
+
+/** The map's artist wall: one row per owner artist, its album chips
+ *  wrapping beside it. Windowed — only the rows near the viewport mount
+ *  and the wall pads itself for the rest (row heights vary with the chip
+ *  wrap, so they're measured as they mount). Its own component so a scroll
+ *  step re-renders these ~50 rows, not the whole center. */
+const MapWall = memo(function MapWall({
+  rows,
+  albumsByArtist,
+  lockedIds,
+  onMatchArtist,
+  onMatchAlbum,
+  resetKey,
+}: {
+  rows: MbArtistRow[];
+  albumsByArtist: Map<number, MbAlbumRow[]>;
+  lockedIds: Set<number>;
+  onMatchArtist: (artistId: number) => void;
+  onMatchAlbum: (albumId: number) => void;
+  resetKey: string;
+}) {
+  const wallRef = useRef<HTMLDivElement | null>(null);
+  const wall = useGridWindow({
+    gridRef: wallRef,
+    count: rows.length,
+    estimateRowHeight: 26,
+    // Generous: rows vary in height and a flick covers a lot of them.
+    overscan: 16,
+    resetKey,
+  });
+  return (
+    <div
+      ref={wallRef}
+      className="flex flex-col gap-1.5"
+      style={{ paddingTop: wall.padTop, paddingBottom: wall.padBottom }}
+    >
+      {rows.slice(wall.start, wall.end).map((a) => (
+        <MapRow
+          key={a.artist_id}
+          artist={a}
+          albums={albumsByArtist.get(a.artist_id) ?? NO_ALBUMS}
+          locked={lockedIds.has(a.artist_id)}
+          lockedIds={lockedIds}
+          onMatchArtist={onMatchArtist}
+          onMatchAlbum={onMatchAlbum}
+        />
+      ))}
+    </div>
+  );
+});
 
 interface MetadataCenterProps {
   libraryId: string;
@@ -962,22 +1160,24 @@ export function MetadataCenter({
   const openArtistRow = onOpenArtist
     ? (a: MbArtistRow) => onOpenArtist(a.artist_id, a.title)
     : undefined;
-  const [review, setReview] = useState<MbReview | null>(null);
-  const [matchState, setMatchState] = useState<MusicMatchState | null>(null);
+  // Last payload per library (see centerCache): a return visit renders it
+  // in the same commit as the page and refetches silently behind it.
+  const cached = centerCache.get(libraryId);
+  const [review, setReview] = useState<MbReview | null>(() => cached?.review ?? null);
+  const [matchState, setMatchState] = useState<MusicMatchState | null>(() => cached?.matchState ?? null);
   const runs = useLibraryRuns();
-  const [fallbacks, setFallbacks] = useState<TagFallbackRow[]>([]);
-  const [issues, setIssues] = useState<ScanIssueRow[]>([]);
-  const [unlinked, setUnlinked] = useState<UnlinkedCredit[]>([]);
-  // Staged directives (splits, combines, separates) a rescan will apply.
-  const [pending, setPending] = useState<
-    { id: number; label: string; kind: string; target: string; locked_ids: number[] }[]
-  >([]);
-  // Applied matches a matching pass has yet to cash in (stamp the artists
-  // their credits prove). Cleared wholesale by a completed pass.
-  const [pendingPass, setPendingPass] = useState<
-    { id: number; target: string; label: string; batch_id: number | null }[]
-  >([]);
-  const [loading, setLoading] = useState(false);
+  const [fallbacks, setFallbacks] = useState<TagFallbackRow[]>(() => cached?.fallbacks ?? []);
+  const [issues, setIssues] = useState<ScanIssueRow[]>(() => cached?.issues ?? []);
+  const [unlinked, setUnlinked] = useState<UnlinkedCredit[]>(() => cached?.unlinked ?? []);
+  // The two work queues, live (see usePendingWork): staged directives a
+  // rescan will apply, and applied matches a matching pass has yet to cash
+  // in. Two cheap queries, refetched on every event that changes them — the
+  // banners they drive must not wait on (or lag behind) the review fetch.
+  const { rescan: pending, pass: pendingPass } = usePendingWork(libraryId);
+  // True from the first frame: with nothing to show yet the spinner must be
+  // the first thing painted, not the empty page shell for a frame (the
+  // "flash" before the spinner).
+  const [loading, setLoading] = useState(true);
   // Which mutation is in flight ("apply:…", "resolve:…", "undo:…") — the
   // matching button shows a spinner; everything else just disables.
   const [busyKey, setBusyKey] = useState<string | null>(null);
@@ -1009,7 +1209,7 @@ export function MetadataCenter({
   } | null>(null);
   const openIdentity = (row: MbArtistRow, mode: IdentityMode) =>
     setIdentitySource({ name: row.title, artistId: row.artist_id, mode, suggested: null, row });
-  const [clusters, setClusters] = useState<IdentityCluster[]>([]);
+  const [clusters, setClusters] = useState<IdentityCluster[]>(() => cached?.clusters ?? []);
   const [clusterMatch, setClusterMatch] = useState<{
     cluster: IdentityCluster;
     survivorId: number;
@@ -1068,40 +1268,42 @@ export function MetadataCenter({
   const [changeLimit, setChangeLimit] = useState(25);
   // Per-library opt-out: false hides every MusicBrainz-backed pane, leaving
   // the local ones (unlinked credits, file problems, history).
-  const [onlineEnabled, setOnlineEnabled] = useState(true);
-  // Per-library: hide MB chips/menu items everywhere OUTSIDE this center.
-  const [hideOutside, setHideOutside] = useState(false);
+  const [onlineEnabled, setOnlineEnabled] = useState(() => cached?.onlineEnabled ?? true);
+  // Per-library: MB chips/menu items OUTSIDE this center — the shared store
+  // every page reads (see the switch on the map pane).
+  const mbHidden = useMbHidden(libraryId);
 
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
-      const [rev, ms, fb, iss, unl, pend, pass, ls, clus] = await Promise.all([
+      const [rev, ms, fb, iss, unl, ls, clus] = await Promise.all([
         invoke<MbReview>("mb_get_review", { libraryId }),
         invoke<MusicMatchState>("music_match_state", { libraryId }),
         invoke<TagFallbackRow[]>("get_music_tag_fallbacks", { libraryId }),
         invoke<ScanIssueRow[]>("get_music_scan_issues", { libraryId }),
         invoke<UnlinkedCredit[]>("get_unlinked_credits", { libraryId }),
-        invoke<
-          { id: number; label: string; kind: string; target: string; locked_ids: number[] }[]
-        >("get_pending_changes", { libraryId }),
-        invoke<{ id: number; target: string; label: string; batch_id: number | null }[]>("get_pending_pass", {
-          libraryId,
-        }),
         invoke<Record<string, string>>("get_library_settings", { libraryId }),
         invoke<IdentityCluster[]>("mb_identity_clusters", { libraryId }),
       ]);
+      const snapshot: CenterSnapshot = {
+        review: rev,
+        matchState: ms,
+        fallbacks: fb,
+        issues: iss,
+        unlinked: unl,
+        clusters: clus,
+        onlineEnabled: ls["online_metadata"] !== "off",
+      };
+      centerCache.set(libraryId, snapshot);
       setReview(rev);
       setMatchState(ms);
       setFallbacks(fb);
       setIssues(iss);
       setUnlinked(unl);
-      setPending(pend);
-      setPendingPass(pass);
       setClusters(clus);
-      setOnlineEnabled(ls["online_metadata"] !== "off");
-      setHideOutside(ls["hide_mb_outside_center"] === "on");
-      // Outside surfaces (sidebar badge, library-page strip) mirror both
-      // queues — tell them whenever the center's view of them refreshes.
+      setOnlineEnabled(snapshot.onlineEnabled);
+      // A refresh follows every mutation this page makes; the queues (here
+      // and on the sidebar badge / library strip) refetch off this.
       notifyPendingWorkChanged();
     } catch (e) {
       toast.error(String(e));
@@ -1289,12 +1491,12 @@ export function MetadataCenter({
     );
   };
 
-  const albums = review?.albums ?? [];
+  const albums = review?.albums ?? NO_ALBUMS;
   // A staged split/combine has already decided these entities' fate — they
   // dissolve when the rescan applies. Their rows leave the work lists and
   // every edit locks until then (or until the staging is undone): a match or
   // ignore made now would be silently discarded with the entity.
-  const stagedLockedIds = new Set(pending.flatMap((p) => p.locked_ids));
+  const stagedLockedIds = useMemo(() => new Set(pending.flatMap((p) => p.locked_ids)), [pending]);
   const stagedSplitNames = new Set(
     pending.filter((p) => p.kind === "artist_split").map((p) => p.target),
   );
@@ -1324,7 +1526,7 @@ export function MetadataCenter({
   const albumsReleaseUnknown = albumsIdentified.filter((a) => a.state === "album");
   const albumsFullyIdentified = albumsIdentified.filter((a) => a.state === "release");
   const visibleChanges = (review?.changes ?? []).filter((c) => !hideUndone || !c.undone);
-  const artists = review?.artists ?? [];
+  const artists = review?.artists ?? NO_ARTISTS;
   const artistMatches = (a: MbArtistRow) =>
     artistFilter.trim() === "" || a.title.toLowerCase().includes(artistFilter.trim().toLowerCase());
   const artistsUnmatched = artists.filter(
@@ -1739,26 +1941,37 @@ export function MetadataCenter({
   // CREDITED artists (containment instead of edges — a joint album chips
   // under every member), feature-only artists as a dot grid below. "Done" is
   // NOTHING RED — every node matched, group-matched (albums), or gray.
-  const albumsByArtist = new Map<number, MbAlbumRow[]>();
-  const orphanAlbums: MbAlbumRow[] = [];
-  for (const al of albums) {
-    if (al.artist_ids.length === 0) {
-      orphanAlbums.push(al);
-      continue;
+  // Memoized on the review: the wall and the feature strip are memo
+  // components, and they can only skip a render if the arrays they're
+  // handed are the same objects as last time. Rebuilding these every
+  // render (they're cheap to build) re-rendered both every time anything
+  // in the center changed — most of a cached arrival's wait.
+  const { albumsByArtist, orphanAlbums } = useMemo(() => {
+    const albumsByArtist = new Map<number, MbAlbumRow[]>();
+    const orphanAlbums: MbAlbumRow[] = [];
+    for (const al of albums) {
+      if (al.artist_ids.length === 0) {
+        orphanAlbums.push(al);
+        continue;
+      }
+      for (const aid of al.artist_ids) {
+        const list = albumsByArtist.get(aid);
+        if (list) list.push(al);
+        else albumsByArtist.set(aid, [al]);
+      }
     }
-    for (const aid of al.artist_ids) {
-      const list = albumsByArtist.get(aid);
-      if (list) list.push(al);
-      else albumsByArtist.set(aid, [al]);
-    }
-  }
+    return { albumsByArtist, orphanAlbums };
+  }, [albums]);
   const albumRed = (a: MbAlbumRow) => !a.ignored && a.state !== "release" && a.state !== "album";
   const artistRed = (a: MbArtistRow) => !a.ignored && a.state !== "matched";
   // Strictly alphabetical (the backend's sort_title order) — the map is a
   // stable picture of the library, not a work queue; the guide's Go buttons
   // and the Artists pane's ready-first lists carry the worklist role.
-  const ownerRows = artists.filter((a) => albumsByArtist.has(a.artist_id));
-  const featureArtists = artists.filter((a) => !albumsByArtist.has(a.artist_id));
+  const ownerRows = useMemo(() => artists.filter((a) => albumsByArtist.has(a.artist_id)), [artists, albumsByArtist]);
+  const featureArtists = useMemo(() => artists.filter((a) => !albumsByArtist.has(a.artist_id)), [artists, albumsByArtist]);
+  const albumChip = (al: MbAlbumRow) => (
+    <AlbumChip key={al.album_id} al={al} locked={stagedLockedIds.has(al.album_id)} onOpen={setMatchAlbum} />
+  );
   const mapReds = artists.filter(artistRed).length + albums.filter(albumRed).length;
   // Completion share over the same population the map colors (ignored
   // entities are out of both sides, per doctrine). floor() so 100 can only
@@ -2224,32 +2437,26 @@ export function MetadataCenter({
           )}
 
           {/* Presentation, per library: the grind can live entirely in here —
-              flipping this clears MB chips and Match menu items from album
+              turning this off clears MB chips and Match menu items from album
               and artist pages and track lists, without touching matching
-              itself. The sidebar's pending-work triangle stays (cheap to
-              clear, and it marks real queued work). */}
+              itself. On by default. The sidebar's pending-work triangle
+              stays (cheap to clear, and it marks real queued work). The
+              flag lives in the shared visibility store (mbVisibility) —
+              this switch reads it like every other page, so nothing here
+              can overwrite a click with a stale settings read. */}
           <div className="flex items-center justify-between gap-4 rounded-md border px-3 py-2">
             <div>
-              <p className="text-sm">Hide MusicBrainz outside this page</p>
+              <p className="text-sm">Show MusicBrainz outside this page</p>
               <p className="text-xs text-muted-foreground">
-                Match status chips, track-list check, and “Match to MusicBrainz” menu items stay
-                in here; the rest of the app shows none of it. Matching keeps working.
+                Match status chips, the track-list check, and “Match to MusicBrainz” menu items on
+                album and artist pages and track lists. Off, they stay in here only. Matching keeps
+                working either way.
               </p>
             </div>
             <Switch
-              checked={hideOutside}
-              onCheckedChange={async (v) => {
-                setHideOutside(v);
-                setMbHiddenLocal(libraryId, v); // outside pages flip instantly
-                try {
-                  await invoke("set_library_setting", {
-                    libraryId,
-                    key: "hide_mb_outside_center",
-                    value: v ? "on" : "off",
-                  });
-                } catch (e) {
-                  toast.error(String(e));
-                }
+              checked={!mbHidden}
+              onCheckedChange={(v) => {
+                setMbHidden(libraryId, !v).catch((e) => toast.error(String(e)));
               }}
             />
           </div>
@@ -2526,8 +2733,8 @@ export function MetadataCenter({
             </div>
           ) : (
             <p className="text-sm text-muted-foreground">
-              {mapReds} unmatched — match them from their nodes below, or right-click to ignore
-              what should stop counting.
+              {mapReds} unmatched — click a node below to match it, or to ignore what should
+              stop counting.
             </p>
           )}
 
@@ -2549,230 +2756,32 @@ export function MetadataCenter({
               <span className="inline-block h-3 w-4 rounded-sm border border-transparent bg-muted" />
               ignored
             </span>
-            <span className="ml-auto">click a node to match · right-click to ignore</span>
+            <span className="ml-auto">click a node to match or ignore it</span>
           </div>
 
           {/* Artist rows: the tree with containment instead of edges. Rows
               with red float to the top — the top of the wall IS the worklist. */}
-          <div className="space-y-1.5">
-            {ownerRows.map((a) => (
-              <div key={a.artist_id} className="flex items-start gap-2">
-                <ContextMenu>
-                  <ContextMenuTrigger
-                    render={
-                      <button
-                        onClick={() => !stagedLockedIds.has(a.artist_id) && setMatchArtist(a.artist_id)}
-                        title={a.title}
-                        className={`flex w-44 shrink-0 items-center gap-1.5 rounded px-1.5 py-0.5 text-left text-xs transition-colors hover:bg-accent/50 ${
-                          a.ignored ? "text-muted-foreground" : ""
-                        }`}
-                      />
-                    }
-                  >
-                    <span
-                      className={`inline-block size-2 shrink-0 rounded-full border ${
-                        a.ignored
-                          ? "border-transparent bg-muted-foreground/40"
-                          : a.state === "matched"
-                            ? "border-emerald-500 bg-emerald-500"
-                            : "border-red-500 bg-transparent"
-                      }`}
-                    />
-                    <span className="min-w-0 truncate">{a.title}</span>
-                  </ContextMenuTrigger>
-                  <ContextMenuContent>
-                    {stagedLockedIds.has(a.artist_id) ? (
-                      <ContextMenuItem disabled>
-                        Staged for rescan — Undo the staged change to edit
-                      </ContextMenuItem>
-                    ) : (
-                      <>
-                        <ContextMenuItem onClick={() => setMatchArtist(a.artist_id)}>
-                          Match…
-                        </ContextMenuItem>
-                        <ContextMenuItem
-                          onClick={() =>
-                            a.ignored
-                              ? setIgnored(a.artist_id, false)
-                              : setConfirmIgnore({ entityId: a.artist_id, name: a.title })
-                          }
-                        >
-                          {a.ignored ? "Un-ignore" : "Ignore"}
-                        </ContextMenuItem>
-                      </>
-                    )}
-                  </ContextMenuContent>
-                </ContextMenu>
-                <div className="flex min-w-0 flex-1 flex-wrap gap-1">
-                  {(albumsByArtist.get(a.artist_id) ?? []).map((al) => (
-                    <ContextMenu key={al.album_id}>
-                      <ContextMenuTrigger
-                        render={
-                          <button
-                            onClick={() => !stagedLockedIds.has(al.album_id) && setMatchAlbum(al.album_id)}
-                            title={al.title}
-                            className={`max-w-48 truncate rounded border px-1.5 py-0.5 text-[11px] transition-colors hover:brightness-125 ${
-                              al.ignored
-                                ? "border-transparent bg-muted text-muted-foreground"
-                                : al.state === "release"
-                                  ? "border-emerald-500/60 bg-emerald-500/20 text-emerald-200"
-                                  : al.state === "album"
-                                    ? "border-amber-500/60 bg-amber-500/10 text-amber-200"
-                                    : "border-red-500/60 bg-transparent text-red-300"
-                            }`}
-                          />
-                        }
-                      >
-                        {al.title}
-                        {/* Multi-version cards say how much of the release
-                            stage is done — amber with 1/3 instead of a green
-                            that rounds up. */}
-                        {al.releases > 1 && !al.ignored && (
-                          <span className="opacity-75"> · {al.resolved_releases}/{al.releases}</span>
-                        )}
-                      </ContextMenuTrigger>
-                      <ContextMenuContent>
-                        {stagedLockedIds.has(al.album_id) ? (
-                          <ContextMenuItem disabled>
-                            Staged for rescan — Undo the staged change to edit
-                          </ContextMenuItem>
-                        ) : (
-                          <>
-                            <ContextMenuItem onClick={() => setMatchAlbum(al.album_id)}>
-                              Match…
-                            </ContextMenuItem>
-                            <ContextMenuItem
-                              onClick={() =>
-                                al.ignored
-                                  ? setIgnored(al.album_id, false)
-                                  : setConfirmIgnore({ entityId: al.album_id, name: al.title })
-                              }
-                            >
-                              {al.ignored ? "Un-ignore" : "Ignore"}
-                            </ContextMenuItem>
-                          </>
-                        )}
-                      </ContextMenuContent>
-                    </ContextMenu>
-                  ))}
-                </div>
-              </div>
-            ))}
-            {orphanAlbums.length > 0 && (
-              <div className="flex items-start gap-2">
-                <span className="w-44 shrink-0 px-1.5 py-0.5 text-xs italic text-muted-foreground">
-                  No artist
-                </span>
-                <div className="flex min-w-0 flex-1 flex-wrap gap-1">
-                  {orphanAlbums.map((al) => (
-                    <ContextMenu key={al.album_id}>
-                      <ContextMenuTrigger
-                        render={
-                          <button
-                            onClick={() => !stagedLockedIds.has(al.album_id) && setMatchAlbum(al.album_id)}
-                            title={al.title}
-                            className={`max-w-48 truncate rounded border px-1.5 py-0.5 text-[11px] transition-colors hover:brightness-125 ${
-                              al.ignored
-                                ? "border-transparent bg-muted text-muted-foreground"
-                                : al.state === "release"
-                                  ? "border-emerald-500/60 bg-emerald-500/20 text-emerald-200"
-                                  : al.state === "album"
-                                    ? "border-amber-500/60 bg-amber-500/10 text-amber-200"
-                                    : "border-red-500/60 bg-transparent text-red-300"
-                            }`}
-                          />
-                        }
-                      >
-                        {al.title}
-                        {/* Multi-version cards say how much of the release
-                            stage is done — amber with 1/3 instead of a green
-                            that rounds up. */}
-                        {al.releases > 1 && !al.ignored && (
-                          <span className="opacity-75"> · {al.resolved_releases}/{al.releases}</span>
-                        )}
-                      </ContextMenuTrigger>
-                      <ContextMenuContent>
-                        {stagedLockedIds.has(al.album_id) ? (
-                          <ContextMenuItem disabled>
-                            Staged for rescan — Undo the staged change to edit
-                          </ContextMenuItem>
-                        ) : (
-                          <>
-                            <ContextMenuItem onClick={() => setMatchAlbum(al.album_id)}>
-                              Match…
-                            </ContextMenuItem>
-                            <ContextMenuItem
-                              onClick={() =>
-                                al.ignored
-                                  ? setIgnored(al.album_id, false)
-                                  : setConfirmIgnore({ entityId: al.album_id, name: al.title })
-                              }
-                            >
-                              {al.ignored ? "Un-ignore" : "Ignore"}
-                            </ContextMenuItem>
-                          </>
-                        )}
-                      </ContextMenuContent>
-                    </ContextMenu>
-                  ))}
-                </div>
-              </div>
-            )}
-          </div>
+          <MapWall
+            rows={ownerRows}
+            albumsByArtist={albumsByArtist}
+            lockedIds={stagedLockedIds}
+            onMatchArtist={setMatchArtist}
+            onMatchAlbum={setMatchAlbum}
+            resetKey={`map|${libraryId}`}
+          />
+          {orphanAlbums.length > 0 && (
+            <div className="flex items-start gap-2">
+              <span className="w-44 shrink-0 px-1.5 py-0.5 text-xs italic text-muted-foreground">
+                No artist
+              </span>
+              <div className="flex min-w-0 flex-1 flex-wrap gap-1">{orphanAlbums.map(albumChip)}</div>
+            </div>
+          )}
 
           {/* Artists with no albums here — features and loose-track credits.
               No children to branch, so they cluster as their own strip. */}
           {featureArtists.length > 0 && (
-            <div>
-              <h4 className="mb-1.5 mt-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                Feature artists
-              </h4>
-              <div className="flex flex-wrap gap-1">
-                {featureArtists.map((a) => (
-                  <ContextMenu key={a.artist_id}>
-                    <ContextMenuTrigger
-                      render={
-                        <button
-                          onClick={() => !stagedLockedIds.has(a.artist_id) && setMatchArtist(a.artist_id)}
-                          title={a.title}
-                          className={`flex max-w-48 items-center gap-1.5 rounded border px-1.5 py-0.5 text-[11px] transition-colors hover:brightness-125 ${
-                            a.ignored
-                              ? "border-transparent bg-muted text-muted-foreground"
-                              : a.state === "matched"
-                                ? "border-emerald-500/60 bg-emerald-500/20 text-emerald-200"
-                                : "border-red-500/60 bg-transparent text-red-300"
-                          }`}
-                        />
-                      }
-                    >
-                      <span className="min-w-0 truncate">{a.title}</span>
-                    </ContextMenuTrigger>
-                    <ContextMenuContent>
-                      {stagedLockedIds.has(a.artist_id) ? (
-                        <ContextMenuItem disabled>
-                          Staged for rescan — Undo the staged change to edit
-                        </ContextMenuItem>
-                      ) : (
-                        <>
-                          <ContextMenuItem onClick={() => setMatchArtist(a.artist_id)}>
-                            Match…
-                          </ContextMenuItem>
-                          <ContextMenuItem
-                            onClick={() =>
-                              a.ignored
-                                ? setIgnored(a.artist_id, false)
-                                : setConfirmIgnore({ entityId: a.artist_id, name: a.title })
-                            }
-                          >
-                            {a.ignored ? "Un-ignore" : "Ignore"}
-                          </ContextMenuItem>
-                        </>
-                      )}
-                    </ContextMenuContent>
-                  </ContextMenu>
-                ))}
-              </div>
-            </div>
+            <FeatureStrip artists={featureArtists} lockedIds={stagedLockedIds} onMatchArtist={setMatchArtist} />
           )}
         </section>
       )}

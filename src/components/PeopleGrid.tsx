@@ -15,7 +15,6 @@ import {
   DropdownMenuItem,
 } from "@/components/ui/dropdown-menu";
 import { ScrubberRail } from "@/components/ScrubberRail";
-import { playDropIn } from "@/lib/dropIn";
 import type { CharacterMatch, DirectorCreatorCounts, PersonRole, PersonSummary, TitleCounts } from "@/types";
 
 // People pages hold thousands of entries, so the grid is virtualized: row
@@ -368,17 +367,6 @@ export function PeoplePage({ people, libraryId, role, initialMode, onModeChange,
     return () => ro.disconnect();
   }, [scrollContainerRef]);
 
-  // Page load-in: drop the initial on-screen face cards in, once, when the page first lays
-  // out (the component is keyed per people view, so this re-arms on each navigation here).
-  const didLoadInRef = useRef(false);
-  useLayoutEffect(() => {
-    if (didLoadInRef.current || viewport.width === 0) return;
-    const cards = scrollContainerRef.current?.querySelectorAll<HTMLElement>("[data-person-card]");
-    if (!cards || cards.length === 0) return;
-    didLoadInRef.current = true;
-    playDropIn(cards);
-  });
-
   // ── Context menu (one root for the whole grid) ────────────────────────────
   // The right-clicked card is read off the event; empty space gets no menu.
   const [ctxPerson, setCtxPerson] = useState<PersonSummary | null>(null);
@@ -579,13 +567,7 @@ function PersonCard({
       data-person-card=""
       data-person-id={person.id}
       style={{ height }}
-      // will-change keeps the card on its own compositor layer permanently.
-      // The page load-in animates transform per card, which promotes each
-      // card for the animation and drops it again at the end — and that
-      // de-promotion re-rasterizes the centered text and the 1px ring at
-      // their true subpixel offsets, a visible "settle" a hair after the
-      // card lands. Keeping the layer means nothing changes at the end.
-      className="group flex will-change-transform flex-col items-center gap-2 overflow-hidden rounded-md p-2 text-center transition-colors hover:bg-accent/40 focus:bg-accent/60 focus:outline-none"
+      className="group flex flex-col items-center gap-2 overflow-hidden rounded-md p-2 text-center transition-colors hover:bg-accent/40 focus:bg-accent/60 focus:outline-none"
     >
       <div className="flex h-32 w-32 shrink-0 items-center justify-center overflow-hidden rounded-full bg-muted shadow-md ring-1 ring-foreground/10 transition-all duration-200 group-hover:shadow-lg group-hover:ring-primary/50">
         {imageSrc ? (

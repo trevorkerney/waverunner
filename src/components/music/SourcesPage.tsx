@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { ChevronRight, Disc3, Music2, Users } from "lucide-react";
 import { Spinner } from "../ui/spinner";
 import { Input } from "../ui/input";
+import { useGridWindow } from "@/hooks/useGridWindow";
 
 /** Where each value came from. Every album and loose track, grouped by
  *  artist, against the three tiers the library resolves from: what the
@@ -248,8 +249,229 @@ function rowEntries(fields: Record<string, TierValue>, onlyDisagreeing: boolean)
   return fieldsInOrder(fields).filter(([, v]) => !onlyDisagreeing || disagrees(v));
 }
 
+/** The matrix per library, kept after the tab unmounts: opening Sources
+ *  again paints the last picture at once and refetches behind it (the
+ *  fetch walks every stored value in the library). */
+const matrixCache = new Map<string, TierMatrix>();
+
+/** One line of the flattened grid — what the window slices. Nesting
+ *  (artist → album → release → tracks) is flattened so every visible line
+ *  is a direct child of one container the windowing can measure. */
+type FlatRow =
+  | { key: string; kind: "artist"; g: TierGroup }
+  | { key: string; kind: "identity"; g: TierGroup; row: ReturnType<typeof identityRows>[number] }
+  | { key: string; kind: "row"; r: TierRow }
+  | { key: string; kind: "release"; rel: TierRelease; album: TierRow }
+  | { key: string; kind: "tracks"; rel: TierRelease; nested: boolean; shown: TierTrack[]; open: boolean }
+  | { key: string; kind: "track"; t: TierTrack; nested: boolean };
+
+/** What the lines render against — the tier columns, the grid template,
+ *  and the filters that shape a line. */
+interface LineCtx {
+  tiers: { key: Tier; label: string; hint: string }[];
+  cols: string;
+  onlyDisagreeing: boolean;
+  filtering: boolean;
+  toggleTracks: (releaseId: number) => void;
+}
+
+function lineRow(r: TierRow, ctx: LineCtx) {
+  const entries = rowEntries(r.fields, ctx.onlyDisagreeing);
+  return (
+    <div
+      className="grid items-start border-t border-border/60 hover:bg-accent/30"
+      style={{ gridTemplateColumns: ctx.cols }}
+    >
+      <div className="flex min-w-0 items-start gap-2 px-3 py-2">
+        {r.kind === "album" ? (
+          <Disc3 size={14} className="mt-0.5 shrink-0 text-muted-foreground" />
+        ) : (
+          <Music2 size={14} className="mt-0.5 shrink-0 text-muted-foreground" />
+        )}
+        <div className="min-w-0">
+          <p className="truncate text-sm" title={r.title}>
+            {r.title}
+          </p>
+          <p className="text-[10px] text-muted-foreground">
+            {r.kind === "album" ? "album" : "loose track"}
+            {r.matched && " · matched"}
+            {r.pinned_releases > 0 &&
+              ` · ${r.pinned_releases} release${r.pinned_releases === 1 ? "" : "s"} pinned`}
+          </p>
+        </div>
+      </div>
+      {ctx.tiers.map((t) => (
+        <TierCell key={t.key} entries={entries} tier={t.key} />
+      ))}
+    </div>
+  );
+}
+
+// A multi-release album lists each release beneath it: the version's own
+// tag title and date, the release id its files carry vs. the pressing
+// pinned, and the label rename. Single-release albums say it all in the
+// album row already.
+function lineRelease(rel: TierRelease, album: TierRow, ctx: LineCtx) {
+  const entries = rowEntries(rel.fields, ctx.onlyDisagreeing);
+  return (
+    <div
+      className="grid items-start border-t border-border/40 bg-muted/10 hover:bg-accent/30"
+      style={{ gridTemplateColumns: ctx.cols }}
+    >
+      <div className="flex min-w-0 items-start gap-2 py-1.5 pl-9 pr-3">
+        <div className="min-w-0">
+          <p className="truncate text-xs" title={rel.folder}>
+            {rel.label ?? album.title}
+            {rel.is_default && <span className="ml-1.5 text-[10px] text-muted-foreground">default</span>}
+          </p>
+          <p className="text-[10px] text-muted-foreground">
+            release · {rel.folder}
+            {rel.declared_none && " · no MB release"}
+          </p>
+        </div>
+      </div>
+      {ctx.tiers.map((t) => (
+        <TierCell key={t.key} entries={entries} tier={t.key} />
+      ))}
+    </div>
+  );
+}
+
+// A release's tracks: a toggle row ("12 tracks"), then one row per track
+// with title, credits, disc and track number across the tiers. Under a
+// filter only the matching tracks show, and the release opens itself (the
+// flattening decides that — see flatRows).
+function lineTracksToggle(row: Extract<FlatRow, { kind: "tracks" }>, ctx: LineCtx) {
+  const { rel, nested, shown, open } = row;
+  const pad = nested ? "pl-14" : "pl-9";
+  return (
+    <button
+      type="button"
+      onClick={() => ctx.toggleTracks(rel.id)}
+      className={`flex w-full items-center gap-1.5 border-t border-border/40 py-1 pr-3 text-left text-[11px] text-muted-foreground hover:bg-accent/30 hover:text-foreground ${pad}`}
+    >
+      <ChevronRight size={12} className={`transition-transform ${open ? "rotate-90" : ""}`} />
+      {ctx.filtering && shown.length !== rel.tracks.length
+        ? `${shown.length} of ${rel.tracks.length} tracks`
+        : `${rel.tracks.length} ${rel.tracks.length === 1 ? "track" : "tracks"}`}
+    </button>
+  );
+}
+
+function lineTrack(t: TierTrack, nested: boolean, ctx: LineCtx) {
+  const entries = rowEntries(t.fields, ctx.onlyDisagreeing);
+  const pad = nested ? "pl-14" : "pl-9";
+  return (
+    <div
+      className="grid items-start border-t border-border/40 hover:bg-accent/30"
+      style={{ gridTemplateColumns: ctx.cols }}
+    >
+      <div className={`flex min-w-0 items-start gap-2 py-1.5 pr-3 ${pad}`}>
+        <span className="w-8 shrink-0 text-right font-mono text-[10px] text-muted-foreground">
+          {t.disc > 1 ? `${t.disc}·` : ""}
+          {t.number ?? "–"}
+        </span>
+        <div className="min-w-0">
+          <p className="truncate text-xs" title={t.title}>
+            {t.title}
+          </p>
+          <p className="text-[10px] text-muted-foreground">
+            track{t.matched && " · matched"}
+          </p>
+        </div>
+      </div>
+      {ctx.tiers.map((tier) => (
+        <TierCell key={tier.key} entries={entries} tier={tier.key} />
+      ))}
+    </div>
+  );
+}
+
+function lineArtist(g: TierGroup, ctx: LineCtx) {
+  const entries = rowEntries(g.artist_fields, ctx.onlyDisagreeing);
+  return (
+    <div
+      className="grid items-start border-t bg-muted/30"
+      style={{ gridTemplateColumns: ctx.cols }}
+    >
+      <div className="flex min-w-0 items-center gap-2 px-3 py-2">
+        <Users size={14} className="shrink-0 text-muted-foreground" />
+        <p className="truncate text-sm font-semibold">
+          {g.artist_title ?? "No artist"}
+        </p>
+        <span className="text-[10px] text-muted-foreground">
+          {g.loose_tracks.length > 0 &&
+            `${g.loose_tracks.length} loose track${g.loose_tracks.length === 1 ? "" : "s"}`}
+          {g.albums.length > 0 && g.loose_tracks.length > 0 && " · "}
+          {g.albums.length > 0 &&
+            `${g.albums.length} album${g.albums.length === 1 ? "" : "s"}`}
+        </span>
+      </div>
+      {ctx.tiers.map((t) =>
+        entries.length > 0 ? (
+          <TierCell key={t.key} entries={entries} tier={t.key} />
+        ) : (
+          <div key={t.key} />
+        ),
+      )}
+    </div>
+  );
+}
+
+// Identity facts — who this artist is, beyond the name: aliases by who
+// wrote them, persona links, splits, kept-separate names. Read-only here;
+// the flows that write them live on the Artists tab and the artist page.
+function lineIdentity(row: Extract<FlatRow, { kind: "identity" }>, ctx: LineCtx) {
+  return (
+    <div
+      className="grid items-start border-t border-border/40 bg-muted/10"
+      style={{ gridTemplateColumns: ctx.cols }}
+    >
+      <div className="flex min-w-0 items-start gap-2 py-1.5 pl-9 pr-3">
+        <p className="truncate text-xs text-muted-foreground">{row.row.label}</p>
+      </div>
+      {ctx.tiers.map((t) => {
+        const lines = row.row.cells[t.key];
+        return (
+          <div key={t.key} className="flex min-w-0 flex-col gap-0.5 px-3 py-1.5">
+            {lines.length === 0 ? (
+              <span className="text-xs text-muted-foreground/40">—</span>
+            ) : (
+              lines.map((line, i) => (
+                <span key={i} className="min-w-0 truncate text-xs text-foreground" title={line}>
+                  {line}
+                </span>
+              ))
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/** One line of the windowed grid. Memoized: a slice move re-renders only
+ *  the lines entering the window (row objects and ctx are stable across
+ *  the window's own re-renders). */
+const SourceLine = memo(function SourceLine({ row, ctx }: { row: FlatRow; ctx: LineCtx }): ReactNode {
+  switch (row.kind) {
+    case "artist":
+      return lineArtist(row.g, ctx);
+    case "identity":
+      return lineIdentity(row, ctx);
+    case "row":
+      return lineRow(row.r, ctx);
+    case "release":
+      return lineRelease(row.rel, row.album, ctx);
+    case "tracks":
+      return lineTracksToggle(row, ctx);
+    case "track":
+      return lineTrack(row.t, row.nested, ctx);
+  }
+});
+
 export function SourcesPage({ libraryId }: { libraryId: string }) {
-  const [matrix, setMatrix] = useState<TierMatrix | null>(null);
+  const [matrix, setMatrix] = useState<TierMatrix | null>(() => matrixCache.get(libraryId) ?? null);
   const [reloadKey, setReloadKey] = useState(0);
   const [filter, setFilter] = useState("");
   const [onlyDisagreeing, setOnlyDisagreeing] = useState(false);
@@ -257,9 +479,12 @@ export function SourcesPage({ libraryId }: { libraryId: string }) {
 
   useEffect(() => {
     let cancelled = false;
-    if (reloadKey === 0) setMatrix(null);
+    // Only a first visit with nothing cached shows the spinner; a cached
+    // arrival and later keys refetch silently behind the rows.
+    if (reloadKey === 0 && !matrixCache.has(libraryId)) setMatrix(null);
     invoke<TierMatrix>("get_tier_matrix", { libraryId })
       .then((m) => {
+        matrixCache.set(libraryId, m);
         if (!cancelled) setMatrix(m);
       })
       .catch((e) => {
@@ -282,13 +507,16 @@ export function SourcesPage({ libraryId }: { libraryId: string }) {
   // otherwise); a filter that hits a track opens its release so the hit is
   // visible. Manual toggles are remembered per release for the visit.
   const [openTracks, setOpenTracks] = useState<Set<number>>(new Set());
-  const toggleTracks = (releaseId: number) =>
-    setOpenTracks((prev) => {
-      const next = new Set(prev);
-      if (next.has(releaseId)) next.delete(releaseId);
-      else next.add(releaseId);
-      return next;
-    });
+  const toggleTracks = useCallback(
+    (releaseId: number) =>
+      setOpenTracks((prev) => {
+        const next = new Set(prev);
+        if (next.has(releaseId)) next.delete(releaseId);
+        else next.add(releaseId);
+        return next;
+      }),
+    [],
+  );
   const filtering = filter.trim() !== "" || onlyDisagreeing || onlyEdited;
   const q = filter.trim().toLowerCase();
   const fieldsKeep = (title: string, fields: Record<string, TierValue>) =>
@@ -330,6 +558,77 @@ export function SourcesPage({ libraryId }: { libraryId: string }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [matrix, filter, onlyDisagreeing, onlyEdited]);
 
+  // The grid as one flat list of lines (see FlatRow), in display order.
+  const flatRows = useMemo<FlatRow[]>(() => {
+    const out: FlatRow[] = [];
+    const pushTracks = (rel: TierRelease, nested: boolean) => {
+      if (rel.tracks.length === 0) return;
+      const shown = filtering ? rel.tracks.filter(trackKeep) : rel.tracks;
+      const forcedOpen = filtering && shown.length > 0;
+      const open = forcedOpen || openTracks.has(rel.id);
+      out.push({ key: `tracks-${rel.id}`, kind: "tracks", rel, nested, shown, open });
+      if (open) for (const t of shown) out.push({ key: `track-${t.id}`, kind: "track", t, nested });
+    };
+    for (const g of groups) {
+      out.push({ key: `artist-${g.artist_id ?? "none"}`, kind: "artist", g });
+      if (
+        !identityEmpty(g.identity) &&
+        !(onlyDisagreeing && !identityRows(g.identity).some((r) => r.cells.mb.length > 0 && r.cells.user.length > 0))
+      ) {
+        for (const row of identityRows(g.identity)) {
+          out.push({ key: `id-${g.artist_id}-${row.key}`, kind: "identity", g, row });
+        }
+      }
+      for (const r of g.loose_tracks) out.push({ key: `${r.kind}-${r.id}`, kind: "row", r });
+      for (const r of g.albums) {
+        out.push({ key: `${r.kind}-${r.id}`, kind: "row", r });
+        if (r.releases.length > 1) {
+          for (const rel of r.releases) {
+            out.push({ key: `rel-${rel.id}`, kind: "release", rel, album: r });
+            pushTracks(rel, true);
+          }
+        } else if (r.releases[0]) {
+          pushTracks(r.releases[0], false);
+        }
+      }
+    }
+    return out;
+    // trackKeep derives from filter/onlyDisagreeing/onlyEdited, all of which groups already keys on.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [groups, openTracks, filtering, onlyDisagreeing]);
+
+  // Windowed: the matrix runs to thousands of lines; only those near the
+  // viewport mount. Lines differ in height by kind, so each is measured as
+  // it mounts. The scroller is the Metadata pane, found by the hook.
+  const listRef = useRef<HTMLDivElement | null>(null);
+  const listWindow = useGridWindow({
+    gridRef: listRef,
+    count: flatRows.length,
+    estimateRowHeight: 44,
+    overscan: 20,
+    resetKey: `sources|${libraryId}`,
+    enabled: matrix !== null,
+  });
+
+  // What every line renders against. One object, memoized, so the lines'
+  // memo holds across the window's own re-renders (a slice move then
+  // re-renders only the lines entering, not the ~60 staying).
+  const mbEnabled = matrix?.mb_enabled ?? false;
+  const ctx = useMemo<LineCtx>(() => {
+    const tiers: LineCtx["tiers"] = [
+      { key: "tag", label: "Tags", hint: "What the files say" },
+      ...(mbEnabled ? [{ key: "mb" as Tier, label: "MusicBrainz", hint: "What the match said" }] : []),
+      { key: "user", label: "Edits", hint: "What you changed" },
+    ];
+    return {
+      tiers,
+      cols: `minmax(16rem,1.1fr) repeat(${tiers.length}, minmax(0,1fr))`,
+      onlyDisagreeing,
+      filtering,
+      toggleTracks,
+    };
+  }, [mbEnabled, onlyDisagreeing, filtering, toggleTracks]);
+
   if (matrix === null) {
     return (
       <div className="absolute inset-0 flex items-center justify-center text-muted-foreground">
@@ -338,145 +637,8 @@ export function SourcesPage({ libraryId }: { libraryId: string }) {
     );
   }
 
-  const tiers: { key: Tier; label: string; hint: string }[] = [
-    { key: "tag", label: "Tags", hint: "What the files say" },
-    ...(matrix.mb_enabled
-      ? [{ key: "mb" as Tier, label: "MusicBrainz", hint: "What the match said" }]
-      : []),
-    { key: "user", label: "Edits", hint: "What you changed" },
-  ];
-  const cols = `minmax(16rem,1.1fr) repeat(${tiers.length}, minmax(0,1fr))`;
+  const { tiers, cols } = ctx;
   const total = matrix.groups.reduce((n, g) => n + g.albums.length + g.loose_tracks.length, 0);
-
-  const renderRow = (r: TierRow) => (
-    <div
-      key={`${r.kind}-${r.id}`}
-      className="grid items-start border-t border-border/60 hover:bg-accent/30"
-      style={{ gridTemplateColumns: cols }}
-    >
-      <div className="flex min-w-0 items-start gap-2 px-3 py-2">
-        {r.kind === "album" ? (
-          <Disc3 size={14} className="mt-0.5 shrink-0 text-muted-foreground" />
-        ) : (
-          <Music2 size={14} className="mt-0.5 shrink-0 text-muted-foreground" />
-        )}
-        <div className="min-w-0">
-          <p className="truncate text-sm" title={r.title}>
-            {r.title}
-          </p>
-          <p className="text-[10px] text-muted-foreground">
-            {r.kind === "album" ? "album" : "loose track"}
-            {r.matched && " · matched"}
-            {r.pinned_releases > 0 &&
-              ` · ${r.pinned_releases} release${r.pinned_releases === 1 ? "" : "s"} pinned`}
-          </p>
-        </div>
-      </div>
-      {(() => {
-        const entries = rowEntries(r.fields, onlyDisagreeing);
-        return tiers.map((t) => <TierCell key={t.key} entries={entries} tier={t.key} />);
-      })()}
-    </div>
-  );
-
-  // A multi-release album lists each release beneath it: the version's own
-  // tag title and date, the release id its files carry vs. the pressing
-  // pinned, and the label rename. Single-release albums say it all in the
-  // album row already.
-  const renderRelease = (rel: TierRelease, album: TierRow) => {
-    const entries = rowEntries(rel.fields, onlyDisagreeing);
-    return (
-      <div
-        key={`rel-${rel.id}`}
-        className="grid items-start border-t border-border/40 bg-muted/10 hover:bg-accent/30"
-        style={{ gridTemplateColumns: cols }}
-      >
-        <div className="flex min-w-0 items-start gap-2 py-1.5 pl-9 pr-3">
-          <div className="min-w-0">
-            <p className="truncate text-xs" title={rel.folder}>
-              {rel.label ?? album.title}
-              {rel.is_default && <span className="ml-1.5 text-[10px] text-muted-foreground">default</span>}
-            </p>
-            <p className="text-[10px] text-muted-foreground">
-              release · {rel.folder}
-              {rel.declared_none && " · no MB release"}
-            </p>
-          </div>
-        </div>
-        {tiers.map((t) => (
-          <TierCell key={t.key} entries={entries} tier={t.key} />
-        ))}
-      </div>
-    );
-  };
-
-  // A release's tracks: a toggle row ("12 tracks"), then one row per track
-  // with title, credits, disc and track number across the tiers. Under a
-  // filter only the matching tracks show, and the release opens itself.
-  const renderTracks = (rel: TierRelease, nested: boolean) => {
-    if (rel.tracks.length === 0) return null;
-    const shown = filtering ? rel.tracks.filter(trackKeep) : rel.tracks;
-    const forcedOpen = filtering && shown.length > 0;
-    const open = forcedOpen || openTracks.has(rel.id);
-    const pad = nested ? "pl-14" : "pl-9";
-    return (
-      <div key={`tracks-${rel.id}`}>
-        <button
-          type="button"
-          onClick={() => toggleTracks(rel.id)}
-          className={`flex w-full items-center gap-1.5 border-t border-border/40 py-1 pr-3 text-left text-[11px] text-muted-foreground hover:bg-accent/30 hover:text-foreground ${pad}`}
-        >
-          <ChevronRight size={12} className={`transition-transform ${open ? "rotate-90" : ""}`} />
-          {filtering && shown.length !== rel.tracks.length
-            ? `${shown.length} of ${rel.tracks.length} tracks`
-            : `${rel.tracks.length} ${rel.tracks.length === 1 ? "track" : "tracks"}`}
-        </button>
-        {open &&
-          shown.map((t) => {
-            const entries = rowEntries(t.fields, onlyDisagreeing);
-            return (
-              <div
-                key={`track-${t.id}`}
-                className="grid items-start border-t border-border/40 hover:bg-accent/30"
-                style={{ gridTemplateColumns: cols }}
-              >
-                <div className={`flex min-w-0 items-start gap-2 py-1.5 pr-3 ${pad}`}>
-                  <span className="w-8 shrink-0 text-right font-mono text-[10px] text-muted-foreground">
-                    {t.disc > 1 ? `${t.disc}·` : ""}
-                    {t.number ?? "–"}
-                  </span>
-                  <div className="min-w-0">
-                    <p className="truncate text-xs" title={t.title}>
-                      {t.title}
-                    </p>
-                    <p className="text-[10px] text-muted-foreground">
-                      track{t.matched && " · matched"}
-                    </p>
-                  </div>
-                </div>
-                {tiers.map((tier) => (
-                  <TierCell key={tier.key} entries={entries} tier={tier.key} />
-                ))}
-              </div>
-            );
-          })}
-      </div>
-    );
-  };
-
-  const renderAlbum = (r: TierRow) => (
-    <div key={`album-${r.id}`}>
-      {renderRow(r)}
-      {r.releases.length > 1
-        ? r.releases.map((rel) => (
-            <div key={`rel-block-${rel.id}`}>
-              {renderRelease(rel, r)}
-              {renderTracks(rel, true)}
-            </div>
-          ))
-        : r.releases[0] && renderTracks(r.releases[0], false)}
-    </div>
-  );
 
   return (
     // -mx-4: back out of the Metadata pane's padding so the table runs the
@@ -551,74 +713,16 @@ export function SourcesPage({ libraryId }: { libraryId: string }) {
             ))}
           </div>
 
-          {groups.map((g) => (
-            <div key={g.artist_id ?? "none"}>
-              {/* Artist header — its own name across the tiers when stored */}
-              <div
-                className="grid items-start border-t bg-muted/30"
-                style={{ gridTemplateColumns: cols }}
-              >
-                <div className="flex min-w-0 items-center gap-2 px-3 py-2">
-                  <Users size={14} className="shrink-0 text-muted-foreground" />
-                  <p className="truncate text-sm font-semibold">
-                    {g.artist_title ?? "No artist"}
-                  </p>
-                  <span className="text-[10px] text-muted-foreground">
-                    {g.loose_tracks.length > 0 &&
-                      `${g.loose_tracks.length} loose track${g.loose_tracks.length === 1 ? "" : "s"}`}
-                    {g.albums.length > 0 && g.loose_tracks.length > 0 && " · "}
-                    {g.albums.length > 0 &&
-                      `${g.albums.length} album${g.albums.length === 1 ? "" : "s"}`}
-                  </span>
-                </div>
-                {(() => {
-                  const entries = rowEntries(g.artist_fields, onlyDisagreeing);
-                  return tiers.map((t) =>
-                    entries.length > 0 ? (
-                      <TierCell key={t.key} entries={entries} tier={t.key} />
-                    ) : (
-                      <div key={t.key} />
-                    ),
-                  );
-                })()}
-              </div>
-              {/* Identity facts — who this artist is, beyond the name: aliases
-                  by who wrote them, persona links, splits, kept-separate names.
-                  Read-only here; the flows that write them live on the
-                  Artists tab and the artist page. */}
-              {!identityEmpty(g.identity) &&
-                !(onlyDisagreeing && !identityRows(g.identity).some((r) => r.cells.mb.length > 0 && r.cells.user.length > 0)) &&
-                identityRows(g.identity).map((row) => (
-                  <div
-                    key={`id-${g.artist_id}-${row.key}`}
-                    className="grid items-start border-t border-border/40 bg-muted/10"
-                    style={{ gridTemplateColumns: cols }}
-                  >
-                    <div className="flex min-w-0 items-start gap-2 py-1.5 pl-9 pr-3">
-                      <p className="truncate text-xs text-muted-foreground">{row.label}</p>
-                    </div>
-                    {tiers.map((t) => {
-                      const lines = row.cells[t.key];
-                      return (
-                        <div key={t.key} className="flex min-w-0 flex-col gap-0.5 px-3 py-1.5">
-                          {lines.length === 0 ? (
-                            <span className="text-xs text-muted-foreground/40">—</span>
-                          ) : (
-                            lines.map((line, i) => (
-                              <span key={i} className="min-w-0 truncate text-xs text-foreground" title={line}>
-                                {line}
-                              </span>
-                            ))
-                          )}
-                        </div>
-                      );
-                    })}
-                  </div>
-                ))}
-              {g.loose_tracks.map(renderRow)}
-              {g.albums.map(renderAlbum)}
-            </div>
-          ))}
+          {/* The lines, windowed: the container pads itself for the ones
+              that aren't mounted (see flatRows / listWindow). */}
+          <div
+            ref={listRef}
+            style={{ paddingTop: listWindow.padTop, paddingBottom: listWindow.padBottom }}
+          >
+            {flatRows.slice(listWindow.start, listWindow.end).map((row) => (
+              <SourceLine key={row.key} row={row} ctx={ctx} />
+            ))}
+          </div>
         </div>
       )}
     </div>

@@ -321,6 +321,7 @@ export function MatchDialog({
   const [relCountry, setRelCountry] = useState("all");
   const [relFormat, setRelFormat] = useState("all");
   const [relTracks, setRelTracks] = useState("all");
+  const [relYear, setRelYear] = useState("all");
   // Rows whose full country list is expanded — digital releases can carry
   // 100+ release events, so the picker shows 3 flags and "N more…" (same
   // collapse MusicBrainz itself uses).
@@ -337,14 +338,16 @@ export function MatchDialog({
   const [justApplied, setJustApplied] = useState(false);
   // "Your tracks": the files being matched, numbered, for comparing against
   // a release's tracklist on MusicBrainz — the modal hides the album page
-  // behind it. Collapsed by default (box sets run to 50+ rows) and fetched
-  // only on first expand. undefined = not loaded yet, null = nothing to show.
+  // behind it. Collapsed by default (box sets run to 50+ rows) but fetched
+  // on open: the header's count and runtime are what you compare against
+  // the candidates, so they must be there before you expand anything.
+  // undefined = not loaded yet, null = nothing to show.
   const [tracksOpen, setTracksOpen] = useState(false);
   const [ourTracks, setOurTracks] = useState<MusicRelease | null | undefined>(undefined);
   const [loadingTracks, setLoadingTracks] = useState(false);
 
   useEffect(() => {
-    if (!open || !tracksOpen || kind !== "album" || ourTracks !== undefined) return;
+    if (!open || kind !== "album" || ourTracks !== undefined) return;
     let stale = false;
     setLoadingTracks(true);
     invoke<MusicAlbumDetail>("get_album_detail", { entryId: entityId })
@@ -366,7 +369,7 @@ export function MatchDialog({
     return () => {
       stale = true;
     };
-  }, [open, tracksOpen, kind, entityId, releaseId, ourTracks]);
+  }, [open, kind, entityId, releaseId, ourTracks]);
 
   const load = useCallback(async () => {
     const s = await invoke<MbStatus>("mb_status", {
@@ -553,6 +556,7 @@ export function MatchDialog({
       setRelCountry("all");
       setRelFormat("all");
       setRelTracks("all");
+      setRelYear("all");
       return;
     }
     let stale = false;
@@ -773,12 +777,20 @@ export function MatchDialog({
   const releaseTrackOptions = Array.from(
     new Set((groupReleases ?? []).flatMap((r) => (r.track_count != null ? [r.track_count] : []))),
   ).sort((a, b) => a - b);
+  // Release year: the first four characters of MB's date (a bare "1984",
+  // "2006-03" and "2006-03-16" all yield one year). Undated releases have
+  // no year to filter on and drop out under any year pick.
+  const yearOf = (r: { date: string | null }) => r.date?.slice(0, 4) ?? null;
+  const releaseYearOptions = Array.from(
+    new Set((groupReleases ?? []).flatMap((r) => (yearOf(r) ? [yearOf(r)!] : []))),
+  ).sort();
   const condense = (s: string) => s.toLowerCase().replace(/[\s-]/g, "");
   const filteredGroupReleases = (groupReleases ?? []).filter((r) => {
     if (relCountry !== "all" && !(r.countries.includes(relCountry) || r.country === relCountry))
       return false;
     if (relFormat !== "all" && r.format !== relFormat) return false;
     if (relTracks !== "all" && String(r.track_count ?? "") !== relTracks) return false;
+    if (relYear !== "all" && yearOf(r) !== relYear) return false;
     const q = relFilter.trim().toLowerCase();
     if (!q) return true;
     const hay = [
@@ -1489,6 +1501,18 @@ export function MatchDialog({
                     {releaseTrackOptions.map((n) => (
                       <option key={n} value={String(n)}>
                         {n} tracks
+                      </option>
+                    ))}
+                  </select>
+                  <select
+                    value={relYear}
+                    onChange={(e) => setRelYear(e.target.value)}
+                    className="h-8 rounded-md border border-input bg-background px-2 text-xs"
+                  >
+                    <option value="all">Any year</option>
+                    {releaseYearOptions.map((y) => (
+                      <option key={y} value={y}>
+                        {y}
                       </option>
                     ))}
                   </select>

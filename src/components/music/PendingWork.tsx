@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Button } from "../ui/button";
 import { useLibraryRuns } from "@/hooks/libraryRuns";
+import { useMbHidden } from "@/lib/mbVisibility";
 import { RefreshCw, Sparkles, TriangleAlert } from "lucide-react";
 
 /** The two deferred-work queues a music library carries:
@@ -13,15 +14,22 @@ import { RefreshCw, Sparkles, TriangleAlert } from "lucide-react";
  *  outside-the-center layer — a sidebar badge (ambient) and a library-page
  *  strip (actionable) — so deferred work is never invisible. */
 
-interface PendingRescanRow {
+/** A staged directive (split, combine, separate) a rescan will apply. */
+export interface PendingRescanRow {
   id: number;
   label: string;
+  kind: string;
+  target: string;
+  /** Entities the directive has decided — frozen until the rescan. */
+  locked_ids: number[];
 }
 
-interface PendingPassRow {
+/** An applied match a matching pass has yet to cash in. */
+export interface PendingPassRow {
   id: number;
   target: string;
   label: string;
+  batch_id: number | null;
 }
 
 /** Staging happens in dialogs scattered across the app — they announce it
@@ -30,6 +38,10 @@ export function notifyPendingWorkChanged() {
   window.dispatchEvent(new Event("waverunner:pending-work-changed"));
 }
 
+/** Both queues, live: fetched on mount (two cheap queries) and again on
+ *  every event that can change them. The metadata center's banners read
+ *  from here too, so the badge, the strip and the banners always agree —
+ *  and the banners don't wait on the center's slow review fetch. */
 export function usePendingWork(libraryId: string | null) {
   const [rescan, setRescan] = useState<PendingRescanRow[]>([]);
   const [pass, setPass] = useState<PendingPassRow[]>([]);
@@ -116,8 +128,10 @@ export function LibraryAttentionBadge({
         );
       }}
       title={`${parts} — open Metadata`}
-      className={`flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded transition-colors hover:bg-foreground/10 ${
-        urgent ? "text-red-400 hover:text-red-300" : "text-primary hover:text-primary/80"
+      // No hover treatment: it's a status mark that happens to be
+      // clickable, not a button — the row it sits in already highlights.
+      className={`flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center ${
+        urgent ? "text-red-400" : "text-primary"
       }`}
     >
       <TriangleAlert size={13} />
@@ -130,8 +144,18 @@ export function LibraryAttentionBadge({
  *  changes; the pass cashes in matches — and staged changes gate the pass
  *  (same rule the backend enforces), so the strip only offers what can run. */
 export function PendingWorkStrip({ libraryId }: { libraryId: string }) {
-  const { rescan, pass } = usePendingWork(libraryId);
-  if (rescan.length === 0 && pass.length === 0) return null;
+  const { rescan, pass: passAll } = usePendingWork(libraryId);
+  // "Show MusicBrainz outside this page" off: the matching-pass queue is
+  // MusicBrainz work, so it stays on the Metadata page. Staged rescan
+  // changes are the library's own and still show.
+  const mbHidden = useMbHidden(libraryId);
+  const pass = mbHidden ? [] : passAll;
+  // A running pass IS the queue being worked — the strip would sit there
+  // still saying "waiting" (the queue only clears when the pass lands),
+  // reading as if the click did nothing. The Metadata page shows the pass.
+  const { runs } = useLibraryRuns();
+  const passRunning = runs[libraryId]?.kind === "match";
+  if (passRunning || (rescan.length === 0 && pass.length === 0)) return null;
   const message = [
     rescan.length > 0 &&
       `${rescan.length} change${rescan.length === 1 ? "" : "s"} staged for the next rescan`,
@@ -140,9 +164,13 @@ export function PendingWorkStrip({ libraryId }: { libraryId: string }) {
   ]
     .filter(Boolean)
     .join(" · ");
-  // App's run controller starts the pass and shows it as a banner over the
-  // library; this only has to ask.
+  // App's run controller starts the pass; its progress lives on the Metadata
+  // page, so the click goes there too — otherwise it starts silently behind
+  // whatever page this strip is on.
   const runPass = () => {
+    window.dispatchEvent(
+      new CustomEvent("waverunner:open-music-center", { detail: { libraryId } }),
+    );
     window.dispatchEvent(
       new CustomEvent("waverunner:open-match", { detail: { libraryId } }),
     );

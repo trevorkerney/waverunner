@@ -975,11 +975,27 @@ export function SplitArtistDialog({
     }
   };
 
-  // The frame follows the member count: 136 (frame) + 80 intro (four
-  // lines) + 12 + rows (38 each, 4 between) + 12 + 32 add = 268 + 42n px,
-  // up to six rows; past that the list scrolls in place.
+  // The frame follows the member count AND the intro's real height: the
+  // intro wraps to four or five lines depending on the artist's name, so
+  // it's measured, not assumed. 136 (frame) + intro + 12 + rows (38 each,
+  // 4 between) + 12 + 32 add; up to six rows, past that the list scrolls
+  // in place.
+  const introRef = useRef<HTMLParagraphElement | null>(null);
+  const [introHeight, setIntroHeight] = useState(80);
+  useLayoutEffect(() => {
+    const el = introRef.current;
+    if (!el) return;
+    const measure = () => {
+      const h = el.offsetHeight;
+      if (h > 0) setIntroHeight(h);
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [open]);
   const sizedRows = Math.min(members.length, 6);
-  const height = `${(268 + 42 * sizedRows) / 16}rem`;
+  const height = `${(136 + introHeight + 12 + 38 * sizedRows + 4 * (sizedRows - 1) + 12 + 32) / 16}rem`;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -990,7 +1006,7 @@ export function SplitArtistDialog({
         {/* A DialogBody: it holds overflow while the frame grows for a new
             row, so the footer doesn't jump before the resize lands. */}
         <DialogBody className="grid content-start gap-3">
-          <p className="text-sm text-muted-foreground">
+          <p ref={introRef} className="text-sm text-muted-foreground">
             <span className="font-medium text-foreground">{artistName}</span> is really these{" "}
             <span className="font-medium text-foreground">{members.length}</span> artists. Their
             joint albums credit every member — in this order — and appear on each one's page;

@@ -102,8 +102,14 @@ export function useListWindow({
     }
     if (boundRef.current?.sc === sc) return;
     boundRef.current?.off();
+    // One range check per frame — scroll events outrun frames.
+    let scrollFrame: number | null = null;
     const onScroll = () => {
-      if (latestRef.current.computeRange()) bump();
+      if (scrollFrame != null) return;
+      scrollFrame = requestAnimationFrame(() => {
+        scrollFrame = null;
+        if (latestRef.current.computeRange()) bump();
+      });
     };
     const ro = new ResizeObserver(() => {
       const l = latestRef.current;
@@ -117,11 +123,22 @@ export function useListWindow({
       sc,
       off: () => {
         sc.removeEventListener("scroll", onScroll);
+        if (scrollFrame != null) cancelAnimationFrame(scrollFrame);
         ro.disconnect();
       },
     };
   });
-  useLayoutEffect(() => () => boundRef.current?.off(), []);
+  // Unmount: unbind AND forget the binding — StrictMode (dev) runs this
+  // teardown and then the effects again on mount, and a binding left on
+  // record would make the rebind pass skip itself: a list with no scroll
+  // listener at all.
+  useLayoutEffect(
+    () => () => {
+      boundRef.current?.off();
+      boundRef.current = null;
+    },
+    [],
+  );
 
   const scrollToIndex = useCallback(
     (index: number, block: "start" | "center" = "start") => {

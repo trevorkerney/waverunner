@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { MetadataCenter, type CenterFocus } from "@/components/music/MetadataCenter";
 import { VideoMetadataCenterPage } from "@/components/VideoMetadataCenter";
 import { MatchRunStrip } from "@/components/LibraryRunUi";
@@ -27,11 +27,27 @@ export function MetadataPage({
   onOpenAlbum: (albumId: number, title: string, releaseId: number | null, trackId?: number) => void;
   onOpenArtist: (artistId: number, name: string) => void;
 }) {
-  // A fresh visit refetches — same as the modal reopening did.
+  // Switching libraries while mounted refetches. Not on mount: the center
+  // fetches on its own mount, and bumping here too meant every arrival ran
+  // its nine calls twice.
   const [reloadKey, setReloadKey] = useState(0);
+  const firstRef = useRef(true);
   useEffect(() => {
+    if (firstRef.current) {
+      firstRef.current = false;
+      return;
+    }
     setReloadKey((k) => k + 1);
   }, [libraryId]);
+  // One-frame yield before the center mounts: its first commit is the
+  // whole page (nav, map, dialogs), and mounting it inside the click's own
+  // tick left the previous page on screen until it finished. Blank for a
+  // frame, then the center — the same two-commit switch the grids use.
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => {
+    const id = requestAnimationFrame(() => setMounted(true));
+    return () => cancelAnimationFrame(id);
+  }, []);
   if (format === null) {
     return (
       <div className="flex flex-1 items-center justify-center">
@@ -39,6 +55,7 @@ export function MetadataPage({
       </div>
     );
   }
+  if (!mounted) return <div className="flex-1" />;
   if (format !== "music") {
     return (
       <div className="flex min-h-0 flex-1 flex-col px-4 pt-2">

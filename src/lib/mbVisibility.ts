@@ -36,6 +36,19 @@ export function setMbHiddenLocal(libraryId: string, hidden: boolean) {
   notify();
 }
 
+/** The toggle: flip every subscriber at once, then persist. This store is
+ *  the ONE source of truth for the flag — the metadata center reads it
+ *  through useMbHidden like every other page, so a data refresh landing
+ *  after the click can't overwrite the click with a stale read. */
+export async function setMbHidden(libraryId: string, hidden: boolean): Promise<void> {
+  setMbHiddenLocal(libraryId, hidden);
+  await invoke("set_library_setting", {
+    libraryId,
+    key: "hide_mb_outside_center",
+    value: hidden ? "on" : "off",
+  });
+}
+
 function subscribe(cb: () => void) {
   listeners.add(cb);
   return () => {

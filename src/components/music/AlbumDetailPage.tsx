@@ -5,6 +5,7 @@ import { toast } from "sonner";
 import { Play, Disc3, Pencil, ListPlus, ListStart, ListEnd, ListChecks, HardDriveDownload } from "lucide-react";
 import { RenameDialog } from "../RenameDialog";
 import { Spinner } from "../ui/spinner";
+import { Skeleton, useSkeletonDelay } from "../ui/skeleton";
 import { MusicAlbumDetail, MusicRelease, MusicQueueItem, MusicTrack } from "../../types";
 import {
   ContextMenu,
@@ -25,6 +26,47 @@ import { ReleasePicker, releaseLabel } from "./ReleasePicker";
 import { useMbHidden } from "@/lib/mbVisibility";
 import { useTagWriting } from "@/lib/tagWriting";
 import { TagWriteDialog, TagWriteScope } from "./TagWriteDialog";
+
+/** The header cover: a fixed-width box that holds its final size BEFORE
+ *  the image paints, so the title beside it and the tracks below never
+ *  move when it lands. The image is decoded off-screen first; until then
+ *  the box is square (the common case — a non-square cover adjusts the box
+ *  once its size is known, one small move instead of a 320px one), with a
+ *  skeleton in it past the usual 500ms. */
+function HeaderCover({ src }: { src: string }) {
+  const [dims, setDims] = useState<{ src: string; w: number; h: number } | null>(null);
+  const ready = dims?.src === src;
+  const skeleton = useSkeletonDelay(!ready);
+  useEffect(() => {
+    let live = true;
+    const img = new Image();
+    img.src = src;
+    img
+      .decode()
+      .catch(() => {})
+      .then(() => {
+        if (!live) return;
+        // A failed decode still shows the (broken) image at square size
+        // rather than a skeleton forever.
+        setDims({ src, w: img.naturalWidth || 1, h: img.naturalHeight || 1 });
+      });
+    return () => {
+      live = false;
+    };
+  }, [src]);
+  return (
+    <div
+      className="w-80 overflow-hidden rounded-[3px] bg-muted shadow-md"
+      style={{ aspectRatio: ready ? `${dims!.w} / ${dims!.h}` : "1 / 1" }}
+    >
+      {ready ? (
+        <img src={src} alt="" className="block h-full w-full" draggable={false} />
+      ) : skeleton ? (
+        <Skeleton className="h-full w-full rounded-[3px]" />
+      ) : null}
+    </div>
+  );
+}
 
 interface AlbumDetailPageProps {
   entryId: number;
@@ -219,22 +261,15 @@ export function AlbumDetailPage({
       <div className="flex items-end gap-5 py-6">
         {/* Right-click the art: the covers menu for the ACTIVE release. */}
         <ContextMenu>
-          <ContextMenuTrigger
-            render={
-              cover ? (
-                <img
-                  src={getFullCoverUrl(cover)}
-                  alt=""
-                  className="h-80 w-80 shrink-0 rounded-[3px] object-cover shadow-md"
-                  draggable={false}
-                />
-              ) : (
-                <div className="flex h-80 w-80 shrink-0 items-center justify-center rounded-[3px] bg-muted text-muted-foreground">
-                  <Disc3 size={56} />
-                </div>
-              )
-            }
-          />
+          <ContextMenuTrigger render={<div className="shrink-0" />}>
+            {cover ? (
+              <HeaderCover src={getFullCoverUrl(cover)} />
+            ) : (
+              <div className="flex h-80 w-80 items-center justify-center rounded-[3px] bg-muted text-muted-foreground">
+                <Disc3 size={56} />
+              </div>
+            )}
+          </ContextMenuTrigger>
           <ContextMenuContent>
             <CoversMenuItem onOpen={() => setCoversOpen(true)} />
           </ContextMenuContent>

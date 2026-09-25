@@ -3435,6 +3435,25 @@ pub async fn ensure_credit_artists(pool: &SqlitePool, library_id: &str) -> Resul
     .execute(pool)
     .await
     .map_err(|e| e.to_string())?;
+    // A pick that no longer names a file in the album's pool is stale — a
+    // combine moved the album onto another folder (the keeper's pool was
+    // rebuilt under the new root), or the file went. Clear it so the card
+    // falls back to the pool's default-release art instead of whatever
+    // sorts first, and so nothing downstream trusts a dead path.
+    sqlx::query(
+        "UPDATE album SET selected_cover = NULL
+         WHERE id IN (SELECT me.id FROM media_entry me WHERE me.library_id = ?)
+           AND selected_cover IS NOT NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM cached_images ci
+             WHERE ci.library_id = ? AND ci.entry_folder_path = album.folder_path
+               AND ci.cached_path = album.selected_cover)",
+    )
+    .bind(library_id)
+    .bind(library_id)
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
     Ok(created)
 }
 

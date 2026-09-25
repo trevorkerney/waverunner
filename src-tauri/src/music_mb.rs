@@ -401,8 +401,9 @@ pub async fn music_match_state(
     .fetch_one(pool)
     .await
     .map_err(|e| e.to_string())?;
-    // Retry-eligible notfound albums count too — the pass WILL search them
-    // (arid tier), so the estimate must say so. Exhausted retries don't.
+    // Retry-eligible notfound / uncertain albums count too — the pass WILL
+    // search them (arid tier), so the estimate must say so. Exhausted
+    // retries don't.
     let (retry_albums,): (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM album al
          JOIN media_entry me ON me.id = al.id
@@ -413,7 +414,7 @@ pub async fn music_match_state(
          LEFT JOIN artist ar ON ar.id = ac0.artist_id
          WHERE me.library_id = ?
            AND EXISTS (SELECT 1 FROM mb_credit_fetch f
-                       WHERE f.album_id = al.id AND f.status = 'notfound')
+                       WHERE f.album_id = al.id AND f.status IN ('notfound', 'uncertain'))
            AND ar.musicbrainz_id IS NOT NULL AND ar.musicbrainz_id <> ''
            AND NOT EXISTS (SELECT 1 FROM mb_derive_exhausted x
                            WHERE x.entity_id = al.id
@@ -587,12 +588,16 @@ async fn enrich_albums(
          LEFT JOIN artist ar ON ar.id = ac0.artist_id
          WHERE me.library_id = ?
            AND (NOT EXISTS (SELECT 1 FROM mb_credit_fetch f WHERE f.album_id = al.id)
+                -- Not-found AND uncertain albums get the arid tier once the
+                -- first credit carries an MBID: a search scoped to the artist
+                -- finds what a name search missed, and narrows a pile of
+                -- same-named candidates to the one that's theirs.
                 OR (EXISTS (SELECT 1 FROM mb_credit_fetch f
-                            WHERE f.album_id = al.id AND f.status = 'notfound')
+                            WHERE f.album_id = al.id AND f.status IN ('notfound', 'uncertain'))
                     AND ar.musicbrainz_id IS NOT NULL AND ar.musicbrainz_id <> ''
                     -- ...but only ONCE per artist identity: an arid-scoped
-                    -- search that already came up empty is exhausted until
-                    -- the album's first-credit artist CHANGES.
+                    -- search that already ran is exhausted until the album's
+                    -- first-credit artist CHANGES.
                     AND NOT EXISTS (SELECT 1 FROM mb_derive_exhausted x
                                     WHERE x.entity_id = al.id
                                       AND x.evidence_key = 'arid:' || ar.musicbrainz_id)))
@@ -690,11 +695,11 @@ async fn enrich_albums(
         // credits filed under one member) is still findable. Each tier tries
         // the title as tagged, then with store/ripper decorations stripped —
         // `[88.2/24 Tidal]` is the most common reason a search finds nothing.
-        // Re-tried not-founds run ONLY the arid tier: the name tier is
-        // exactly what already failed, and repeating it would bill two
-        // pointless requests per album every pass.
+        // Re-tried not-founds and uncertains run ONLY the arid tier: the
+        // name tier is exactly what already ran, and repeating it would bill
+        // two pointless requests per album every pass.
         let arid = artist_mbid.as_deref().filter(|s| !s.is_empty());
-        let retry = prior_stamp == "notfound";
+        let retry = prior_stamp == "notfound" || prior_stamp == "uncertain";
         let stripped = strip_title_decorations(&title);
         let mut attempts: Vec<(&str, bool)> = Vec::new();
         if arid.is_some() {
@@ -785,6 +790,20 @@ async fn enrich_albums(
             apply_group(pool, library_id, album_id, &title, credible[0], TIER_MB).await?;
             stamp(pool, album_id, "matched").await?;
             matched += 1;
+            // An uncertain album re-searched by artist and now settled: its
+            // open "which of these?" card asks a question the pass just
+            // answered — settle it as obsolete so it leaves review.
+            if prior_stamp == "uncertain" {
+                sqlx::query(
+                    "UPDATE mb_suggestion SET status = 'obsolete'
+                     WHERE library_id = ? AND kind = 'album_match' AND target_key = ? AND status = 'pending'",
+                )
+                .bind(library_id)
+                .bind(album_id.to_string())
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            }
         } else if !credible.is_empty() {
             let payload = serde_json::json!({
                 "album_id": album_id,
@@ -792,6 +811,21 @@ async fn enrich_albums(
                 "artist_title": artist,
                 "groups": credible.iter().take(5).collect::<Vec<_>>(),
             });
+            // A re-search replaces the card's candidates (the arid tier
+            // narrowed them — that's the point); a first search keeps an
+            // existing card untouched (OR IGNORE on the unique key).
+            if prior_stamp == "uncertain" {
+                sqlx::query(
+                    "UPDATE mb_suggestion SET payload = ?
+                     WHERE library_id = ? AND kind = 'album_match' AND target_key = ? AND status = 'pending'",
+                )
+                .bind(payload.to_string())
+                .bind(library_id)
+                .bind(album_id.to_string())
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            }
             sqlx::query(
                 "INSERT OR IGNORE INTO mb_suggestion (library_id, kind, target_key, payload)
                  VALUES (?, 'album_match', ?, ?)",
@@ -803,8 +837,27 @@ async fn enrich_albums(
             .await
             .map_err(|e| e.to_string())?;
             stamp(pool, album_id, "uncertain").await?;
+            // Still several even scoped to the artist: that search is spent
+            // for this artist identity, same as a not-found — the card
+            // holds the question until the user answers or the first
+            // credit changes.
+            if let Some(arid) = arid {
+                sqlx::query(
+                    "INSERT OR IGNORE INTO mb_derive_exhausted (entity_id, evidence_key)
+                     VALUES (?, 'arid:' || ?)",
+                )
+                .bind(album_id)
+                .bind(arid)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            }
         } else {
-            stamp(pool, album_id, "notfound").await?;
+            // A re-searched uncertain album whose artist-scoped search found
+            // nothing credible keeps its card (and stamp): the name-search
+            // candidates are still the user's to judge — the artist match
+            // might be the thing that's wrong.
+            stamp(pool, album_id, if prior_stamp == "uncertain" { "uncertain" } else { "notfound" }).await?;
             // The arid tier ran and found nothing — remember it, so this
             // album isn't re-searched every pass until the artist identity
             // it searched under changes. (search_failed already bailed out
@@ -7593,10 +7646,12 @@ pub(crate) async fn enqueue_pass_recheck(
 }
 
 /// After a USER artist match: the fresh MBID re-arms the arid-tier retry for
-/// every notfound album whose first credit is this artist — a scoped search
-/// far sharper than the name search that already failed. Enqueues only when
-/// at least one such album exists; matching an artist whose albums are all
-/// matched (or arid-exhausted) creates no pass work, so no row.
+/// every notfound OR uncertain album whose first credit is this artist — a
+/// scoped search far sharper than the name search that already ran (it finds
+/// what that missed, and narrows same-named candidates to the artist's own).
+/// Enqueues only when at least one such album exists; matching an artist
+/// whose albums are all matched (or arid-exhausted) creates no pass work, so
+/// no row.
 pub(crate) async fn enqueue_artist_match_recheck(
     pool: &SqlitePool,
     library_id: &str,
@@ -7615,7 +7670,7 @@ pub(crate) async fn enqueue_artist_match_recheck(
          WHERE me.library_id = ? AND ar.id = ?
            AND ar.musicbrainz_id IS NOT NULL AND ar.musicbrainz_id <> ''
            AND EXISTS (SELECT 1 FROM mb_credit_fetch f
-                       WHERE f.album_id = al.id AND f.status = 'notfound')
+                       WHERE f.album_id = al.id AND f.status IN ('notfound', 'uncertain'))
            AND NOT EXISTS (SELECT 1 FROM mb_derive_exhausted x
                            WHERE x.entity_id = al.id
                              AND x.evidence_key = 'arid:' || ar.musicbrainz_id)
@@ -7645,7 +7700,7 @@ pub(crate) async fn enqueue_artist_match_recheck(
         library_id,
         &format!("artist:{artist_id}:match"),
         &format!(
-            "Re-check \u{201c}{title}\u{201d} \u{2014} {retry} unfound {noun} now searchable by artist"
+            "Re-check \u{201c}{title}\u{201d} \u{2014} {retry} unmatched {noun} now searchable by artist"
         ),
         None,
     )
@@ -7717,7 +7772,7 @@ pub(crate) async fn enqueue_album_credit_recheck(
                             WHERE ac.album_id = al.id
                               AND (a.musicbrainz_id IS NULL OR a.musicbrainz_id = '')),
                 EXISTS (SELECT 1 FROM mb_credit_fetch f
-                        WHERE f.album_id = al.id AND f.status = 'notfound')
+                        WHERE f.album_id = al.id AND f.status IN ('notfound', 'uncertain'))
                 AND EXISTS (SELECT 1 FROM album_artist_credit ac0
                             JOIN artist ar ON ar.id = ac0.artist_id
                             WHERE ac0.album_id = al.id

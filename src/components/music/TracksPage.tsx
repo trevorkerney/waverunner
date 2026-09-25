@@ -1,7 +1,6 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useListWindow } from "@/hooks/useListWindow";
-import { playDropIn } from "@/lib/dropIn";
 import { Play, Music, Music2, Pencil, ListPlus, ListStart, ListEnd, Disc3 } from "lucide-react";
 import { Spinner } from "../ui/spinner";
 import { ClearableInput } from "../ui/clearable-input";
@@ -83,11 +82,7 @@ export const TrackRow = memo(function TrackRow({
     <div
       data-track-row
       data-music-track-id={t.id}
-      // will-change: keeps the row on its own compositor layer so the
-      // load-in's transform animation has no layer to drop (and re-raster)
-      // at the end — the same end-of-landing jump the grids had. Windowed,
-      // so this is ~50 layers, not 10K.
-      className={`group/track flex will-change-transform cursor-default items-center gap-3 rounded-md px-2 py-1.5 text-sm ${isSelected ? "bg-accent" : "hover:bg-accent/50"}`}
+      className={`group/track flex cursor-default items-center gap-3 rounded-md px-2 py-1.5 text-sm ${isSelected ? "bg-accent" : "hover:bg-accent/50"}`}
       onClick={() => onSelect(t.id)}
       onDoubleClick={() => onPlayAt(index)}
       onContextMenu={() => onMenuTarget(t.id)}
@@ -327,18 +322,6 @@ export function TracksPage({ libraryId, onPlayQueue, currentTrackId, playing, on
   const listRef = useRef<HTMLDivElement | null>(null);
   const listWindow = useListWindow({ listRef, count: filtered.length, estimateRowHeight: 44 });
   const { scrollToIndex } = listWindow;
-
-  // Page load-in (the grids' drop-in), once per arrival: the first render
-  // that has rows mounted. Silent refetches and window shifts don't replay
-  // it. Only the mounted slice animates — that IS the visible page.
-  const didLoadInRef = useRef(false);
-  useLayoutEffect(() => {
-    if (didLoadInRef.current) return;
-    const list = listRef.current;
-    if (!list || list.children.length === 0) return;
-    didLoadInRef.current = true;
-    playDropIn(list.children, { list: true });
-  });
 
   // Scroll-to-track request (album-page pattern): consumed once per nonce.
   // The row may not be mounted (windowing) — scroll its slot into the
