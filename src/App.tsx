@@ -13,6 +13,7 @@ import { usePlayer } from "@/hooks/usePlayer";
 import { useMusicPlayer, currentMusicItem } from "@/hooks/useMusicPlayer";
 import { NowPlayingBar } from "@/components/player/NowPlayingBar";
 import type { CenterFocus } from "@/components/music/MetadataCenter";
+import { collectPageState, requestPageRestore, type MetadataPageState } from "@/lib/pageState";
 import { Toaster } from "@/components/ui/sonner";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
@@ -43,6 +44,9 @@ type NavSnapshot = {
   entry: MediaEntry | null;
   crumbs: BreadcrumbItem[];
   search: string;
+  /** State the page itself owns (the Metadata page's tab + pane scroll),
+   *  collected at push time so back/forward return to it. See pageState.ts. */
+  pageState?: MetadataPageState | null;
 };
 
 // Identity key for consecutive-duplicate suppression in the history stack.
@@ -1142,10 +1146,16 @@ function App() {
   const historyRef = useRef<NavSnapshot[]>([]);
   const forwardHistRef = useRef<NavSnapshot[]>([]);
 
-  const pushHistory = useCallback(() => {
+  // The current visit as a snapshot: nav state plus whatever the mounted
+  // page wants remembered (collected NOW, before the navigation commits).
+  const snapshotNow = useCallback((): NavSnapshot => {
     const s = navStateRef.current;
-    if (!s.view) return; // startup — nothing to return to
-    const snap: NavSnapshot = { ...s, crumbs: [...s.crumbs] };
+    return { ...s, crumbs: [...s.crumbs], pageState: collectPageState() };
+  }, []);
+
+  const pushHistory = useCallback(() => {
+    if (!navStateRef.current.view) return; // startup — nothing to return to
+    const snap = snapshotNow();
     // Handlers push before their own "already here" early-outs — dropping
     // identical consecutive snapshots keeps no-op navigations out of history.
     const top = historyRef.current[historyRef.current.length - 1];
@@ -1154,12 +1164,15 @@ function App() {
       if (historyRef.current.length > 100) historyRef.current.shift();
     }
     forwardHistRef.current = [];
-  }, []);
+  }, [snapshotNow]);
 
   const applySnapshot = useCallback(
     (snap: NavSnapshot) => {
       setSearch(snap.search);
       if (!snap.view) return;
+      // The page mounting for this view picks its remembered state up from
+      // here (a snapshot without any lands like a fresh visit).
+      requestPageRestore(snap.view.kind === "metadata" ? snap.pageState ?? null : null);
       setActiveView(snap.view);
       if (snap.entry) {
         // Detail page: restore it directly (the page fetches its own data),
@@ -2104,20 +2117,18 @@ function App() {
   const goBack = useCallback(() => {
     if (historyRef.current.length === 0) return;
     saveScrollPosition();
-    const cur = navStateRef.current;
-    if (cur.view) forwardHistRef.current.push({ ...cur, crumbs: [...cur.crumbs] });
+    if (navStateRef.current.view) forwardHistRef.current.push(snapshotNow());
     const snap = historyRef.current.pop()!;
     applySnapshot(snap);
-  }, [saveScrollPosition, applySnapshot]);
+  }, [saveScrollPosition, applySnapshot, snapshotNow]);
 
   const goForward = useCallback(() => {
     if (forwardHistRef.current.length === 0) return;
     saveScrollPosition();
-    const cur = navStateRef.current;
-    if (cur.view) historyRef.current.push({ ...cur, crumbs: [...cur.crumbs] });
+    if (navStateRef.current.view) historyRef.current.push(snapshotNow());
     const snap = forwardHistRef.current.pop()!;
     applySnapshot(snap);
-  }, [saveScrollPosition, applySnapshot]);
+  }, [saveScrollPosition, applySnapshot, snapshotNow]);
 
   const invalidateCache = useCallback((libraryId?: string, parentId?: number | null) => {
     if (libraryId != null && parentId !== undefined) {

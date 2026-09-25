@@ -51,14 +51,14 @@ export interface ScanRun {
   stopRequested: boolean;
 }
 
+/** The post-scan question. Video only now — music libraries carry their
+ *  pass work on the Metadata page's banner instead (see afterScan). */
 export interface PromptRun {
   kind: "prompt";
   libraryId: string;
   name: string;
   format: string;
   setup: boolean;
-  /** Music: what the pass would check. Video loads its own targets. */
-  music: { unchecked: number; uncheckedArtists: number } | null;
 }
 
 export interface MatchProgress {
@@ -282,22 +282,18 @@ export function LibraryRunsProvider({ children }: { children: ReactNode }) {
           }));
           return;
         }
-        if (ms.unchecked === 0 && ms.unchecked_artists === 0) {
-          // Nothing a pass could do — don't ask.
-          await finishRun(libraryId);
-          return;
-        }
-        update(libraryId, () => ({
-          kind: "prompt", libraryId, name, format, setup,
-          music: { unchecked: ms.unchecked, uncheckedArtists: ms.unchecked_artists },
-        }));
+        // No question for music (user's call, 2026-09-25): the Metadata
+        // page's pass banner shows whatever the next pass has to do —
+        // unchecked albums/artists and the queue alike — and stays until a
+        // pass runs. Nothing to answer, so the run just ends.
+        await finishRun(libraryId);
       } catch (e) {
         toast.error(String(e));
         await finishRun(libraryId);
       }
       return;
     }
-    update(libraryId, () => ({ kind: "prompt", libraryId, name, format, setup, music: null }));
+    update(libraryId, () => ({ kind: "prompt", libraryId, name, format, setup }));
   }, [finishRun, update]);
 
   // ---- scans --------------------------------------------------------------

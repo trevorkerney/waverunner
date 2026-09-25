@@ -18,6 +18,7 @@ import { PlayingIndicator } from "./PlayingIndicator";
 import { LoveButton, LoveMenuItem } from "./LoveButton";
 import { RevealMenuItem } from "./RevealMenuItem";
 import { CodecBadge } from "./CodecBadge";
+import { MbDot } from "./MbDot";
 import { LibraryTrackRow, MusicQueueItem } from "../../types";
 import { fmtTrackTime, trackDisplayTitle } from "./musicQueue";
 import { useMbHidden } from "@/lib/mbVisibility";
@@ -62,6 +63,7 @@ export const TrackRow = memo(function TrackRow({
   onOpenArtist,
   onOpenAlbum,
   numWidthCh,
+  mbState,
 }: {
   t: LibraryTrackRow;
   index: number;
@@ -77,6 +79,9 @@ export const TrackRow = memo(function TrackRow({
   onOpenAlbum: (albumId: number, albumTitle: string) => void;
   /** Digit count of the largest list position — sizes the number column. */
   numWidthCh: number;
+  /** MusicBrainz match-state dot between the album and the codec; null =
+   *  none ("Show MusicBrainz outside this page" off). */
+  mbState: string | null;
 }) {
   return (
     <div
@@ -189,6 +194,8 @@ export const TrackRow = memo(function TrackRow({
           t.album_title ?? ""
         )}
       </span>
+      {/* Match dot: the left edge of the gap between album and codec. */}
+      {mbState && <MbDot state={mbState} />}
       <CodecBadge codec={t.codec} bitrate={t.bitrate_kbps} mode={t.bitrate_mode} />
       <span className="w-12 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
         {fmtTrackTime(t.runtime_secs)}
@@ -396,6 +403,7 @@ export function TracksPage({ libraryId, onPlayQueue, currentTrackId, playing, on
                   onOpenArtist={handleOpenArtist}
                   onOpenAlbum={handleOpenAlbum}
                   numWidthCh={Math.max(2, String(filtered.length).length)}
+                  mbState={mbHidden ? null : t.mb_state}
                 />
               );
             })}

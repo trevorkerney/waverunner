@@ -2885,7 +2885,9 @@ pub async fn combine_albums_multi(
         // Any standing split on these folders is superseded by the merge —
         // dropped here and restored by the staged change's undo.
         let split_folders: Vec<String> = unsplit.iter().map(|(f, _)| f.clone()).collect();
-        let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+        // IMMEDIATE (here and below): write lock up front, so a concurrent
+        // writer waits on the busy timeout instead of voiding our snapshot.
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.map_err(|e| e.to_string())?;
         for folder in &split_folders {
             sqlx::query("DELETE FROM album_release_split WHERE library_id = ? AND folder_path = ? COLLATE NOCASE")
                 .bind(&library_id)
@@ -2935,7 +2937,7 @@ pub async fn combine_albums_multi(
     }
 
     if !unsplit.is_empty() {
-        let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.map_err(|e| e.to_string())?;
         for (folder, _) in &unsplit {
             sqlx::query("DELETE FROM album_release_split WHERE library_id = ? AND folder_path = ? COLLATE NOCASE")
                 .bind(&library_id)
@@ -2979,7 +2981,7 @@ pub async fn combine_albums_multi(
         return Ok(());
     }
 
-    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.map_err(|e| e.to_string())?;
     let mut directive_ids: Vec<i64> = Vec::new();
     for (src_artist, src_title, src_name) in &directives {
         let res = sqlx::query(
@@ -3681,7 +3683,7 @@ pub async fn merge_album_release(
     .into_iter()
     .map(|(f,)| f)
     .collect();
-    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.map_err(|e| e.to_string())?;
     sqlx::query("DELETE FROM album_release_split WHERE library_id = ? AND folder_path = ? COLLATE NOCASE")
         .bind(&library_id)
         .bind(&folder_path)

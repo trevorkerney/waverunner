@@ -1,6 +1,7 @@
 import { type RefObject } from "react";
 import { Music2 } from "lucide-react";
 import { MediaEntry } from "../../types";
+import { MbDot } from "./MbDot";
 
 interface ArtistsGridProps {
   entries: MediaEntry[];
@@ -15,6 +16,9 @@ interface ArtistsGridProps {
   /** Section/scrubber letter for a title — MainContent's letterForTitle, so
    *  sections and scrubber jumps can never disagree. */
   letterFor: (title: string) => string;
+  /** MusicBrainz match-state dot after each name ("Show MusicBrainz
+   *  outside this page" on). */
+  showMbDots?: boolean;
 }
 
 function displayCover(entry: MediaEntry): string | null {
@@ -26,7 +30,7 @@ function displayCover(entry: MediaEntry): string | null {
 
 /** Artists page — mirrors the video libraries' People pages: circular image,
  *  centered name, works-count subtitle, letter sections in A–Z mode. */
-export function ArtistsGrid({ entries, getCoverUrl, onNavigate, gridRef, sortMode, letterFor }: ArtistsGridProps) {
+export function ArtistsGrid({ entries, getCoverUrl, onNavigate, gridRef, sortMode, letterFor, showMbDots = false }: ArtistsGridProps) {
   if (entries.length === 0) {
     return <p className="p-4 text-sm text-muted-foreground">No artists found.</p>;
   }
@@ -88,7 +92,10 @@ export function ArtistsGrid({ entries, getCoverUrl, onNavigate, gridRef, sortMod
               )}
             </div>
             <div className="flex min-w-0 flex-col items-center">
-              <span className="line-clamp-2 text-sm font-medium leading-tight">{artist.title}</span>
+              <span className="line-clamp-2 text-sm font-medium leading-tight">
+                {artist.title}
+                {showMbDots && <MbDot state={artist.mb_state} className="ml-1.5 -translate-y-px" />}
+              </span>
               {subtitle && (
                 <span
                   className="w-full break-words text-xs leading-tight text-muted-foreground"

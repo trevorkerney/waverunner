@@ -397,7 +397,6 @@ export function MatchDialog({
     setAlbumLeads(null);
     setLeadAlbum(null);
     setJustApplied(false);
-    setConfirmIgnore(false);
     setExpandedCountries(new Set());
     load().catch((e) => toast.error(String(e)));
   }, [open, load]);
@@ -623,16 +622,30 @@ export function MatchDialog({
   const apply = async (mbid: string, mbidKind?: string, preferredName?: string | null) => {
     setBusy(`apply:${mbid}`);
     try {
-      await invoke("mb_apply_entity_match", {
-        kind,
-        entityId,
-        mbid,
-        mbidKind,
-        // Release applies pin the version this dialog was opened on.
-        releaseDbId: releaseId ?? null,
-        // Artists: adopt this display name instead of MB's canonical one.
-        preferredName: preferredName ?? null,
-      });
+      const outcome = await invoke<{ merged_into: { artist_id: number; title: string } | null }>(
+        "mb_apply_entity_match",
+        {
+          kind,
+          entityId,
+          mbid,
+          mbidKind,
+          // Release applies pin the version this dialog was opened on.
+          releaseDbId: releaseId ?? null,
+          // Artists: adopt this display name instead of MB's canonical one.
+          preferredName: preferredName ?? null,
+        },
+      );
+      // Another page already held that id, so this one was folded into it
+      // — the artist this dialog was opened on no longer exists. Say so and
+      // close; reloading would only fail on the vanished row.
+      if (outcome.merged_into) {
+        toast.success(
+          `Merged into “${outcome.merged_into.title}” — that page already holds this MusicBrainz artist.`,
+        );
+        onChanged?.();
+        onOpenChange(false);
+        return;
+      }
       // No success toast — the status card flips to Matched right here in
       // view, which says it better than a popup.
       await load();
@@ -691,15 +704,12 @@ export function MatchDialog({
   // "Not on MusicBrainz — stop counting this." The honest end state for an
   // entity MB has no entry for (an alter ego it doesn't model, a bootleg, a
   // junk tag): excluded from passes, counts and work lists, gray on the map.
-  // Ignoring confirms first (it's the one action here that would otherwise
-  // fire on a bare click); un-ignoring is instant — it only returns the
-  // entity to the pool.
-  const [confirmIgnore, setConfirmIgnore] = useState(false);
+  // Instant both ways (his call, 2026-09-25: no confirm step — the header
+  // states the outcome and Un-ignore is one click away).
   const setIgnored = async (ignored: boolean) => {
     setBusy("ignore");
     try {
       await invoke("mb_set_ignored", { entityId, ignored });
-      setConfirmIgnore(false);
       await load();
       onChanged?.();
     } catch (e) {
@@ -990,9 +1000,9 @@ export function MatchDialog({
                     variant="ghost"
                     className="gap-1.5 leading-none"
                     disabled={busy !== null}
-                    onClick={() => setConfirmIgnore(true)}
+                    onClick={() => setIgnored(true)}
                   >
-                    <CircleSlash size={13} />
+                    {busy === "ignore" ? <Spinner className="size-3" /> : <CircleSlash size={13} />}
                     Ignore
                   </Button>
                 )
@@ -1156,34 +1166,6 @@ export function MatchDialog({
                     No tracks to show.
                   </p>
                 ))}
-            </div>
-          )}
-
-          {/* Two-step, same shape as the credit-consistency warning below. */}
-          {confirmIgnore && (
-            <div className="flex items-center gap-3 rounded-md border px-3 py-2">
-              <CircleSlash size={14} className="shrink-0 text-muted-foreground" />
-              <p className="min-w-0 flex-1 text-xs text-muted-foreground">
-                Stop counting this {NOUN[kind]}? It leaves every matching pass, count and work
-                list, and goes gray on the library map. Reversible here at any time.
-              </p>
-              <Button
-                size="sm"
-                className="shrink-0"
-                disabled={busy !== null}
-                onClick={() => setIgnored(true)}
-              >
-                {busy === "ignore" && <Spinner className="size-3" />}
-                Ignore
-              </Button>
-              <Button
-                size="sm"
-                variant="outline"
-                className="shrink-0"
-                onClick={() => setConfirmIgnore(false)}
-              >
-                Cancel
-              </Button>
             </div>
           )}
 
@@ -1666,6 +1648,22 @@ export function MatchDialog({
             </>
           )}
 
+          {/* The fused-album case (see the metadata page's card): several
+              versions here, several albums on MusicBrainz of this name —
+              one group match can't cover two different records. Separate
+              lives in the versions picker behind this dialog. */}
+          {kind === "album" &&
+            !releaseStage &&
+            (status?.total_releases ?? 0) > 1 &&
+            results != null &&
+            results.length > 1 && (
+              <p className="rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-[11px] text-amber-200/90">
+                {status!.total_releases} versions here and {results.length} albums on MusicBrainz
+                answer to this name. If your versions are different albums that share a name,
+                close this and use Separate in the album's versions picker first — each then
+                matches on its own.
+              </p>
+            )}
           {/* Results */}
           {searching ? (
             <div className="flex flex-col items-center gap-1.5 py-4">
@@ -1710,7 +1708,7 @@ export function MatchDialog({
                               setUseEnglish((m) => ({ ...m, [c.mbid]: e.target.checked }))
                             }
                           />
-                          use English name “{c.en_name}”
+                          use alias “{c.en_name}”
                         </label>
                       )}
                     </span>

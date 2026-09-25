@@ -50,6 +50,9 @@ export interface MediaEntry {
   link_id: number | null;
   /** Albums page only: how many releases (editions) the album has. */
   release_count?: number | null;
+  /** Music artists/albums: MusicBrainz match-state dot — matched · partial ·
+   *  unmatched · ignored. Absent elsewhere. */
+  mb_state?: string | null;
   /** Movie with an interactive branch-graph pair next to its video — Play
    *  routes into the interactive engine instead of linear playback. */
   interactive: boolean;
@@ -205,6 +208,8 @@ export interface MusicAlbumCard {
   runtime_secs: number;
   /** Owning artist — set on appears-on cards (another artist's album). */
   artist_title: string | null;
+  /** MusicBrainz match-state dot — matched · partial · unmatched · ignored. */
+  mb_state: string | null;
   /** Full artist credit for the album's header line (multi-artist albums list
    *  every owner; single-artist albums list the one). Linkable when resolved. */
   artists: { name: string; artist_id: number | null }[];
@@ -351,6 +356,8 @@ export interface LibraryTrackRow {
   codec: string | null;
   bitrate_kbps: number | null;
   bitrate_mode: string | null;
+  /** MusicBrainz match-state dot — matched · partial · unmatched · ignored. */
+  mb_state: string | null;
 }
 
 // Backend row from get_track_queue_items — everything needed to build a

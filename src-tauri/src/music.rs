@@ -4794,6 +4794,9 @@ pub struct AlbumCard {
     pub runtime_secs: i64,
     /// Owning artist — set on appears-on cards (another artist's album).
     pub artist_title: Option<String>,
+    /// Match-state dot (music_mb::album_dot_states): matched / partial /
+    /// unmatched / ignored.
+    pub mb_state: Option<String>,
     /// Full artist credit for the album header line: the album_artist_credit
     /// rows when multi-artist, else the single owner. Each linkable when the
     /// library has that artist.
@@ -4933,7 +4936,13 @@ pub(crate) async fn resolve_credit_ids(pool: &SqlitePool, library_id: &str) -> R
     // the scan look hung at its tail. Batched, it's one sync.
     // (The old parent→solo-row backfill is gone with the artist parent
     // itself: write_album_credits guarantees rows on every insert/reconcile.)
-    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+    // IMMEDIATE: this reads first, then writes. A deferred BEGIN takes its
+    // snapshot on the read, and any other connection committing before the
+    // first write (a cache row landing from the release picker or a
+    // prefetch) makes the upgrade fail at once with SQLITE_BUSY_SNAPSHOT
+    // (517, "database is locked") — the busy timeout never gets a say.
+    // Taking the write lock up front lets that timeout do its job instead.
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.map_err(|e| e.to_string())?;
 
     let track_rows: Vec<(i64, i64, String, Option<i64>)> = sqlx::query_as(
         "SELECT tc.track_id, tc.position, tc.name, tc.artist_id FROM track_credit tc
@@ -5169,6 +5178,7 @@ pub async fn get_artist_detail(
         }
     };
 
+    let album_dots = crate::music_mb::album_dot_states(pool, &library_id).await?;
     let mut albums = Vec::new();
     let mut track_count = 0;
     for (id, title, release_date, folder, sel, tracks, releases, runtime) in album_rows {
@@ -5184,6 +5194,7 @@ pub async fn get_artist_detail(
             release_count: releases,
             runtime_secs: runtime,
             artist_title: None,
+            mb_state: album_dots.get(&id).map(|s| s.to_string()),
             artists: album_artists(id, Some((&self_title_for_cards, entry_id))),
         });
     }
@@ -5241,6 +5252,7 @@ pub async fn get_artist_detail(
             release_count: 1,
             runtime_secs: 0,
             artist_title: owner,
+            mb_state: album_dots.get(&id).map(|s| s.to_string()),
             artists,
         });
     }
@@ -5894,6 +5906,8 @@ pub struct LibraryTrackRow {
     pub codec: Option<String>,
     pub bitrate_kbps: Option<i64>,
     pub bitrate_mode: Option<String>,
+    /// Match-state dot (music_mb::track_dot_states).
+    pub mb_state: Option<String>,
 }
 
 /// Every track in the library — the all-Tracks page. Loose tracks (no album,
@@ -5982,6 +5996,7 @@ pub async fn get_music_tracks(
         .map_err(|e| e.to_string())?;
 
     let single_base = if bases.len() == 1 { Some(bases[0].0.clone()) } else { None };
+    let track_dots = crate::music_mb::track_dot_states(pool, &library_id).await?;
     let mut out = Vec::with_capacity(rows.len());
     for (id, title, rel, runtime, artist_name, album_id, album_title, is_loose, album_parent, play_count, loved, album_folder, album_selected_cover, codec, bitrate_kbps, bitrate_mode) in rows {
         let file_name = Path::new(&rel)
@@ -6027,6 +6042,7 @@ pub async fn get_music_tracks(
             codec,
             bitrate_kbps,
             bitrate_mode,
+            mb_state: track_dots.get(&id).map(|s| s.to_string()),
         });
     }
     Ok(out)

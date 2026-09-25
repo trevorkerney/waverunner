@@ -27,6 +27,8 @@ import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ClearableInput } from "@/components/ui/clearable-input";
 import { useFlipList } from "@/hooks/useFlipList";
 import { useGridWindow } from "@/hooks/useGridWindow";
+import { useMbHidden } from "@/lib/mbVisibility";
+import { MbDot } from "@/components/music/MbDot";
 import { Slider } from "@/components/ui/slider";
 import {
   DropdownMenu,
@@ -533,6 +535,10 @@ export function MainContent({
   // slider, and instant (unanimated) sort switches.
   const isArtistsView =
     selectedLibrary?.format === "music" && activeView?.kind === "library-root" && !searchResults;
+  // Match-state dots on music cards (artists, albums): only while "Show
+  // MusicBrainz outside this page" is on for the library.
+  const gridMbHidden = useMbHidden(selectedLibrary?.format === "music" ? selectedLibrary.id : null);
+  const showMbDots = selectedLibrary?.format === "music" && !gridMbHidden;
 
   // Artists-page "hide feature-only" toggle (see isFeatureOnlyArtist).
   const [hideFeatureOnly, setHideFeatureOnlyState] = useState(cachedHideFeatureOnly ?? false);
@@ -2041,6 +2047,7 @@ export function MainContent({
             onNavigate={onNavigate}
             gridRef={gridRef}
             sortMode={sortMode}
+            showMbDots={showMbDots}
             letterFor={letterForTitle}
           />
         )
@@ -2156,6 +2163,7 @@ export function MainContent({
                     isDragActive={dragId != null}
                     pendingRemoval={pendingRemovalId != null && pendingRemovalId === sortableIdFor(entry)}
                     sortMode={sortMode}
+                    mbState={showMbDots ? entry.mb_state ?? null : null}
                   />
                 ))}
               </div>
@@ -2412,6 +2420,9 @@ interface CoverCardProps {
   /** True while this card's drop-into-container move is settling — keeps it
    *  hidden so it doesn't pop back at its old spot before the grid refreshes. */
   pendingRemoval?: boolean;
+  /** MusicBrainz match-state dot after the title (music grids, when shown
+   *  outside the metadata page); null = none. */
+  mbState?: string | null;
   /** Present when the grid can drag (SortableCoverCard wires it); a static
    *  grid renders the same card with none of dnd-kit's per-card cost. */
   drag?: {
@@ -2493,6 +2504,7 @@ const CoverCard = memo(function CoverCard({
   isDragActive,
   deletingId,
   pendingRemoval,
+  mbState,
   drag,
 }: CoverCardProps) {
   const isCollection = entry.entry_type === "collection";
@@ -2716,7 +2728,7 @@ const CoverCard = memo(function CoverCard({
             />
           ) : (
             <>
-              <p className="text-sm font-medium"><CardTitle entry={entry} /></p>
+              <p className="text-sm font-medium"><CardTitle entry={entry} mbState={mbState} /></p>
               {/* Person-page filmography shows the character ("as …") instead of the usual subtitle */}
               {entry.role_display ? (
                 <p className="text-xs text-muted-foreground">{entry.role_display}</p>
@@ -2771,9 +2783,14 @@ function MoveUpDropZone({ isActive }: { isActive: boolean }) {
 /** A card's title. An album with several releases gets the sidebar's
  *  record icon + the count after it, glued to the title's last word so the
  *  badge always wraps WITH that word instead of dangling alone on a line. */
-function CardTitle({ entry }: { entry: MediaEntry }) {
-  const n = entry.release_count ?? 0;
-  if (entry.entry_type !== "album" || n <= 1) return <>{entry.title}</>;
+/** A card's title, plus (albums with several releases) the sidebar's record
+ *  icon + the count, and (music, "Show MusicBrainz outside" on) the match
+ *  dot — both glued to the title's last word so they wrap WITH it instead
+ *  of dangling alone on a line. `mbState` null = no dot. */
+function CardTitle({ entry, mbState }: { entry: MediaEntry; mbState?: string | null }) {
+  const n = entry.entry_type === "album" ? (entry.release_count ?? 0) : 0;
+  const trailing = n > 1 || !!mbState;
+  if (!trailing) return <>{entry.title}</>;
   const cut = entry.title.lastIndexOf(" ");
   const head = cut === -1 ? "" : entry.title.slice(0, cut + 1);
   const last = cut === -1 ? entry.title : entry.title.slice(cut + 1);
@@ -2782,15 +2799,18 @@ function CardTitle({ entry }: { entry: MediaEntry }) {
       {head}
       <span className="whitespace-nowrap">
         {last}
-        <span
-          // align-middle + a slight lift: centres the badge on the title's
-          // x-height instead of sitting on its baseline.
-          className="ml-1.5 inline-flex -translate-y-px items-center gap-0.5 align-middle text-xs font-normal text-muted-foreground"
-          title={`${n} releases`}
-        >
-          <Disc3 size={12} />
-          {n}
-        </span>
+        {n > 1 && (
+          <span
+            // align-middle + a slight lift: centres the badge on the title's
+            // x-height instead of sitting on its baseline.
+            className="ml-1.5 inline-flex -translate-y-px items-center gap-0.5 align-middle text-xs font-normal text-muted-foreground"
+            title={`${n} releases`}
+          >
+            <Disc3 size={12} />
+            {n}
+          </span>
+        )}
+        {mbState && <MbDot state={mbState} className="ml-1.5 -translate-y-px" />}
       </span>
     </>
   );

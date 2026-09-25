@@ -24,6 +24,7 @@ import { PlayingIndicator } from "./PlayingIndicator";
 import { LoveButton, LoveMenuItem } from "./LoveButton";
 import { RevealMenuItem } from "./RevealMenuItem";
 import { useMbHidden } from "@/lib/mbVisibility";
+import { MbDot } from "./MbDot";
 import { useTagWriting } from "@/lib/tagWriting";
 import { TagWriteDialog, TagWriteScope } from "./TagWriteDialog";
 import type { LoveLevel } from "../../types";
@@ -427,6 +428,7 @@ export function ArtistDetailPage({
                         title={d && release ? releaseTitle(d, release) : album.title}
                       >
                         {d && release ? releaseTitle(d, release) : album.title}
+                        {!mbHidden && <MbDot state={album.mb_state} className="ml-2" />}
                       </button>
                       <p className="mt-0.5 text-sm text-muted-foreground">
                         {/* Album-page parity: every credited owner, linked —
@@ -916,6 +918,7 @@ export function ArtistDetailPage({
                     {album.release_count}
                   </span>
                 )}
+                {!mbHidden && <MbDot state={album.mb_state} className="ml-1.5 -translate-y-px" />}
               </button>
               <p className="truncate text-xs text-muted-foreground">
                 {[album.year]
@@ -1191,6 +1194,7 @@ export function ArtistDetailPage({
                       title={album.title}
                     >
                       {album.title}
+                      {!mbHidden && <MbDot state={album.mb_state} className="ml-1.5 -translate-y-px" />}
                     </button>
                     <p className="truncate text-xs text-muted-foreground">
                       {[album.artist_title, album.year].filter(Boolean).join(", ") || " "}

@@ -133,12 +133,12 @@ export function LibraryScanView({ run }: { run: ScanRun }) {
 /** The match QUESTION, over the library page — the one interactive moment,
  *  shown until answered. The running pass is not a banner: it's a sidebar
  *  line (like the waveform preload) and the strip below on the Metadata page. */
+/** The post-scan question. Video only: TMDB matching is elective (pass
+ *  checkboxes, a token). Music libraries no longer get one — the Metadata
+ *  page's pass banner lists the work and stays until a pass runs. */
 export function LibraryRunBanner({ run, library }: { run: PromptRun; library: Library }) {
-  return run.format === "music" ? (
-    <MusicPrompt run={run} library={library} />
-  ) : (
-    <VideoPrompt run={run} library={library} />
-  );
+  if (run.format === "music") return null;
+  return <VideoPrompt run={run} library={library} />;
 }
 
 /** The running pass's detail — stage bar, ETA, sweep, Skip remaining — at
@@ -152,58 +152,6 @@ export function MatchRunStrip({ libraryId, className }: { libraryId: string; cla
 
 function bannerClass(extra = "") {
   return `flex flex-col gap-2 border-b border-primary/25 bg-primary/5 px-4 py-2 ${extra}`;
-}
-
-function MusicPrompt({ run, library }: { run: PromptRun; library: Library }) {
-  const { startMatch, skipMatch } = useLibraryRuns();
-  const [busy, setBusy] = useState<"start" | "skip" | null>(null);
-  const m = run.music;
-  const estMinutes = m ? Math.max(1, Math.round((m.unchecked * 3 + m.uncheckedArtists * 1.5) / 60)) : null;
-  const canStart = !!m && (m.unchecked > 0 || m.uncheckedArtists > 0);
-  return (
-    <div className={bannerClass()}>
-      <div className="flex items-center gap-3">
-        <Sparkles size={14} className="shrink-0 text-primary" />
-        <div className="min-w-0 flex-1">
-          <p className="text-sm font-medium">Match against MusicBrainz?</p>
-          <p className="text-xs text-muted-foreground">
-            {m
-              ? `${m.unchecked} ${m.unchecked === 1 ? "album" : "albums"} · ${m.uncheckedArtists} ${m.uncheckedArtists === 1 ? "artist" : "artists"} to check` +
-                (estMinutes != null && canStart
-                  ? ` · about ${estMinutes} ${estMinutes === 1 ? "minute" : "minutes"} — MusicBrainz allows ~1 request per second`
-                  : "")
-              : ""}
-            {" "}Fills gaps your tags don't cover; anything uncertain waits for your review. You can also match
-            later from the Metadata page.
-          </p>
-        </div>
-        <Button
-          size="sm"
-          variant="outline"
-          className="h-7 shrink-0 text-xs"
-          disabled={busy !== null}
-          onClick={async () => {
-            setBusy("skip");
-            await skipMatch(run.libraryId);
-          }}
-        >
-          {busy === "skip" ? <Spinner className="size-3.5" /> : "Not now"}
-        </Button>
-        <Button
-          size="sm"
-          className="h-7 shrink-0 text-xs"
-          disabled={busy !== null || !canStart}
-          onClick={async () => {
-            setBusy("start");
-            await startMatch(library);
-            setBusy(null);
-          }}
-        >
-          {busy === "start" ? <Spinner className="size-3.5" /> : "Start matching"}
-        </Button>
-      </div>
-    </div>
-  );
 }
 
 /** Elective TMDB matching: the pass checkboxes + request estimate. The run

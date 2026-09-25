@@ -38,26 +38,109 @@ export function notifyPendingWorkChanged() {
   window.dispatchEvent(new Event("waverunner:pending-work-changed"));
 }
 
-/** Both queues, live: fetched on mount (two cheap queries) and again on
+/** What the next pass will do besides the queue rows: albums MusicBrainz
+ *  has never been asked about (plus retry-eligible ones) and artists whose
+ *  identity matched evidence can derive. Each bucket counts as ONE queued
+ *  item — the banner lists it as one line. Zero when online metadata is off
+ *  for the library (the pass won't run). */
+export interface PendingPassBuckets {
+  uncheckedAlbums: number;
+  uncheckedArtists: number;
+}
+
+/** The one number every surface shows for the pass: queue rows + one per
+ *  non-empty bucket. */
+export function passItemCount(pass: PendingPassRow[], buckets: PendingPassBuckets): number {
+  return (
+    pass.length + (buckets.uncheckedAlbums > 0 ? 1 : 0) + (buckets.uncheckedArtists > 0 ? 1 : 0)
+  );
+}
+
+export function passItemsLabel(n: number): string {
+  return `${n} ${n === 1 ? "item" : "items"} queued for the next matching pass`;
+}
+
+const NO_BUCKETS: PendingPassBuckets = { uncheckedAlbums: 0, uncheckedArtists: 0 };
+
+interface PendingSnapshot {
+  rescan: PendingRescanRow[];
+  pass: PendingPassRow[];
+  buckets: PendingPassBuckets;
+}
+
+/** One fetch per library at a time, shared by every hook instance. The
+ *  sidebar badge, the library strip and the metadata page all listen to the
+ *  same events, so they all refetch in the same tick — three copies of four
+ *  round-trips each, parsed on the main thread, for one answer. Joiners
+ *  await the in-flight promise instead. */
+const inflight = new Map<string, Promise<PendingSnapshot>>();
+
+/** Last snapshot per library. An instance mounting for a library seen
+ *  before renders from this in its FIRST commit and refetches behind it —
+ *  otherwise the banner lands one round-trip after the page and shoves the
+ *  content down. The sidebar badges fetch every music library at startup,
+ *  so by the time a page opens, its library is usually already here. */
+const lastSnapshot = new Map<string, PendingSnapshot>();
+
+function fetchPending(libraryId: string): Promise<PendingSnapshot> {
+  const running = inflight.get(libraryId);
+  if (running) return running;
+  const p = (async () => {
+    const [rescan, pass, ms, ls] = await Promise.all([
+      invoke<PendingRescanRow[]>("get_pending_changes", { libraryId }),
+      invoke<PendingPassRow[]>("get_pending_pass", { libraryId }),
+      invoke<{ unchecked: number; unchecked_artists: number }>("music_match_state", {
+        libraryId,
+      }),
+      invoke<Record<string, string>>("get_library_settings", { libraryId }),
+    ]);
+    const snap: PendingSnapshot = {
+      rescan,
+      pass,
+      buckets:
+        ls["online_metadata"] === "off"
+          ? NO_BUCKETS
+          : { uncheckedAlbums: ms.unchecked, uncheckedArtists: ms.unchecked_artists },
+    };
+    lastSnapshot.set(libraryId, snap);
+    return snap;
+  })();
+  inflight.set(libraryId, p);
+  p.finally(() => {
+    if (inflight.get(libraryId) === p) inflight.delete(libraryId);
+  }).catch(() => {});
+  return p;
+}
+
+/** Both queues, live: fetched on mount (a few cheap queries) and again on
  *  every event that can change them. The metadata center's banners read
  *  from here too, so the badge, the strip and the banners always agree —
  *  and the banners don't wait on the center's slow review fetch. */
 export function usePendingWork(libraryId: string | null) {
-  const [rescan, setRescan] = useState<PendingRescanRow[]>([]);
-  const [pass, setPass] = useState<PendingPassRow[]>([]);
+  const cached = libraryId ? lastSnapshot.get(libraryId) : undefined;
+  const [rescan, setRescan] = useState<PendingRescanRow[]>(() => cached?.rescan ?? []);
+  const [pass, setPass] = useState<PendingPassRow[]>(() => cached?.pass ?? []);
+  const [buckets, setBuckets] = useState<PendingPassBuckets>(() => cached?.buckets ?? NO_BUCKETS);
   const refetch = useCallback(async () => {
     if (!libraryId) {
       setRescan([]);
       setPass([]);
+      setBuckets(NO_BUCKETS);
       return;
     }
+    // A library switch on a mounted instance: show its last snapshot now,
+    // not the previous library's rows until the fetch lands.
+    const known = lastSnapshot.get(libraryId);
+    if (known) {
+      setRescan(known.rescan);
+      setPass(known.pass);
+      setBuckets(known.buckets);
+    }
     try {
-      const [r, p] = await Promise.all([
-        invoke<PendingRescanRow[]>("get_pending_changes", { libraryId }),
-        invoke<PendingPassRow[]>("get_pending_pass", { libraryId }),
-      ]);
-      setRescan(r);
-      setPass(p);
+      const snap = await fetchPending(libraryId);
+      setRescan(snap.rescan);
+      setPass(snap.pass);
+      setBuckets(snap.buckets);
     } catch {
       // Library mid-delete or backend busy — keep the last known state.
     }
@@ -82,7 +165,7 @@ export function usePendingWork(libraryId: string | null) {
       unScan.then((fn) => fn());
     };
   }, [refetch]);
-  return { rescan, pass, refetch };
+  return { rescan, pass, buckets, passItems: passItemCount(pass, buckets), refetch };
 }
 
 /** The sidebar's Metadata row's ONE attention slot — never two icons side by side.
@@ -100,19 +183,13 @@ export function LibraryAttentionBadge({
   format: string;
 }) {
   // Only music carries the deferred-work queues; other formats skip the fetch.
-  const { rescan, pass } = usePendingWork(format === "music" ? libraryId : null);
-  // The match QUESTION after a scan waits on the Metadata page (its banner
-  // shows only there) — the badge is how the user finds it.
-  const { runs } = useLibraryRuns();
-  const asking = runs[libraryId]?.kind === "prompt";
-  if (rescan.length === 0 && pass.length === 0 && !asking) return null;
+  const { rescan, passItems } = usePendingWork(format === "music" ? libraryId : null);
+  if (rescan.length === 0 && passItems === 0) return null;
   const urgent = rescan.length > 0;
   const parts = [
-    asking && "Match question waiting",
     rescan.length > 0 &&
       `${rescan.length} change${rescan.length === 1 ? "" : "s"} staged for the next rescan`,
-    pass.length > 0 &&
-      `${pass.length} match${pass.length === 1 ? "" : "es"} waiting for a matching pass`,
+    passItems > 0 && passItemsLabel(passItems),
   ]
     .filter(Boolean)
     .join(" · ");
@@ -144,23 +221,22 @@ export function LibraryAttentionBadge({
  *  changes; the pass cashes in matches — and staged changes gate the pass
  *  (same rule the backend enforces), so the strip only offers what can run. */
 export function PendingWorkStrip({ libraryId }: { libraryId: string }) {
-  const { rescan, pass: passAll } = usePendingWork(libraryId);
+  const { rescan, passItems: passItemsAll } = usePendingWork(libraryId);
   // "Show MusicBrainz outside this page" off: the matching-pass queue is
   // MusicBrainz work, so it stays on the Metadata page. Staged rescan
   // changes are the library's own and still show.
   const mbHidden = useMbHidden(libraryId);
-  const pass = mbHidden ? [] : passAll;
+  const passItems = mbHidden ? 0 : passItemsAll;
   // A running pass IS the queue being worked — the strip would sit there
   // still saying "waiting" (the queue only clears when the pass lands),
   // reading as if the click did nothing. The Metadata page shows the pass.
   const { runs } = useLibraryRuns();
   const passRunning = runs[libraryId]?.kind === "match";
-  if (passRunning || (rescan.length === 0 && pass.length === 0)) return null;
+  if (passRunning || (rescan.length === 0 && passItems === 0)) return null;
   const message = [
     rescan.length > 0 &&
       `${rescan.length} change${rescan.length === 1 ? "" : "s"} staged for the next rescan`,
-    pass.length > 0 &&
-      `${pass.length} match${pass.length === 1 ? "" : "es"} waiting for a matching pass`,
+    passItems > 0 && passItemsLabel(passItems),
   ]
     .filter(Boolean)
     .join(" · ");
@@ -212,7 +288,7 @@ export function PendingWorkStrip({ libraryId }: { libraryId: string }) {
           Rescan now
         </Button>
       )}
-      {pass.length > 0 && rescan.length === 0 && (
+      {passItems > 0 && rescan.length === 0 && (
         <Button
           size="sm"
           variant="outline"

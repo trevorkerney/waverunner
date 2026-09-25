@@ -14,7 +14,7 @@
 //! only requirement is a descriptive User-Agent identifying the app.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -34,6 +34,34 @@ static CANCEL: AtomicBool = AtomicBool::new(false);
 /// the DB and CPU (waveform preload) polls this and yields.
 pub(crate) fn pass_running() -> bool {
     RUNNING.load(Ordering::SeqCst)
+}
+
+/// How many user-initiated commands are waiting on MusicBrainz right now
+/// (a match apply, a dialog search). The background prefetch loops share the
+/// one request gate and would otherwise queue a click behind their own
+/// fetches; they poll this between requests and hold off while it's nonzero.
+static USER_WAITING: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn user_waiting() -> bool {
+    USER_WAITING.load(Ordering::SeqCst) > 0
+}
+
+/// RAII marker for a user-facing command's lifetime: held from entry to
+/// return (including early returns and errors), so the prefetch loops stand
+/// aside for exactly as long as the click is being served.
+pub(crate) struct UserPriority;
+
+impl UserPriority {
+    pub(crate) fn hold() -> Self {
+        USER_WAITING.fetch_add(1, Ordering::SeqCst);
+        UserPriority
+    }
+}
+
+impl Drop for UserPriority {
+    fn drop(&mut self) {
+        USER_WAITING.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Which library the running pass is working on (None = no pass).
@@ -368,8 +396,14 @@ pub async fn music_match_skip() -> Result<(), String> {
 #[derive(Serialize)]
 pub struct MusicMatchState {
     pub running: bool,
-    /// Albums never checked against MusicBrainz (no stamp).
+    /// Albums never checked against MusicBrainz (no stamp). ONLY those —
+    /// the artist-scoped retries below are a separate number, because each
+    /// of them is already announced by its own re-check row in the pass
+    /// queue; folding them in here counted every retry twice.
     pub unchecked: i64,
+    /// Searched-and-not-found albums the next pass will retry under their
+    /// now-identified artist's id (the arid tier).
+    pub retry_albums: i64,
     /// Artists whose identity the pass can DERIVE: no MBID yet, but credited
     /// on a matched album (whose MB credit names them by id). Artists with no
     /// matched evidence aren't counted — the pass won't touch them. Albums
@@ -430,7 +464,6 @@ pub async fn music_match_state(
     .fetch_one(pool)
     .await
     .map_err(|e| e.to_string())?;
-    let unchecked = unchecked + retry_albums;
     let (unchecked_artists,): (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM artist a
          JOIN media_entry me ON me.id = a.id
@@ -476,6 +509,7 @@ pub async fn music_match_state(
     Ok(MusicMatchState {
         running: RUNNING.load(Ordering::SeqCst),
         unchecked,
+        retry_albums,
         unchecked_artists,
         pending_suggestions,
         unmatched: by("notfound"),
@@ -1627,6 +1661,7 @@ pub async fn mb_group_release_art(
     album_id: i64,
     release_id: Option<i64>,
 ) -> Result<Vec<GroupArtRelease>, String> {
+    let _priority = UserPriority::hold();
     let pool = &state.app_db;
     let group_id = mb_id(pool, album_id, MB_RELEASE_GROUP)
         .await?
@@ -5057,6 +5092,22 @@ pub async fn mb_get_review(state: State<'_, AppState>, library_id: String) -> Re
         .map_err(|e| e.to_string())?;
         s.payload["library_tracks"] = serde_json::json!(tracks);
         s.payload["library_versions"] = serde_json::json!(versions);
+        // Per-version track counts (default first): "7 + 18 tracks across 2
+        // versions" pairs by eye with an EP and an album on the card, which
+        // is the fused-album tell made legible.
+        if versions > 1 {
+            let per: Vec<(i64,)> = sqlx::query_as(
+                "SELECT (SELECT COUNT(*) FROM track_release tr WHERE tr.release_id = ar.id)
+                 FROM album_release ar WHERE ar.album_id = ?
+                 ORDER BY ar.is_default DESC, ar.id ASC",
+            )
+            .bind(album_id)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            s.payload["library_version_tracks"] =
+                serde_json::json!(per.into_iter().map(|(n,)| n).collect::<Vec<i64>>());
+        }
     }
     for s in suggestions.iter_mut() {
         if s.kind != "artist_match" {
@@ -6096,6 +6147,7 @@ pub async fn mb_search_entity(
     // (arid) — features count, MB indexes every credited artist.
     artist_mbid: Option<String>,
 ) -> Result<Vec<MbCandidateRow>, String> {
+    let _priority = UserPriority::hold();
     let client = mb_client()?;
     let context = context.map(|c| c.trim().to_string()).filter(|c| !c.is_empty());
     match kind.as_str() {
@@ -6367,7 +6419,8 @@ pub async fn mb_apply_entity_match(
     // user ticked "use the English name" on a candidate). The canonical
     // name is recorded as an alias so MB-authored credits still resolve.
     preferred_name: Option<String>,
-) -> Result<(), String> {
+) -> Result<ApplyOutcome, String> {
+    let _priority = UserPriority::hold();
     ensure_entity_not_matching(&state.app_db, entity_id).await?;
     let pool = &state.app_db;
     // Staged = immutable: a match on an entity a staged rescan action will
@@ -6387,11 +6440,15 @@ pub async fn mb_apply_entity_match(
     // Track matches: whether the recording's credits actually replaced ours —
     // only then does the parent album hold new evidence worth re-checking.
     let mut track_credits_applied = false;
+    // Artist matches: whether the page took a new name or alias — only then
+    // can a credit row that was unlinked now resolve to it.
+    let mut artist_names_changed = false;
     match kind.as_str() {
         "album" => {
             if mbid_kind.as_deref() == Some("release") {
-                return mb_apply_album_match(app, state, library_id, entity_id, mbid, release_db_id)
-                    .await;
+                mb_apply_album_match(app, state, library_id, entity_id, mbid, release_db_id)
+                    .await?;
+                return Ok(ApplyOutcome { merged_into: None });
             }
             let (title,): (String,) = sqlx::query_as("SELECT title FROM album WHERE id = ?")
                 .bind(entity_id)
@@ -6439,6 +6496,59 @@ pub async fn mb_apply_entity_match(
                     .fetch_one(pool)
                     .await
                     .map_err(|e| e.to_string())?;
+            // Another page in this library already holds the id: the match
+            // IS a merge — "Cash" is the Johnny Cash page that's already
+            // here. Merge into the existing page now, keeping it (its ids,
+            // matches and history all stand), instead of renaming this one
+            // into a same-named duplicate that waits for the next pass or a
+            // suggestion click to fold it in (2026-09-25). Logged as a USER
+            // merge: the person said who this is, so undo simply restores
+            // the page — no standing "no" against the pass.
+            if !is_placeholder_artist(&mbid) {
+                let holder: Option<(i64, String)> = sqlx::query_as(
+                    "SELECT a.id, a.title FROM artist a
+                     JOIN media_entry me ON me.id = a.id
+                     WHERE me.library_id = ? AND a.musicbrainz_id = ? AND a.id != ?
+                     ORDER BY (SELECT COUNT(*) FROM album_artist_credit c WHERE c.artist_id = a.id) DESC,
+                              a.id ASC
+                     LIMIT 1",
+                )
+                .bind(&library_id)
+                .bind(&mbid)
+                .bind(entity_id)
+                .fetch_optional(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+                if let Some((keep_id, keep_title)) = holder {
+                    // This page's own "which artist is this?" card is answered
+                    // (merge_artists would mark it obsolete — accepted is the
+                    // truth: the person chose).
+                    sqlx::query(
+                        "UPDATE mb_suggestion SET status = 'accepted'
+                         WHERE library_id = ? AND kind = 'artist_match' AND target_key = ? AND status = 'pending'",
+                    )
+                    .bind(&library_id)
+                    .bind(entity_id.to_string())
+                    .execute(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                    merge_artists(pool, &library_id, keep_id, &keep_title, Some(entity_id), &title, "user")
+                        .await?;
+                    // The survivor just gained this page's unmatched albums —
+                    // searchable under its id on the next pass.
+                    enqueue_artist_match_recheck(pool, &library_id, keep_id).await?;
+                    let _ = app.emit(
+                        "music-enrich-done",
+                        serde_json::json!({ "libraryId": library_id, "updated": 0, "albumsMatched": 0, "processed": 0, "pendingReview": 0 }),
+                    );
+                    evict_artist_group_caches(pool).await?;
+                    // The caller's entity is gone — a dialog open on it must
+                    // close rather than reload it.
+                    return Ok(ApplyOutcome {
+                        merged_into: Some(MergedInto { artist_id: keep_id, title: keep_title }),
+                    });
+                }
+            }
             set_mb_id(pool, entity_id, MB_ARTIST, &mbid, TIER_USER).await?;
             sqlx::query("UPDATE artist SET musicbrainz_id = ? WHERE id = ?")
                 .bind(&mbid)
@@ -6488,6 +6598,7 @@ pub async fn mb_apply_entity_match(
                 if let Some(target) = target.filter(|n| *n != title) {
                     rename_artist_page(pool, &library_id, entity_id, &title, &target, "mb", batch)
                         .await?;
+                    artist_names_changed = true;
                 }
                 // The canonical spelling must keep resolving to this page
                 // even when the preferred name won the title.
@@ -6501,6 +6612,7 @@ pub async fn mb_apply_entity_match(
                         .execute(pool)
                         .await
                         .map_err(|e| e.to_string())?;
+                        artist_names_changed = true;
                     }
                 }
             }
@@ -6661,7 +6773,15 @@ pub async fn mb_apply_entity_match(
     }
     // Applied credits can carry names new to the library: pages for them, and
     // fresh stamps for every touched row (ensure ends with resolve_credit_ids).
-    crate::music::ensure_credit_artists(pool, &library_id).await?;
+    // Album and track matches only — an artist match writes no credit rows,
+    // and the library-wide walk was most of what made the click slow. A
+    // renamed/aliased artist page still gets one re-stamp pass so credits
+    // that were unlinked under the old spelling can find it.
+    if kind != "artist" {
+        crate::music::ensure_credit_artists(pool, &library_id).await?;
+    } else if artist_names_changed {
+        crate::music::resolve_credit_ids(pool, &library_id).await?;
+    }
     // Second stamping walk now that pages for newly-credited names exist.
     if let Some((pairs, canonical)) = &album_credit_pairs {
         stamp_artist_ids_from_credit(pool, &library_id, pairs, canonical).await?;
@@ -6684,7 +6804,21 @@ pub async fn mb_apply_entity_match(
     );
     // A matched album may have been its artists' last unmatched one.
     evict_artist_group_caches(pool).await?;
-    Ok(())
+    Ok(ApplyOutcome { merged_into: None })
+}
+
+/// What an apply did beyond the match itself. `merged_into`: an artist
+/// match whose id another page already held folded the matched page into
+/// that one — the entity the caller named no longer exists.
+#[derive(Debug, Serialize)]
+pub struct ApplyOutcome {
+    pub merged_into: Option<MergedInto>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MergedInto {
+    pub artist_id: i64,
+    pub title: String,
 }
 
 /// The ordered artist credit of one recording.
@@ -6926,6 +7060,7 @@ pub async fn mb_search_releases(
     query: String,
     artist: Option<String>,
 ) -> Result<ReleaseSearch, String> {
+    let _priority = UserPriority::hold();
     let client = mb_client()?;
     let artist = artist.map(|a| a.trim().to_string()).filter(|a| !a.is_empty());
 
@@ -6958,6 +7093,7 @@ pub async fn mb_search_releases(
 /// existing group match, and silently re-grouping would be a trap.
 #[tauri::command]
 pub async fn mb_release_group_of(release_mbid: String) -> Result<Option<String>, String> {
+    let _priority = UserPriority::hold();
     let client = mb_client()?;
     Ok(fetch_release(&client, &release_mbid)
         .await?
@@ -7396,10 +7532,22 @@ pub async fn mb_prefetch_estimate(
 }
 
 /// Wait out a running matching pass (it shares the MB request gate — a
-/// prefetch alongside it would halve the pass). True = cancelled meanwhile.
+/// prefetch alongside it would halve the pass) and any user-initiated MB
+/// command (a click must never queue behind background fetches; polled
+/// finely so the loop resumes the moment the click is served). True =
+/// cancelled meanwhile.
 async fn yield_to_pass(job: &crate::jobs::JobHandle) -> bool {
-    while pass_running() && !job.cancelled() {
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    loop {
+        if job.cancelled() {
+            break;
+        }
+        if pass_running() {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        } else if user_waiting() {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        } else {
+            break;
+        }
     }
     job.cancelled()
 }
@@ -7529,6 +7677,7 @@ pub async fn mb_group_releases(
     current_release_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<ReleaseCandidate>, String> {
+    let _priority = UserPriority::hold();
     let client = mb_client()?;
     let mut releases = group_releases_sorted(&client, &group_id).await?;
     // Fresh list → the cache (the picker serves it instantly next time and
@@ -7594,6 +7743,152 @@ async fn latest_merge_batch(pool: &SqlitePool, artist_id: i64) -> Result<Option<
     .await
     .map_err(|e| e.to_string())?;
     Ok(row.map(|(b,)| b))
+}
+
+// ---------------------------------------------------------------------------
+// Match-state dots for the grids and lists OUTSIDE the metadata center: one
+// word per entity, coloured like the entity's own page chip.
+//   "matched"   green  — artist: has an MBID; album: EVERY release resolved
+//                        and its tracks line up; track: on such a release
+//   "partial"   amber  — album: group known but a release still unpinned (a
+//                        multi-version card stays amber until all are), or
+//                        pinned with tracks that don't line up; track: on an
+//                        album in that state, or itself an unpaired track
+//   "unmatched" red    — nothing known
+//   "ignored"   grey   — flagged out of matching (and nothing matched)
+// Bulk, per library: the pages render hundreds of these per view.
+// ---------------------------------------------------------------------------
+
+pub(crate) async fn artist_dot_states(
+    pool: &SqlitePool,
+    library_id: &str,
+) -> Result<HashMap<i64, &'static str>, String> {
+    let rows: Vec<(i64, i64, i64)> = sqlx::query_as(
+        "SELECT a.id,
+                (a.musicbrainz_id IS NOT NULL AND a.musicbrainz_id <> '')
+                  OR EXISTS (SELECT 1 FROM field_override o
+                             WHERE o.entity_id = a.id AND o.field = 'mb_artist_id'
+                               AND o.value IS NOT NULL AND o.value <> ''),
+                EXISTS (SELECT 1 FROM field_override ig
+                        WHERE ig.entity_id = a.id AND ig.field = 'mb_ignored')
+         FROM artist a JOIN media_entry me ON me.id = a.id
+         WHERE me.library_id = ?",
+    )
+    .bind(library_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, matched, ignored)| {
+            (id, if matched != 0 { "matched" } else if ignored != 0 { "ignored" } else { "unmatched" })
+        })
+        .collect())
+}
+
+pub(crate) async fn album_dot_states(
+    pool: &SqlitePool,
+    library_id: &str,
+) -> Result<HashMap<i64, &'static str>, String> {
+    // Same resolution rule as the metadata center's map: 'release' only
+    // when every version carries a release_match row (a pin or the
+    // declared-none sentinel); 'album' when the group is known or some
+    // versions are pinned. Our-side gaps (a track of ours the release
+    // doesn't pair) keep a pinned album amber, like its page chip.
+    let rows: Vec<(i64, String, i64, i64)> = sqlx::query_as(
+        "SELECT al.id,
+                CASE
+                  WHEN EXISTS (SELECT 1 FROM release_match rm WHERE rm.album_id = al.id)
+                       AND NOT EXISTS (SELECT 1 FROM album_release ar
+                                       WHERE ar.album_id = al.id
+                                         AND NOT EXISTS (SELECT 1 FROM release_match rm2
+                                                         WHERE rm2.album_id = al.id
+                                                           AND rm2.folder_path = ar.folder_path COLLATE NOCASE)) THEN 'release'
+                  WHEN EXISTS (SELECT 1 FROM release_match rm WHERE rm.album_id = al.id) THEN 'album'
+                  WHEN EXISTS (SELECT 1 FROM field_override o
+                               WHERE o.entity_id = al.id AND o.field = 'mb_release_group_id'
+                                 AND o.value IS NOT NULL AND o.value <> '') THEN 'album'
+                  ELSE 'none'
+                END,
+                COALESCE((SELECT SUM(side = 'ours') FROM album_match_gap g WHERE g.album_id = al.id), 0),
+                EXISTS (SELECT 1 FROM field_override ig
+                        WHERE ig.entity_id = al.id AND ig.field = 'mb_ignored')
+         FROM album al JOIN media_entry me ON me.id = al.id
+         WHERE me.library_id = ?",
+    )
+    .bind(library_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, state, gap_ours, ignored)| {
+            let dot = match state.as_str() {
+                "release" if gap_ours > 0 => "partial",
+                "release" => "matched",
+                "album" => "partial",
+                _ if ignored != 0 => "ignored",
+                _ => "unmatched",
+            };
+            (id, dot)
+        })
+        .collect())
+}
+
+pub(crate) async fn track_dot_states(
+    pool: &SqlitePool,
+    library_id: &str,
+) -> Result<HashMap<i64, &'static str>, String> {
+    // Album tracks take their release's state, minus their own gap row (a
+    // track the release didn't pair is amber on its own). Loose tracks match
+    // on their own recording.
+    let rows: Vec<(i64, i64, i64, i64, i64, i64, i64)> = sqlx::query_as(
+        "SELECT t.id,
+                EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = me.parent_id),
+                EXISTS (SELECT 1 FROM track_release tr
+                        JOIN album_release ar ON ar.id = tr.release_id
+                        JOIN release_match rm ON rm.album_id = ar.album_id
+                                             AND rm.folder_path = ar.folder_path COLLATE NOCASE
+                        WHERE tr.track_id = t.id),
+                EXISTS (SELECT 1 FROM field_override o
+                        WHERE o.entity_id = me.parent_id AND o.field = 'mb_release_group_id'
+                          AND o.value IS NOT NULL AND o.value <> ''),
+                EXISTS (SELECT 1 FROM album_match_gap g
+                        JOIN track_release tr2 ON tr2.track_id = t.id
+                        JOIN album_release ar2 ON ar2.id = tr2.release_id
+                        WHERE g.album_id = me.parent_id AND g.side = 'ours'
+                          AND g.folder_path = ar2.folder_path COLLATE NOCASE
+                          AND g.disc = COALESCE(t.disc_number, 1)
+                          AND g.position = COALESCE(t.track_number, 0)),
+                EXISTS (SELECT 1 FROM field_override r
+                        WHERE r.entity_id = t.id AND r.field = 'mb_recording_id'
+                          AND r.value IS NOT NULL AND r.value <> ''),
+                EXISTS (SELECT 1 FROM field_override ig
+                        WHERE ig.entity_id = me.parent_id AND ig.field = 'mb_ignored')
+         FROM track t JOIN media_entry me ON me.id = t.id
+         WHERE me.library_id = ?",
+    )
+    .bind(library_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, loose, release_matched, group_matched, gapped, recording, album_ignored)| {
+            let dot = if loose != 0 {
+                if recording != 0 { "matched" } else { "unmatched" }
+            } else if release_matched != 0 {
+                if gapped != 0 { "partial" } else { "matched" }
+            } else if group_matched != 0 {
+                "partial"
+            } else if album_ignored != 0 {
+                "ignored"
+            } else {
+                "unmatched"
+            };
+            (id, dot)
+        })
+        .collect())
 }
 
 pub(crate) async fn enqueue_pass_work(
@@ -7908,6 +8203,7 @@ pub async fn mb_apply_album_match(
     mb_release_id: String,
     release_db_id: Option<i64>,
 ) -> Result<(), String> {
+    let _priority = UserPriority::hold();
     ensure_not_matching(&state.app_db, &library_id).await?;
     let pool = &state.app_db;
     crate::music_edit::ensure_not_staged(pool, album_id).await?;

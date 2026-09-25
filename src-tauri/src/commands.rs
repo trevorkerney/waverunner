@@ -174,6 +174,9 @@ pub struct MediaEntry {
     /// only worth showing past 1. Absent everywhere else.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub release_count: Option<i64>,
+    /// Music artists and albums: the MusicBrainz match-state dot — matched /
+    /// partial / unmatched / ignored (music_mb::*_dot_states). None elsewhere.
+    pub mb_state: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1519,7 +1522,7 @@ pub async fn get_entries(
                         watch_progress: None,
                         unwatched: false,
                         has_progress: false,
-                        sort_date: None, release_count: None,
+                        sort_date: None, release_count: None, mb_state: None,
                     }
                 })
                 .collect();
@@ -1659,6 +1662,7 @@ pub async fn get_entries(
                 .map_err(|e| e.to_string())?;
                 let releases_by_album: std::collections::HashMap<i64, i64> =
                     release_rows.into_iter().collect();
+                let album_dots = crate::music_mb::album_dot_states(&state.app_db, &library_id).await?;
                 let entries: Vec<MediaEntry> = rows
                     .into_iter()
                     .map(|(id, title, release_date, folder_path, selected_cover)| {
@@ -1694,6 +1698,7 @@ pub async fn get_entries(
                             has_progress: false,
                             sort_date: release_date,
                             release_count,
+                            mb_state: album_dots.get(&id).map(|s| s.to_string()),
                         }
                     })
                     .collect();
@@ -1918,6 +1923,7 @@ pub async fn get_entries(
                 if parts.is_empty() { None } else { Some(parts.join(" · ")) }
             };
 
+            let artist_dots = crate::music_mb::artist_dot_states(&state.app_db, &library_id).await?;
             let mut entries: Vec<MediaEntry> = rows
                 .into_iter()
                 .map(|(id, title, folder_path, selected_cover)| {
@@ -1970,6 +1976,7 @@ pub async fn get_entries(
                         unwatched: false,
                         has_progress: false,
                         sort_date: None, release_count: None,
+                        mb_state: artist_dots.get(&id).map(|s| s.to_string()),
                     }
                 })
                 .collect();
@@ -2113,7 +2120,7 @@ pub async fn search_entries(
             let mut entries: Vec<MediaEntry> = rows.into_iter()
                 .map(|(id, title, year, end_year, folder_path, parent_id, entry_type, selected_cover, tmdb_id, season_display)| {
                     let covers = covers_map.get(&folder_path).cloned().unwrap_or_default();
-                    MediaEntry { id, title, year, end_year, folder_path, parent_id, entry_type, covers, selected_cover, child_count: 0, season_display, collection_display: None, role_display: None, tmdb_id, link_id: None, interactive: false, watched: false, watch_progress: None, unwatched: false, has_progress: false, sort_date: None, release_count: None }
+                    MediaEntry { id, title, year, end_year, folder_path, parent_id, entry_type, covers, selected_cover, child_count: 0, season_display, collection_display: None, role_display: None, tmdb_id, link_id: None, interactive: false, watched: false, watch_progress: None, unwatched: false, has_progress: false, sort_date: None, release_count: None, mb_state: None }
                 })
                 .collect();
 
@@ -2208,6 +2215,7 @@ pub async fn search_entries(
                 }
             }
 
+            let artist_dots = crate::music_mb::artist_dot_states(&state.app_db, &library_id).await?;
             let mut results: Vec<MediaEntry> = artist_rows
                 .into_iter()
                 .map(|(id, title, folder_path, selected_cover)| {
@@ -2218,7 +2226,7 @@ pub async fn search_entries(
                             .cloned()
                             .unwrap_or_default(),
                     );
-                    MediaEntry { id, title, year: None, end_year: None, folder_path, parent_id: None, entry_type: "artist".to_string(), covers, selected_cover, child_count: 0, season_display: None, collection_display: None, role_display: None, tmdb_id: None, link_id: None, interactive: false, watched: false, watch_progress: None, unwatched: false, has_progress: false, sort_date: None, release_count: None }
+                    MediaEntry { id, title, year: None, end_year: None, folder_path, parent_id: None, entry_type: "artist".to_string(), covers, selected_cover, child_count: 0, season_display: None, collection_display: None, role_display: None, tmdb_id: None, link_id: None, interactive: false, watched: false, watch_progress: None, unwatched: false, has_progress: false, sort_date: None, release_count: None, mb_state: artist_dots.get(&id).map(|s| s.to_string()) }
                 })
                 .collect();
             results.extend(album_rows.into_iter().map(
@@ -2249,7 +2257,7 @@ pub async fn search_entries(
                             watch_progress: None,
                             unwatched: false,
                             has_progress: false,
-                            sort_date: release_date, release_count: None,
+                            sort_date: release_date, release_count: None, mb_state: None,
                         }
                     },
                 ));
@@ -3936,7 +3944,7 @@ pub async fn get_entries_for_genre(
                     watch_progress: None,
                     unwatched: false,
                     has_progress: false,
-                    sort_date: release_date, release_count: None,
+                    sort_date: release_date, release_count: None, mb_state: None,
                 }
             })
             .collect());
@@ -4007,7 +4015,7 @@ pub async fn get_entries_for_genre(
                 watch_progress: None,
                 unwatched: false,
                 has_progress: false,
-                sort_date: None, release_count: None,
+                sort_date: None, release_count: None, mb_state: None,
             }
         })
         .collect();
@@ -5116,7 +5124,7 @@ pub async fn get_entries_for_person(
                 watch_progress: None,
                 unwatched: false,
                 has_progress: false,
-                sort_date: None, release_count: None,
+                sort_date: None, release_count: None, mb_state: None,
             }
         })
         .collect();
@@ -6433,7 +6441,7 @@ pub async fn get_playlist_contents(
             watch_progress: None,
             unwatched: false,
             has_progress: false,
-            sort_date: None, release_count: None,
+            sort_date: None, release_count: None, mb_state: None,
         };
         items.push((sort_order, sort_title.unwrap_or_default(), sort_date, entry));
     }
@@ -6541,7 +6549,7 @@ pub async fn get_playlist_contents(
             watch_progress: None,
             unwatched: false,
             has_progress: false,
-            sort_date: None, release_count: None,
+            sort_date: None, release_count: None, mb_state: None,
         };
         items.push((sort_order, sort_title, min_date, entry));
     }
@@ -7534,7 +7542,14 @@ pub async fn move_entry(
             // Moves are purely virtual: parent_id and sort_order change; folder_path
             // (the disk location) and the image cache never do.
             let db_result: Result<(), String> = async {
-                let mut tx = state.app_db.begin().await.map_err(|e| e.to_string())?;
+                // IMMEDIATE: reads sort orders before it writes them — the
+                // write lock up front keeps a concurrent commit from voiding
+                // the snapshot (SQLITE_BUSY_SNAPSHOT, no retry).
+                let mut tx = state
+                    .app_db
+                    .begin_with("BEGIN IMMEDIATE")
+                    .await
+                    .map_err(|e| e.to_string())?;
 
                 // Determine sort_order for the moved entry
                 // Note: sort_order is on detail tables but we can't use the view inside a transaction easily,

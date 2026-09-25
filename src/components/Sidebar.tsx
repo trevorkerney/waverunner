@@ -36,6 +36,7 @@ import { getComplicationsForLibrary } from "@/lib/complications";
 import type { ComplicationNode, GenreSummary, LibraryCounts, PlaylistSummary } from "@/types";
 import { Library, ViewSpec } from "@/types";
 import type { BackgroundJob } from "@/lib/backgroundJobs";
+import { useApplyQueue } from "@/lib/applyQueue";
 
 const MIN_WIDTH = 180;
 const MAX_WIDTH = 480;
@@ -110,6 +111,8 @@ export function Sidebar({
   const [dragging, setDragging] = useState(false);
   // Library runs (scan / prompt / match) — progress lines and locked rows.
   const { runs, rescan } = useLibraryRuns();
+  // The Metadata page's apply queue — a line per library while it works.
+  const applyQueue = useApplyQueue();
   // Libraries mid-CREATION: hidden from get_libraries until their scan
   // lands, so they render from the run (a scanning row below the list).
   const creatingRuns = Object.values(runs).filter(
@@ -411,6 +414,21 @@ export function Sidebar({
                     >
                       <Spinner className="mt-1 size-2 shrink-0" />
                       <span className="min-w-0 break-words">{runLine(lib.id)}</span>
+                    </button>
+                  )}
+                  {/* Decisions applying in the background (the Metadata
+                      page's apply queue) — one line while any remain, like
+                      a background job; the click goes to the page's banner. */}
+                  {applyQueue.items.some((i) => i.libraryId === lib.id) && (
+                    <button
+                      onClick={() => onSelectView({ kind: "metadata", libraryId: lib.id })}
+                      className="flex items-start gap-1.5 pb-1 pl-6 pr-2 pt-1 text-left text-xs italic text-muted-foreground hover:text-foreground"
+                    >
+                      <Spinner className="mt-1 size-2 shrink-0" />
+                      <span className="min-w-0 break-words">
+                        applying matches ·{" "}
+                        {applyQueue.items.filter((i) => i.libraryId === lib.id).length} left
+                      </span>
                     </button>
                   )}
                   {/* Background jobs — background work lives in the sidebar;
