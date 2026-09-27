@@ -113,7 +113,9 @@ export const TrackRow = memo(function TrackRow({
           <img
             src={getCoverUrl(t.cover)}
             alt=""
-            loading="lazy"
+            // Eager: the list windows itself, and an explicit policy opts
+            // out of the webview's lazy-loading intervention.
+            loading="eager"
             decoding="async"
             className="size-full object-cover"
             draggable={false}
@@ -475,6 +477,7 @@ export function TracksPage({ libraryId, onPlayQueue, currentTrackId, playing, on
       />
       <TrackEditDialog
         trackId={editTrackId}
+        libraryId={libraryId}
         open={editTrackId !== null}
         onOpenChange={(o) => {
           if (!o) setEditTrackId(null);

@@ -1208,6 +1208,13 @@ pub async fn delete_library(
     state: tauri::State<'_, AppState>,
     library_id: String,
 ) -> Result<(), String> {
+    // Background work on this library stops first: the pass, if it's on
+    // this library, and every registered job (artist images, prefetches).
+    // Each polls its flag per item, so they end at their next step instead
+    // of walking a snapshot of rows the cascade below deletes — the image
+    // job used to keep asking Wikidata for every artist of a gone library.
+    crate::music_mb::cancel_pass_for_library(&library_id);
+    crate::jobs::cancel_for_library(&library_id);
     let cache_dir = state.app_data_dir.join("cache").join(&library_id);
     if cache_dir.exists() {
         std::fs::remove_dir_all(&cache_dir).map_err(|e| {

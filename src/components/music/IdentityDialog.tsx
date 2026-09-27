@@ -2,11 +2,13 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { toast } from "sonner";
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from "../ui/dialog";
+import { Dialog, DialogBody, DialogContent, DialogHeader, DialogTitle } from "../ui/dialog";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { Spinner } from "../ui/spinner";
+import { FadeIn, SkeletonRows, useSkeletonDelay } from "../ui/skeleton";
 import { Search, Music2, Equal, VenetianMask, Scissors, Sparkles } from "lucide-react";
+import { MATCH_LOCK_TITLE, useMatchLock } from "@/hooks/libraryRuns";
 
 /** An existing artist page, as a link target. */
 interface ArtistChoice {
@@ -43,6 +45,8 @@ function ArtistPicker({
   const [results, setResults] = useState<ArtistChoice[] | null>(null);
   const seq = useRef(0);
   const timer = useRef<number | undefined>(undefined);
+  // A pass on this library holds the pick (the backend refuses the write).
+  const locked = useMatchLock(libraryId);
 
   const search = (q: string) => {
     window.clearTimeout(timer.current);
@@ -71,7 +75,8 @@ function ArtistPicker({
     <button
       key={o.id}
       type="button"
-      disabled={applying !== null}
+      disabled={applying !== null || locked}
+      title={locked ? MATCH_LOCK_TITLE : undefined}
       onClick={() => onPick(o)}
       className={`flex w-full items-center gap-2 px-2 py-1.5 text-left hover:bg-accent disabled:opacity-60 ${
         i === 0 ? "" : "border-t"
@@ -106,6 +111,10 @@ function ArtistPicker({
   );
 
   const list = results ?? [];
+  const pending = query.trim().length >= 1 && results === null;
+  // Skeleton rows after 500ms of a search in flight; results fade in.
+  const showSkeleton = useSkeletonDelay(pending);
+  const listKey = results ? `${results.length}:${results[0]?.id ?? ""}` : "none";
   return (
     <>
       <Input
@@ -116,23 +125,25 @@ function ArtistPicker({
           search(e.target.value);
         }}
         placeholder="Search artists…"
-        className="h-8 text-sm"
+        className="h-8 shrink-0 text-sm"
       />
       <div className="overflow-hidden rounded-md border">
         {query.trim().length < 1 && suggested && (
           <SuggestedRow libraryId={libraryId} suggested={suggested} render={row} />
         )}
-        {list.map((o, i) => row(o, i))}
-        {list.length === 0 && (
+        {pending ? (
+          showSkeleton ? <SkeletonRows rows={5} avatar /> : null
+        ) : (
+          <FadeIn key={listKey}>{list.map((o, i) => row(o, i))}</FadeIn>
+        )}
+        {list.length === 0 && !pending && (
           <p className="flex items-center gap-1.5 px-2 py-1.5 text-[11px] text-muted-foreground">
             <Search size={12} />
             {query.trim().length < 1
               ? suggested
                 ? "Or type to search other artists"
                 : "Type to search existing artists"
-              : results === null
-                ? "Searching…"
-                : "No matching artists"}
+              : "No matching artists"}
           </p>
         )}
       </div>
@@ -197,6 +208,7 @@ export function IdentityDialog({
   onOpenChange,
   onDone,
   onSplit,
+  queue,
 }: {
   libraryId: string;
   sourceName: string;
@@ -210,9 +222,16 @@ export function IdentityDialog({
   onDone: () => void;
   /** Opens the split editor for the page (the host owns that dialog). */
   onSplit?: () => void;
+  /** Given (the metadata page), a pick hands the write to the host's apply
+   *  queue and the dialog closes at once — the row leaves at the click and
+   *  the link lands in the background; the host refreshes when the queue
+   *  drains, so onDone isn't called. Absent, the write runs here. */
+  queue?: (job: { label: string; run: () => Promise<void> }) => void;
 }) {
   const [mode, setMode] = useState<IdentityMode>(initialMode);
   const [applying, setApplying] = useState<number | null>(null);
+  // A pass on this library holds every identity write (backend refuses).
+  const locked = useMatchLock(libraryId);
   const [links, setLinks] = useState<PersonaLinks | null>(null);
   const hasPage = sourceArtistId != null;
 
@@ -235,10 +254,23 @@ export function IdentityDialog({
     onDone();
   };
 
+  // Queued (metadata page): hand the write over and close now — the queue
+  // banner is the feedback, the drain refresh brings the result.
+  const handOff = (label: string, run: () => Promise<void>) => {
+    queue!({ label, run });
+    onOpenChange(false);
+  };
+
   const linkSame = async (target: ArtistChoice) => {
+    const run = () =>
+      invoke<void>("link_credit_name", { libraryId, name: sourceName, targetArtistId: target.id });
+    if (queue) {
+      handOff(`\u{201c}${sourceName}\u{201d} \u{2192} ${target.name}`, run);
+      return;
+    }
     setApplying(target.id);
     try {
-      await invoke("link_credit_name", { libraryId, name: sourceName, targetArtistId: target.id });
+      await run();
       finish(`“${sourceName}” is now ${target.name}.`);
     } catch (e) {
       toast.error(String(e));
@@ -247,9 +279,15 @@ export function IdentityDialog({
   };
 
   const linkPersona = async (target: ArtistChoice) => {
+    const run = () =>
+      invoke<void>("set_artist_persona", { personaId: sourceArtistId, parentId: target.id });
+    if (queue) {
+      handOff(`\u{201c}${sourceName}\u{201d} \u{2192} persona of ${target.name}`, run);
+      return;
+    }
     setApplying(target.id);
     try {
-      await invoke("set_artist_persona", { personaId: sourceArtistId, parentId: target.id });
+      await run();
       finish(`“${sourceName}” is a persona of ${target.name}.`);
     } catch (e) {
       toast.error(String(e));
@@ -258,9 +296,14 @@ export function IdentityDialog({
   };
 
   const unlinkPersona = async () => {
+    const run = () => invoke<void>("unset_artist_persona", { personaId: sourceArtistId });
+    if (queue) {
+      handOff(`\u{201c}${sourceName}\u{201d} \u{2192} its own artist`, run);
+      return;
+    }
     setApplying(-1);
     try {
-      await invoke("unset_artist_persona", { personaId: sourceArtistId });
+      await run();
       finish(`“${sourceName}” is its own artist again.`);
     } catch (e) {
       toast.error(String(e));
@@ -279,11 +322,14 @@ export function IdentityDialog({
 
   return (
     <Dialog open onOpenChange={onOpenChange}>
-      <DialogContent>
+      {/* STATIC height across all three modes (modal rule): the tab strip
+          swaps the body's content, the frame stays put; the pickers'
+          result lists scroll inside. */}
+      <DialogContent size="md" height="28rem">
         <DialogHeader>
           <DialogTitle>“{sourceName}” is really…</DialogTitle>
         </DialogHeader>
-        <div className="flex gap-1 rounded-md border p-0.5 text-xs">
+        <div className="flex shrink-0 gap-1 rounded-md border p-0.5 text-xs">
           {tabs.map((t) => (
             <button
               key={t.id}
@@ -305,6 +351,7 @@ export function IdentityDialog({
           ))}
         </div>
 
+        <DialogBody className="-mx-1 flex flex-col gap-3 overflow-x-hidden px-1 pb-1">
         {mode === "same" && (
           <>
             <p className="text-xs text-muted-foreground">
@@ -340,7 +387,8 @@ export function IdentityDialog({
                   size="sm"
                   variant="outline"
                   className="shrink-0 gap-1.5"
-                  disabled={applying !== null}
+                  disabled={applying !== null || locked}
+                  title={locked ? MATCH_LOCK_TITLE : undefined}
                   onClick={unlinkPersona}
                 >
                   {applying === -1 && <Spinner className="size-3" />}
@@ -387,6 +435,7 @@ export function IdentityDialog({
             </Button>
           </>
         )}
+        </DialogBody>
       </DialogContent>
     </Dialog>
   );

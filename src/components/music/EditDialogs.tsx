@@ -26,6 +26,7 @@ import {
   SelectItem,
 } from "@/components/ui/select";
 import { Undo2, X } from "lucide-react";
+import { MATCH_LOCK_TITLE, useMatchLock } from "@/hooks/libraryRuns";
 
 /** Metadata editors — the user tier of the provenance model. Edits are stored
  *  as overrides in waverunner's database (files stay untouched) and survive
@@ -37,8 +38,12 @@ import { Undo2, X } from "lucide-react";
 // ---------------------------------------------------------------------------
 
 /** The fade-in class for a form once its data is in (see useHandoff). */
+// grid-cols-[minmax(0,1fr)]: an auto grid column is sized from its items'
+// min-content, and a picker row (avatar + name + note + X) reports more than
+// the scrolling body's width — the whole form then ran under the scrollbar
+// with its right edge clipped. A minmax(0, 1fr) track can't exceed the box.
 const formFade = (visible: boolean) =>
-  `grid gap-4 transition-opacity duration-200 will-change-[opacity] ${visible ? "opacity-100" : "opacity-0"}`;
+  `grid grid-cols-[minmax(0,1fr)] gap-4 transition-opacity duration-200 will-change-[opacity] ${visible ? "opacity-100" : "opacity-0"}`;
 /** The skeleton overlay: same layout as the form, fades out first. */
 const skeletonFade = (stage: string) =>
   `absolute inset-x-1 top-0 grid gap-4 transition-opacity duration-200 ${stage === "hidden" ? "" : "opacity-0"}`;
@@ -222,13 +227,15 @@ interface TrackEditView {
 
 interface TrackEditDialogProps {
   trackId: number | null;
+  /** The track's library — a pass running on it holds the save. */
+  libraryId?: string;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   /** Fired after any change lands (save / reset) so the host can refetch. */
   onSaved: () => void;
 }
 
-export function TrackEditDialog({ trackId, open, onOpenChange, onSaved }: TrackEditDialogProps) {
+export function TrackEditDialog({ trackId, libraryId, open, onOpenChange, onSaved }: TrackEditDialogProps) {
   const [view, setView] = useState<TrackEditView | null>(null);
   const [title, setTitle] = useState("");
   // One artist per row, main artist first — replaces the old free-text
@@ -237,6 +244,8 @@ export function TrackEditDialog({ trackId, open, onOpenChange, onSaved }: TrackE
   const [trackNo, setTrackNo] = useState("");
   const [discNo, setDiscNo] = useState("");
   const [busy, setBusy] = useState(false);
+  // A pass on the library holds every write here (the backend refuses it).
+  const locked = useMatchLock(libraryId);
   // Skeleton form after 500ms, then skeleton out / form in (the dialog
   // portals its last-open content through the exit, so clearing `view` on
   // close is safe and keeps a reopen from flashing the previous track).
@@ -396,7 +405,13 @@ export function TrackEditDialog({ trackId, open, onOpenChange, onSaved }: TrackE
         </DialogBody>
         <DialogFooter>
           {view && view.overridden.length > 0 && (
-            <Button variant="ghost" className="mr-auto gap-1.5" disabled={busy} onClick={reset}>
+            <Button
+              variant="ghost"
+              className="mr-auto gap-1.5"
+              disabled={busy || locked}
+              title={locked ? MATCH_LOCK_TITLE : undefined}
+              onClick={reset}
+            >
               <Undo2 size={14} />
               Reset to file tags
             </Button>
@@ -404,7 +419,11 @@ export function TrackEditDialog({ trackId, open, onOpenChange, onSaved }: TrackE
           <Button variant="outline" disabled={busy} onClick={() => onOpenChange(false)}>
             Cancel
           </Button>
-          <Button disabled={busy || !view} onClick={save}>
+          <Button
+            disabled={busy || locked || !view}
+            title={locked ? MATCH_LOCK_TITLE : undefined}
+            onClick={save}
+          >
             Save
           </Button>
         </DialogFooter>
@@ -433,10 +452,16 @@ interface AlbumEditView {
     /** Your override; null = go by the cue. */
     pre_emphasis_pref: boolean | null;
   }[];
+  /** Albums a combine folded into this one — shown here (and only here on
+   *  the album's side: on the surface a merged album is one album) with an
+   *  Undo each. */
+  absorbed: { combine_id: number; name: string; mode: string }[];
 }
 
 interface AlbumEditDialogProps {
   albumId: number | null;
+  /** The album's library — a pass running on it holds the save. */
+  libraryId?: string;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onSaved: () => void;
@@ -449,21 +474,45 @@ const ALBUM_TYPES = [
   { value: "compilation", label: "Compilation" },
 ];
 
-export function AlbumEditDialog({ albumId, open, onOpenChange, onSaved }: AlbumEditDialogProps) {
+export function AlbumEditDialog({ albumId, libraryId, open, onOpenChange, onSaved }: AlbumEditDialogProps) {
   const [view, setView] = useState<AlbumEditView | null>(null);
   const [title, setTitle] = useState("");
   const [date, setDate] = useState("");
   const [type, setType] = useState("album");
   const [genresText, setGenresText] = useState("");
+  // The user's note on the album (entry_note): its own store, not a field
+  // override — saved on its own, never touched by Clear overrides, never
+  // written to files. Edited here rather than on the page (user's call,
+  // 2026-09-27).
+  const [note, setNote] = useState("");
+  const [noteInitial, setNoteInitial] = useState("");
   // Album-level artist credit rows — a joint album ("Drake & Future") lists
-  // every owner here and shows in each of their discographies.
-  const [artistRows, setArtistRows] = useState<string[]>([""]);
+  // every owner here and shows in each of their discographies. Pickers, as
+  // in the split dialog (user's call, 2026-09-25): each row is a decision
+  // drawn as a profile (image, release count), not free text; a typed name
+  // that matches nothing becomes a new page on save.
+  const [artistPicks, setArtistPicks] = useState<(PickedArtist | null)[]>([null]);
   // Per-release pre-emphasis: the user's override per release id (null =
   // defer to the cue sheet). Staged here, written on Save.
   const [preEmphasis, setPreEmphasis] = useState<Map<number, boolean | null>>(new Map());
   const [busy, setBusy] = useState(false);
+  // A pass on the library holds every write here (the backend refuses it).
+  const locked = useMatchLock(libraryId);
+  // Combines undone from this dialog (staged; the row leaves the list).
+  const [undoneCombines, setUndoneCombines] = useState<Set<number>>(new Set());
   const bodyRef = useRef<HTMLDivElement | null>(null);
   const { stage, skeletonSeen, shown, contentVisible } = useHandoff(!!view, bodyRef);
+
+  const undoCombine = async (combineId: number, name: string) => {
+    try {
+      await invoke("undo_album_combine", { combineId });
+      setUndoneCombines((s) => new Set(s).add(combineId));
+      toast(`Un-combine of “${name}” staged — it applies on the next rescan`);
+      notifyPendingWorkChanged();
+    } catch (e) {
+      toast.error(String(e));
+    }
+  };
 
   useEffect(() => {
     if (!open) {
@@ -475,13 +524,29 @@ export function AlbumEditDialog({ albumId, open, onOpenChange, onSaved }: AlbumE
     (async () => {
       try {
         const v = await invoke<AlbumEditView>("get_album_edit", { albumId });
+        const n = await invoke<string | null>("get_note", { kind: "entry", subjectId: albumId });
+        // The current credits as profiles (image, release count) — resolved
+        // before the form shows so the rows land drawn, not as bare names.
+        const choices = await invoke<(ArtistChoice | null)[]>("resolve_artist_choices", {
+          artistId: albumId,
+          names: v.artist_credits,
+        });
+        const picks: PickedArtist[] = v.artist_credits.map((name, i) => {
+          const c = choices[i];
+          return c
+            ? { name: c.name, id: c.id, image: c.image, releaseCount: c.release_count }
+            : { name, isNew: true };
+        });
         setView(v);
         setTitle(v.title);
         setDate(v.release_date ?? "");
         setType(v.album_type);
         setGenresText(v.genres.join("\n"));
-        setArtistRows(v.artist_credits.length > 0 ? v.artist_credits : [""]);
+        setNote(n ?? "");
+        setNoteInitial(n ?? "");
+        setArtistPicks(picks.length > 0 ? picks : [null]);
         setPreEmphasis(new Map(v.releases.map((r) => [r.id, r.pre_emphasis_pref])));
+        setUndoneCombines(new Set());
       } catch (e) {
         toast.error(String(e));
         onOpenChange(false);
@@ -501,7 +566,10 @@ export function AlbumEditDialog({ albumId, open, onOpenChange, onSaved }: AlbumE
       .map((s) => s.trim())
       .filter(Boolean);
     if (JSON.stringify(genres) !== JSON.stringify(view.genres)) fields.genres = genres;
-    const artists = artistRows.map((a) => a.trim()).filter(Boolean);
+    const artists = artistPicks.flatMap((p) => {
+      const name = p?.name.trim() ?? "";
+      return name ? [name] : [];
+    });
     if (JSON.stringify(artists) !== JSON.stringify(view.artist_credits)) {
       fields.artist_credits = artists;
     }
@@ -515,6 +583,9 @@ export function AlbumEditDialog({ albumId, open, onOpenChange, onSaved }: AlbumE
         if (next !== r.pre_emphasis_pref) {
           await invoke("set_release_pre_emphasis", { releaseId: r.id, value: next });
         }
+      }
+      if (note.trim() !== noteInitial) {
+        await invoke("set_note", { kind: "entry", subjectId: albumId, text: note.trim() });
       }
       onSaved();
       onOpenChange(false);
@@ -542,18 +613,22 @@ export function AlbumEditDialog({ albumId, open, onOpenChange, onSaved }: AlbumE
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      {/* Static: 136 + 56 title + 16 + 56 date/type + 16 + 120 artists +
-          16 + 118 genres (4 rows) + 16 + 32 note = 582px, plus the playback
-          section once the releases are known: 16 + 20 label + 6 + 44 per
-          release (40 rows, 4 between). */}
-      <DialogContent
-        size="md"
-        height={`${(582 + (view && view.releases.length > 0 ? 42 + 44 * view.releases.length - 4 : 0)) / 16}rem`}
-      >
+      {/* STATIC height (user's call, 2026-09-25): the frame never grows —
+          not on load (the skeleton opens at the final size), not per artist
+          row, release, or combined album. 38rem holds a one-artist,
+          one-release album with room to spare; anything longer scrolls in
+          the body. xl wide (2026-09-27): the Playback rows name a release
+          by label and folder, and at lg the switches fell off the edge. */}
+      <DialogContent size="xl" height="38rem">
         <DialogHeader>
           <DialogTitle>Edit album</DialogTitle>
         </DialogHeader>
-        <DialogBody ref={bodyRef} className="relative -mx-1 px-1">
+        {/* The body backs out of the frame's right padding (-mr-4, pr-4
+            puts the content back) so its scrollbar rides the dialog's edge
+            rather than sitting 16px in from it; the left keeps the 4px ring
+            room. overflow-x-hidden: a scrolling box clips both axes, and the
+            negative margins would otherwise summon a horizontal bar. */}
+        <DialogBody ref={bodyRef} className="relative -ml-1 -mr-4 overflow-x-hidden pl-1 pr-4">
         {view && (
           <div className={formFade(contentVisible)}>
             <div className="grid gap-1.5">
@@ -586,15 +661,62 @@ export function AlbumEditDialog({ albumId, open, onOpenChange, onSaved }: AlbumE
                 </Select>
               </div>
             </div>
-            <div className="grid gap-1.5">
-              <Label>Artists (all credited owners, first is primary)</Label>
-              <ArtistRows
-                rows={artistRows}
-                onChange={setArtistRows}
-                placeholders={["Primary artist", "Co-artist"]}
-                // Library-scoped artist suggestions; resolves via any entry id.
-                search={(query) => invoke<string[]>("search_artist_options", { artistId: albumId, query })}
-              />
+            <div className="grid grid-cols-[minmax(0,1fr)] gap-1.5">
+              {/* Owners are equal (a joint album sits in every member's
+                  discography); the order is the credit's reading order, and
+                  the first name is what stands for the album where only one
+                  fits (card subtitle, now playing, the library map, the
+                  matching pass's search scope). Not "primary owner". */}
+              <Label>Artists (all credited owners, in credit order)</Label>
+              {/* Same rows as the split dialog: picker + one X that cancels
+                  the choice or, on an empty row, drops the row (never below
+                  one). The body scrolls as a whole, so the rows just stack. */}
+              <div className="flex flex-col gap-1">
+                {artistPicks.map((picked, i) => (
+                  <div key={i} className="flex min-w-0 items-center gap-1">
+                    <ArtistPicker
+                      value={picked}
+                      onChange={(v) => {
+                        const next = artistPicks.slice();
+                        next[i] = v;
+                        setArtistPicks(next);
+                      }}
+                      // The search scopes to the album's library (any entry
+                      // id resolves it); the album itself is never an artist.
+                      contextArtistId={albumId}
+                      exclude={artistPicks
+                        .filter((_, idx) => idx !== i)
+                        .map((m) => m?.name ?? "")
+                        .filter(Boolean)}
+                      placeholder={i === 0 ? "Artist…" : "Co-artist…"}
+                    />
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      disabled={picked == null && artistPicks.length <= 1}
+                      onClick={() => {
+                        if (picked != null) {
+                          const next = artistPicks.slice();
+                          next[i] = null;
+                          setArtistPicks(next);
+                        } else {
+                          setArtistPicks(artistPicks.filter((_, idx) => idx !== i));
+                        }
+                      }}
+                    >
+                      <X size={14} />
+                    </Button>
+                  </div>
+                ))}
+              </div>
+              <Button
+                size="sm"
+                variant="outline"
+                className="w-fit"
+                onClick={() => setArtistPicks([...artistPicks, null])}
+              >
+                + Add artist
+              </Button>
             </div>
             <div className="grid gap-1.5">
               <Label htmlFor="ae-genres">Genres (one per line)</Label>
@@ -608,8 +730,24 @@ export function AlbumEditDialog({ albumId, open, onOpenChange, onSaved }: AlbumE
                 className="w-full resize-none rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-xs outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50"
               />
             </div>
+            <div className="grid gap-1.5">
+              <Label htmlFor="ae-note">Note</Label>
+              {/* The album's note (a version's own is edited from the
+                  versions picker). Fixed rows like Genres. */}
+              <textarea
+                id="ae-note"
+                value={note}
+                onChange={(e) => setNote(e.target.value)}
+                rows={4}
+                placeholder="Anything worth remembering about this album…"
+                className="w-full resize-none rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-xs outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50"
+              />
+            </div>
             {view.releases.length > 0 && (
-              <div className="grid gap-1.5">
+              // minmax(0,1fr), like the sections below: a row's nowrap
+              // label would otherwise size this auto column past the body
+              // and carry the switch off the right edge (it did).
+              <div className="grid grid-cols-[minmax(0,1fr)] gap-1.5">
                 <Label>Playback</Label>
                 {view.releases.map((r) => {
                   const pref = preEmphasis.get(r.id) ?? null;
@@ -652,6 +790,49 @@ export function AlbumEditDialog({ albumId, open, onOpenChange, onSaved }: AlbumE
                 })}
               </div>
             )}
+            {view.absorbed.length > 0 && (
+              // Same minmax(0,1fr) column as the form: a row's nowrap title
+              // would otherwise size this section's auto column past the
+              // body, and the Undo links walked off the right edge.
+              <div className="grid grid-cols-[minmax(0,1fr)] gap-1.5">
+                <Label>Combined albums</Label>
+                {/* Fixed 28px rows; an undone row stays (struck) so the
+                    frame never moves while the dialog is open. */}
+                <div className="flex min-w-0 flex-col">
+                  {view.absorbed.map((a) => {
+                    const undone = undoneCombines.has(a.combine_id);
+                    return (
+                      <div key={a.combine_id} className="flex h-7 min-w-0 items-center gap-2 text-sm">
+                        <span
+                          className={`min-w-0 flex-1 truncate ${undone ? "text-muted-foreground line-through" : ""}`}
+                          title={a.name}
+                        >
+                          {a.name}
+                        </span>
+                        <span className="shrink-0 text-[11px] text-muted-foreground">
+                          {a.mode === "merge" ? "merged in" : "as a release"}
+                        </span>
+                        {undone ? (
+                          <span className="shrink-0 text-[11px] text-muted-foreground">
+                            un-combine staged
+                          </span>
+                        ) : (
+                          <button
+                            type="button"
+                            disabled={busy}
+                            onClick={() => void undoCombine(a.combine_id, a.name)}
+                            className="shrink-0 text-[11px] underline underline-offset-2 hover:text-foreground"
+                            title="Back to its own album on the next rescan"
+                          >
+                            Undo
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
             <p className="text-xs text-muted-foreground">
               Edits are saved in waverunner, not your files, and outrank MusicBrainz. Retagging
               a field at the source replaces the edit on it.
@@ -672,12 +853,19 @@ export function AlbumEditDialog({ albumId, open, onOpenChange, onSaved }: AlbumE
               <Skeleton className="h-8 w-24" />
             </div>
             <FieldSkeleton field="h-[98px]" />
+            <FieldSkeleton field="h-[98px]" />
           </div>
         )}
         </DialogBody>
         <DialogFooter>
           {view && view.overridden.length > 0 && (
-            <Button variant="ghost" className="mr-auto gap-1.5" disabled={busy} onClick={reset}>
+            <Button
+              variant="ghost"
+              className="mr-auto gap-1.5"
+              disabled={busy || locked}
+              title={locked ? MATCH_LOCK_TITLE : undefined}
+              onClick={reset}
+            >
               <Undo2 size={14} />
               Clear overrides
             </Button>
@@ -685,7 +873,11 @@ export function AlbumEditDialog({ albumId, open, onOpenChange, onSaved }: AlbumE
           <Button variant="outline" disabled={busy} onClick={() => onOpenChange(false)}>
             Cancel
           </Button>
-          <Button disabled={busy || !view} onClick={save}>
+          <Button
+            disabled={busy || locked || !view}
+            title={locked ? MATCH_LOCK_TITLE : undefined}
+            onClick={save}
+          >
             Save
           </Button>
         </DialogFooter>
@@ -703,16 +895,20 @@ interface ArtistEditView {
 
 interface ArtistEditDialogProps {
   artistId: number | null;
+  /** The artist's library — a pass running on it holds the save. */
+  libraryId?: string;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onSaved: () => void;
 }
 
-export function ArtistEditDialog({ artistId, open, onOpenChange, onSaved }: ArtistEditDialogProps) {
+export function ArtistEditDialog({ artistId, libraryId, open, onOpenChange, onSaved }: ArtistEditDialogProps) {
   const [view, setView] = useState<ArtistEditView | null>(null);
   const [name, setName] = useState("");
   const [bio, setBio] = useState("");
   const [busy, setBusy] = useState(false);
+  // A pass on the library holds every write here (the backend refuses it).
+  const locked = useMatchLock(libraryId);
   const [fetching, setFetching] = useState(false);
   const bodyRef = useRef<HTMLDivElement | null>(null);
   const { stage, skeletonSeen, shown, contentVisible } = useHandoff(!!view, bodyRef);
@@ -848,7 +1044,13 @@ export function ArtistEditDialog({ artistId, open, onOpenChange, onSaved }: Arti
         </DialogBody>
         <DialogFooter>
           {view && view.overridden.length > 0 && (
-            <Button variant="ghost" className="mr-auto gap-1.5" disabled={busy} onClick={reset}>
+            <Button
+              variant="ghost"
+              className="mr-auto gap-1.5"
+              disabled={busy || locked}
+              title={locked ? MATCH_LOCK_TITLE : undefined}
+              onClick={reset}
+            >
               <Undo2 size={14} />
               Clear rename
             </Button>
@@ -856,7 +1058,11 @@ export function ArtistEditDialog({ artistId, open, onOpenChange, onSaved }: Arti
           <Button variant="outline" disabled={busy} onClick={() => onOpenChange(false)}>
             Cancel
           </Button>
-          <Button disabled={busy || !view} onClick={save}>
+          <Button
+            disabled={busy || locked || !view}
+            title={locked ? MATCH_LOCK_TITLE : undefined}
+            onClick={save}
+          >
             Save
           </Button>
         </DialogFooter>
@@ -895,12 +1101,16 @@ const MAX_SPLIT_MEMBERS = 12;
  *  entry sweeps away. Rescan-proof — the directive re-applies every scan. */
 export function SplitArtistDialog({
   artistId,
+  libraryId,
   artistName,
   open,
   onOpenChange,
   beforeSplit,
+  queue,
 }: {
   artistId: number | null;
+  /** The artist's library — a pass running on it holds the split. */
+  libraryId?: string;
   artistName: string;
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -909,11 +1119,17 @@ export function SplitArtistDialog({
    *  the aliases the merge just made. Cancel never reaches it: nothing is
    *  merged until the members are confirmed. */
   beforeSplit?: () => Promise<void>;
+  /** Given (the metadata page), confirming hands the staging to the host's
+   *  apply queue and closes at once — the row leaves at the click. Absent,
+   *  it runs here. */
+  queue?: (job: { label: string; run: () => Promise<void> }) => void;
 }) {
   // Each row is a decision — an existing artist, a name to create, or nothing
   // yet — rather than free text, so the dialog can show who was chosen.
   const [members, setMembers] = useState<(PickedArtist | null)[]>([null, null]);
   const [busy, setBusy] = useState(false);
+  // A pass on the library holds every write here (the backend refuses it).
+  const locked = useMatchLock(libraryId);
 
   useEffect(() => {
     if (!open) return;
@@ -957,17 +1173,25 @@ export function SplitArtistDialog({
       toast.error("A split needs at least two artists");
       return;
     }
-    setBusy(true);
-    try {
+    // STAGED, not applied: the migration is a rescan, and splits batch up
+    // behind one rescan with every other staged directive instead of each
+    // forcing its own. The metadata center's pending banner shows the batch
+    // and offers the rescan.
+    const stage = async () => {
       if (beforeSplit) await beforeSplit();
       await invoke<string>("split_artist", { artistId, members: list });
-      onOpenChange(false);
-      // STAGED, not applied: the migration is a rescan, and splits batch up
-      // behind one rescan with every other staged directive instead of each
-      // forcing its own. The metadata center's pending banner shows the batch
-      // and offers the rescan.
       toast("Split staged — it applies on the next rescan");
       notifyPendingWorkChanged();
+    };
+    if (queue) {
+      queue({ label: `Split \u{201c}${artistName}\u{201d} into ${list.join(", ")}`, run: stage });
+      onOpenChange(false);
+      return;
+    }
+    setBusy(true);
+    try {
+      await stage();
+      onOpenChange(false);
     } catch (e) {
       toast.error(String(e));
     } finally {
@@ -1085,7 +1309,11 @@ export function SplitArtistDialog({
           <Button variant="outline" disabled={busy} onClick={() => onOpenChange(false)}>
             Cancel
           </Button>
-          <Button disabled={busy} onClick={apply}>
+          <Button
+            disabled={busy || locked}
+            title={locked ? MATCH_LOCK_TITLE : undefined}
+            onClick={apply}
+          >
             {busy ? "Staging…" : "Stage split"}
           </Button>
         </DialogFooter>

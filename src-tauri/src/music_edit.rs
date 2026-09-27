@@ -826,27 +826,74 @@ pub async fn resolve_artist_choices(
             out.push(None);
             continue;
         }
-        // Exact title first; else a punctuation-blind key match — the same
+        // A credit the CONTEXT already links comes first: the album edit
+        // dialog prefills from the album's own credit rows, and those carry
+        // the artist id a pass or an apply stamped — the answer is that
+        // artist, whatever its page is called. MusicBrainz's "credited as"
+        // names make the two differ routinely (Highwayman, 1985: the artist
+        // The Highwaymen credited as "Waylon Jennings, Willie Nelson, Johnny
+        // Cash & Kris Kristofferson"), and re-resolving that string by title
+        // found nothing and offered to create it (2026-09-27). An artist
+        // context (the split dialog) has no credit rows under its id.
+        let mut row: Option<(i64, String, Option<String>, String, i64)> = sqlx::query_as(
+            "SELECT a.id, a.title, a.selected_cover, a.folder_path,
+                    (SELECT COUNT(*) FROM album_artist_credit c2 WHERE c2.artist_id = a.id)
+             FROM album_artist_credit c
+             JOIN artist a ON a.id = c.artist_id
+             WHERE c.album_id = ?1 AND c.name = ?2 COLLATE NOCASE
+             LIMIT 1",
+        )
+        .bind(artist_id)
+        .bind(trimmed)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        // Then a name the library records as an alias of exactly ONE artist
+        // (merges and credited-as names both leave one); two claimants is
+        // an ambiguity, not an answer.
+        if row.is_none() {
+            let aliased: Vec<(i64, String, Option<String>, String, i64)> = sqlx::query_as(
+                "SELECT a.id, a.title, a.selected_cover, a.folder_path,
+                        (SELECT COUNT(*) FROM album_artist_credit c WHERE c.artist_id = a.id)
+                 FROM artist_alias aa
+                 JOIN artist a ON a.id = aa.artist_id
+                 JOIN media_entry me ON me.id = a.id
+                 WHERE me.library_id = ?1 AND a.id != ?2 AND aa.name = ?3 COLLATE NOCASE
+                 LIMIT 2",
+            )
+            .bind(&library_id)
+            .bind(artist_id)
+            .bind(trimmed)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            if aliased.len() == 1 {
+                row = aliased.into_iter().next();
+            }
+        }
+        // Exact title next; else a punctuation-blind key match — the same
         // identity rule the lookalike/cluster machinery uses, so a tag's
         // straight-apostrophe "O'Donnell" finds the MB-canonical curly
         // "O’Donnell" page instead of offering to create a duplicate. Key
         // hits count only when UNIQUE: a split member is a specific artist,
         // and an ambiguous fuzzy hit would silently attach albums to the
         // wrong page.
-        let mut row: Option<(i64, String, Option<String>, String, i64)> = sqlx::query_as(
-            "SELECT a.id, a.title, a.selected_cover, a.folder_path,
-                    (SELECT COUNT(*) FROM album_artist_credit c WHERE c.artist_id = a.id)
-             FROM artist a
-             JOIN media_entry me ON me.id = a.id
-             WHERE me.library_id = ?1 AND a.id != ?2 AND a.title = ?3 COLLATE NOCASE
-             LIMIT 1",
-        )
-        .bind(&library_id)
-        .bind(artist_id)
-        .bind(trimmed)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| e.to_string())?;
+        if row.is_none() {
+            row = sqlx::query_as(
+                "SELECT a.id, a.title, a.selected_cover, a.folder_path,
+                        (SELECT COUNT(*) FROM album_artist_credit c WHERE c.artist_id = a.id)
+                 FROM artist a
+                 JOIN media_entry me ON me.id = a.id
+                 WHERE me.library_id = ?1 AND a.id != ?2 AND a.title = ?3 COLLATE NOCASE
+                 LIMIT 1",
+            )
+            .bind(&library_id)
+            .bind(artist_id)
+            .bind(trimmed)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        }
         if row.is_none() {
             let key = crate::music::credit_name_key(trimmed);
             if !key.is_empty() {
@@ -1543,6 +1590,10 @@ pub struct TierRow {
     pub fields: HashMap<String, TierValue>,
     /// Albums: every release, default first. Tracks: empty.
     pub releases: Vec<TierRelease>,
+    /// Albums: the albums a MERGE-mode combine poured into this one (one
+    /// track list, so nothing else on the page says they ever existed —
+    /// versions-mode combines show as releases already). Display names.
+    pub combined_from: Vec<String>,
 }
 
 /// An alias (a spelling that resolves to this page) and who wrote it:
@@ -1959,15 +2010,48 @@ pub async fn get_tier_matrix(
     .fetch_all(pool)
     .await
     .map_err(|e| e.to_string())?;
+    // Merge-mode combines, keyed the way the directives are: lowercased tag
+    // album-artist + tag title of the target. Resolved against each album's
+    // TAG tier (what the scanner wrote from the files) rather than by
+    // reading the naming file — a file read per album is what the one-album
+    // lookup (album_tag_identity) affords, not an 800-album matrix.
+    let combine_rows: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT target_artist, target_title, source_title, source_name
+         FROM album_combine WHERE library_id = ? AND mode = 'merge' ORDER BY id",
+    )
+    .bind(&library_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let mut combined: HashMap<(String, String), Vec<String>> = HashMap::new();
+    for (ta, tt, st, sn) in combine_rows {
+        combined.entry((ta, tt)).or_default().push(sn.unwrap_or(st));
+    }
+    let tag_identity = |fields: &HashMap<String, TierValue>| -> Option<(String, String)> {
+        let title = fields.get("title")?.tag.clone()?;
+        let credits = fields.get("artist_credits")?.tag.clone()?;
+        let first = serde_json::from_str::<Vec<String>>(&credits).ok()?.into_iter().next()?;
+        Some((first.to_lowercase(), title.to_lowercase()))
+    };
+
     for (id, title, artist_id) in albums {
+        let fields = by_entity.remove(&id).unwrap_or_default();
+        let combined_from = if combined.is_empty() {
+            Vec::new()
+        } else {
+            tag_identity(&fields)
+                .and_then(|key| combined.get(&key).cloned())
+                .unwrap_or_default()
+        };
         let row = TierRow {
             id,
             kind: "album".to_string(),
             title,
             matched: group_matched.contains(&id),
             pinned_releases: *pinned.get(&id).unwrap_or(&0),
-            fields: by_entity.remove(&id).unwrap_or_default(),
+            fields,
             releases: releases_by_album.remove(&id).unwrap_or_default(),
+            combined_from,
         };
         match artist_id.and_then(|a| index.get(&a)) {
             Some(&i) => groups[i].albums.push(row),
@@ -1999,6 +2083,7 @@ pub async fn get_tier_matrix(
             pinned_releases: 0,
             fields: by_entity.remove(&id).unwrap_or_default(),
             releases: Vec::new(),
+            combined_from: Vec::new(),
         };
         match artist_id.and_then(|a| index.get(&a)) {
             Some(&i) => groups[i].loose_tracks.push(row),
@@ -2039,6 +2124,10 @@ pub struct AlbumEditView {
     pub overridden: Vec<String>,
     /// Every release, for the per-release pre-emphasis switch.
     pub releases: Vec<ReleaseEditRow>,
+    /// Albums a user combine folded into this one — the editor's undo list
+    /// (on the surface a merged album is ONE album; this is where its
+    /// making is shown and reversed).
+    pub absorbed: Vec<AbsorbedAlbum>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2119,6 +2208,7 @@ pub async fn get_album_edit(
             pre_emphasis_pref,
         });
     }
+    let absorbed = absorbed_albums(pool, album_id).await?;
     Ok(AlbumEditView {
         id: album_id,
         title,
@@ -2128,6 +2218,7 @@ pub async fn get_album_edit(
         artist_credits,
         overridden: edited_fields(&overrides, ALBUM_FIELDS),
         releases,
+        absorbed,
     })
 }
 
@@ -2188,9 +2279,17 @@ pub async fn set_album_fields(
     if let Some((lib,)) = library_id {
         if fields.contains_key("artist_credits") {
             // Newly credited co-artists get pages (and the album in their
-            // discography) immediately.
-            crate::music::ensure_credit_artists(pool, &lib).await?;
-            if album_credit_names(pool, album_id).await? != credits_before {
+            // discography) immediately. Targeted (2026-09-25): a page per
+            // credited name that lacks one, then the stamp walk — not
+            // ensure_credit_artists, whose library-wide missing-name scan
+            // (a LOWER() anti-join over every credit row) made Save on one
+            // album take seconds.
+            let names_after = album_credit_names(pool, album_id).await?;
+            for name in &names_after {
+                crate::music::resolve_or_create_artist(pool, &lib, name).await?;
+            }
+            crate::music::resolve_credit_ids(pool, &lib).await?;
+            if names_after != credits_before {
                 crate::music_mb::enqueue_album_credit_recheck(pool, &lib, album_id).await?;
             }
         }
@@ -2373,6 +2472,8 @@ pub async fn reset_album_fields(
         .map_err(|e| e.to_string())?;
     resolve_album_fields(pool, album_id, true).await?;
     // Restored credits may name artists whose pages the edit had orphaned.
+    // Targeted like the save path (2026-09-25): a page per credited name
+    // that lacks one, then the stamp walk — not the library-wide scan.
     let library_id: Option<(String,)> =
         sqlx::query_as("SELECT library_id FROM media_entry WHERE id = ?")
             .bind(album_id)
@@ -2380,7 +2481,10 @@ pub async fn reset_album_fields(
             .await
             .map_err(|e| e.to_string())?;
     if let Some((lib,)) = library_id {
-        crate::music::ensure_credit_artists(pool, &lib).await?;
+        for name in album_credit_names(pool, album_id).await? {
+            crate::music::resolve_or_create_artist(pool, &lib, &name).await?;
+        }
+        crate::music::resolve_credit_ids(pool, &lib).await?;
     }
     Ok(())
 }
@@ -2465,6 +2569,16 @@ async fn release_tag_identity(
 /// One album in a combine selection: what the dialog shows, plus the
 /// editions it holds (the keeper's are pickable merge targets; a non-keeper
 /// with several is refused by merge).
+/// One disc of an edition: what a merge's per-disc name fields are built
+/// from — the number, and the name it already carries (tag subtitle or an
+/// earlier rename), if any.
+#[derive(Serialize)]
+pub struct CombineDisc {
+    pub disc_no: i64,
+    pub track_count: i64,
+    pub title: Option<String>,
+}
+
 #[derive(Serialize)]
 pub struct CombineEdition {
     pub release_id: i64,
@@ -2472,6 +2586,7 @@ pub struct CombineEdition {
     pub folder_path: String,
     pub is_default: bool,
     pub track_count: i64,
+    pub discs: Vec<CombineDisc>,
 }
 
 #[derive(Serialize)]
@@ -2584,6 +2699,40 @@ pub async fn get_combine_info(
                 .fetch_one(pool)
                 .await
                 .map_err(|e| e.to_string())?;
+        let mut editions = Vec::with_capacity(rows.len());
+        for (release_id, label, folder_path, is_default, track_count) in rows {
+            // The edition's discs, as the merge will see them (untagged
+            // disc numbers count as disc 1, like the slot check), with the
+            // name each already carries.
+            let disc_rows: Vec<(i64, i64)> = sqlx::query_as(
+                "SELECT COALESCE(t.disc_number, 1), COUNT(*) FROM track t
+                 JOIN track_release tr ON tr.track_id = t.id
+                 WHERE tr.release_id = ?
+                 GROUP BY 1 ORDER BY 1",
+            )
+            .bind(release_id)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            let names =
+                crate::music::resolved_disc_titles(pool, release_id, id, &folder_path).await?;
+            let discs = disc_rows
+                .into_iter()
+                .map(|(disc_no, track_count)| CombineDisc {
+                    disc_no,
+                    track_count,
+                    title: names.iter().find(|(d, _)| *d == disc_no).map(|(_, t)| t.clone()),
+                })
+                .collect();
+            editions.push(CombineEdition {
+                release_id,
+                label,
+                folder_path,
+                is_default: is_default != 0,
+                track_count,
+                discs,
+            });
+        }
         out.push(CombineAlbumInfo {
             id,
             title,
@@ -2594,16 +2743,7 @@ pub async fn get_combine_info(
                 .filter(|s| !s.is_empty()),
             genres,
             cover,
-            editions: rows
-                .into_iter()
-                .map(|(release_id, label, folder_path, is_default, track_count)| CombineEdition {
-                    release_id,
-                    label,
-                    folder_path,
-                    is_default: is_default != 0,
-                    track_count,
-                })
-                .collect(),
+            editions,
         });
     }
     Ok(out)
@@ -3414,7 +3554,15 @@ pub async fn get_album_absorbed(
     state: State<'_, AppState>,
     album_id: i64,
 ) -> Result<Vec<AbsorbedAlbum>, String> {
-    let pool = &state.app_db;
+    absorbed_albums(&state.app_db, album_id).await
+}
+
+/// The combines whose target this album is (both modes), by the album's tag
+/// identity — the same key the directives carry. One file read.
+pub(crate) async fn absorbed_albums(
+    pool: &SqlitePool,
+    album_id: i64,
+) -> Result<Vec<AbsorbedAlbum>, String> {
     let Some((library_id,)) =
         sqlx::query_as::<_, (String,)>("SELECT library_id FROM media_entry WHERE id = ?")
             .bind(album_id)

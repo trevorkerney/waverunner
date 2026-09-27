@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { toast } from "sonner";
+import { MATCH_LOCK_TITLE, useMatchLock } from "@/hooks/libraryRuns";
 import {
   Dialog,
   DialogBody,
@@ -142,7 +143,12 @@ export function CoversMenuItem({ onOpen }: { onOpen: () => void }) {
 
 /** The covers grid: five fixed columns (a 2xl dialog's width), so a tile is
  *  always the same size and two rows are always the same height. */
-export const COVER_GRID = "grid grid-cols-5 items-start gap-3";
+// items-end: tiles in a row align by their BOTTOM edge (user's call,
+// 2026-09-25). Every tile ends in a one-line caption, so aligning the tiles'
+// bottoms lines up the captions and, above them, the covers' bottom edges —
+// a short scan sits on the same baseline as a tall poster, not hung from
+// the top with its caption adrift.
+export const COVER_GRID = "grid grid-cols-5 items-end gap-3";
 /** The covers dialogs' fixed height: padding + title + gap + a body of
  *  exactly two rows of square tiles (the WIDEST tiles a 2xl dialog yields,
  *  ~135px, plus the gap and the body's padding, with a little slack so two
@@ -440,14 +446,18 @@ function CaaImageBrowserDialog({
             ? "release group matched · release matched"
             : "release group matched · release unmatched"}
         </p>
-        {/* -mt-0.5 / -mb-0.5 with no padding: 14px from the subtitle to the
-            section label, and the same 14px from the last caption to the
-            footer (the dialog's 16px gaps, each pulled up 2px). */}
+        {/* -mt-0.5 with no top padding: 14px from the subtitle to the
+            section label (the dialog's 16px gap, pulled up 2px). Bottom:
+            4px of padding so the last tile's selection ring isn't clipped
+            by the scroll edge, pulled up 6px so the footer gap stays 14px.
+            -mr-4 / pr-4: the scroll region runs to the dialog's right edge,
+            so the scrollbar sits there (same as the other scrolling dialogs)
+            rather than inset by the dialog's padding. */}
         <DialogBody
           ref={contentRef}
           // No scrollbar until the content is shown — the skeleton row (and
           // the invisible content beneath it) must not summon one.
-          className={`relative isolate -mb-0.5 -mt-0.5 px-1.5 pb-0 pt-0 [scrollbar-gutter:stable] ${
+          className={`relative isolate -mb-1.5 -mr-4 -mt-0.5 pb-1 pl-1.5 pr-4 pt-0 [scrollbar-gutter:stable] ${
             shown ? "" : "overflow-hidden"
           }`}
         >
@@ -763,6 +773,9 @@ export function CoversDialog({
   const [mbReleaseMatched, setMbReleaseMatched] = useState(false);
   const [busy, setBusy] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  // A release cover is a release-scoped write the backend refuses while a
+  // pass runs on the library; entry covers (artists, video) aren't.
+  const locked = useMatchLock(target?.kind === "release" ? target.libraryId : null);
   // Remote pickers (each its own modal, TMDB-style). The CAA browser opens
   // at once; the TMDB one needs the entry's tmdb id first — that lookup is
   // the button's own work, so the button spins past 500ms.
@@ -1026,12 +1039,12 @@ export function CoversDialog({
     return (
       <div key={c.path} className={`group relative ${extraClass}`}>
         {/* Natural aspect — posters, squares, and odd scans all
-            display WHOLE; rows align to the tallest tile. */}
+            display WHOLE; the row aligns tiles by their bottom edge. */}
         {/* Same hover treatment as grid-page cover cards. */}
         <button
-          disabled={busy}
+          disabled={busy || locked}
           onClick={() => setCover(c.path)}
-          title={isSelected ? "Current cover" : "Use this cover"}
+          title={locked ? MATCH_LOCK_TITLE : isSelected ? "Current cover" : "Use this cover"}
           className={`block w-full overflow-hidden rounded-[3px] bg-muted shadow-md transition-[translate,scale] duration-200 group-hover:-translate-y-1 group-hover:scale-[1.04] group-hover:shadow-xl ${
             isSelected
               ? "ring-2 ring-primary"
@@ -1149,7 +1162,13 @@ export function CoversDialog({
                 return c ? (
                   renderTile(c, "animate-in fade-in duration-300")
                 ) : (
-                  <Skeleton key={`incoming-${slot.id}`} className="aspect-square w-full rounded-[3px]" />
+                  // The square plus a caption line, like SkeletonTiles: the
+                  // real tile carries its resolution under it, so the
+                  // placeholder holds that line's height too.
+                  <div key={`incoming-${slot.id}`}>
+                    <Skeleton className="aspect-square w-full rounded-[3px]" />
+                    <Skeleton className="mx-auto mt-1.5 h-3 w-2/3" />
+                  </div>
                 );
               })}
             </div>

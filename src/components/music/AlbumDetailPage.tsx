@@ -15,6 +15,7 @@ import {
 } from "../ui/context-menu";
 import { TrackEditDialog, AlbumEditDialog } from "./EditDialogs";
 import { MatchDialog, MbStatusChip } from "./MatchDialog";
+import { NoteBlock } from "../NoteBlock";
 import { MoveToCollectionDialog } from "./MoveToCollectionDialog";
 import { PlayingIndicator } from "./PlayingIndicator";
 import { LoveButton, LoveMenuItem } from "./LoveButton";
@@ -26,6 +27,7 @@ import { ReleasePicker, releaseLabel } from "./ReleasePicker";
 import { useMbHidden } from "@/lib/mbVisibility";
 import { useTagWriting } from "@/lib/tagWriting";
 import { TagWriteDialog, TagWriteScope } from "./TagWriteDialog";
+import { MATCH_LOCK_TITLE, useMatchLock } from "@/hooks/libraryRuns";
 
 /** The header cover: a fixed-width box that holds its final size BEFORE
  *  the image paints, so the title beside it and the tracks below never
@@ -108,6 +110,9 @@ export function AlbumDetailPage({
   const [detail, setDetail] = useState<MusicAlbumDetail | null>(null);
   // Per-library "hide MusicBrainz outside the center" (center map toggle).
   const mbHidden = useMbHidden(detail?.library_id);
+  // A pass on this library holds the page's own writes (re-check, disc
+  // names); the dialogs it opens lock themselves.
+  const locked = useMatchLock(detail?.library_id);
   // Per-library tag-writing opt-in: the Write-to-files actions exist only when on.
   const tagWriting = useTagWriting(detail?.library_id);
   const [writeScope, setWriteScope] = useState<TagWriteScope | null>(null);
@@ -274,7 +279,10 @@ export function AlbumDetailPage({
             <CoversMenuItem onOpen={() => setCoversOpen(true)} />
           </ContextMenuContent>
         </ContextMenu>
-        <div className="min-w-0 pb-1">
+        {/* flex-1: the column runs to the page's right edge, so the note
+            below can too (the title's hover buttons still trail the title —
+            they follow its text, not the column's edge). */}
+        <div className="min-w-0 flex-1 pb-1">
           <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
             {detail.album_type || "album"}
           </p>
@@ -318,7 +326,7 @@ export function AlbumDetailPage({
                     setChecking(false);
                   }
                 }}
-                disabled={checking}
+                disabled={checking || locked}
                 className="mt-2 shrink-0 rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/title:opacity-100 disabled:opacity-40"
                 title="Check track list against MusicBrainz"
               >
@@ -412,6 +420,31 @@ export function AlbumDetailPage({
               />
             )}
           </div>
+          {/* The user's own notes, display only (user's call, 2026-09-27:
+              nothing here on an album without one): the album's, edited in
+              Edit album, then the version on show's — the pressing, the
+              rip, what's different about this copy — edited from the
+              versions picker and keyed to its folder like the pin and disc
+              names, so it travels with the version. The version note is
+              prefixed with its label when there are versions to tell apart;
+              a lone version's (a combine can leave one) shows unprefixed. */}
+          <NoteBlock
+            kind="entry"
+            subjectId={detail.id}
+            editable={false}
+            reloadKey={reloadKey}
+            className="mt-3"
+          />
+          {release && (
+            <NoteBlock
+              kind="release"
+              subjectId={release.id}
+              prefix={detail.releases.length > 1 ? releaseLabel(release) : undefined}
+              editable={false}
+              reloadKey={reloadKey}
+              className="mt-1.5"
+            />
+          )}
         </div>
       </div>
 
@@ -432,9 +465,10 @@ export function AlbumDetailPage({
               )}
               <button
                 type="button"
-                title="Name this disc"
+                disabled={locked}
+                title={locked ? MATCH_LOCK_TITLE : "Name this disc"}
                 onClick={() => setRenameDisc(discNo)}
-                className="opacity-0 transition-opacity hover:text-foreground group-hover/disc:opacity-100"
+                className="opacity-0 transition-opacity hover:text-foreground group-hover/disc:opacity-100 disabled:opacity-40"
               >
                 <Pencil size={11} />
               </button>
@@ -597,6 +631,7 @@ export function AlbumDetailPage({
       />
       <TrackEditDialog
         trackId={editTrackId}
+        libraryId={detail?.library_id}
         open={editTrackId !== null}
         onOpenChange={(o) => {
           if (!o) setEditTrackId(null);
@@ -605,12 +640,14 @@ export function AlbumDetailPage({
       />
       <AlbumEditDialog
         albumId={editAlbumOpen ? entryId : null}
+        libraryId={detail?.library_id}
         open={editAlbumOpen}
         onOpenChange={setEditAlbumOpen}
         onSaved={handleSaved}
       />
       <TagWriteDialog
         scope={writeScope}
+        libraryId={detail?.library_id}
         onOpenChange={(o) => {
           if (!o) setWriteScope(null);
         }}

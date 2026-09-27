@@ -1,6 +1,9 @@
+import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
-import { Disc3, FolderOpen, Merge, Pencil, Scissors, Star } from "lucide-react";
+import { Disc3, FolderOpen, Merge, NotebookPen, Pencil, Scissors, Star } from "lucide-react";
+import { ConfirmDialog } from "../ConfirmDialog";
+import { NoteDialog } from "../NoteDialog";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -8,6 +11,7 @@ import {
   DropdownMenuTrigger,
 } from "../ui/dropdown-menu";
 import { notifyPendingWorkChanged } from "./PendingWork";
+import { MATCH_LOCK_TITLE, useMatchLock } from "@/hooks/libraryRuns";
 import { releaseCover } from "./musicQueue";
 import type { MusicAlbumDetail, MusicRelease } from "../../types";
 
@@ -43,9 +47,89 @@ export function ReleasePicker({
   onChanged: () => void;
   mbHidden: boolean;
 }) {
+  // A pass on this library holds every release write here (default, label,
+  // merge, split) — the backend refuses them meanwhile. Above the early
+  // return: hooks run on every render.
+  const locked = useMatchLock(detail.library_id);
+  // Merge and separate ask first (user's call, 2026-09-26): both are one
+  // click on a small icon in a row of them, and both reshape the album on
+  // the next rescan. The confirm names what folds into what.
+  const [confirm, setConfirm] = useState<{ kind: "merge" | "split"; release: MusicRelease } | null>(
+    null,
+  );
+  // A version's note, edited from its row (user's call, 2026-09-27): the
+  // current text is fetched on the click, then the note dialog opens on
+  // it. Never locked — a note is the user's remark, not library data.
+  const [noteFor, setNoteFor] = useState<{ release: MusicRelease; text: string } | null>(null);
   const release = detail.releases.find((r) => r.id === releaseId) ?? null;
   if (detail.releases.length <= 1 || !release) return null;
+  const openNote = async (r: MusicRelease) => {
+    try {
+      const text = await invoke<string | null>("get_note", { kind: "release", subjectId: r.id });
+      setNoteFor({ release: r, text: text ?? "" });
+    } catch (err) {
+      toast.error(String(err));
+    }
+  };
+  const merge = async (r: MusicRelease) => {
+    try {
+      await invoke<string>("merge_album_release", { releaseId: r.id, intoReleaseId: releaseId });
+      toast("Merge staged — it applies on the next rescan");
+      notifyPendingWorkChanged();
+    } catch (err) {
+      toast.error(String(err));
+    }
+  };
+  const split = async (r: MusicRelease) => {
+    try {
+      await invoke<string>("split_album_release", { releaseId: r.id });
+      toast("Separation staged — it applies on the next rescan");
+      notifyPendingWorkChanged();
+    } catch (err) {
+      toast.error(String(err));
+    }
+  };
   return (
+    <>
+    <ConfirmDialog
+      open={confirm !== null}
+      onOpenChange={(o) => {
+        if (!o) setConfirm(null);
+      }}
+      title={confirm?.kind === "split" ? "Separate this release?" : "Merge releases?"}
+      message={
+        confirm?.kind === "split"
+          ? `“${confirm ? releaseLabel(confirm.release) : ""}” becomes its own album. Files stay put; it applies on the next rescan and can be undone until then.`
+          : `“${confirm ? releaseLabel(confirm.release) : ""}” merges into “${releaseLabel(release)}” — one track list. Files stay put; it applies on the next rescan and can be undone until then.`
+      }
+      lines={3}
+      confirmLabel={confirm?.kind === "split" ? "Separate" : "Merge"}
+      destructive={false}
+      onConfirm={() => {
+        if (!confirm) return;
+        void (confirm.kind === "split" ? split(confirm.release) : merge(confirm.release));
+      }}
+    />
+    <NoteDialog
+      open={noteFor !== null}
+      onOpenChange={(o) => {
+        if (!o) setNoteFor(null);
+      }}
+      label="note"
+      subject={noteFor ? `${detail.title} · ${releaseLabel(noteFor.release)}` : undefined}
+      initialValue={noteFor?.text ?? ""}
+      onSubmit={async (text) => {
+        if (!noteFor) return;
+        try {
+          await invoke("set_note", { kind: "release", subjectId: noteFor.release.id, text });
+        } catch (err) {
+          toast.error(String(err));
+          throw err;
+        }
+        // The page shows the note under the header — refetch.
+        onChanged();
+      }}
+    />
     <DropdownMenu>
       <DropdownMenuTrigger className="flex items-center gap-1.5 rounded-full border px-3.5 py-2 text-xs font-medium text-muted-foreground hover:text-foreground">
         <Disc3 size={13} />
@@ -104,8 +188,9 @@ export function ReleasePicker({
               {!r.is_default && (
                 <button
                   type="button"
-                  title="Make this the default release"
-                  className="rounded p-1 text-muted-foreground hover:bg-foreground/10 hover:text-foreground"
+                  disabled={locked}
+                  title={locked ? MATCH_LOCK_TITLE : "Make this the default release"}
+                  className="rounded p-1 text-muted-foreground hover:bg-foreground/10 hover:text-foreground disabled:opacity-40"
                   onClick={async (e) => {
                     e.stopPropagation();
                     e.preventDefault();
@@ -134,8 +219,21 @@ export function ReleasePicker({
               </button>
               <button
                 type="button"
-                title="Rename this release's label"
+                title="Note for this version…"
                 className="rounded p-1 text-muted-foreground hover:bg-foreground/10 hover:text-foreground"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  e.preventDefault();
+                  void openNote(r);
+                }}
+              >
+                <NotebookPen size={13} />
+              </button>
+              <button
+                type="button"
+                disabled={locked}
+                title={locked ? MATCH_LOCK_TITLE : "Rename this release's label"}
+                className="rounded p-1 text-muted-foreground hover:bg-foreground/10 hover:text-foreground disabled:opacity-40"
                 onClick={(e) => {
                   e.stopPropagation();
                   e.preventDefault();
@@ -147,18 +245,17 @@ export function ReleasePicker({
               {r.id !== releaseId && (
                 <button
                   type="button"
-                  title={`Merge into “${releaseLabel(release)}” — one track list (staged — applies on the next rescan)`}
-                  className="rounded p-1 text-muted-foreground hover:bg-foreground/10 hover:text-foreground"
-                  onClick={async (e) => {
+                  disabled={locked}
+                  title={
+                    locked
+                      ? MATCH_LOCK_TITLE
+                      : `Merge into “${releaseLabel(release)}” — one track list (staged — applies on the next rescan)`
+                  }
+                  className="rounded p-1 text-muted-foreground hover:bg-foreground/10 hover:text-foreground disabled:opacity-40"
+                  onClick={(e) => {
                     e.stopPropagation();
                     e.preventDefault();
-                    try {
-                      await invoke<string>("merge_album_release", { releaseId: r.id, intoReleaseId: releaseId });
-                      toast("Merge staged — it applies on the next rescan");
-                      notifyPendingWorkChanged();
-                    } catch (err) {
-                      toast.error(String(err));
-                    }
+                    setConfirm({ kind: "merge", release: r });
                   }}
                 >
                   <Merge size={13} />
@@ -166,18 +263,17 @@ export function ReleasePicker({
               )}
               <button
                 type="button"
-                title="Separate into its own album (staged — applies on the next rescan)"
-                className="rounded p-1 text-muted-foreground hover:bg-foreground/10 hover:text-foreground"
-                onClick={async (e) => {
+                disabled={locked}
+                title={
+                  locked
+                    ? MATCH_LOCK_TITLE
+                    : "Separate into its own album (staged — applies on the next rescan)"
+                }
+                className="rounded p-1 text-muted-foreground hover:bg-foreground/10 hover:text-foreground disabled:opacity-40"
+                onClick={(e) => {
                   e.stopPropagation();
                   e.preventDefault();
-                  try {
-                    await invoke<string>("split_album_release", { releaseId: r.id });
-                    toast("Separation staged — it applies on the next rescan");
-                    notifyPendingWorkChanged();
-                  } catch (err) {
-                    toast.error(String(err));
-                  }
+                  setConfirm({ kind: "split", release: r });
                 }}
               >
                 <Scissors size={13} />
@@ -187,5 +283,6 @@ export function ReleasePicker({
         ))}
       </DropdownMenuContent>
     </DropdownMenu>
+    </>
   );
 }

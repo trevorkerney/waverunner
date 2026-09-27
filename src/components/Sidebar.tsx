@@ -122,6 +122,10 @@ export function Sidebar({
   const [deleteTarget, setDeleteTarget] = useState<Library | null>(null);
   // Typed-name gate for the delete dialog — must equal the library's name.
   const [deleteConfirmText, setDeleteConfirmText] = useState("");
+  // The delete in flight: the dialog locks (no second click, no dismiss)
+  // until the backend answers — the cascade over a big library takes a
+  // moment, and a repeated click used to fire it again.
+  const [deleting, setDeleting] = useState(false);
   const [renameTarget, setRenameTarget] = useState<Library | null>(null);
   // Library whose source folders are being managed (add/remove/repoint).
   const [manageFoldersTarget, setManageFoldersTarget] = useState<Library | null>(null);
@@ -359,7 +363,9 @@ export function Sidebar({
                       </ContextMenuItem>
                       <ContextMenuItem
                         // Rescans show in place of the library's page, then
-                        // the match question follows as a banner there.
+                        // the match question follows as a banner there. A
+                        // running pass holds the rescan (backend refuses).
+                        disabled={run?.kind === "match"}
                         onClick={() => void rescan(lib)}
                       >
                         <RefreshCw size={14} />
@@ -596,7 +602,7 @@ export function Sidebar({
       <Dialog
         open={deleteTarget !== null}
         onOpenChange={(open) => {
-          if (!open) {
+          if (!open && !deleting) {
             setDeleteTarget(null);
             setDeleteConfirmText("");
           }
@@ -618,19 +624,26 @@ export function Sidebar({
             value={deleteConfirmText}
             onChange={(e) => setDeleteConfirmText(e.target.value)}
             placeholder={deleteTarget?.name ?? ""}
+            disabled={deleting}
             autoFocus
           />
           <DialogFooter>
-            <Button variant="outline" onClick={() => { setDeleteTarget(null); setDeleteConfirmText(""); }}>
+            <Button
+              variant="outline"
+              disabled={deleting}
+              onClick={() => { setDeleteTarget(null); setDeleteConfirmText(""); }}
+            >
               Cancel
             </Button>
             <Button
               variant="destructive"
+              className="gap-1.5"
               // Exact name, case included — deliberate friction for a
               // destructive, unrecoverable action.
-              disabled={deleteConfirmText !== (deleteTarget?.name ?? "")}
+              disabled={deleting || deleteConfirmText !== (deleteTarget?.name ?? "")}
               onClick={async () => {
-                if (!deleteTarget) return;
+                if (!deleteTarget || deleting) return;
+                setDeleting(true);
                 try {
                   await invoke("delete_library", { libraryId: deleteTarget.id });
                   setDeleteTarget(null);
@@ -638,10 +651,13 @@ export function Sidebar({
                   onLibraryDeleted(deleteTarget.id);
                 } catch (err) {
                   toast.error(String(err));
+                } finally {
+                  setDeleting(false);
                 }
               }}
             >
-              Delete
+              {deleting && <Spinner className="size-3" />}
+              {deleting ? "Deleting…" : "Delete"}
             </Button>
           </DialogFooter>
         </DialogContent>

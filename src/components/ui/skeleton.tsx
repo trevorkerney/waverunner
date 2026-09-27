@@ -102,4 +102,54 @@ function useHandoff(ready: boolean, contentRef: React.RefObject<HTMLElement | nu
   }
 }
 
-export { Skeleton, useHandoff, useSkeletonDelay }
+/** Grey list rows — the stand-in for a list still loading (search results,
+ *  a discography, a release list). Two text lines per row, an optional
+ *  round avatar; `rows` should match how many the frame shows. */
+function SkeletonRows({
+  rows = 5,
+  avatar = false,
+  className,
+}: {
+  rows?: number
+  avatar?: boolean
+  className?: string
+}) {
+  return (
+    <div className={cn("flex flex-col", className)}>
+      {Array.from({ length: rows }, (_, i) => (
+        <div key={i} className={cn("flex items-center gap-2 px-3 py-2", i > 0 && "border-t border-border/40")}>
+          {avatar && <Skeleton className="size-7 shrink-0 rounded-full" />}
+          <div className="flex flex-1 flex-col gap-1.5">
+            <Skeleton className="h-3.5 w-1/3" />
+            <Skeleton className="h-3 w-2/3" />
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+/** Content that fades in on mount (200ms). The lightweight half of the
+ *  skeleton → content hand-off for lists that load repeatedly (a search
+ *  box): the skeleton shows after 500ms, and whatever replaces it arrives
+ *  faded in rather than snapping. */
+function FadeIn({ className, children }: { className?: string; children: React.ReactNode }) {
+  const [on, setOn] = React.useState(false)
+  React.useEffect(() => {
+    const id = requestAnimationFrame(() => setOn(true))
+    return () => cancelAnimationFrame(id)
+  }, [])
+  return (
+    <div
+      className={cn(
+        "transition-opacity duration-200 will-change-[opacity]",
+        on ? "opacity-100" : "opacity-0",
+        className,
+      )}
+    >
+      {children}
+    </div>
+  )
+}
+
+export { Skeleton, SkeletonRows, FadeIn, useHandoff, useSkeletonDelay }

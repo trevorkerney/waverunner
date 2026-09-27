@@ -19,6 +19,7 @@ import {
 } from "../ui/context-menu";
 import { TrackEditDialog, ArtistEditDialog, SplitArtistDialog } from "./EditDialogs";
 import { MatchDialog, MbStatusChip } from "./MatchDialog";
+import { NoteBlock } from "../NoteBlock";
 import { PersonaDialog } from "./PersonaDialog";
 import { PlayingIndicator } from "./PlayingIndicator";
 import { LoveButton, LoveMenuItem } from "./LoveButton";
@@ -650,7 +651,10 @@ export function ArtistDetailPage({
             <Music2 size={48} />
           </div>
         )}
-        <div className="min-w-0">
+        {/* flex-1: the column runs up to the actions on the right, so the
+            note below can (the actions block is shrink-0 and keeps its
+            width; the title's pencil still trails the title text). */}
+        <div className="min-w-0 flex-1">
           <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Artist</p>
           <h1 className="group/title flex min-w-0 items-center gap-2 font-heading text-3xl font-bold">
             <span className="truncate">{detail.title}</span>
@@ -764,6 +768,9 @@ export function ArtistDetailPage({
               {detail.biography}
             </p>
           )}
+          {/* The user's own note, separate from the biography (fetched-data
+              territory) — shown in full, edited in place. */}
+          <NoteBlock kind="entry" subjectId={detail.id} subject={detail.title} className="mt-2" />
         </div>
         <div className="ml-auto flex shrink-0 items-center gap-2 self-start">
           {/* Heart filter — detail view only; the grid has no rows to filter. */}
@@ -1284,6 +1291,7 @@ export function ArtistDetailPage({
       )}
       <TrackEditDialog
         trackId={editTrackId}
+        libraryId={libraryId}
         open={editTrackId !== null}
         onOpenChange={(o) => {
           if (!o) setEditTrackId(null);
@@ -1292,12 +1300,14 @@ export function ArtistDetailPage({
       />
       <ArtistEditDialog
         artistId={editArtistOpen ? entryId : null}
+        libraryId={libraryId}
         open={editArtistOpen}
         onOpenChange={setEditArtistOpen}
         onSaved={handleSaved}
       />
       <TagWriteDialog
         scope={writeScope}
+        libraryId={libraryId}
         onOpenChange={(o) => {
           if (!o) setWriteScope(null);
         }}
@@ -1318,6 +1328,7 @@ export function ArtistDetailPage({
       />
       <SplitArtistDialog
         artistId={splitArtistOpen ? entryId : null}
+        libraryId={libraryId}
         artistName={detail?.title ?? ""}
         open={splitArtistOpen}
         onOpenChange={setSplitArtistOpen}

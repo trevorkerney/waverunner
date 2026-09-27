@@ -26,7 +26,8 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ClearableInput } from "@/components/ui/clearable-input";
 import { useFlipList } from "@/hooks/useFlipList";
-import { useGridWindow } from "@/hooks/useGridWindow";
+import type { GridWindow } from "@/hooks/useGridWindow";
+import { WindowedGrid } from "@/components/WindowedGrid";
 import { useMbHidden } from "@/lib/mbVisibility";
 import { MbDot } from "@/components/music/MbDot";
 import { Slider } from "@/components/ui/slider";
@@ -107,8 +108,9 @@ import { RenameDialog } from "@/components/RenameDialog";
 import { NameDialog } from "@/components/NameDialog";
 import { ArtistDetailPage } from "@/components/music/ArtistDetailPage";
 import { PlaylistTrackList } from "@/components/music/PlaylistTrackList";
+import { NoteBlock } from "@/components/NoteBlock";
 import { HomePage } from "@/components/HomePage";
-import { CombineSelectedDialog, type AlbumSelection } from "@/components/music/CombineSelectedDialog";
+import { CombineSelectedDialog, type AlbumSelection, type DiscName } from "@/components/music/CombineSelectedDialog";
 
 /** What the combine dialog holds while no selection is in progress. */
 const EMPTY_ALBUM_SELECTION: AlbumSelection = {
@@ -424,11 +426,24 @@ export function MainContent({
     },
     [selectedLibrary, albumSelect, toggleAlbumSelect],
   );
-  const combineSelected = useCallback(async (targetReleaseFolder: string | null) => {
+  const combineSelected = useCallback(async (targetReleaseFolder: string | null, title: string | null, discs: DiscName[]) => {
     if (!albumSelect || albumSelect.keeperId == null || albumSelect.picked.length < 2) return;
     const { libraryId, picked, keeperId, mode } = albumSelect;
     setAlbumSelect((s) => (s ? { ...s, busy: true } : s));
     try {
+      // The title nudge's answer FIRST: a user-tier title on the keeper,
+      // carried through the rescan. It must land before the combine is
+      // staged — staged is immutable, and the keeper is part of the
+      // staging, so a title written after it is refused.
+      if (title) {
+        await invoke("set_album_fields", { albumId: keeperId, fields: { title } });
+      }
+      // Disc names likewise: folder-keyed on the keeper's edition, which is
+      // the merged release's key after the rescan — names for the discs the
+      // other albums bring show up when their tracks land.
+      for (const d of discs) {
+        await invoke("set_disc_title", { releaseId: d.releaseId, discNo: d.discNo, title: d.title });
+      }
       await invoke("combine_albums_multi", {
         libraryId,
         sourceIds: picked.filter((p) => p.id !== keeperId).map((p) => p.id),
@@ -643,27 +658,32 @@ export function MainContent({
   // flying across the grid. Rebaseline without animating on those renders.
   const navKey = `${activeView ? viewCacheKey(activeView) : "none"}|${breadcrumbs[breadcrumbs.length - 1]?.id ?? "root"}|${isSearching ? "s" : ""}`;
 
+  // Inside a video collection: the last crumb is the collection itself — a
+  // plain id + title crumb (detail pages carry `entry`, roots carry `view`).
+  // Its note sits at the top of the grid, which has no title header.
+  const lastCrumb = breadcrumbs[breadcrumbs.length - 1];
+  const videoCollectionId =
+    selectedLibrary?.format === "video" && lastCrumb && lastCrumb.id != null && !lastCrumb.view && !lastCrumb.entry
+      ? lastCrumb.id
+      : null;
+
   // Row windowing for the cover grid: only rows near the viewport mount
   // (the grid pads itself to full height for the rows that don't). This is
   // what makes an 800-album page mount like a 40-album one. Off for the
   // lists that share gridRef but aren't card grids (artists, music
   // playlists) and while a card is being dragged (it must stay mounted).
-  const gridWindow = useGridWindow({
-    scrollRef: scrollContainerRef,
-    gridRef,
-    count: filteredEntries.length,
-    minColumnWidth: coverSize,
-    // Square cover + two text lines; the first measured row replaces it.
-    estimateRowHeight: coverSize + 56,
-    overscan: 3,
-    resetKey: `${coverSize}|${navKey}`,
-    enabled:
-      !selectedEntry &&
-      !isArtistsView &&
-      !(selectedLibrary?.format === "music" && activeView?.kind === "playlist-detail"),
-    frozen: dragId != null,
-  });
-  const { scrollToIndex } = gridWindow;
+  // The window itself lives in WindowedGrid (its slice is that component's
+  // state, so a scrolled row re-renders the grid, not this page); this is
+  // the page's handle on it, for the scrubber and scroll restore.
+  const gridWindowRef = useRef<GridWindow | null>(null);
+  const scrollToIndex = useCallback(
+    (index: number, delta?: number) => gridWindowRef.current?.scrollToIndex(index, delta),
+    [],
+  );
+  const gridWindowEnabled =
+    !selectedEntry &&
+    !isArtistsView &&
+    !(selectedLibrary?.format === "music" && activeView?.kind === "playlist-detail");
 
   const jumpToGridEntry = useCallback(
     (label: string) => {
@@ -680,6 +700,15 @@ export function MainContent({
       const padTop = parseFloat(getComputedStyle(container).paddingTop) || 0;
       const offset = (el: Element) =>
         el.getBoundingClientRect().top - (container.getBoundingClientRect().top + padTop);
+      // The artists grid windows per letter section: its cards may not be
+      // mounted, but every section header is — land on the header.
+      const header = isArtistsView
+        ? gridRef.current?.querySelector(`[data-letter="${window.CSS.escape(label)}"]`)
+        : null;
+      if (header) {
+        container.scrollTop += offset(header);
+        return;
+      }
       const first = gridRef.current?.querySelector(sel);
       if (first) {
         container.scrollTop += offset(first);
@@ -688,9 +717,8 @@ export function MainContent({
         // row arithmetic, then let the settle loop below find the real card.
         scrollToIndex(filteredEntries.indexOf(target), padTop);
       }
-      // Rows above the target are ESTIMATES until they render (windowing,
-      // and content-visibility inside the cards), so the first jump can land
-      // off. Re-align over a few frames until the target stops moving —
+      // Rows above the target are ESTIMATES until they render (windowing),
+      // so the first jump can land off. Re-align over a few frames until the target stops moving —
       // each pass renders the surroundings and tightens the layout.
       let attempts = 0;
       const settle = () => {
@@ -708,7 +736,7 @@ export function MainContent({
       };
       requestAnimationFrame(settle);
     },
-    [gridScrubber, scrollContainerRef, scrollToIndex, filteredEntries],
+    [gridScrubber, scrollContainerRef, scrollToIndex, filteredEntries, isArtistsView],
   );
 
   // Scroll restore (App) anchors on the card that sat at the top of the
@@ -720,6 +748,10 @@ export function MainContent({
     if (!c) return;
     const onAnchor = (e: Event) => {
       const d = (e as CustomEvent<{ id: string; delta: number; handled: boolean }>).detail;
+      // No windowed cover grid mounted (the artists view, a playlist's
+      // track list): leave the event unhandled, and App restores the raw
+      // offset — those pages pad themselves to full height too.
+      if (!gridWindowRef.current) return;
       const idx = filteredEntries.findIndex((en) => String(sortableIdFor(en)) === d.id);
       if (idx < 0) return;
       scrollToIndex(idx, d.delta);
@@ -882,8 +914,8 @@ export function MainContent({
       // Animate only movers whose old OR new box crosses the viewport (plus a
       // margin). A full re-sort moves nearly every card; the offscreen ones can
       // land instantly — animating them wastes compositor work and drags cards
-      // through the viewport, forcing paints of content-visibility regions
-      // mid-animation. This is what keeps big-grid sort switches smooth.
+      // through the viewport, forcing paints mid-animation. This is what
+      // keeps big-grid sort switches smooth.
       const sc = scrollContainerRef.current;
       const viewTop = (sc?.scrollTop ?? 0) - 200;
       const viewBottom = (sc?.scrollTop ?? 0) + (sc?.clientHeight ?? window.innerHeight) + 200;
@@ -1207,6 +1239,41 @@ export function MainContent({
     entry.link_id == null &&
     selectedLibrary?.id === albumSelect.libraryId;
   const cardSelected = (entry: MediaEntry) => !!albumSelect?.picked.some((p) => p.id === entry.id);
+  // One card of the windowed grid. A callback so the grid can render its
+  // slice without this page rendering: the deps are everything a card
+  // shows, and a change to any of them re-renders the grid through a new
+  // callback, as before.
+  const renderCard = useCallback(
+    (entry: MediaEntry) => (
+      <Card
+        key={sortableIdFor(entry)}
+        sortableId={sortableIdFor(entry)}
+        entry={entry}
+        size={coverSize}
+        onNavigate={onNavigate}
+        onRename={onRenameEntry}
+        isRenaming={renamingId != null && renamingId === sortableIdFor(entry)}
+        onRenameEnd={endRename}
+        watchOverride={watchOverrides.get(entry.id) ?? null}
+        selectMode={cardSelectMode(entry)}
+        selected={cardSelected(entry)}
+        onToggleSelect={toggleAlbumSelect}
+        deletingId={deletingId}
+        getCoverUrl={getCoverUrl}
+        getCoverAspect={getCoverAspect}
+        isDragActive={dragId != null}
+        pendingRemoval={pendingRemovalId != null && pendingRemovalId === sortableIdFor(entry)}
+        sortMode={sortMode}
+        mbState={showMbDots ? entry.mb_state ?? null : null}
+      />
+    ),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [
+      Card, coverSize, onNavigate, onRenameEntry, renamingId, endRename, watchOverrides,
+      albumSelect, selectedLibrary, toggleAlbumSelect, deletingId, getCoverUrl, getCoverAspect,
+      dragId, pendingRemovalId, sortMode, showMbDots,
+    ],
+  );
   const captureMenuTarget = (e: ReactMouseEvent) => {
     if (isMusicPlaylist) return;
     const el = (e.target as Element).closest?.("[data-flip-id]") as HTMLElement | null;
@@ -2057,6 +2124,34 @@ export function MainContent({
       // selection mode swaps its contents rather than silencing it.
       <ContextMenu open={gridMenuOpen} onOpenChange={setGridMenuOpen}>
         <ContextMenuTrigger render={<div className="flex min-h-full flex-col" onContextMenuCapture={captureMenuTarget} />}>
+        {/* The page's own note or description, at the top: grid pages have
+            no title header, so this is where it reads. Playlists and the
+            collections inside them carry a description; a video collection
+            carries a note. Hidden while a search is showing results. */}
+        {!searchResults && activeView?.kind === "playlist-detail" && (
+          activeView.collectionId != null ? (
+            <NoteBlock
+              kind="playlist_collection"
+              subjectId={activeView.collectionId}
+              // The collection's crumb carries its name (App pushes one per
+              // collection drilled into); the playlist's is the fallback.
+              subject={lastCrumb?.title ?? activeView.playlistName}
+              label="description"
+              className="mb-4"
+            />
+          ) : (
+            <NoteBlock
+              kind="playlist"
+              subjectId={activeView.playlistId}
+              subject={activeView.playlistName}
+              label="description"
+              className="mb-4"
+            />
+          )
+        )}
+        {!searchResults && activeView?.kind !== "playlist-detail" && videoCollectionId != null && (
+          <NoteBlock kind="entry" subjectId={videoCollectionId} subject={lastCrumb?.title} className="mb-4" />
+        )}
         {/* Albums page: album-less tracks get a header button above the grid —
             their hidden containers never surface as cards, so this is their
             only album-side entrance. The Sounds page gets the same button for
@@ -2127,46 +2222,26 @@ export function MainContent({
                   />
                 </div>
               ) : (
-              <div
-                ref={gridRef}
-                // gap-2.5: cards carry 8px of their own padding per side, so the
-                // visible cover-to-cover distance is gap + 16px. Cards span two
-                // implicit rows and subgrid onto them, so every cover in a row
-                // shares one (bottom-aligned) track and every title the next —
-                // covers keep their natural heights but their bottoms line up.
+              // gap-2.5: cards carry 8px of their own padding per side, so the
+              // visible cover-to-cover distance is gap + 16px. Cards span two
+              // implicit rows and subgrid onto them, so every cover in a row
+              // shares one (bottom-aligned) track and every title the next —
+              // covers keep their natural heights but their bottoms line up.
+              <WindowedGrid
+                items={filteredEntries}
+                renderItem={renderCard}
+                gridRef={gridRef}
+                scrollRef={scrollContainerRef}
+                minColumnWidth={coverSize}
+                // Square cover + two text lines; the first measured row replaces it.
+                estimateRowHeight={coverSize + 56}
+                overscan={3}
+                resetKey={`${coverSize}|${navKey}`}
+                enabled={gridWindowEnabled}
+                frozen={dragId != null}
                 className="grid gap-2.5"
-                style={{
-                  gridTemplateColumns: `repeat(auto-fill, minmax(${coverSize}px, 1fr))`,
-                  justifyItems: "center",
-                  // Windowing: the rows that aren't mounted are this padding.
-                  paddingTop: gridWindow.padTop,
-                  paddingBottom: gridWindow.padBottom,
-                }}
-              >
-                {filteredEntries.slice(gridWindow.start, gridWindow.end).map((entry) => (
-                  <Card
-                    key={sortableIdFor(entry)}
-                    sortableId={sortableIdFor(entry)}
-                    entry={entry}
-                    size={coverSize}
-                    onNavigate={onNavigate}
-                    onRename={onRenameEntry}
-                    isRenaming={renamingId != null && renamingId === sortableIdFor(entry)}
-                    onRenameEnd={endRename}
-                    watchOverride={watchOverrides.get(entry.id) ?? null}
-                    selectMode={cardSelectMode(entry)}
-                    selected={cardSelected(entry)}
-                    onToggleSelect={toggleAlbumSelect}
-                    deletingId={deletingId}
-                    getCoverUrl={getCoverUrl}
-                    getCoverAspect={getCoverAspect}
-                    isDragActive={dragId != null}
-                    pendingRemoval={pendingRemovalId != null && pendingRemovalId === sortableIdFor(entry)}
-                    sortMode={sortMode}
-                    mbState={showMbDots ? entry.mb_state ?? null : null}
-                  />
-                ))}
-              </div>
+                windowRef={gridWindowRef}
+              />
               ),
           )
         )}
@@ -2289,7 +2364,7 @@ export function MainContent({
         onKeeper={(id) => setAlbumSelect((s) => (s ? { ...s, keeperId: id } : s))}
         onMode={(mode) => setAlbumSelect((s) => (s ? { ...s, mode } : s))}
         onOpenChange={(o) => setAlbumSelect((s) => (s ? { ...s, configuring: o } : s))}
-        onConfirm={(targetReleaseFolder) => void combineSelected(targetReleaseFolder)}
+        onConfirm={(targetReleaseFolder, title, discs) => void combineSelected(targetReleaseFolder, title, discs)}
       />
 
       <EditCharacterNameDialog
@@ -2440,7 +2515,10 @@ interface CoverCardProps {
  *  playlists, a video library's collections) — every registration is a
  *  node the drag context measures, and a thousand of them for grids that
  *  can't reorder was a big slice of the mount. */
-function SortableCoverCard(props: CoverCardProps) {
+/** Memoized like CoverCard beneath it: a window slice move re-renders only
+ *  the cards entering the grid. (The drag context still re-renders every
+ *  sortable while a drag is live — that's dnd-kit's own subscription.) */
+const SortableCoverCard = memo(function SortableCoverCard(props: CoverCardProps) {
   const { entry, sortableId, sortMode } = props;
   const {
     attributes,
@@ -2482,7 +2560,7 @@ function SortableCoverCard(props: CoverCardProps) {
       drag={{ setRef, attributes, listeners, style, isDragging, isOver }}
     />
   );
-}
+});
 
 /** Memoized: a window slice move re-renders only the cards entering the
  *  grid; the cards staying keep their elements. Holds as long as the
@@ -2556,22 +2634,21 @@ const CoverCard = memo(function CoverCard({
           !isDragging &&
           (selectMode && onToggleSelect ? onToggleSelect(entry) : onNavigate(entry))
         }
-        // will-change: the list-change FLIP animates transform per card
-        // (sort switches, drops, deletes), which promotes each card to a
-        // compositor layer and drops it at the end — the drop re-rasterizes
-        // text at its true subpixel offset (cards sit at fractional x in
-        // centered 1fr columns), a visible end-of-landing jump. A permanent
-        // layer has nothing to snap back to. Affordable now that the grid is
-        // windowed (~50 cards, not the library).
-        className={`group grid will-change-transform justify-items-center rounded-md p-2 text-left ${
+        // No permanent compositor layer per card (will-change removed
+        // 2026-09-26). It had been kept so the list-change FLIP's transform
+        // had no layer to drop at the end (the drop re-rasterized text at
+        // its subpixel offset — a small end-of-landing snap). The cost was
+        // worse: a cover that finished decoding inside an already-rasterized
+        // layer was never repainted until a hover transform forced it —
+        // grey covers that filled in on hover. The snap is cosmetic.
+        className={`group grid justify-items-center rounded-md p-2 text-left ${
           isDragging || pendingRemoval ? "pointer-events-none opacity-0" : ""
         } ${drag?.isOver && isDragActive ? "ring-2 ring-primary ring-offset-2 ring-offset-background" : ""}`}
         style={{ ...drag?.style, maxWidth: size, gridRow: "span 2", gridTemplateRows: "subgrid" }}
       >
-        {/* content-visibility lives on the cover box, NOT the card root: it brings
-            paint containment, and on the root it would clip the hover lift (the
-            cover translates above the card's padding). Here the clip box is the
-            already-overflow-hidden cover and transforms along with the hover. */}
+        {/* No content-visibility on the cover box (removed 2026-09-26): the
+            grid is row-windowed, so only the rows near the viewport are in
+            the DOM and skipping offscreen boxes had nothing left to skip. */}
         <div
           className={`relative self-end overflow-hidden bg-muted shadow-md transition-[translate,scale] duration-200 group-hover:-translate-y-1 group-hover:scale-[1.04] group-hover:shadow-xl ${
             entry.entry_type === "artist" ? "rounded-full" : "rounded-[3px]"
@@ -2586,33 +2663,25 @@ const CoverCard = memo(function CoverCard({
               ? {
                   width: size - 16,
                   aspectRatio: "1",
-                  contentVisibility: "auto",
-                  containIntrinsicSize: `${size - 16}px ${size - 16}px`,
                 }
               : coverAspect
               ? {
                   // Known aspect → reserve the exact box so the image can't shift the row on load.
                   width: size - 16,
                   aspectRatio: String(coverAspect),
-                  contentVisibility: "auto",
-                  containIntrinsicSize: `${size - 16}px ${Math.round((size - 16) / coverAspect)}px`,
                 }
               : entry.entry_type === "album" || entry.entry_type === "track"
               ? {
                   // Album art is square: reserve 1:1 (center-crop the rare
-                  // non-square cover). The 2:3 poster estimate below would
-                  // collapse by a third on image load and shove the row —
-                  // multiplied across a grid, that's a visible stutter.
+                  // non-square cover). A 2:3 poster estimate would collapse
+                  // by a third on image load and shove the row — multiplied
+                  // across a grid, that's a visible stutter.
                   width: size - 16,
                   aspectRatio: "1",
-                  contentVisibility: "auto",
-                  containIntrinsicSize: `${size - 16}px ${size - 16}px`,
                 }
               : {
+                  // Video without a decoded aspect: the poster's own height.
                   width: size - 16,
-                  // Skips layout/paint/decode for offscreen covers; estimates a 2:3 poster.
-                  contentVisibility: "auto",
-                  containIntrinsicSize: `${size - 16}px ${Math.round((size - 16) * 1.5)}px`,
                 }
           }
         >
@@ -2620,7 +2689,13 @@ const CoverCard = memo(function CoverCard({
             <img
               src={coverSrc}
               alt={entry.title}
-              loading="lazy"
+              // Eager: the row windowing bounds how many covers are mounted,
+              // and an explicit policy opts out of the webview's automatic
+              // lazy-loading intervention (placeholders swapped in until
+              // interaction). Decoded off the main thread: a row mounts
+              // six covers at once, and decoding them during paint costs
+              // the frame.
+              loading="eager"
               decoding="async"
               // Covers cached before thumbnails existed for app-added images
               // 404 on the thumb path — fall back to the full-res original.
@@ -3534,6 +3609,10 @@ function EntryDetailPage({
 
             {detail.plot && <p className="text-sm leading-relaxed">{detail.plot}</p>}
 
+            {/* The user's own note on the movie — below the plot, above the
+                credits; the edit form above has its own fields. */}
+            <NoteBlock kind="entry" subjectId={entry.id} subject={entry.title} />
+
             {(detail.directors.length > 0 || detail.composers.length > 0) && (
               <div className="flex flex-wrap gap-x-12 gap-y-4">
                 {detail.directors.length > 0 && (
@@ -4366,6 +4445,10 @@ function ShowDetailPage({
 
             {detail.plot && <p className="text-sm leading-relaxed">{detail.plot}</p>}
 
+            {/* The user's own note on the show — below the plot, above the
+                credits. Show-level only; seasons and episodes carry none. */}
+            <NoteBlock kind="entry" subjectId={entry.id} subject={entry.title} />
+
             {(detail.creators.length > 0 || detail.composers.length > 0) && (
               <div className="flex flex-wrap gap-x-12 gap-y-4">
                 {detail.creators.length > 0 && (
@@ -5122,6 +5205,9 @@ function PersonDetailHeader({
                 )}
               </div>
             )}
+            {/* The user's own note on the person — global, like the person
+                row itself, so it shows on their page in every video library. */}
+            <NoteBlock kind="person" subjectId={personId} subject={displayName} className="mt-1.5" />
           </div>
         </ContextMenuTrigger>
         <ContextMenuContent>
@@ -5270,7 +5356,11 @@ function PlaylistsView({
   // Reorder only makes sense in custom sort with no active search filter.
   const dragEnabled = sortMode === "custom" && !q;
 
+  // A drag in flight holds the grid's window (the dragged card must stay
+  // mounted); cleared on drop or cancel.
+  const [dragging, setDragging] = useState(false);
   const handleDragEnd = (event: DragEndEvent) => {
+    setDragging(false);
     // Hold the FLIP through the post-drop render + dnd's settle animation.
     window.setTimeout(() => {
       flipSkipRef.current = false;
@@ -5371,28 +5461,40 @@ function PlaylistsView({
               collisionDetection={closestCenter}
               onDragStart={() => {
                 flipSkipRef.current = true;
+                setDragging(true);
               }}
+              onDragCancel={() => setDragging(false)}
               onDragEnd={handleDragEnd}
             >
               <SortableContext items={visible.map((p) => p.id)} strategy={rectSortingStrategy}>
-                <div
-                  ref={gridRef}
-                  className="grid gap-4 p-4"
-                  style={{ gridTemplateColumns: `repeat(auto-fill, minmax(${coverSize}px, 1fr))`, justifyItems: "center" }}
-                >
-                  {visible.map((pl) => (
-                    <PlaylistCard
-                      key={pl.id}
-                      playlist={pl}
-                      coverSize={coverSize}
-                      sortable={dragEnabled}
-                      onClick={() => onNavigateToPlaylist(pl)}
-                  onRename={() => setRenameTarget(pl)}
-                  onDelete={() => handleDelete(pl)}
-                  onCreatePeer={() => setCreateOpen(true)}
-                  onAddCover={() => handleAddCover(pl)}
-                    />
-                  ))}
+                {/* Windowed like the library grid (2026-09-26): the page's
+                    16px inset stays on this wrapper — the grid's own top and
+                    bottom padding stand in for the rows that aren't mounted. */}
+                <div className="p-4">
+                  <WindowedGrid
+                    items={visible}
+                    renderItem={(pl) => (
+                      <PlaylistCard
+                        key={pl.id}
+                        playlist={pl}
+                        coverSize={coverSize}
+                        sortable={dragEnabled}
+                        onClick={() => onNavigateToPlaylist(pl)}
+                        onRename={() => setRenameTarget(pl)}
+                        onDelete={() => handleDelete(pl)}
+                        onCreatePeer={() => setCreateOpen(true)}
+                        onAddCover={() => handleAddCover(pl)}
+                      />
+                    )}
+                    gridRef={gridRef}
+                    scrollRef={scrollContainerRef}
+                    minColumnWidth={coverSize}
+                    // Square cover + two text lines; the first measured row replaces it.
+                    estimateRowHeight={coverSize + 48}
+                    resetKey={`${coverSize}|${sortMode}|${q}`}
+                    frozen={dragging}
+                    className="grid gap-4"
+                  />
                 </div>
               </SortableContext>
             </DndContext>
@@ -5497,7 +5599,7 @@ function PlaylistCard({
         {/* Square, not 2:3 — playlist covers are expected square (album-art shaped). */}
         <div className="relative aspect-square overflow-hidden rounded-[3px] bg-muted shadow-md ring-1 ring-foreground/10 transition-[translate,scale] duration-200 group-hover:-translate-y-1 group-hover:scale-[1.04] group-hover:shadow-xl group-hover:ring-foreground/25">
           {coverSrc ? (
-            <img src={coverSrc} alt={playlist.title} className="h-full w-full object-cover" draggable={false} />
+            <img src={coverSrc} alt={playlist.title} loading="eager" decoding="async" className="h-full w-full object-cover" draggable={false} />
           ) : (
             <div className="flex h-full w-full items-center justify-center text-muted-foreground">
               <ListMusic size={36} />

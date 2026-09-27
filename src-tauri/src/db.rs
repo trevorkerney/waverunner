@@ -701,6 +701,35 @@ const MIGRATIONS: &[Migration] = &[
             "ALTER TABLE album_release_pref ADD COLUMN pre_emphasis INTEGER",
         ],
     },
+    Migration {
+        id: 41,
+        app_version: "1.0.0-alpha.12.5",
+        description: "release_match.disc_titles — the pinned pressing's MusicBrainz medium titles",
+        requires_table: Some("release_match"),
+        // JSON [[disc, title], …] stored at pin time, one entry per medium
+        // that has a title ("Dawn to Dusk" / "Twilight to Starlight"). The
+        // mb tier of a disc's name: overlays the DISCSUBTITLE tag, the
+        // user's rename overlays it. Lives and dies with the pin (cleared
+        // when the pinned release changes). NULL for pins made before this
+        // column existed until re-pinned.
+        statements: &["ALTER TABLE release_match ADD COLUMN disc_titles TEXT"],
+    },
+    Migration {
+        id: 42,
+        app_version: "1.0.0-alpha.12.5",
+        description: "library_setting mb_pass_ran — libraries whose first matching pass already completed",
+        requires_table: Some("mb_credit_fetch"),
+        // The flag is written by every completed pass from here on; the
+        // library map's step 0 shows until it exists. Libraries that ran
+        // their passes before the flag was born have stamped albums — mark
+        // them, so the step doesn't reappear on a library that's long past
+        // it. A fresh database has no stamps and nothing is marked.
+        statements: &[
+            "INSERT OR IGNORE INTO library_setting (library_id, key, value)
+             SELECT DISTINCT me.library_id, 'mb_pass_ran', '1'
+             FROM mb_credit_fetch f JOIN media_entry me ON me.id = f.album_id",
+        ],
+    },
 ];
 
 /// Copy the database beside itself before the first migration of a run
@@ -1809,6 +1838,23 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .execute(&pool)
     .await?;
 
+    // The user's note on ONE version of an album ("this pressing has the
+    // short Music Box Blues") — folder-keyed like the pin and disc names,
+    // so it rides combines, splits and folder moves with its version. The
+    // card-wide note is entry_note. See notes.rs.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS album_release_note (
+            album_id INTEGER NOT NULL,
+            folder_path TEXT NOT NULL,
+            text TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (album_id, folder_path),
+            FOREIGN KEY (album_id) REFERENCES album(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     // ── Music play history ────────────────────────────────────────────
     // One row per playback START, however brief — recently-played shows all
     // of these. `scrobbled` flips once the Last.fm rule trips (>=50% of the
@@ -2383,6 +2429,40 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     )
     .execute(&pool)
     .await?;
+
+    // ── Notes ─────────────────────────────────────────────────────────
+    // The user's free-text note on anything with a page of its own (a
+    // playlist calls it a description). One table per id space, each
+    // cascading with its owner. App data only: never written to files,
+    // never seeded from tags. See notes.rs.
+    for stmt in [
+        "CREATE TABLE IF NOT EXISTS entry_note (
+            entry_id INTEGER PRIMARY KEY,
+            text TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (entry_id) REFERENCES media_entry(id) ON DELETE CASCADE
+        )",
+        "CREATE TABLE IF NOT EXISTS person_note (
+            person_id INTEGER PRIMARY KEY,
+            text TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE CASCADE
+        )",
+        "CREATE TABLE IF NOT EXISTS playlist_note (
+            playlist_id INTEGER PRIMARY KEY,
+            text TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (playlist_id) REFERENCES media_playlist(id) ON DELETE CASCADE
+        )",
+        "CREATE TABLE IF NOT EXISTS playlist_collection_note (
+            collection_id INTEGER PRIMARY KEY,
+            text TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (collection_id) REFERENCES media_playlist_collection(id) ON DELETE CASCADE
+        )",
+    ] {
+        sqlx::query(stmt).execute(&pool).await?;
+    }
 
     // ── TMDB fetch stamps per season ──────────────────────────────────
     // Which TMDB passes have run for a season ('season' metadata pass,

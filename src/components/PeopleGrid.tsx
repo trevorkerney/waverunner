@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type RefObject } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type RefObject } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { ListFilter, Search, Star, User } from "lucide-react";
 import { ClearableInput } from "@/components/ui/clearable-input";
@@ -516,7 +516,7 @@ export function PeoplePage({ people, libraryId, role, initialMode, onModeChange,
                         person={p}
                         height={row.cardH}
                         subtitle={subtitleTextFor(p)}
-                        onClick={() => onSelectPerson(p)}
+                        onSelect={onSelectPerson}
                       />
                     ))}
                   </div>
@@ -541,16 +541,19 @@ export function PeoplePage({ people, libraryId, role, initialMode, onModeChange,
   );
 }
 
-function PersonCard({
+/** Memoized: the grid re-renders on every scroll frame (its window is
+ *  scroll-offset state), and the cards that stay on screen keep their
+ *  elements instead of re-rendering with it. */
+const PersonCard = memo(function PersonCard({
   person,
   height,
-  onClick,
+  onSelect,
   subtitle,
 }: {
   person: PersonSummary;
   /** Row-uniform card height, sized upstream to fit the tallest subtitle. */
   height: number;
-  onClick: () => void;
+  onSelect: (person: PersonSummary) => void;
   /** Computed by PeoplePage's subtitleTextFor — the same text row heights were measured against. */
   subtitle: string;
 }) {
@@ -563,7 +566,7 @@ function PersonCard({
   // a fast scroll — enough to hang the WebView on a 15K-person library.
   return (
     <button
-      onClick={onClick}
+      onClick={() => onSelect(person)}
       data-person-card=""
       data-person-id={person.id}
       style={{ height }}
@@ -574,7 +577,9 @@ function PersonCard({
           <img
             src={imageSrc}
             alt={person.name}
-            loading="lazy"
+            // Eager: only the rows in view are mounted, and an explicit
+            // policy opts out of the webview's lazy-loading intervention.
+            loading="eager"
             decoding="async"
             className="h-full w-full object-cover"
             draggable={false}
@@ -594,4 +599,4 @@ function PersonCard({
       </div>
     </button>
   );
-}
+});

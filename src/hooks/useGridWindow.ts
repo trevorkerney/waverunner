@@ -16,7 +16,10 @@ import { useCallback, useLayoutEffect, useRef, useState, type RefObject } from "
  *
  *  The mounted slice is React STATE: a scroll that moves it sets state,
  *  and measurement reads the slice the DOM actually reflects (the one
- *  last rendered), never a newer one still waiting to render.
+ *  last rendered), never a newer one still waiting to render. Call this
+ *  from the component that renders the grid and nothing else (see
+ *  WindowedGrid): the slice moves on every scrolled row, and whatever
+ *  component owns it re-renders that often.
  *
  *  `enabled` false = no windowing (everything renders, no padding). Used
  *  while the ref points at a different kind of list than a card grid.
@@ -88,6 +91,9 @@ export function useGridWindow({
   renderedRangeRef.current = range;
 
   const heightsRef = useRef<number[]>([]);
+  // What the last render laid out above the mounted rows — so a
+  // measurement-only re-render happens only when that would change.
+  const lastPadRef = useRef<{ padTop: number; startRow: number } | null>(null);
   // The estimate for rows never measured: the MEAN of measured rows (the
   // last measured row swung with every mount on rows of varying height,
   // re-estimating every unmeasured row above the viewport each pass and
@@ -143,9 +149,10 @@ export function useGridWindow({
   };
 
   /** The slice the scroll position calls for, or null when the current one
-   *  still serves. Hysteresis: the slice only moves once the visible rows
-   *  have eaten into half its overscan margin (or the row count changed) —
-   *  one render per couple of rows scrolled, not one per row boundary. */
+   *  still serves. The slice moves as soon as a row crosses either edge of
+   *  the viewport, so each move mounts one row and unmounts one: the work
+   *  arrives in the smallest pieces, and a main-thread-driven scroll
+   *  (middle-click autoscroll) never has a big mount to wait behind. */
   const nextRange = (cur: RowRange): RowRange | null => {
     const rows = rowsNow();
     const span = visibleSpan();
@@ -166,7 +173,7 @@ export function useGridWindow({
       y += h + gap;
     }
     if (visStart < 0) visStart = Math.max(0, rows - 1);
-    const slack = Math.max(1, Math.floor(overscan / 2));
+    const slack = Math.max(1, overscan);
     const serves =
       cur.end <= rows &&
       visStart >= cur.start &&
@@ -202,7 +209,10 @@ export function useGridWindow({
   };
 
   /** Row heights from the rendered rows (the slice the DOM reflects); true
-   *  when any changed. */
+   *  when any changed. Fractional (the rect, not offsetHeight): rows lay
+   *  out at fractions, and rounding each row turned into padding shifted
+   *  the content by a pixel or two per slice move. Card roots carry no
+   *  transform, so the rect is the layout height. */
   const measureRows = (): boolean => {
     const grid = gridRef.current;
     if (!grid) return false;
@@ -213,9 +223,9 @@ export function useGridWindow({
     for (let r = start; r < end; r++) {
       const child = children[(r - start) * columns] as HTMLElement | undefined;
       if (!child) break;
-      const h = child.offsetHeight;
+      const h = child.getBoundingClientRect().height;
       const had = heightsRef.current[r];
-      if (h > 0 && had !== h) {
+      if (h > 0 && (had == null || Math.abs(had - h) > 0.05)) {
         heightsRef.current[r] = h;
         if (had == null) {
           measuredCountRef.current++;
@@ -230,9 +240,24 @@ export function useGridWindow({
     return changed;
   };
 
+  /** Would the padding above the mounted rows differ from what the last
+   *  render laid out? Only then does a measurement-only re-render show
+   *  anything: new measurements below the viewport (the row that just
+   *  mounted, the estimate nudged) move only the padding under it and the
+   *  scrollbar's length, which the next slice render carries anyway. */
+  const paddingAboveStale = (): boolean => {
+    const last = lastPadRef.current;
+    if (!last) return true;
+    const gap = gapRef.current;
+    let padTop = 0;
+    for (let r = 0; r < last.startRow; r++) padTop += rowHeight(r) + gap;
+    return Math.abs(padTop - last.padTop) > 0.5;
+  };
+
   /** One settle pass: measure, then move the slice if the scroll position
-   *  calls for it (or re-render for new measurements alone, so the padding
-   *  reflects them). Shared by the layout effect and the DOM listeners. */
+   *  calls for it (or re-render for new measurements alone, when they
+   *  change the padding above). Shared by the layout effect and the DOM
+   *  listeners. */
   const settle = (opts: { measure: boolean }) => {
     if (!enabled) return;
     let remeasured = false;
@@ -243,7 +268,7 @@ export function useGridWindow({
     }
     const next = frozen ? null : nextRange(renderedRangeRef.current);
     if (next) setRange(next);
-    else if (remeasured) setVersion((v) => v + 1);
+    else if (remeasured && paddingAboveStale()) setVersion((v) => v + 1);
   };
 
   // Keep the latest closure reachable from the DOM listeners without re-binding.
@@ -346,6 +371,7 @@ export function useGridWindow({
   for (let r = 0; r < startRow; r++) padTop += rowHeight(r) + gap;
   let padBottom = 0;
   for (let r = endRow; r < rows; r++) padBottom += gap + rowHeight(r);
+  lastPadRef.current = { padTop, startRow };
   return {
     start: Math.min(count, startRow * columns),
     end: Math.min(count, endRow * columns),

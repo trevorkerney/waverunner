@@ -44,6 +44,8 @@ interface TierRow {
   pinned_releases: number;
   fields: Record<string, TierValue>;
   releases: TierRelease[];
+  /** Albums a merge-mode combine poured into this one (display names). */
+  combined_from: string[];
 }
 interface NamedArtist {
   artist_id: number;
@@ -298,6 +300,17 @@ function lineRow(r: TierRow, ctx: LineCtx) {
             {r.pinned_releases > 0 &&
               ` · ${r.pinned_releases} release${r.pinned_releases === 1 ? "" : "s"} pinned`}
           </p>
+          {/* A merged album is one album everywhere else; here, where every
+              value's origin is on record, so is its making. Undo lives in
+              Edit album. */}
+          {r.combined_from.length > 0 && (
+            <p
+              className="truncate text-[10px] text-muted-foreground"
+              title={`Combined from: ${r.combined_from.join(", ")}`}
+            >
+              combined from {r.combined_from.map((n) => `“${n}”`).join(", ")}
+            </p>
+          )}
         </div>
       </div>
       {ctx.tiers.map((t) => (

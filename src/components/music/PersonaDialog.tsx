@@ -2,11 +2,13 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { toast } from "sonner";
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from "../ui/dialog";
+import { Dialog, DialogBody, DialogContent, DialogHeader, DialogTitle } from "../ui/dialog";
+import { FadeIn, SkeletonRows, useSkeletonDelay } from "../ui/skeleton";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { Spinner } from "../ui/spinner";
 import { Search, Music2 } from "lucide-react";
+import { MATCH_LOCK_TITLE, useMatchLock } from "@/hooks/libraryRuns";
 
 /** An existing artist page, as a link target. */
 interface ArtistChoice {
@@ -41,6 +43,8 @@ export function PersonaDialog({
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<ArtistChoice[] | null>(null);
   const [applying, setApplying] = useState<number | null>(null);
+  // A pass on this library holds persona writes (backend refuses).
+  const locked = useMatchLock(libraryId);
   const [links, setLinks] = useState<PersonaLinks | null>(null);
   const seq = useRef(0);
   const timer = useRef<number | undefined>(undefined);
@@ -108,13 +112,19 @@ export function PersonaDialog({
 
   const parent = links?.parent ?? null;
   const owns = links?.personas ?? [];
+  const pending = query.trim().length >= 1 && results === null;
+  // Skeleton rows after 500ms of a search in flight; results fade in.
+  const showSkeleton = useSkeletonDelay(pending);
+  const listKey = results ? `${results.length}:${results[0]?.id ?? ""}` : "none";
 
   return (
     <Dialog open onOpenChange={onOpenChange}>
-      <DialogContent>
+      {/* STATIC height (modal rule): the result list scrolls in the body. */}
+      <DialogContent size="md" height="26rem">
         <DialogHeader>
           <DialogTitle>“{personaName}” is a persona of…</DialogTitle>
         </DialogHeader>
+        <DialogBody className="-mx-1 flex flex-col gap-3 overflow-x-hidden px-1 pb-1">
         <p className="text-xs text-muted-foreground">
           Same person, independent identity — both pages keep their own credits and matching, and
           each links to the other. Undoable from History. (For a misspelling of the same identity,
@@ -133,7 +143,8 @@ export function PersonaDialog({
               size="sm"
               variant="outline"
               className="shrink-0 gap-1.5"
-              disabled={applying !== null}
+              disabled={applying !== null || locked}
+              title={locked ? MATCH_LOCK_TITLE : undefined}
               onClick={unlink}
             >
               {applying === -1 && <Spinner className="size-3" />}
@@ -160,14 +171,16 @@ export function PersonaDialog({
             search(e.target.value);
           }}
           placeholder="Search artists…"
-          className="h-8 text-sm"
+          className="h-8 shrink-0 text-sm"
         />
         <div className="overflow-hidden rounded-md border">
-          {(results ?? []).map((o, i) => (
+          {pending && showSkeleton && <SkeletonRows rows={5} avatar />}
+          {!pending && <FadeIn key={listKey}>{(results ?? []).map((o, i) => (
             <button
               key={o.id}
               type="button"
-              disabled={applying !== null}
+              disabled={applying !== null || locked}
+              title={locked ? MATCH_LOCK_TITLE : undefined}
               onClick={() => apply(o)}
               className={`flex w-full items-center gap-2 px-2 py-1.5 text-left hover:bg-accent disabled:opacity-60 ${
                 i === 0 ? "" : "border-t"
@@ -193,18 +206,15 @@ export function PersonaDialog({
               </span>
               {applying === o.id && <Spinner className="size-3.5 shrink-0" />}
             </button>
-          ))}
-          {(results ?? []).length === 0 && (
+          ))}</FadeIn>}
+          {(results ?? []).length === 0 && !pending && (
             <p className="flex items-center gap-1.5 px-2 py-1.5 text-[11px] text-muted-foreground">
               <Search size={12} />
-              {query.trim().length < 1
-                ? "Type to search existing artists"
-                : results === null
-                  ? "Searching…"
-                  : "No matching artists"}
+              {query.trim().length < 1 ? "Type to search existing artists" : "No matching artists"}
             </p>
           )}
         </div>
+        </DialogBody>
       </DialogContent>
     </Dialog>
   );

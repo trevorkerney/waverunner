@@ -134,6 +134,20 @@ export function useLibraryRuns(): LibraryRunsApi {
   return api;
 }
 
+/** What a locked control says while a pass holds its library. */
+export const MATCH_LOCK_TITLE =
+  "Waits for the matching pass to finish — Skip remaining on the pass to act now";
+
+/** A matching pass holds this library (user's call, 2026-09-26): the
+ *  backend refuses every matching decision and edit on it until the pass
+ *  ends, because the pass is rewriting exactly what those decisions are
+ *  made against. Controls that would make one disable with
+ *  MATCH_LOCK_TITLE; browsing, and opening dialogs to look, stay. */
+export function useMatchLock(libraryId: string | null | undefined): boolean {
+  const { isMatching } = useLibraryRuns();
+  return !!libraryId && isMatching(libraryId);
+}
+
 /** The one component that owns navigation (App) registers here. */
 export function useLibraryRunsHost(libraries: Library[], callbacks: RunsCallbacks): LibraryRunsApi {
   const api = useContext(LibraryRunsContext);

@@ -13,6 +13,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { Skeleton, useHandoff } from "@/components/ui/skeleton";
+import { MATCH_LOCK_TITLE, useMatchLock } from "@/hooks/libraryRuns";
 
 /** "Write to files" — the preview-then-commit dialog for pushing waverunner's
  *  resolved values (edits, else MusicBrainz, else tags) into the audio files.
@@ -60,10 +61,13 @@ interface TagWriteOutcome {
 
 export function TagWriteDialog({
   scope,
+  libraryId,
   onOpenChange,
   onDone,
 }: {
   scope: TagWriteScope | null;
+  /** The scope's library — a pass running on it holds the write. */
+  libraryId?: string;
   onOpenChange: (open: boolean) => void;
   /** Fired after a write landed (any file written) so the host refetches. */
   onDone?: () => void;
@@ -71,6 +75,7 @@ export function TagWriteDialog({
   const [plan, setPlan] = useState<TagWritePlan | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const locked = useMatchLock(libraryId);
   const [open, setOpen] = useState<Set<number>>(new Set());
   // Skeleton plan after 500ms (reading tags off disk takes a moment on a
   // big album), then the hand-off. The dialog portals its last-open content
@@ -276,7 +281,8 @@ export function TagWriteDialog({
             Cancel
           </Button>
           <Button
-            disabled={busy || !plan || plan.writable === 0}
+            disabled={busy || locked || !plan || plan.writable === 0}
+            title={locked ? MATCH_LOCK_TITLE : undefined}
             onClick={write}
             className="gap-1.5"
           >

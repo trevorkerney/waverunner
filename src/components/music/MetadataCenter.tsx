@@ -9,10 +9,12 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
 import {
   Dialog,
+  DialogBody,
   DialogContent,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { FadeIn, SkeletonRows, useSkeletonDelay } from "@/components/ui/skeleton";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ClearableInput } from "@/components/ui/clearable-input";
@@ -46,7 +48,7 @@ import {
   type MetadataPageState,
 } from "@/lib/pageState";
 import { IdentityDialog, type IdentityMode } from "./IdentityDialog";
-import { useLibraryRuns } from "@/hooks/libraryRuns";
+import { MATCH_LOCK_TITLE, useLibraryRuns, useMatchLock } from "@/hooks/libraryRuns";
 import { MatchRunStrip } from "@/components/LibraryRunUi";
 
 /** The metadata matching/cleaning center — the permanent home for a music
@@ -241,6 +243,9 @@ interface CenterSnapshot {
   unlinked: UnlinkedCredit[];
   clusters: IdentityCluster[];
   onlineEnabled: boolean;
+  /** A matching pass has completed for this library (library_setting
+   *  mb_pass_ran) — until it has, the map leads with step 0: run it. */
+  passRan: boolean;
 }
 const centerCache = new Map<string, CenterSnapshot>();
 
@@ -563,6 +568,7 @@ function ClusterMatchDialog({
   const [searching, setSearching] = useState(false);
   const mbBusy = useMbBusy();
   const [applying, setApplying] = useState<string | null>(null);
+  const locked = useMatchLock(libraryId);
   // Per-candidate "adopt the English name instead of the canonical script".
   const [useEnglish, setUseEnglish] = useState<Record<string, boolean>>({});
   const searchedOnce = useRef(false);
@@ -619,18 +625,24 @@ function ClusterMatchDialog({
     }
   };
 
+  // Skeleton rows after 500ms of a search in flight; results fade in.
+  const showSkeleton = useSkeletonDelay(searching || results === null);
+  const listKey = results ? `${results.length}:${results[0]?.mbid ?? ""}` : "none";
+
   return (
     <Dialog open onOpenChange={onOpenChange}>
-      <DialogContent>
+      {/* STATIC height (modal rule): the candidate list scrolls in the body. */}
+      <DialogContent size="md" height="30rem">
         <DialogHeader>
           <DialogTitle>Who is this artist?</DialogTitle>
         </DialogHeader>
+        <DialogBody className="-mx-1 flex flex-col gap-3 overflow-x-hidden px-1 pb-1">
         <p className="text-xs text-muted-foreground">
           Confirming merges {cluster.members.map((m) => `“${m.name}”`).join(", ")} into one page,
           matches it to MusicBrainz, and adopts the canonical name — every old spelling lives on as
           an alias. Undoable from History.
         </p>
-        <div className="flex gap-2">
+        <div className="flex shrink-0 gap-2">
           <Input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
@@ -650,8 +662,9 @@ function ClusterMatchDialog({
             {searching ? <Spinner className="size-3" /> : <Search size={13} />}
           </Button>
         </div>
-        <div className="max-h-64 overflow-y-auto rounded-md border">
-          {(results ?? []).map((r, i) => (
+        <div className="rounded-md border">
+          {(searching || results === null) && showSkeleton && <SkeletonRows rows={5} />}
+          {!searching && results !== null && <FadeIn key={listKey}>{results.map((r, i) => (
             <div
               key={r.mbid}
               className={`flex items-center gap-2 px-2 py-1.5 ${i === 0 ? "" : "border-t"}`}
@@ -684,25 +697,28 @@ function ClusterMatchDialog({
               </button>
               <Button
                 size="sm"
-                disabled={applying !== null}
+                disabled={applying !== null || locked}
+                title={locked ? MATCH_LOCK_TITLE : undefined}
                 onClick={() => apply(r.mbid, useEnglish[r.mbid] ? r.en_name : null)}
               >
                 {applying === r.mbid && <Spinner className="size-3" />}
                 Yes, it&apos;s them
               </Button>
             </div>
-          ))}
-          {(results ?? []).length === 0 && (
+          ))}</FadeIn>}
+          {(searching || results === null) && showSkeleton && mbBusy && (
+            <p className="border-t px-2 py-1.5 text-[11px] text-muted-foreground">
+              MusicBrainz is busy — retrying…
+            </p>
+          )}
+          {!searching && results !== null && results.length === 0 && (
             <p className="flex items-center gap-1.5 px-2 py-1.5 text-[11px] text-muted-foreground">
               <Search size={12} />
-              {searching || results === null
-                ? mbBusy
-                  ? "MusicBrainz is busy — retrying…"
-                  : "Searching MusicBrainz…"
-                : "No candidates found"}
+              No candidates found
             </p>
           )}
         </div>
+        </DialogBody>
       </DialogContent>
     </Dialog>
   );
@@ -1273,6 +1289,9 @@ export function MetadataCenter({
   const queuedArtistIds = new Set(
     hiddenApplies.map((i) => i.target.artistId).filter((id): id is number => id != null),
   );
+  const queuedAlbumIds = new Set(
+    hiddenApplies.map((i) => i.target.albumId).filter((id): id is number => id != null),
+  );
   // True from the first frame: with nothing to show yet the spinner must be
   // the first thing painted, not the empty page shell for a frame (the
   // "flash" before the spinner).
@@ -1280,7 +1299,15 @@ export function MetadataCenter({
   // Which mutation is in flight ("apply:…", "resolve:…", "undo:…") — the
   // matching button shows a spinner; everything else just disables.
   const [busyKey, setBusyKey] = useState<string | null>(null);
-  const busy = busyKey !== null;
+  // Live from the run controller (a pass started anywhere — the library
+  // banner, the sidebar, here — flips it the moment it starts), with the
+  // load-time snapshot as the fallback before the first event lands.
+  const running = runs.isMatching(libraryId) || (matchState?.running ?? false);
+  // Every decision control on the page disables on `busy`. A running pass
+  // counts (user's call, 2026-09-26): the backend refuses every decision
+  // meanwhile, and the pass rewrites what the cards show — decisions wait
+  // for the fresh picture. Browsing (tabs, Go, the map) stays.
+  const busy = busyKey !== null || running;
   // Pass progress is NOT rendered here — the match modal owns it. The center
   // only keeps the completion listener (silent refresh) and the running flag
   // (button states + the rail's "open the modal" pointer).
@@ -1380,6 +1407,9 @@ export function MetadataCenter({
   // Per-library opt-out: false hides every MusicBrainz-backed pane, leaving
   // the local ones (unlinked credits, file problems, history).
   const [onlineEnabled, setOnlineEnabled] = useState(() => cached?.onlineEnabled ?? true);
+  // Assumed true until the settings land: step 0 must never flash onto a
+  // library that is long past it.
+  const [passRan, setPassRan] = useState(() => cached?.passRan ?? true);
   // Per-library: MB chips/menu items OUTSIDE this center — the shared store
   // every page reads (see the switch on the map pane).
   const mbHidden = useMbHidden(libraryId);
@@ -1389,6 +1419,7 @@ export function MetadataCenter({
   // command's writes, so the action's own post-run refresh can join it
   // instead of loading the whole snapshot a second time.
   const refreshInFlight = useRef<Promise<void> | null>(null);
+  const refreshStartedAt = useRef(0);
   const eventRefreshed = useRef(false);
   // Whether a `run` (a button's mutation) is in progress — the done-event
   // listener leaves the parent notification to the run's own tail then, so
@@ -1401,6 +1432,7 @@ export function MetadataCenter({
   hasReview.current = review !== null;
 
   const refresh = useCallback(async () => {
+    refreshStartedAt.current = performance.now();
     const p = refreshOnce();
     refreshInFlight.current = p;
     try {
@@ -1431,6 +1463,7 @@ export function MetadataCenter({
         unlinked: unl,
         clusters: clus,
         onlineEnabled: ls["online_metadata"] !== "off",
+        passRan: ls["mb_pass_ran"] === "1",
       };
       centerCache.set(libraryId, snapshot);
       setReview(rev);
@@ -1440,6 +1473,7 @@ export function MetadataCenter({
       setUnlinked(unl);
       setClusters(clus);
       setOnlineEnabled(snapshot.onlineEnabled);
+      setPassRan(snapshot.passRan);
       // The new review no longer holds what the queue applied — the hide
       // on those cards can stop (same tick as the data, so no flash).
       clearSettledApplies(libraryId);
@@ -1486,21 +1520,38 @@ export function MetadataCenter({
   }, [libraryId, refresh, onChanged]);
 
   const run = async (key: string, fn: () => Promise<void>) => {
+    // Backstop for anything not visibly locked: the backend would refuse
+    // the write anyway, this says why without a round trip.
+    if (runs.isMatching(libraryId)) {
+      toast.error(MATCH_LOCK_TITLE);
+      return;
+    }
     setBusyKey(key);
     eventRefreshed.current = false;
     runInFlight.current = true;
+    let finishedAt = 0;
     try {
       await fn();
     } catch (e) {
       toast.error(String(e));
     } finally {
+      finishedAt = performance.now();
       // Refresh even on failure — some errors dismiss the item they were
       // about (e.g. a stale merge suggestion), and the list must show that.
       // When the command's done event already started one, wait for that
-      // instead of loading the snapshot twice back to back.
+      // instead of loading the snapshot twice back to back — UNLESS that
+      // refresh began before the command finished: a command that fires
+      // its event mid-way (an unmatch undoing a dozen rows, then clearing
+      // ids after) would leave the page on mid-command state, and the row
+      // it just freed never came back until F5. Then refresh once more.
       const joined = eventRefreshed.current ? refreshInFlight.current : null;
-      if (joined) await joined;
-      else await refresh();
+      if (joined) {
+        const startedEarly = refreshStartedAt.current < finishedAt;
+        await joined;
+        if (startedEarly) await refresh();
+      } else {
+        await refresh();
+      }
       setBusyKey(null);
       runInFlight.current = false;
       onChanged?.();
@@ -1512,6 +1563,10 @@ export function MetadataCenter({
   const queueAlbumMatch = (s: MbSuggestion, groupId: string) => {
     const albumId = s.payload.album_id;
     if (albumId == null) return;
+    if (runs.isMatching(libraryId)) {
+      toast.error(MATCH_LOCK_TITLE);
+      return;
+    }
     const g = (s.payload.groups ?? []).find((x) => x.group_id === groupId);
     const year = g?.first_release_date?.slice(0, 4);
     enqueueApply({
@@ -1647,15 +1702,52 @@ export function MetadataCenter({
   const [combinePartnerFor, setCombinePartnerFor] = useState<MbAlbumRow | null>(null);
   const [partnerFilter, setPartnerFilter] = useState("");
   const [combineSelect, setCombineSelect] = useState<AlbumSelection | null>(null);
-  // Row-button handlers, stable for the memo rows.
+  // Row buttons QUEUE (user's call, 2026-09-26): the row leaves at the
+  // click and the write lands in the background, like the cards' applies.
+  // A pass running on the library holds them (the backend refuses); read
+  // through a ref so the handlers stay stable for the memo rows.
+  const lockedRef = useRef(false);
+  lockedRef.current = runs.isMatching(libraryId);
   const ignoreArtist = useCallback(
-    (row: MbArtistRow) => void setIgnoredRef.current(row.artist_id, true),
-    [],
+    (row: MbArtistRow) => {
+      if (lockedRef.current) {
+        toast.error(MATCH_LOCK_TITLE);
+        return;
+      }
+      enqueueApply({
+        libraryId,
+        label: `Ignore \u{201c}${row.title}\u{201d}`,
+        target: { artistId: row.artist_id },
+        run: () => invoke("mb_set_ignored", { entityId: row.artist_id, ignored: true }),
+      });
+    },
+    [libraryId],
   );
   const ignoreAlbum = useCallback(
-    (row: MbAlbumRow) => void setIgnoredRef.current(row.album_id, true),
-    [],
+    (row: MbAlbumRow) => {
+      if (lockedRef.current) {
+        toast.error(MATCH_LOCK_TITLE);
+        return;
+      }
+      enqueueApply({
+        libraryId,
+        label: `Ignore \u{201c}${row.title}\u{201d}`,
+        target: { albumId: row.album_id },
+        run: () => invoke("mb_set_ignored", { entityId: row.album_id, ignored: true }),
+      });
+    },
+    [libraryId],
   );
+  // Dialog hand-off to the same queue: the artist row leaves when the
+  // dialog's pick lands, not when the write does.
+  const queueForArtist =
+    (artistId: number | null) => (job: { label: string; run: () => Promise<void> }) =>
+      enqueueApply({
+        libraryId,
+        label: job.label,
+        target: artistId != null ? { artistId } : {},
+        run: job.run,
+      });
   const startCombine = useCallback((row: MbAlbumRow) => {
     setPartnerFilter("");
     setCombinePartnerFor(row);
@@ -1697,6 +1789,7 @@ export function MetadataCenter({
       (a.state === "notfound" || a.state === "unchecked") &&
       !a.ignored &&
       !stagedLockedIds.has(a.album_id) &&
+      !queuedAlbumIds.has(a.album_id) &&
       albumMatches(a),
   );
   const albumsIdentified = albums.filter(
@@ -1751,7 +1844,14 @@ export function MetadataCenter({
     return list && list.length === 1 ? list[0] : null;
   };
   const artistsUnmatchedOwnersDirect = artistsUnmatchedOwners.filter((a) => !viaAlbumOf(a));
-  const artistsUnmatchedOwnersViaAlbum = artistsUnmatchedOwners.filter((a) => !!viaAlbumOf(a));
+  // A via-album row whose one album is already queued for a match has
+  // nothing left to offer — the release's credits will rewrite the album's
+  // artist line and this page empties. It leaves with the album's row and
+  // stays hidden until the drain refresh (by then it's gone for real).
+  const artistsUnmatchedOwnersViaAlbum = artistsUnmatchedOwners.filter((a) => {
+    const al = viaAlbumOf(a);
+    return !!al && !queuedAlbumIds.has(al.album_id);
+  });
   const artistsUnmatchedFeatures = artistsUnmatched.filter(
     (a) => a.album_count === 0 && notStagedSplit(a),
   );
@@ -1884,10 +1984,7 @@ export function MetadataCenter({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [focus?.nonce, review]);
 
-  // Live from the run controller (a pass started anywhere — the library
-  // banner, the sidebar, here — flips it the moment it starts), with the
-  // load-time snapshot as the fallback before the first event lands.
-  const running = runs.isMatching(libraryId) || (matchState?.running ?? false);
+  // (`running` is declared with `busy`, above.)
   // What the next pass will do, for the banner: never-searched albums and
   // id-less artists (each one line), plus every queued row. From the shared
   // pending-work hook, so this number is the sidebar badge's and the
@@ -1946,6 +2043,12 @@ export function MetadataCenter({
           : guideFeatureLeft > 0
             ? 4
             : 0;
+  // Step 0 — run the first matching pass — from the library's creation
+  // until a pass completes (library_setting mb_pass_ran). It outranks the
+  // stages: the pass does the bulk of them for free, so the map leads with
+  // it and highlights nothing else meanwhile.
+  const guideStep0 = onlineEnabled && !passRan && (passWorkCount > 0 || running);
+  const guideCurrent = guideStep0 ? 0 : guideStage;
 
   // Suggestions ordered by the map's doctrine: owner-artist questions are
   // stage-1 work (each answer arid-unlocks a discography), feature-artist
@@ -2273,6 +2376,10 @@ export function MetadataCenter({
               // the background (see applyQueue.ts).
               const artistId = s.payload.artist_id;
               if (artistId == null || !chosen) return;
+              if (runs.isMatching(libraryId)) {
+                toast.error(MATCH_LOCK_TITLE);
+                return;
+              }
               const c = candidates.find((x) => x.mbid === chosen);
               const preferredName =
                 (useEnglish[`${s.id}|${chosen}`] && c?.en_name) || null;
@@ -2482,12 +2589,11 @@ export function MetadataCenter({
   // ledger, not a queue.
   const historyCount = review?.changes.length ?? 0;
 
-  // Banners above the tabs (opt-out notice, staged changes, pass queue).
-  // With none showing, the tabs sit flush at the top: no spacer, no rule.
-  const bannersAbove =
-    (!!review && !onlineEnabled) ||
-    pending.length > 0 ||
-    (onlineEnabled && (running || passWorkCount > 0));
+  // Above the tabs only the opt-out notice remains (user's call, 2026-09-26:
+  // the work banners — apply queue, pass queue, staged changes — live in a
+  // footer under the pane, so the top reserves no space for them). With it
+  // absent, the tabs sit flush at the top: no spacer, no rule.
+  const bannersAbove = !!review && !onlineEnabled;
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -2519,189 +2625,6 @@ export function MetadataCenter({
           >
             Turn on
           </Button>
-        </div>
-      )}
-      {/* Staged directives waiting for one rescan — splits, combines,
-          separates accumulate here instead of each forcing its own rescan.
-          Any rescan applies (and clears) the whole batch. */}
-      {pending.length > 0 && (
-        // Full-bleed strip, like the running-pass one: backs out of the
-        // host's left padding, runs to the right edge, as tall as it needs.
-        // Two rows: a header row (icon, title, the button — the controls
-        // never scroll), then the list under it at FULL width, so its
-        // scrollbar sits on the banner's right edge rather than between the
-        // text and the button.
-        <div className="-ml-4 bg-red-500/5 px-4 py-3">
-          <div className="flex items-center gap-3">
-            <TriangleAlert size={14} className="shrink-0 text-red-400" />
-            <p className="min-w-0 flex-1 text-sm text-red-200/90">
-              {pending.length} staged {pending.length === 1 ? "change" : "changes"} — applied by the
-              next rescan
-            </p>
-            <Button
-              size="sm"
-              variant="outline"
-              className="shrink-0 gap-1.5"
-              disabled={busy || running}
-              onClick={() => {
-                if (onRescanNeeded) onRescanNeeded(libraryId);
-                else
-                  window.dispatchEvent(
-                    new CustomEvent("waverunner:open-rescan", { detail: { libraryId } }),
-                  );
-              }}
-            >
-              <RefreshCw size={13} />
-              Rescan now
-            </Button>
-          </div>
-          {/* One line per staged action; each truncates on its own instead of
-              the whole batch collapsing into one clipped run-on. Undo reverts
-              the directive itself — nothing has applied yet, so no rescan. */}
-          {/* Height-capped: a long batch scrolls inside the banner instead of
-              shoving the actual work below the fold. Indented under the
-              title (icon + gap); the negative right margin runs the scroller
-              to the banner's edge. The right padding is the SAME in both
-              banners — one cutoff line, set to clear the pass banner's
-              estimate + button with room to spare — so a long row never
-              runs under the controls above it. */}
-          <ul className="-mr-4 mt-1 max-h-[70px] space-y-0.5 overflow-y-auto pl-[26px] pr-72">
-            {pending.map((p) => (
-              <li key={p.id} className="flex min-w-0 items-baseline gap-1.5 text-xs text-muted-foreground">
-                <span className="shrink-0">•</span>
-                <span className="min-w-0 truncate">{p.label}</span>
-                <button
-                  onClick={() =>
-                    run(`unstage:${p.id}`, () => invoke("unstage_pending_change", { id: p.id }))
-                  }
-                  disabled={busy}
-                  className="shrink-0 underline underline-offset-2 hover:text-foreground"
-                >
-                  {busyKey === `unstage:${p.id}` ? "…" : "Undo"}
-                </button>
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
-      {/* A running pass takes the queue banner's slot: it's consuming that
-          queue, so the queue box would only repeat the question. */}
-      {/* Full-bleed: backs out of the host's left padding (like the panel
-          root below) and runs to the right edge, as tall as it needs. */}
-      {onlineEnabled && running && (
-        <MatchRunStrip libraryId={libraryId} className={`-ml-4 ${pending.length > 0 ? "border-t" : ""}`} />
-      )}
-      {/* Everything the next matching pass will do, in one place: albums and
-          artists MusicBrainz has never been asked about (the old post-scan
-          question's numbers) and the queue — matches to cash in, re-checks.
-          No question, no "not now": while there's work, this shows, and a
-          pass is what clears it. Staged changes gate it (same rule the
-          backend enforces): rescan first, then pass. "Unmatch" per queue
-          line rather than "Undo": nothing staged here, undoing means
-          forgetting the match. */}
-      {onlineEnabled && !running && passWorkCount > 0 && (
-        // Same two-row shape as the staged strip above (header row with the
-        // fixed controls, full-width list under it); a 1px rule (the app's
-        // section border) separates the two when both show.
-        <div
-          className={`-ml-4 bg-primary/5 px-4 py-3 ${
-            pending.length > 0 ? "border-t" : ""
-          }`}
-        >
-          <div className="flex items-center gap-3">
-            {/* The running pass's palette (it takes this slot when it runs). */}
-            <RefreshCw size={14} className="shrink-0 text-primary" />
-            <p className="min-w-0 flex-1 text-sm">{passItemsLabel(passWorkCount)}</p>
-            {/* Estimate + button, centred on each other. */}
-            <div className="flex shrink-0 items-center gap-3">
-              {/* MusicBrainz allows ~1 request per second — the estimate is
-                  requests, not work: ~3 per album, ~1.5 per artist. */}
-              <span className="text-[11px] text-muted-foreground">
-                about {passEstimateMinutes} {passEstimateMinutes === 1 ? "minute" : "minutes"}
-              </span>
-              <Button
-                size="sm"
-                variant="outline"
-                className="shrink-0 gap-1.5"
-                disabled={busy || running || pending.length > 0}
-                title={pending.length > 0 ? "Staged changes need a rescan first" : undefined}
-                onClick={rerunMatching}
-              >
-                <RefreshCw size={13} />
-                {pending.length > 0 ? "Rescan first" : running ? "Pass running…" : "Run pass now"}
-              </Button>
-            </div>
-          </div>
-          {/* Same cutoff as the staged strip. STATIC height — exactly four
-              rows, whatever the queue holds (user's call, 2026-09-25): the
-              banner never grows or shrinks as decisions land, so the page
-              below it stays put. */}
-          <ul className="-mr-4 mt-1 h-[70px] space-y-0.5 overflow-y-auto pl-[26px] pr-72">
-            {uncheckedAlbums > 0 && (
-              <li className="flex min-w-0 items-baseline gap-1.5 text-xs text-muted-foreground">
-                <span className="shrink-0">•</span>
-                <span className="min-w-0 truncate">
-                  Check {uncheckedAlbums} {uncheckedAlbums === 1 ? "album" : "albums"} MusicBrainz hasn't been
-                  asked about yet
-                </span>
-              </li>
-            )}
-            {uncheckedArtists > 0 && (
-              <li className="flex min-w-0 items-baseline gap-1.5 text-xs text-muted-foreground">
-                <span className="shrink-0">•</span>
-                <span className="min-w-0 truncate">
-                  Look up {uncheckedArtists} {uncheckedArtists === 1 ? "artist" : "artists"} without a
-                  MusicBrainz id
-                </span>
-              </li>
-            )}
-            {pendingPass.map((p) => (
-              <li
-                key={p.id}
-                className="flex min-w-0 items-baseline gap-1.5 text-xs text-muted-foreground"
-              >
-                <span className="shrink-0">•</span>
-                <span className="min-w-0 truncate">{p.label}</span>
-                {/* Album-match rows (bare album-id targets) offer Unmatch.
-                    Re-check rows queued by ONE merge/link carry that change's
-                    History batch and undo it right here (the undo clears the
-                    row); rows from several changes, or older rows without
-                    the link, point at History instead of guessing. */}
-                {/^\d+$/.test(p.target) ? (
-                  <button
-                    onClick={() =>
-                      run(`passunmatch:${p.id}`, () =>
-                        invoke("mb_unmatch_entity", {
-                          kind: "album",
-                          entityId: parseInt(p.target, 10),
-                        }),
-                      )
-                    }
-                    disabled={busy}
-                    className="shrink-0 underline underline-offset-2 hover:text-foreground"
-                  >
-                    {busyKey === `passunmatch:${p.id}` ? "…" : "Unmatch"}
-                  </button>
-                ) : p.batch_id != null ? (
-                  <button
-                    onClick={() => undo(p.batch_id as number)}
-                    disabled={busy}
-                    className="shrink-0 underline underline-offset-2 hover:text-foreground"
-                  >
-                    {busyKey === `undo:${p.batch_id}` ? "…" : "Undo"}
-                  </button>
-                ) : (
-                  <button
-                    onClick={() => goTo("history")}
-                    disabled={busy}
-                    className="shrink-0 underline underline-offset-2 hover:text-foreground"
-                  >
-                    see History
-                  </button>
-                )}
-              </li>
-            ))}
-          </ul>
         </div>
       )}
     {/* Same border the nav/pane divider uses, closing the header (and the
@@ -2825,29 +2748,10 @@ export function MetadataCenter({
       {pane === "sources" && <SourcesPage libraryId={libraryId} />}
       {pane === "map" && (
         <section className="space-y-4">
-          {/* The pass entry point when the banner has nothing to list: a
-              pass still has work with nothing queued (suggestion sweeps,
-              the backfills). Hidden when the banner is up: one button. */}
-          {passWorkCount === 0 && (
-            <div className="flex items-center gap-3 rounded-md border px-3 py-2">
-              <RefreshCw size={14} className="shrink-0 text-muted-foreground" />
-              <p className="min-w-0 flex-1 text-xs text-muted-foreground">
-                A pass checks unmatched albums and sweeps for suggestions — run one after a batch
-                of decisions, or any time.
-              </p>
-              <Button
-                size="sm"
-                variant="outline"
-                className="shrink-0 gap-1.5"
-                disabled={busy || running || pending.length > 0}
-                title={pending.length > 0 ? "Staged changes need a rescan first" : undefined}
-                onClick={rerunMatching}
-              >
-                <RefreshCw size={13} />
-                {pending.length > 0 ? "Rescan first" : running ? "Pass running…" : "Run pass now"}
-              </Button>
-            </div>
-          )}
+          {/* No standing "run a pass" strip (user's call, 2026-09-26): the
+              queue count and the pass select by the same rules, so a pass
+              only has work when the footer's queue banner is up — and that
+              banner carries the button. Step 0 covers the first pass. */}
 
           {/* Presentation, per library: the grind can live entirely in here —
               turning this off clears MB chips and Match menu items from album
@@ -2989,8 +2893,53 @@ export function MetadataCenter({
                 Nothing left to match — every artist and album is matched or ignored.
               </p>
             </div>
-          ) : guideStage !== 0 ? (
+          ) : guideStep0 || guideStage !== 0 ? (
             <div className="overflow-hidden rounded-md border">
+              {guideStep0 && (
+                <div className="flex items-center gap-3 bg-accent/40 px-3 py-2">
+                  <span className="flex size-5 shrink-0 items-center justify-center rounded-full border border-primary text-[11px] text-primary">
+                    0
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <p className="flex items-center gap-1.5 text-sm font-medium">
+                      <span className="shrink-0">
+                        Run the first matching pass
+                        <span className="font-normal text-muted-foreground"> —</span>
+                      </span>
+                      {running && <Spinner className="size-3.5 shrink-0 text-muted-foreground" />}
+                      <span className="truncate font-normal text-muted-foreground">
+                        {running
+                          ? "running"
+                          : `${[
+                              uncheckedAlbums > 0 &&
+                                `${uncheckedAlbums} ${uncheckedAlbums === 1 ? "album" : "albums"}`,
+                              uncheckedArtists > 0 &&
+                                `${uncheckedArtists} ${uncheckedArtists === 1 ? "artist" : "artists"}`,
+                              pendingPass.length > 0 && `${pendingPass.length} queued`,
+                            ]
+                              .filter(Boolean)
+                              .join(" · ")}, ~${passEstimateMinutes} min`}
+                      </span>
+                    </p>
+                    <p className="text-xs text-muted-foreground">
+                      Asks MusicBrainz about every album and artist here. Most match on their own;
+                      whatever it can't settle comes back as the steps below.
+                    </p>
+                  </div>
+                  {!running && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="shrink-0"
+                      disabled={busy || pending.length > 0}
+                      title={pending.length > 0 ? "Staged changes need a rescan first" : undefined}
+                      onClick={rerunMatching}
+                    >
+                      {pending.length > 0 ? "Rescan first" : "Run pass now"}
+                    </Button>
+                  )}
+                </div>
+              )}
               {(
                 [
                   [
@@ -3003,7 +2952,7 @@ export function MetadataCenter({
                   ],
                   [
                     2,
-                    "Match your albums",
+                    "Match album release groups",
                     guideAlbumsLeft,
                     albumSuggestions.length,
                     "albums",
@@ -3029,15 +2978,15 @@ export function MetadataCenter({
               ).map(([n, title, left, ready, target, desc]) => (
                 <Fragment key={n}>
                 <div
-                  className={`flex items-center gap-3 px-3 py-2 ${n > 1 ? "border-t" : ""} ${
-                    guideStage === n ? "bg-accent/40" : ""
+                  className={`flex items-center gap-3 px-3 py-2 ${n > 1 || guideStep0 ? "border-t" : ""} ${
+                    guideCurrent === n ? "bg-accent/40" : ""
                   }`}
                 >
                   <span
                     className={`flex size-5 shrink-0 items-center justify-center rounded-full border text-[11px] ${
                       left === 0
                         ? "border-primary bg-primary text-primary-foreground"
-                        : guideStage === n
+                        : guideCurrent === n
                           ? "border-primary text-primary"
                           : "border-border text-muted-foreground"
                     }`}
@@ -3084,7 +3033,7 @@ export function MetadataCenter({
                     ? `${count} ${count === 1 ? "artist" : "artists"}`
                     : `${count} ${count === 1 ? "album" : "albums"}`;
                   const desc = isGroups
-                    ? "Fetches each identified artist's discography in the background so the match dialog opens instantly. Get the main artist matches right first — only matched artists with unmatched albums are fetched."
+                    ? "Fetches each identified artist's discography in the background so the release group picker opens instantly. Get the main artist matches right first — only matched artists with unmatched albums are fetched."
                     : "Fetches every matched group's release list in the background so the release picker opens instantly. Pick release groups accurately first — only matched groups with an unresolved release are fetched.";
                   return (
                     <div className="flex items-center gap-3 border-t bg-muted/20 py-2 pl-11 pr-3">
@@ -3404,8 +3353,13 @@ export function MetadataCenter({
                         a={a}
                         first
                         disabled={!!sug}
+                        // Only while there ARE albums left to match through:
+                        // an artist whose albums are all matched already
+                        // (a real band name with an "and" in it) gets no
+                        // advice that can't be followed.
                         note={
-                          looksJoint(a.title)
+                          looksJoint(a.title) &&
+                          (unmatchedAlbumsByArtist.get(a.artist_id)?.length ?? 0) > 0
                             ? "looks like several artists — match their albums instead"
                             : undefined
                         }
@@ -3932,8 +3886,10 @@ export function MetadataCenter({
           their exit; the targets are read at confirm time. */}
       <SplitArtistDialog
         artistId={splitArtist?.artist_id ?? null}
+        libraryId={libraryId}
         artistName={splitArtist?.title ?? ""}
         open={splitArtist !== null}
+        queue={queueForArtist(splitArtist?.artist_id ?? null)}
         onOpenChange={(o) => {
           if (!o) {
             setSplitArtist(null);
@@ -3944,12 +3900,14 @@ export function MetadataCenter({
       />
       <SplitArtistDialog
         artistId={mergeSplit?.survivorId ?? null}
+        libraryId={libraryId}
         artistName={
           mergeSplit
             ? (mergeSplit.cluster.members.find((m) => m.artist_id === mergeSplit.survivorId)?.name ?? "")
             : ""
         }
         open={mergeSplit !== null}
+        queue={queueForArtist(mergeSplit?.survivorId ?? null)}
         beforeSplit={
           mergeSplit ? () => runClusterMerge(mergeSplit.cluster, mergeSplit.survivorId) : undefined
         }
@@ -3987,6 +3945,7 @@ export function MetadataCenter({
               refresh();
               onChanged?.();
             }}
+            queue={queueForArtist(identitySource.artistId)}
             onSplit={
               identitySource.row
                 ? () => {
@@ -4003,6 +3962,7 @@ export function MetadataCenter({
             kind="artist"
             entityId={matchArtist}
             open={matchArtist != null}
+            queueApplies
             onOpenChange={(o) => !o && setMatchArtist(null)}
             onChanged={() => {
               refresh();
@@ -4015,6 +3975,7 @@ export function MetadataCenter({
             kind="album"
             entityId={matchAlbum}
             open={matchAlbum != null}
+            queueApplies
             onOpenChange={(o) => !o && setMatchAlbum(null)}
             onChanged={() => {
               refresh();
@@ -4028,7 +3989,8 @@ export function MetadataCenter({
         open={combinePartnerFor !== null}
         onOpenChange={(o) => !o && setCombinePartnerFor(null)}
       >
-        <DialogContent>
+        {/* STATIC height (modal rule): the album list scrolls in the body. */}
+        <DialogContent size="md" height="30rem">
           <DialogHeader>
             <DialogTitle>Combine “{combinePartnerFor?.title}” with…</DialogTitle>
           </DialogHeader>
@@ -4036,10 +3998,11 @@ export function MetadataCenter({
             autoFocus
             value={partnerFilter}
             onChange={(e) => setPartnerFilter(e.target.value)}
-            className="h-8 text-sm"
+            className="h-8 shrink-0 text-sm"
             placeholder="Filter albums…"
           />
-          <div className="max-h-72 overflow-y-auto rounded-md border">
+          <DialogBody className="-mx-1 px-1 pb-1">
+          <div className="rounded-md border">
             {albums
               .filter(
                 (a) =>
@@ -4083,6 +4046,7 @@ export function MetadataCenter({
                 </button>
               ))}
           </div>
+          </DialogBody>
         </DialogContent>
       </Dialog>
       {combineSelect && (
@@ -4093,11 +4057,16 @@ export function MetadataCenter({
           onOpenChange={(o) => {
             if (!o) setCombineSelect(null);
           }}
-          onConfirm={async (targetReleaseFolder) => {
+          onConfirm={async (targetReleaseFolder, title) => {
             const sel = combineSelect;
             if (!sel || sel.keeperId == null) return;
             setCombineSelect((s) => (s ? { ...s, busy: true } : s));
             try {
+              // The title nudge's answer FIRST — staged is immutable, and
+              // the keeper is part of the staging once the combine lands.
+              if (title) {
+                await invoke("set_album_fields", { albumId: sel.keeperId, fields: { title } });
+              }
               await invoke("combine_albums_multi", {
                 libraryId,
                 sourceIds: sel.picked.filter((p) => p.id !== sel.keeperId).map((p) => p.id),
@@ -4117,11 +4086,14 @@ export function MetadataCenter({
         />
       )}
       </div>
-      {/* Decisions applying in the background — a footer under the pane
-          (user's call, 2026-09-25: the top is for what needs doing; this is
-          work already ordered, landing). Neutral tone; the running item
-          spins, the waiting ones can still be pulled back. Same 4-row cap
-          as the strips above the nav. */}
+      {/* THE FOOTER (user's call, 2026-09-26): every work banner lives under
+          the pane, so the top reserves nothing. Top to bottom — the apply
+          queue (work already ordered, landing), the matching pass (what the
+          next pass will do, or the running pass), the staged changes (what
+          the next rescan applies). Each list caps at four rows and scrolls;
+          the pane above takes whatever height is left. */}
+      {/* Decisions applying in the background. Neutral tone; the running
+          item spins, the waiting ones can still be pulled back. */}
       {queuedForLib.length > 0 && (
         <div className="shrink-0 border-t bg-muted/30 px-4 py-3">
           <div className="flex items-center gap-3">
@@ -4148,6 +4120,171 @@ export function MetadataCenter({
                     Cancel
                   </button>
                 )}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {/* A running pass takes the pass banner's slot: it's consuming that
+          queue, so the queue box would only repeat the question. */}
+      {onlineEnabled && running && (
+        <MatchRunStrip libraryId={libraryId} className="shrink-0 border-t" />
+      )}
+      {/* Everything the next matching pass will do, in one place: albums and
+          artists MusicBrainz has never been asked about (the old post-scan
+          question's numbers) and the queue — matches to cash in, re-checks.
+          No question, no "not now": while there's work, this shows, and a
+          pass is what clears it. Staged changes gate it (same rule the
+          backend enforces): rescan first, then pass. "Unmatch" per queue
+          line rather than "Undo": nothing staged here, undoing means
+          forgetting the match. */}
+      {onlineEnabled && !running && passWorkCount > 0 && (
+        // Two rows: a header row (icon, title, the fixed controls — they
+        // never scroll), then the list under it at FULL width, so its
+        // scrollbar sits on the banner's right edge.
+        <div className="shrink-0 border-t bg-primary/5 px-4 py-3">
+          <div className="flex items-center gap-3">
+            <RefreshCw size={14} className="shrink-0 text-primary" />
+            <p className="min-w-0 flex-1 text-sm">{passItemsLabel(passWorkCount)}</p>
+            {/* Estimate + button, centred on each other. */}
+            <div className="flex shrink-0 items-center gap-3">
+              {/* MusicBrainz allows ~1 request per second — the estimate is
+                  requests, not work: ~3 per album, ~1.5 per artist. */}
+              <span className="text-[11px] text-muted-foreground">
+                about {passEstimateMinutes} {passEstimateMinutes === 1 ? "minute" : "minutes"}
+              </span>
+              <Button
+                size="sm"
+                variant="outline"
+                className="shrink-0 gap-1.5"
+                disabled={busy || running || pending.length > 0}
+                title={pending.length > 0 ? "Staged changes need a rescan first" : undefined}
+                onClick={rerunMatching}
+              >
+                <RefreshCw size={13} />
+                {pending.length > 0 ? "Rescan first" : running ? "Pass running…" : "Run pass now"}
+              </Button>
+            </div>
+          </div>
+          {/* Four rows, then it scrolls. The right padding is the SAME in
+              every footer list — one cutoff line, set to clear this
+              banner's estimate + button with room to spare — so a long row
+              never runs under the controls above it. */}
+          <ul className="-mr-4 mt-1 max-h-[70px] space-y-0.5 overflow-y-auto pl-[26px] pr-72">
+            {uncheckedAlbums > 0 && (
+              <li className="flex min-w-0 items-baseline gap-1.5 text-xs text-muted-foreground">
+                <span className="shrink-0">•</span>
+                <span className="min-w-0 truncate">
+                  Check {uncheckedAlbums} {uncheckedAlbums === 1 ? "album" : "albums"} MusicBrainz hasn't been
+                  asked about yet
+                </span>
+              </li>
+            )}
+            {uncheckedArtists > 0 && (
+              <li className="flex min-w-0 items-baseline gap-1.5 text-xs text-muted-foreground">
+                <span className="shrink-0">•</span>
+                <span className="min-w-0 truncate">
+                  Look up {uncheckedArtists} {uncheckedArtists === 1 ? "artist" : "artists"} without a
+                  MusicBrainz id
+                </span>
+              </li>
+            )}
+            {pendingPass.map((p) => (
+              <li
+                key={p.id}
+                className="flex min-w-0 items-baseline gap-1.5 text-xs text-muted-foreground"
+              >
+                <span className="shrink-0">•</span>
+                <span className="min-w-0 truncate">{p.label}</span>
+                {/* Album-match rows (bare album-id targets) offer Unmatch.
+                    Re-check rows queued by ONE merge/link carry that change's
+                    History batch and undo it right here (the undo clears the
+                    row); rows from several changes, or older rows without
+                    the link, point at History instead of guessing. */}
+                {/^\d+$/.test(p.target) ? (
+                  <button
+                    onClick={() =>
+                      run(`passunmatch:${p.id}`, () =>
+                        invoke("mb_unmatch_entity", {
+                          kind: "album",
+                          entityId: parseInt(p.target, 10),
+                        }),
+                      )
+                    }
+                    disabled={busy}
+                    className="shrink-0 underline underline-offset-2 hover:text-foreground"
+                  >
+                    {busyKey === `passunmatch:${p.id}` ? "…" : "Unmatch"}
+                  </button>
+                ) : p.batch_id != null ? (
+                  <button
+                    onClick={() => undo(p.batch_id as number)}
+                    disabled={busy}
+                    className="shrink-0 underline underline-offset-2 hover:text-foreground"
+                  >
+                    {busyKey === `undo:${p.batch_id}` ? "…" : "Undo"}
+                  </button>
+                ) : (
+                  <button
+                    onClick={() => goTo("history")}
+                    // Navigation, not a decision: open during a pass too.
+                    disabled={busyKey !== null}
+                    className="shrink-0 underline underline-offset-2 hover:text-foreground"
+                  >
+                    see History
+                  </button>
+                )}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {/* Staged directives waiting for one rescan — splits, combines,
+          separates accumulate here instead of each forcing its own rescan.
+          Any rescan applies (and clears) the whole batch. Bottom of the
+          stack: the rescan gates the pass above it. */}
+      {pending.length > 0 && (
+        <div className="shrink-0 border-t bg-red-500/5 px-4 py-3">
+          <div className="flex items-center gap-3">
+            <TriangleAlert size={14} className="shrink-0 text-red-400" />
+            <p className="min-w-0 flex-1 text-sm text-red-200/90">
+              {pending.length} staged {pending.length === 1 ? "change" : "changes"} — applied by the
+              next rescan
+            </p>
+            <Button
+              size="sm"
+              variant="outline"
+              className="shrink-0 gap-1.5"
+              disabled={busy || running}
+              onClick={() => {
+                if (onRescanNeeded) onRescanNeeded(libraryId);
+                else
+                  window.dispatchEvent(
+                    new CustomEvent("waverunner:open-rescan", { detail: { libraryId } }),
+                  );
+              }}
+            >
+              <RefreshCw size={13} />
+              Rescan now
+            </Button>
+          </div>
+          {/* One line per staged action; each truncates on its own instead of
+              the whole batch collapsing into one clipped run-on. Undo reverts
+              the directive itself — nothing has applied yet, so no rescan. */}
+          <ul className="-mr-4 mt-1 max-h-[70px] space-y-0.5 overflow-y-auto pl-[26px] pr-72">
+            {pending.map((p) => (
+              <li key={p.id} className="flex min-w-0 items-baseline gap-1.5 text-xs text-muted-foreground">
+                <span className="shrink-0">•</span>
+                <span className="min-w-0 truncate">{p.label}</span>
+                <button
+                  onClick={() =>
+                    run(`unstage:${p.id}`, () => invoke("unstage_pending_change", { id: p.id }))
+                  }
+                  disabled={busy}
+                  className="shrink-0 underline underline-offset-2 hover:text-foreground"
+                >
+                  {busyKey === `unstage:${p.id}` ? "…" : "Undo"}
+                </button>
               </li>
             ))}
           </ul>

@@ -32,11 +32,15 @@ export function useListWindow({
   count,
   estimateRowHeight,
   overscan = 12,
+  frozen = false,
 }: {
   listRef: RefObject<HTMLElement | null>;
   count: number;
   estimateRowHeight: number;
   overscan?: number;
+  /** Hold the current slice (a drag: the row being dragged must stay
+   *  mounted, and dnd-kit's transforms hold the others in place). */
+  frozen?: boolean;
 }): ListWindow {
   const [, setVersion] = useState(0);
   const bump = useCallback(() => setVersion((v) => v + 1), []);
@@ -52,6 +56,7 @@ export function useListWindow({
   };
 
   const computeRange = (): boolean => {
+    if (frozen) return false;
     const sc = scRef.current;
     const h = rowHeightRef.current;
     let start = 0;

@@ -1723,6 +1723,60 @@ async fn write_disc_subtitles(
     Ok(())
 }
 
+/// A release's disc names as shown, tiered like every other field: tag
+/// truth (release_disc_subtitle), under the pinned pressing's MusicBrainz
+/// medium titles (release_match.disc_titles), under the user's rename
+/// (disc_title_pref). The latter two are keyed on the album + folder, so
+/// they outlive the release row. Sorted by disc.
+pub(crate) async fn resolved_disc_titles(
+    pool: &SqlitePool,
+    release_id: i64,
+    album_id: i64,
+    folder_path: &str,
+) -> Result<Vec<(i64, String)>, String> {
+    let mut disc_titles: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT disc_no, title FROM release_disc_subtitle WHERE release_id = ?",
+    )
+    .bind(release_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let mut overlay = |layer: Vec<(i64, String)>| {
+        for (d, t) in layer {
+            if let Some(e) = disc_titles.iter_mut().find(|(dd, _)| *dd == d) {
+                e.1 = t;
+            } else {
+                disc_titles.push((d, t));
+            }
+        }
+    };
+    let mb_json: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT disc_titles FROM release_match
+         WHERE album_id = ? AND folder_path = ? AND mb_release_id <> ''",
+    )
+    .bind(album_id)
+    .bind(folder_path)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    if let Some(json) = mb_json.flatten() {
+        if let Ok(mb) = serde_json::from_str::<Vec<(i64, String)>>(&json) {
+            overlay(mb);
+        }
+    }
+    let disc_prefs: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT disc_no, title FROM disc_title_pref WHERE album_id = ? AND folder_path = ?",
+    )
+    .bind(album_id)
+    .bind(folder_path)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    overlay(disc_prefs);
+    disc_titles.sort_by_key(|(d, _)| *d);
+    Ok(disc_titles)
+}
+
 /// Reconcile an existing album entry against a fresh scan: update the album
 /// row (including the canonical folder — the default edition can change when
 /// siblings merge), rebuild the release rows, upsert tracks by file_path.
@@ -2685,6 +2739,7 @@ async fn migrate_moved_folders(
             "release_match",
             "album_release_pref",
             "disc_title_pref",
+            "album_release_note",
             "album_match_gap",
         ] {
             sqlx::query(&format!(
@@ -3743,6 +3798,15 @@ pub(crate) async fn apply_album_combines(
     // release arrive with its cover pick, disc names and (same group only)
     // its pinned pressing intact.
     let mut version_carries: Vec<(i64, String, Vec<String>)> = Vec::new();
+    // Notes carry in BOTH modes: (source album row id, keeper album folder).
+    // The source row goes in the reconcile, and its note with it unless it
+    // has joined the keeper's first.
+    let mut note_carries: Vec<(i64, String)> = Vec::new();
+    // Merge mode: the poured-in editions' RELEASE notes join the poured-into
+    // release's — (source album row id, its release folders, keeper album
+    // folder, the release folder they pour into). Versions mode re-keys
+    // release notes with the other folder-keyed rows (version_carries).
+    let mut merge_note_carries: Vec<(i64, Vec<String>, String, String)> = Vec::new();
     // Leaf-first order, and each directive extracts its sources AT ITS TURN
     // rather than all up front — a chain's middle album (Bonus → Bad 25 →
     // Bad) must RECEIVE its folds before it is itself pulled out as a
@@ -3817,12 +3881,18 @@ pub(crate) async fn apply_album_combines(
                         .5
                         .clone()
                         .unwrap_or_else(|| t.releases[t.default_release].folder_rel.clone());
+                    if let Some(sid) = source_row {
+                        merge_note_carries.push((sid, src_release_folders.clone(), t.folder_rel.clone(), rf.clone()));
+                    }
                     let key = (t.folder_rel.clone(), rf);
                     if !merge_targets.contains(&key) {
                         merge_targets.push(key);
                     }
                 } else if let (false, Some(sid)) = (d.4 == "merge", source_row) {
                     version_carries.push((sid, t.folder_rel.clone(), src_release_folders));
+                }
+                if let Some(sid) = source_row {
+                    note_carries.push((sid, t.folder_rel.clone()));
                 }
                 fold_album(&mut artists[ai].albums[bi], src, &d.4, d.5.as_deref())
             }
@@ -3833,12 +3903,18 @@ pub(crate) async fn apply_album_combines(
                         .5
                         .clone()
                         .unwrap_or_else(|| t.releases[t.default_release].folder_rel.clone());
+                    if let Some(sid) = source_row {
+                        merge_note_carries.push((sid, src_release_folders.clone(), t.folder_rel.clone(), rf.clone()));
+                    }
                     let key = (t.folder_rel.clone(), rf);
                     if !merge_targets.contains(&key) {
                         merge_targets.push(key);
                     }
                 } else if let (false, Some(sid)) = (d.4 == "merge", source_row) {
                     version_carries.push((sid, t.folder_rel.clone(), src_release_folders));
+                }
+                if let Some(sid) = source_row {
+                    note_carries.push((sid, t.folder_rel.clone()));
                 }
                 fold_album(&mut orphans.albums[bi], src, &d.4, d.5.as_deref())
             }
@@ -3884,6 +3960,40 @@ pub(crate) async fn apply_album_combines(
             .map_err(|e| e.to_string())?;
     }
 
+    // A source album's note would go with its row in the reconcile; it joins
+    // the keeper's first (concatenated — the user's call for now).
+    for (source_id, keeper_folder) in note_carries {
+        let keeper: Option<(i64,)> = sqlx::query_as(
+            "SELECT al.id FROM album al JOIN media_entry me ON me.id = al.id
+             WHERE me.library_id = ? AND al.folder_path = ?",
+        )
+        .bind(library_id)
+        .bind(&keeper_folder)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        if let Some((keeper_id,)) = keeper {
+            crate::notes::append_note(pool, "entry", source_id, keeper_id).await?;
+        }
+    }
+    // Merge mode: a poured-in edition stops being a release, so its release
+    // note joins the note of the release it pours into.
+    for (source_id, src_folders, keeper_folder, into_folder) in merge_note_carries {
+        let keeper: Option<(i64,)> = sqlx::query_as(
+            "SELECT al.id FROM album al JOIN media_entry me ON me.id = al.id
+             WHERE me.library_id = ? AND al.folder_path = ?",
+        )
+        .bind(library_id)
+        .bind(&keeper_folder)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        let Some((keeper_id,)) = keeper else { continue };
+        for folder in &src_folders {
+            crate::notes::append_release_note(pool, source_id, folder, keeper_id, &into_folder).await?;
+        }
+    }
+
     // Versions mode changes no track list, so the incoming release's state
     // is still true — it just needs to belong to the keeper before the
     // reconcile deletes the source row (and, by cascade, everything keyed to
@@ -3923,7 +4033,7 @@ pub(crate) async fn apply_album_combines(
             (Some(k), Some(s)) => k == s,
             _ => false,
         };
-        let mut tables: Vec<&str> = vec!["album_release_pref", "disc_title_pref"];
+        let mut tables: Vec<&str> = vec!["album_release_pref", "disc_title_pref", "album_release_note"];
         if same_group {
             tables.extend(["release_match", "album_match_gap"]);
         }
@@ -5662,29 +5772,7 @@ pub async fn get_album_detail(
             });
         }
         // Disc names: tag truth first, the user's rename wins per disc.
-        let mut disc_titles: Vec<(i64, String)> = sqlx::query_as(
-            "SELECT disc_no, title FROM release_disc_subtitle WHERE release_id = ?",
-        )
-        .bind(rid)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| e.to_string())?;
-        let disc_prefs: Vec<(i64, String)> = sqlx::query_as(
-            "SELECT disc_no, title FROM disc_title_pref WHERE album_id = ? AND folder_path = ?",
-        )
-        .bind(entry_id)
-        .bind(&folder_path)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| e.to_string())?;
-        for (d, t) in disc_prefs {
-            if let Some(e) = disc_titles.iter_mut().find(|(dd, _)| *dd == d) {
-                e.1 = t;
-            } else {
-                disc_titles.push((d, t));
-            }
-        }
-        disc_titles.sort_by_key(|(d, _)| *d);
+        let disc_titles = resolved_disc_titles(pool, rid, entry_id, &folder_path).await?;
 
         // This release's OWN art and nothing else: covers under its folders,
         // plus the bare-named ones when it's the default. Releases don't

@@ -160,3 +160,16 @@ pub async fn background_job_cancel(id: String) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// Flag every job registered to a library — called when the library is
+/// deleted, so a walk over its rows (artist images, prefetches) stops at
+/// its next poll instead of failing item by item against a cascade.
+pub fn cancel_for_library(library_id: &str) {
+    if let Ok(t) = table().lock() {
+        for e in t.values() {
+            if e.status.library_id.as_deref() == Some(library_id) {
+                e.cancel.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+}

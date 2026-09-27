@@ -351,8 +351,8 @@ function App() {
   }
 
   // Only the first screenfuls are decode-gated before the grid swaps in; the
-  // rest lazy-load their thumbnails as cards scroll near (content-visibility +
-  // loading="lazy" on the cards keep offscreen work at zero).
+  // rest load as their rows mount (the grid is row-windowed, so offscreen
+  // rows aren't in the DOM at all).
   const PRELOAD_COVER_CAP = 150;
 
   const preloadCovers = useCallback(async (entries: MediaEntry[]) => {
@@ -364,6 +364,12 @@ function App() {
             : entry.covers[0];
         if (!cover) return;
         let url = thumbCacheRef.current.get(cover);
+        // Already fetched AND measured: nothing left to do for this cover.
+        // After an edit's in-place grid refresh that's every cover on the
+        // page — without this, each refresh re-decoded up to 150 images
+        // that were already painted, and the edit dialog's close waited
+        // behind it.
+        if (url && coverAspectRef.current.has(cover)) return;
         if (!url) {
           try {
             const thumbPath = toThumbPath(cover);
@@ -672,8 +678,8 @@ function App() {
     const key = `${activeView?.kind === "home" ? "home" : selectedLibrary!.id}:${scrollKindFor(activeView)}:${parentId}`;
     // Anchor to the card currently at the top of the viewport so restore can
     // re-find it by id. A raw scrollTop drifts on the way back because off-screen
-    // cards above are height-estimated (content-visibility) and never render to
-    // correct themselves, so the saved pixel no longer points at the same card.
+    // rows above are height-estimated (the grid's windowing) until they render,
+    // so the saved pixel no longer points at the same card.
     const cTop = container.getBoundingClientRect().top;
     let anchorId: string | null = null;
     let anchorDelta = 0;
@@ -732,8 +738,8 @@ function App() {
     }
     // Two restore strategies, both patient about content that isn't there yet:
     //  - Anchored (grids): re-align the card that sat at the top of the
-    //    viewport. content-visibility cards above it settle over a few frames
-    //    and nudge it, so re-align until the adjustment stops.
+    //    viewport. Estimated rows above it settle over a few frames as they
+    //    render and nudge it, so re-align until the adjustment stops.
     //  - Raw offset (detail pages, Tracks, Home — no [data-flip-id] anchors):
     //    these pages fetch their own data AFTER mounting, so the container is
     //    near-empty on the first frames and an early scrollTop write just
@@ -757,7 +763,7 @@ function App() {
           const cTop = c.getBoundingClientRect().top;
           c.scrollTop += (el.getBoundingClientRect().top - cTop) - saved.anchorDelta;
           // First write puts the anchor in place — safe to show. Later
-          // frames only nudge by the content-visibility drift.
+          // frames only nudge by the row-estimate drift.
           unveil();
           alignFrames++;
           if (alignFrames < 8 && Math.abs(c.scrollTop - before) > 1) requestAnimationFrame(settle);
@@ -1427,13 +1433,12 @@ function App() {
       if (!lib) return;
       const v = navStateRef.current.view;
       if (v && v.libraryId === libraryId) {
-        // Land on the root grid, freshly loaded.
-        const view: ViewSpec = { kind: "library-root", libraryId };
-        setActiveView(view);
-        setSelectedEntry(null);
-        void loadView(view, null, [
-          { id: null, title: `${lib.name} - ${lib.format === "music" ? "Artists" : "All"}`, view },
-        ], false);
+        // Land on the Metadata page (user's call, 2026-09-26): after a
+        // scan — the first one or any rescan — the work is there: the
+        // first pass to run, what the staged changes did, and the video
+        // match question, which rides above that page only. Through the
+        // ref, since selectView is declared further down.
+        openMetadataRef.current(libraryId);
       }
       afterLibraryChanged(lib);
     },

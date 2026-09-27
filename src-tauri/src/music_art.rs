@@ -265,6 +265,21 @@ pub async fn start_artist_images_job(
             while crate::music_mb::pass_running() && !job.cancelled() {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
+            // The library itself may be gone (deleted mid-walk): the list
+            // above is a snapshot, and every fetch after that would only
+            // fail to write. Deletion also cancels this job, but the walk
+            // guards itself too.
+            let exists: bool = sqlx::query_scalar::<_, i64>(
+                "SELECT EXISTS(SELECT 1 FROM library WHERE id = ?)",
+            )
+            .bind(&library_id)
+            .fetch_one(&pool)
+            .await
+            .map(|v| v != 0)
+            .unwrap_or(true);
+            if !exists {
+                break;
+            }
             job.progress(i, total, Some(title.clone()));
             match artist_has_image(&pool, &library_id, artist_id, &folder_path, selected_cover.as_deref()).await {
                 Ok(true) => {

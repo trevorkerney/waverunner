@@ -15,6 +15,7 @@ mod music_edit;
 mod music_mb;
 mod music_player;
 mod music_tagwrite;
+mod notes;
 mod player;
 mod rt;
 mod tmdb;
@@ -149,6 +150,8 @@ pub fn run() {
             commands::set_setting,
             commands::get_library_settings,
             commands::set_library_setting,
+            notes::get_note,
+            notes::set_note,
             music_mb::mb_set_ignored,
             commands::get_app_version,
             commands::get_file_size,

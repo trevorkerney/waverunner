@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Button } from "../ui/button";
-import { useLibraryRuns } from "@/hooks/libraryRuns";
+import { MATCH_LOCK_TITLE, useLibraryRuns } from "@/hooks/libraryRuns";
 import { useMbHidden } from "@/lib/mbVisibility";
 import { RefreshCw, Sparkles, TriangleAlert } from "lucide-react";
 
@@ -278,6 +278,9 @@ export function PendingWorkStrip({ libraryId }: { libraryId: string }) {
           size="sm"
           variant="outline"
           className="h-6 shrink-0 gap-1.5 px-2 text-xs"
+          // The pass holds the rescan (backend refuses) — it ends first.
+          disabled={passRunning}
+          title={passRunning ? MATCH_LOCK_TITLE : undefined}
           onClick={() =>
             window.dispatchEvent(
               new CustomEvent("waverunner:open-rescan", { detail: { libraryId } }),
