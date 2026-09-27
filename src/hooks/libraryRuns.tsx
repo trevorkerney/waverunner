@@ -79,6 +79,9 @@ export interface MatchRun {
   sub: Record<string, { done: number; total: number }>;
   sweep: number;
   skipRequested: boolean;
+  /** Requests that failed so far this pass (distinct items) — the strip
+   *  counts them live; the finish toast and the queue banner say the rest. */
+  failed: number;
 }
 
 export type LibraryRun = ScanRun | PromptRun | MatchRun;
@@ -292,7 +295,7 @@ export function LibraryRunsProvider({ children }: { children: ReactNode }) {
         if (ms.running) {
           update(libraryId, () => ({
             kind: "match", libraryId, name, format, setup,
-            progress: null, sub: {}, sweep: 1, skipRequested: false,
+            progress: null, sub: {}, sweep: 1, skipRequested: false, failed: 0,
           }));
           return;
         }
@@ -522,7 +525,7 @@ export function LibraryRunsProvider({ children }: { children: ReactNode }) {
           kind: "match", libraryId,
           name: meta?.name ?? "", format: meta?.format ?? "music",
           setup: r?.setup ?? meta?.setup ?? false,
-          progress: null, sub: {}, sweep: iteration, skipRequested: false,
+          progress: null, sub: {}, sweep: iteration, skipRequested: false, failed: 0,
         };
       });
     });
@@ -547,16 +550,34 @@ export function LibraryRunsProvider({ children }: { children: ReactNode }) {
         });
       },
     );
-    const unDone = listen<{ libraryId: string; error?: string }>("music-enrich-done", (e) => {
-      const { libraryId, error } = e.payload;
-      if (error) {
-        toast.error(`MusicBrainz matching failed: ${error}. You can retry from the Metadata page.`);
-      }
-      if (runsRef.current[libraryId]?.kind === "match") void finishRun(libraryId);
+    // A request failed during the pass: the strip's live count.
+    const unFailure = listen<{ libraryId: string; failed: number }>("music-enrich-failure", (e) => {
+      const { libraryId, failed } = e.payload;
+      update(libraryId, (r) => (r?.kind === "match" ? { ...r, failed } : r));
     });
+    const unDone = listen<{ libraryId: string; error?: string; failed?: number }>(
+      "music-enrich-done",
+      (e) => {
+        const { libraryId, error, failed } = e.payload;
+        if (error) {
+          toast.error(`MusicBrainz matching failed: ${error}. You can retry from the Metadata page.`);
+        } else if ((failed ?? 0) > 0 && runsRef.current[libraryId]?.kind === "match") {
+          // Said at the finish (user's call, 2026-09-27): a pass that ended
+          // with failures must not look like one that went through. They
+          // stay in the queue banner until a pass gets them or a person
+          // settles them; nothing retries on its own.
+          const n = failed ?? 0;
+          toast.warning(
+            `Matching pass finished — ${n} ${n === 1 ? "request" : "requests"} failed (MusicBrainz was unavailable). Still queued for the next pass.`,
+          );
+        }
+        if (runsRef.current[libraryId]?.kind === "match") void finishRun(libraryId);
+      },
+    );
     return () => {
       unIteration.then((fn) => fn());
       unProgress.then((fn) => fn());
+      unFailure.then((fn) => fn());
       unDone.then((fn) => fn());
     };
   }, [finishRun, libMeta, update]);
@@ -598,7 +619,7 @@ export function LibraryRunsProvider({ children }: { children: ReactNode }) {
     const setup = existing?.setup ?? library.setup_stage != null;
     update(library.id, () => ({
       kind: "match", libraryId: library.id, name: library.name, format: library.format, setup,
-      progress: null, sub: {}, sweep: 1, skipRequested: false,
+      progress: null, sub: {}, sweep: 1, skipRequested: false, failed: 0,
     }));
     if (library.format !== "music") {
       if (!video) {

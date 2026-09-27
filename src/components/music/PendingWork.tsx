@@ -46,13 +46,33 @@ export function notifyPendingWorkChanged() {
 export interface PendingPassBuckets {
   uncheckedAlbums: number;
   uncheckedArtists: number;
+  /** Items whose last request failed — the pass retries them, and they
+   *  stay listed until one goes through (or is settled by hand). */
+  failedRequests: number;
+}
+
+/** One item whose MusicBrainz request failed on its last try (user's call,
+ *  2026-09-27: failures are said, listed, and retried by the next pass —
+ *  never silently, never on their own). */
+export interface FetchFailureRow {
+  kind: string;
+  target: string;
+  label: string;
+  phase: string;
+  error: string;
+  /** Passes in a row it has failed. */
+  attempts: number;
+  last_failed_at: string;
 }
 
 /** The one number every surface shows for the pass: queue rows + one per
  *  non-empty bucket. */
 export function passItemCount(pass: PendingPassRow[], buckets: PendingPassBuckets): number {
   return (
-    pass.length + (buckets.uncheckedAlbums > 0 ? 1 : 0) + (buckets.uncheckedArtists > 0 ? 1 : 0)
+    pass.length +
+    (buckets.uncheckedAlbums > 0 ? 1 : 0) +
+    (buckets.uncheckedArtists > 0 ? 1 : 0) +
+    (buckets.failedRequests > 0 ? 1 : 0)
   );
 }
 
@@ -60,12 +80,13 @@ export function passItemsLabel(n: number): string {
   return `${n} ${n === 1 ? "item" : "items"} queued for the next matching pass`;
 }
 
-const NO_BUCKETS: PendingPassBuckets = { uncheckedAlbums: 0, uncheckedArtists: 0 };
+const NO_BUCKETS: PendingPassBuckets = { uncheckedAlbums: 0, uncheckedArtists: 0, failedRequests: 0 };
 
 interface PendingSnapshot {
   rescan: PendingRescanRow[];
   pass: PendingPassRow[];
   buckets: PendingPassBuckets;
+  failures: FetchFailureRow[];
 }
 
 /** One fetch per library at a time, shared by every hook instance. The
@@ -86,21 +107,28 @@ function fetchPending(libraryId: string): Promise<PendingSnapshot> {
   const running = inflight.get(libraryId);
   if (running) return running;
   const p = (async () => {
-    const [rescan, pass, ms, ls] = await Promise.all([
+    const [rescan, pass, ms, ls, failures] = await Promise.all([
       invoke<PendingRescanRow[]>("get_pending_changes", { libraryId }),
       invoke<PendingPassRow[]>("get_pending_pass", { libraryId }),
-      invoke<{ unchecked: number; unchecked_artists: number }>("music_match_state", {
-        libraryId,
-      }),
+      invoke<{ unchecked: number; unchecked_artists: number; failed_requests: number }>(
+        "music_match_state",
+        { libraryId },
+      ),
       invoke<Record<string, string>>("get_library_settings", { libraryId }),
+      invoke<FetchFailureRow[]>("get_fetch_failures", { libraryId }),
     ]);
+    const online = ls["online_metadata"] !== "off";
     const snap: PendingSnapshot = {
       rescan,
       pass,
-      buckets:
-        ls["online_metadata"] === "off"
-          ? NO_BUCKETS
-          : { uncheckedAlbums: ms.unchecked, uncheckedArtists: ms.unchecked_artists },
+      buckets: online
+        ? {
+            uncheckedAlbums: ms.unchecked,
+            uncheckedArtists: ms.unchecked_artists,
+            failedRequests: ms.failed_requests,
+          }
+        : NO_BUCKETS,
+      failures: online ? failures : [],
     };
     lastSnapshot.set(libraryId, snap);
     return snap;
@@ -121,11 +149,13 @@ export function usePendingWork(libraryId: string | null) {
   const [rescan, setRescan] = useState<PendingRescanRow[]>(() => cached?.rescan ?? []);
   const [pass, setPass] = useState<PendingPassRow[]>(() => cached?.pass ?? []);
   const [buckets, setBuckets] = useState<PendingPassBuckets>(() => cached?.buckets ?? NO_BUCKETS);
+  const [failures, setFailures] = useState<FetchFailureRow[]>(() => cached?.failures ?? []);
   const refetch = useCallback(async () => {
     if (!libraryId) {
       setRescan([]);
       setPass([]);
       setBuckets(NO_BUCKETS);
+      setFailures([]);
       return;
     }
     // A library switch on a mounted instance: show its last snapshot now,
@@ -135,12 +165,14 @@ export function usePendingWork(libraryId: string | null) {
       setRescan(known.rescan);
       setPass(known.pass);
       setBuckets(known.buckets);
+      setFailures(known.failures);
     }
     try {
       const snap = await fetchPending(libraryId);
       setRescan(snap.rescan);
       setPass(snap.pass);
       setBuckets(snap.buckets);
+      setFailures(snap.failures);
     } catch {
       // Library mid-delete or backend busy — keep the last known state.
     }
@@ -165,7 +197,7 @@ export function usePendingWork(libraryId: string | null) {
       unScan.then((fn) => fn());
     };
   }, [refetch]);
-  return { rescan, pass, buckets, passItems: passItemCount(pass, buckets), refetch };
+  return { rescan, pass, buckets, failures, passItems: passItemCount(pass, buckets), refetch };
 }
 
 /** The sidebar's Metadata row's ONE attention slot — never two icons side by side.

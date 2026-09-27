@@ -78,6 +78,11 @@ interface AlbumInfo {
   /** Display cover (cached path). */
   cover: string | null;
   editions: Edition[];
+  /** Matched to MusicBrainz — its credits are MB's; the album-artist choice
+   *  isn't offered on such a keeper (his call, 2026-09-27). */
+  mb_matched: boolean;
+  /** Credits set by hand — likewise not offered; the edit stands. */
+  credits_edited: boolean;
 }
 
 const editionName = (e: Edition) => e.label ?? "1";
@@ -93,9 +98,32 @@ const TITLE_BLOCK_PX = 12 + 20 + 6 + 32 + 4 + 32 + 6;
 // between + 4 + a one-line hint 16 + slack 6.
 const discBlockPx = (rows: number) =>
   rows > 0 ? 12 + 20 + 6 + rows * 32 + (rows - 1) * 4 + 4 + 16 + 6 : 0;
+// Album-artist block: same frame as the edition pick — label 34, two
+// 30px radio rows.
+const ARTIST_BLOCK_PX = 34 + 30 * 2;
 // The frame never outgrows a two-album, two-disc merge (his rule): more
-// albums, more discs, an edition pick or a warning scroll the body.
-const CAP_PX = BASE_PX + ROW_PX * 2 + TITLE_BLOCK_PX + discBlockPx(2);
+// albums, more discs, an edition pick or a warning scroll the body. Two
+// albums by two artists ask the album-artist question, so that block is
+// part of the cap.
+const CAP_PX = BASE_PX + ROW_PX * 2 + ARTIST_BLOCK_PX + TITLE_BLOCK_PX + discBlockPx(2);
+
+/** "Various Artists" — the credit a compilation carries; the matching pass
+ *  scopes such an album by Various Artists' MusicBrainz id. */
+export const VARIOUS_ARTISTS = "Various Artists";
+
+/** Distinct credit lines among the picked albums, case-blind. */
+function distinctArtists(info: AlbumInfo[] | null): string[] {
+  const names = (info ?? []).map((a) => a.artist ?? "");
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const n of names) {
+    const key = n.trim().toLowerCase();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(n.trim());
+  }
+  return out;
+}
 
 /** Configure step for combining the current selection: pick the keeper, pick
  *  the mode, confirm. A normal centered dialog — the grid keeps its full
@@ -113,13 +141,30 @@ export function CombineSelectedDialog({
   onOpenChange: (open: boolean) => void;
   /** `title`: a new title for the keeper, when the user accepted (or typed)
    *  one in the title nudge; null = keep the keeper's title. `discs`: the
-   *  disc names that differ from what the keeper's edition has on file. */
-  onConfirm: (targetReleaseFolder: string | null, title: string | null, discs: DiscName[]) => void;
+   *  disc names that differ from what the keeper's edition has on file.
+   *  `albumArtist`: the combined album's credit when it differs from the
+   *  keeper's own ("Various Artists"); null = keep the keeper's. */
+  onConfirm: (
+    targetReleaseFolder: string | null,
+    title: string | null,
+    discs: DiscName[],
+    albumArtist: string | null,
+  ) => void;
 }) {
   const { picked, keeperId, mode, busy, configuring } = selection;
   // A pass on this library holds the combine (the backend refuses it).
   const locked = useMatchLock(selection.libraryId);
-  const [info, setInfo] = useState<AlbumInfo[] | null>(null);
+  // The albums' info (credits, editions, discs), fetched when the picks are
+  // confirmed — and the dialog OPENS ONLY ONCE IT'S HERE (his rule,
+  // 2026-09-27: a modal opens at one size and stays there). Every term of
+  // the frame's height comes from this info, so a frame computed before it
+  // landed was a guess that then visibly corrected itself. A local read of
+  // a few albums: milliseconds. Keyed on the picks, so a result for other
+  // albums never opens the frame; the last result stays through the exit.
+  const key = picked.map((p) => p.id).join(",");
+  const [loaded, setLoaded] = useState<{ key: string; info: AlbumInfo[] } | null>(null);
+  const info: AlbumInfo[] | null = loaded?.key === key ? loaded.info : null;
+  const open = configuring && info !== null;
   // Which keeper edition a merge pours into (folder path); null = default.
   const [targetFolder, setTargetFolder] = useState<string | null>(null);
   // The title nudge: a merge offers the combined album's title, prefilled
@@ -128,15 +173,26 @@ export function CombineSelectedDialog({
   const [title, setTitle] = useState("");
   // Per-disc names for the merged track list, keyed by disc number.
   const [discNames, setDiscNames] = useState<Record<number, string>>({});
+  // The combined album's artist: the keeper's own credit, or Various Artists.
+  const [artistChoice, setArtistChoice] = useState<"keeper" | "various">("keeper");
 
   useEffect(() => {
     if (!configuring) return;
-    setInfo(null);
+    let cancelled = false;
     invoke<AlbumInfo[]>("get_combine_info", { albumIds: picked.map((p) => p.id) })
-      .then(setInfo)
-      .catch(() => setInfo([]));
-    // Album membership only changes when the selection does.
-  }, [configuring, picked]);
+      .then((result) => {
+        if (!cancelled) setLoaded({ key, info: result });
+      })
+      .catch(() => {
+        if (!cancelled) setLoaded({ key, info: [] });
+      });
+    return () => {
+      cancelled = true;
+    };
+    // `key` stands in for `picked`: album membership is what the fetch
+    // keys on, and it only changes when the selection does.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [configuring, key]);
 
   const byId = (id: number) => info?.find((a) => a.id === id);
   const keeper = keeperId != null ? byId(keeperId) : undefined;
@@ -169,6 +225,28 @@ export function CombineSelectedDialog({
     keeperEditions.find((e) => targetFolder === e.folder_path) ??
     keeperEditions.find((e) => e.is_default) ??
     keeperEditions[0];
+
+  // The album-artist question (user's call, 2026-09-27): albums by
+  // different artists combined into one is either a collaboration keeping
+  // the keeper's credit, or a compilation — Various Artists. Asked whenever
+  // the picks carry two or more distinct credits; three or more is a
+  // compilation until said otherwise, so Various Artists leads there. Not
+  // asked when the keeper already IS Various Artists (nothing to choose),
+  // when all picks share one credit, or when the keeper's credit is
+  // settled already — matched to MusicBrainz (MB's credit stands) or set
+  // by hand (the edit stands).
+  const distinct = useMemo(() => distinctArtists(info), [info]);
+  const keeperArtist = keeper?.artist ?? null;
+  const keeperIsVarious = keeperArtist?.trim().toLowerCase() === VARIOUS_ARTISTS.toLowerCase();
+  const keeperSettled = !!keeper && (keeper.mb_matched || keeper.credits_edited);
+  const showArtist =
+    keeperId != null && distinct.length >= 2 && !keeperIsVarious && !keeperSettled;
+  const distinctKey = distinct.join("\u0000");
+  useEffect(() => {
+    setArtistChoice(distinct.length >= 3 ? "various" : "keeper");
+    // Re-defaults only when the set of credits changes — never under a click.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [distinctKey]);
 
   // The merged track list's discs — the union of disc numbers across the
   // keeper's target edition and each other album's only edition (one with
@@ -221,10 +299,9 @@ export function CombineSelectedDialog({
     setDiscNames(next);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [suggestionKey]);
-  // Before the info lands, one disc per pick keeps the frame's height
-  // right for the common case; an empty info (fetch failed) shows none.
-  const showDiscs = showTitle && (info === null || mergedDiscs.length > 0);
-  const discRows = showDiscs ? (info === null ? picked.length : mergedDiscs.length) : 0;
+  // An empty info (fetch failed) shows none.
+  const showDiscs = showTitle && mergedDiscs.length > 0;
+  const discRows = showDiscs ? mergedDiscs.length : 0;
 
   // Merge can't pour a set of alternate cuts into one track list — those
   // albums have to be separated first (matches the backend's refusal).
@@ -241,13 +318,14 @@ export function CombineSelectedDialog({
     BASE_PX +
     ROW_PX * picked.length +
     (editionRows > 0 ? 34 + 30 * editionRows : 0) +
+    (showArtist ? ARTIST_BLOCK_PX : 0) +
     (showTitle ? TITLE_BLOCK_PX : 0) +
     discBlockPx(discRows) +
     (blocked ? 76 : 0);
   const height = `${Math.min(px, CAP_PX) / 16}rem`;
 
   return (
-    <Dialog open={configuring} onOpenChange={(o) => !busy && onOpenChange(o)}>
+    <Dialog open={open} onOpenChange={(o) => !busy && onOpenChange(o)}>
       <DialogContent size="lg" height={height}>
         <DialogHeader>
           <DialogTitle>Combine {picked.length} albums</DialogTitle>
@@ -398,6 +476,48 @@ export function CombineSelectedDialog({
             </div>
           )}
 
+          {showArtist && (
+            <div>
+              <p className="mb-1 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                Album artist
+              </p>
+              <div className="flex flex-col gap-0.5">
+                {(
+                  [
+                    ["keeper", keeperArtist ?? "No artist", "the keeper's own credit"],
+                    [
+                      "various",
+                      VARIOUS_ARTISTS,
+                      `${distinct.length} artists across these albums — a compilation`,
+                    ],
+                  ] as const
+                ).map(([choice, label, note]) => (
+                  <button
+                    key={choice}
+                    type="button"
+                    onClick={() => setArtistChoice(choice)}
+                    disabled={busy}
+                    className="flex items-center gap-2 rounded px-1 py-1 text-left hover:bg-accent/50"
+                  >
+                    <input
+                      type="radio"
+                      name="combine-album-artist"
+                      checked={artistChoice === choice}
+                      onChange={() => setArtistChoice(choice)}
+                      disabled={busy}
+                      tabIndex={-1}
+                      className="pointer-events-none size-3.5 shrink-0 accent-primary"
+                    />
+                    <span className="min-w-0 flex-1 truncate text-sm">
+                      {label}
+                      <span className="ml-1.5 text-[11px] text-muted-foreground">{note}</span>
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
           {showTitle && (
             <div>
               <p className="mb-1 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
@@ -426,20 +546,15 @@ export function CombineSelectedDialog({
                 Disc names
               </p>
               <div className="flex flex-col gap-1">
-                {(info === null
-                  ? // Placeholders until the info lands: one per pick, the
-                    // common case, so the frame doesn't grow in.
-                    picked.map((_, i) => ({ disc_no: i + 1, from: null as string | null, pending: true }))
-                  : mergedDiscs.map((d) => ({ disc_no: d.disc_no, from: d.from, pending: false }))
-                ).map((d) => (
+                {mergedDiscs.map((d) => (
                   <label key={d.disc_no} className="flex min-w-0 items-center gap-2">
                     <span className="w-12 shrink-0 text-xs text-muted-foreground">Disc {d.disc_no}</span>
                     <input
-                      value={d.pending ? "" : (discNames[d.disc_no] ?? "")}
+                      value={discNames[d.disc_no] ?? ""}
                       onChange={(e) =>
                         setDiscNames((s) => ({ ...s, [d.disc_no]: e.target.value }))
                       }
-                      disabled={busy || d.pending}
+                      disabled={busy}
                       // The album this disc comes from, greyed — a name is
                       // optional, and this says which one it would name.
                       placeholder={d.from ?? ""}
@@ -479,7 +594,7 @@ export function CombineSelectedDialog({
               // disc another album brings has nothing on file, so any name
               // typed for it is written and an empty field is left alone.
               const discs: DiscName[] = [];
-              if (showDiscs && info !== null && targetEdition) {
+              if (showDiscs && targetEdition) {
                 for (const d of mergedDiscs) {
                   const value = (discNames[d.disc_no] ?? "").trim();
                   if (value !== d.keeperExisting) {
@@ -491,6 +606,7 @@ export function CombineSelectedDialog({
                 mode === "merge" ? targetFolder : null,
                 showTitle && t && t !== keeperTitle ? t : null,
                 discs,
+                showArtist && artistChoice === "various" ? VARIOUS_ARTISTS : null,
               );
             }}
           >

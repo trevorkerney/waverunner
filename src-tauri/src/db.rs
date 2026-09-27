@@ -1619,6 +1619,61 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .execute(&pool)
     .await?;
 
+    // ── Band membership (membership.rs) ───────────────────────────────
+    // MusicBrainz "member of band" relationships, by MBID: one row per
+    // stint (a member who left and rejoined has two), attributes as a JSON
+    // array. The fetch stamp per artist carries MusicBrainz's type and the
+    // artist's life span — a group that has ended has no current members
+    // even where its member rows carry no dates.
+    for stmt in [
+        "CREATE TABLE IF NOT EXISTS mb_membership (
+            group_mbid TEXT NOT NULL,
+            member_mbid TEXT NOT NULL,
+            stint TEXT NOT NULL DEFAULT '',
+            group_name TEXT NOT NULL,
+            member_name TEXT NOT NULL,
+            begin_date TEXT,
+            end_date TEXT,
+            ended INTEGER NOT NULL DEFAULT 0,
+            attributes TEXT NOT NULL DEFAULT '[]',
+            PRIMARY KEY (group_mbid, member_mbid, stint)
+        )",
+        "CREATE INDEX IF NOT EXISTS idx_mb_membership_member ON mb_membership(member_mbid)",
+        "CREATE TABLE IF NOT EXISTS mb_membership_fetch (
+            artist_mbid TEXT PRIMARY KEY,
+            artist_type TEXT,
+            life_begin TEXT,
+            life_end TEXT,
+            life_ended INTEGER NOT NULL DEFAULT 0,
+            fetched_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+    ] {
+        sqlx::query(stmt).execute(&pool).await?;
+    }
+
+    // ── Failed MusicBrainz requests (what the pass couldn't get through) ──
+    // One row per item whose request failed on the pass's last try: the
+    // queue banner lists them, the finish line counts them, a later success
+    // (any pass, any path) clears the row, and each phase prunes rows for
+    // items outside its current work when it starts. Nothing retries on
+    // its own. See music_mb::record_fetch_failure.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS mb_fetch_failure (
+            library_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            target TEXT NOT NULL,
+            label TEXT NOT NULL,
+            phase TEXT NOT NULL,
+            error TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 1,
+            last_failed_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (library_id, kind, target),
+            FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     // ── Release-group releases cache (match dialog's release picker) ──
     // Same rules as the artist cache: served instantly, refreshed in the
     // background on open, evicted once no album in the group still has an
@@ -2035,6 +2090,42 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             track_id INTEGER PRIMARY KEY,
             dismissed_at TEXT NOT NULL DEFAULT (datetime('now')),
             FOREIGN KEY (track_id) REFERENCES track(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // ── Split-compilation dismissals ──────────────────────────────────
+    // A folder whose files carry one album title under several album
+    // artists scans as several one-artist albums; the metadata center
+    // offers to combine them as Various Artists (split_compilations). A
+    // row here is the standing "no, these are separate albums" for that
+    // folder — the card never comes back for it.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS compilation_dismiss (
+            library_id TEXT NOT NULL,
+            folder_path TEXT NOT NULL,
+            dismissed_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (library_id, folder_path),
+            FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // ── Album scanner identity ────────────────────────────────────────
+    // The (album artist, title) pair the scanner grouped each album on,
+    // lowercased — the key combine directives are matched with. Written at
+    // every scan. A merged album's identity is its KEEPER's, which no
+    // single file carries once the poured-in tracks sort ahead of the
+    // keeper's own; reading "the first file's tags" for it keyed the
+    // absorbed list (and the rescan's row claim) on a folded-in fragment.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS album_identity (
+            album_id INTEGER PRIMARY KEY,
+            artist TEXT NOT NULL,
+            title TEXT NOT NULL,
+            FOREIGN KEY (album_id) REFERENCES media_entry(id) ON DELETE CASCADE
         )",
     )
     .execute(&pool)

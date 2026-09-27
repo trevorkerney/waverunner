@@ -20,6 +20,7 @@ export const MATCH_STAGES = [
   ["titles", "Applying track titles"],
   ["artist-ids", "Identifying artists"],
   ["artist-credits", "Reading album credits"],
+  ["memberships", "Reading band members"],
   ["dates", "Filling release dates"],
   ["artist-search", "Searching artists"],
 ] as const;
@@ -358,6 +359,8 @@ function MatchRunning({ run, className = "" }: { run: MatchRun; className?: stri
     ? "Matching against TMDB"
     : p?.phase === "artist-ids"
       ? "Identifying artists from matched albums"
+      : p?.phase === "memberships"
+        ? "Reading band members on MusicBrainz"
       : p?.phase === "artist-credits"
         ? "Reading album credits on MusicBrainz"
         : p?.phase === "dates"
@@ -378,6 +381,13 @@ function MatchRunning({ run, className = "" }: { run: MatchRun; className?: stri
             {music && (
               <span className="ml-2 text-xs font-normal text-muted-foreground">
                 sweep {run.sweep} of up to 3
+              </span>
+            )}
+            {/* Live: requests that failed so far — the queue banner lists
+                them once the pass ends. */}
+            {music && run.failed > 0 && (
+              <span className="ml-2 text-xs font-normal text-red-300">
+                {run.failed} failed
               </span>
             )}
           </p>

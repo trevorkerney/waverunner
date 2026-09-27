@@ -3331,6 +3331,30 @@ pub async fn add_cover(
         }
     }
 
+    // Adding must never change what's showing (user's call, 2026-09-27).
+    // With no explicit pick, the shown cover is simply the first by
+    // filename, and a new file that sorts ahead of it took its place as it
+    // landed. So when a cover is already showing, pin it first — the pick
+    // the display was already making, made explicit. An entry with no
+    // cover at all still shows the new one, which is the wanted "first
+    // cover" behaviour.
+    if let Some(rid) = release_id {
+        let rc = crate::music::release_covers(&state.app_db, entry_id, Some(rid)).await?;
+        if rc.selected.is_none() {
+            if let Some(first) = rc.covers.first() {
+                crate::music_edit::write_release_cover(&state.app_db, rid, Some(first.path.clone()))
+                    .await?;
+            }
+        }
+    } else {
+        let ec = entry_covers(&state.app_db, &library_id, entry_id).await?;
+        if ec.selected.is_none() {
+            if let Some(first) = ec.covers.first() {
+                set_entry_cover(&state.app_db, &library_id, entry_id, Some(first.path.clone())).await?;
+            }
+        }
+    }
+
     // App-added covers never touch the media folders — originals live in app-data.
     // This also covers virtual collections, whose synthetic folder_path has no disk home.
     let app_base = app_images_base(&state.app_data_dir, &library_id);
@@ -3386,10 +3410,20 @@ pub async fn get_entry_covers(
     library_id: String,
     entry_id: i64,
 ) -> Result<EntryCovers, String> {
+    entry_covers(&state.app_db, &library_id, entry_id).await
+}
+
+/// The command's body, for callers inside the app too (add_cover reads the
+/// shown cover before adding, to pin it).
+pub(crate) async fn entry_covers(
+    pool: &SqlitePool,
+    library_id: &str,
+    entry_id: i64,
+) -> Result<EntryCovers, String> {
     let entry_row: Option<(String,)> =
         sqlx::query_as("SELECT folder_path FROM media_entry_full WHERE id = ?")
             .bind(entry_id)
-            .fetch_optional(&state.app_db)
+            .fetch_optional(pool)
             .await
             .map_err(|e| e.to_string())?;
     let (folder_path,) = entry_row.ok_or("Entry not found")?;
@@ -3399,15 +3433,15 @@ pub async fn get_entry_covers(
          WHERE library_id = ? AND entry_folder_path = ? AND image_type = 'cover'
          ORDER BY source_filename",
     )
-    .bind(&library_id)
+    .bind(library_id)
     .bind(&folder_path)
-    .fetch_all(&state.app_db)
+    .fetch_all(pool)
     .await
     .map_err(|e| e.to_string())?;
     // Artists also carry auto-fetched portraits under their synthetic key.
     let is_artist: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM artist WHERE id = ?")
         .bind(entry_id)
-        .fetch_optional(&state.app_db)
+        .fetch_optional(pool)
         .await
         .map_err(|e| e.to_string())?;
     if is_artist.is_some() {
@@ -3416,9 +3450,9 @@ pub async fn get_entry_covers(
              WHERE library_id = ? AND entry_folder_path = ? AND image_type = 'cover'
              ORDER BY source_filename",
         )
-        .bind(&library_id)
+        .bind(library_id)
         .bind(crate::music_art::artist_fetch_rel(entry_id))
-        .fetch_all(&state.app_db)
+        .fetch_all(pool)
         .await
         .map_err(|e| e.to_string())?;
         rows.extend(fetched);
@@ -3430,7 +3464,7 @@ pub async fn get_entry_covers(
         let q = format!("SELECT selected_cover FROM {table} WHERE id = ?");
         let r: Option<(Option<String>,)> = sqlx::query_as(&q)
             .bind(entry_id)
-            .fetch_optional(&state.app_db)
+            .fetch_optional(pool)
             .await
             .map_err(|e| e.to_string())?;
         if let Some((v,)) = r {
@@ -7713,24 +7747,35 @@ pub async fn set_cover(
     entry_id: i64,
     cover_path: Option<String>,
 ) -> Result<(), String> {
-    let (format, _paths, _default_sort_mode) = get_library_meta(&state.app_db, &library_id).await?;
+    set_entry_cover(&state.app_db, &library_id, entry_id, cover_path).await
+}
+
+/// The pick itself, for callers inside the app (add_cover pins the cover
+/// already showing before a new file can take its place).
+pub(crate) async fn set_entry_cover(
+    pool: &SqlitePool,
+    library_id: &str,
+    entry_id: i64,
+    cover_path: Option<String>,
+) -> Result<(), String> {
+    let (format, _paths, _default_sort_mode) = get_library_meta(pool, library_id).await?;
 
     match format.as_str() {
         "video" => {
             // Update whichever detail table owns this entry
             sqlx::query("UPDATE movie SET selected_cover = ? WHERE id = ?")
-                .bind(&cover_path).bind(entry_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
+                .bind(&cover_path).bind(entry_id).execute(pool).await.map_err(|e| e.to_string())?;
             sqlx::query("UPDATE show SET selected_cover = ? WHERE id = ?")
-                .bind(&cover_path).bind(entry_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
+                .bind(&cover_path).bind(entry_id).execute(pool).await.map_err(|e| e.to_string())?;
             sqlx::query("UPDATE media_collection SET selected_cover = ? WHERE id = ?")
-                .bind(&cover_path).bind(entry_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
+                .bind(&cover_path).bind(entry_id).execute(pool).await.map_err(|e| e.to_string())?;
         }
         "music" => {
             // Blind updates like the video branch — only the matching row bites.
             sqlx::query("UPDATE artist SET selected_cover = ? WHERE id = ?")
-                .bind(&cover_path).bind(entry_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
+                .bind(&cover_path).bind(entry_id).execute(pool).await.map_err(|e| e.to_string())?;
             sqlx::query("UPDATE album SET selected_cover = ? WHERE id = ?")
-                .bind(&cover_path).bind(entry_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
+                .bind(&cover_path).bind(entry_id).execute(pool).await.map_err(|e| e.to_string())?;
             // The album card's cover IS the default release's pick, so the
             // grid picker writes that release's pref too (folder-keyed —
             // survives the release-row rebuild). No-op for artists.
@@ -7740,7 +7785,7 @@ pub async fn set_cover(
                  WHERE ar.album_id = ? AND ar.is_default = 1
                  ON CONFLICT(album_id, folder_path) DO UPDATE SET cover = excluded.cover",
             )
-            .bind(&cover_path).bind(entry_id).execute(&state.app_db).await.map_err(|e| e.to_string())?;
+            .bind(&cover_path).bind(entry_id).execute(pool).await.map_err(|e| e.to_string())?;
         }
         _ => {
             return Err(format!("Unsupported library format: {}", format));

@@ -229,6 +229,32 @@ export interface MusicArtistDetail {
   loose_tracks: MusicTrack[];
   /** User-written biography (nothing fills this automatically yet). */
   biography: string | null;
+  /** Band membership (MusicBrainz "member of band"): this group's members,
+   *  current first, former after. Empty for people and unfetched groups. */
+  members: MusicMember[];
+  /** The groups this artist is in, each with the group's albums when the
+   *  group is in the library — shown as a section of its own, never counted
+   *  as this artist's. */
+  member_of: MusicMemberOf[];
+}
+
+/** One name on a membership line — a member of a group, or a group an
+ *  artist is in. Linkable when the library has the page; former (left, or
+ *  the group ended) carry their years where MusicBrainz has them. */
+export interface MusicMember {
+  name: string;
+  mbid: string;
+  artist_id: number | null;
+  begin: string | null;
+  end: string | null;
+  former: boolean;
+  /** MusicBrainz's attributes on the stint: instruments, "original"… */
+  attributes: string[];
+}
+
+export interface MusicMemberOf {
+  group: MusicMember;
+  albums: MusicAlbumCard[];
 }
 
 // A track's heart, two tiers: 'liked' (rose outline) or 'loved' (filled).

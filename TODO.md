@@ -6,10 +6,6 @@
 
 ## bugs / needs fixing
 
-when rescan finishes, open to metadata page.
-
-hide musicbrainz button needs large rework. it currently doesnt work at all.
-
 cover picker doesnt seem to be updating based on release picker on artist page in detail view
 
 on matching banner, add artist name at the beginning plus a long dash, and remove 'edits wait until the pass finishes'

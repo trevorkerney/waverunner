@@ -20,6 +20,62 @@ import {
 import { TrackEditDialog, ArtistEditDialog, SplitArtistDialog } from "./EditDialogs";
 import { MatchDialog, MbStatusChip } from "./MatchDialog";
 import { NoteBlock } from "../NoteBlock";
+import { Users } from "lucide-react";
+import type { MusicMember } from "../../types";
+
+/** The years of a stint, as MusicBrainz has them: "1985–1995", "2016–",
+ *  "–1995", or nothing when neither end is dated. */
+function stintYears(m: MusicMember): string | null {
+  const b = m.begin?.slice(0, 4) ?? "";
+  const e = m.end?.slice(0, 4) ?? "";
+  if (!b && !e) return null;
+  return `${b}–${e}`;
+}
+
+/** One name on a membership line: a link in the usual foreground when the
+ *  library has the page, a muted name when not (user's call: absent
+ *  members still appear). Brightness follows clickability only — a former
+ *  member's link is as bright as anyone's; the years say "former"
+ *  (2026-09-27: dimming ended stints muted every link on Johnny Cash's
+ *  page, since all his groups have ended). Attributes (instruments,
+ *  "original") ride the tooltip. */
+function MemberName({
+  m,
+  onNavigateToArtist,
+}: {
+  m: MusicMember;
+  onNavigateToArtist?: (artistId: number, title: string) => void;
+}) {
+  const years = m.former ? stintYears(m) : null;
+  const tone = m.artist_id != null ? "text-foreground" : "text-muted-foreground/70";
+  const title = m.attributes.length > 0 ? m.attributes.join(", ") : undefined;
+  return (
+    <>
+      {m.artist_id != null && onNavigateToArtist ? (
+        // An inline span, not a button (same as the track rows' credit
+        // links): a button is its own box and sat off the baseline of the
+        // plain names beside it.
+        <span
+          role="link"
+          tabIndex={0}
+          onClick={() => onNavigateToArtist(m.artist_id!, m.name)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") onNavigateToArtist(m.artist_id!, m.name);
+          }}
+          className={`${tone} cursor-pointer underline-offset-2 hover:underline`}
+          title={title}
+        >
+          {m.name}
+        </span>
+      ) : (
+        <span className={tone} title={title}>
+          {m.name}
+        </span>
+      )}
+      {years && <span className="text-muted-foreground/60"> ({years})</span>}
+    </>
+  );
+}
 import { PersonaDialog } from "./PersonaDialog";
 import { PlayingIndicator } from "./PlayingIndicator";
 import { LoveButton, LoveMenuItem } from "./LoveButton";
@@ -763,14 +819,48 @@ export function ArtistDetailPage({
               )}
             </p>
           )}
+          {/* Band membership from MusicBrainz — a lens beside the credits,
+              which stay as MusicBrainz has them. Current members first,
+              former after with their years; same for the groups this
+              artist is in. Inline text like the persona line: the words
+              and names are a sentence. */}
+          {detail.members.length > 0 && (
+            <p className="mt-1.5 flex items-start gap-x-1.5 text-sm text-muted-foreground">
+              <Users size={14} className="mt-0.5 shrink-0" />
+              <span>
+                Members:{" "}
+                {detail.members.map((m, i) => (
+                  <span key={`${m.mbid}|${m.begin ?? ""}`}>
+                    {i > 0 && " · "}
+                    <MemberName m={m} onNavigateToArtist={onNavigateToArtist} />
+                  </span>
+                ))}
+              </span>
+            </p>
+          )}
+          {detail.member_of.length > 0 && (
+            <p className="mt-1.5 flex items-start gap-x-1.5 text-sm text-muted-foreground">
+              <Users size={14} className="mt-0.5 shrink-0" />
+              <span>
+                Member of{" "}
+                {detail.member_of.map((g, i) => (
+                  <span key={`${g.group.mbid}|${g.group.begin ?? ""}`}>
+                    {i > 0 && " · "}
+                    <MemberName m={g.group} onNavigateToArtist={onNavigateToArtist} />
+                  </span>
+                ))}
+              </span>
+            </p>
+          )}
           {detail.biography && (
             <p className="mt-2 line-clamp-3 max-w-2xl whitespace-pre-line text-sm text-muted-foreground" title={detail.biography}>
               {detail.biography}
             </p>
           )}
           {/* The user's own note, separate from the biography (fetched-data
-              territory) — shown in full, edited in place. */}
-          <NoteBlock kind="entry" subjectId={detail.id} subject={detail.title} className="mt-2" />
+              territory) — display only, edited in Edit artist (user's call,
+              2026-09-27); nothing shows while there is none. */}
+          <NoteBlock kind="entry" subjectId={detail.id} editable={false} reloadKey={reloadKey} className="mt-2" />
         </div>
         <div className="ml-auto flex shrink-0 items-center gap-2 self-start">
           {/* Heart filter — detail view only; the grid has no rows to filter. */}
@@ -1289,6 +1379,76 @@ export function ArtistDetailPage({
           )}
         </>
       )}
+
+      {/* Albums by the groups this artist is in — the group's, listed here
+          as context, never counted as this artist's (user's call). Cards
+          only, in either view mode; hidden under the heart filter, which
+          works on the sections above. */}
+      {!heartOn &&
+        detail.member_of
+          .filter((g) => g.albums.length > 0)
+          .map((g) => (
+            <div key={g.group.mbid}>
+              <p className="mb-2 mt-6 text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+                With {g.group.name}
+              </p>
+              <div
+                className="grid gap-x-4 gap-y-1.5"
+                style={{ gridTemplateColumns: "repeat(auto-fill, minmax(224px, 1fr))" }}
+              >
+                {sortCards(g.albums).map((album) => {
+                  const albumCoverPath = displayCover(album.covers, album.selected_cover);
+                  return (
+                    <div
+                      key={album.id}
+                      className="group grid min-w-0"
+                      style={{ gridRow: "span 2", gridTemplateRows: "subgrid" }}
+                    >
+                      <div
+                        className="relative cursor-pointer self-end overflow-hidden rounded-[3px] bg-muted shadow-sm"
+                        onClick={() => onOpenAlbum(album)}
+                      >
+                        {albumCoverPath ? (
+                          <img
+                            src={getCoverUrl(albumCoverPath)}
+                            alt=""
+                            className="block h-auto w-full"
+                            loading="lazy"
+                            draggable={false}
+                          />
+                        ) : (
+                          <div className="flex aspect-square w-full items-center justify-center text-muted-foreground">
+                            <Disc3 size={40} />
+                          </div>
+                        )}
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            playAlbum(album.id);
+                          }}
+                          className="absolute bottom-2 right-2 rounded-full bg-black/60 p-2.5 text-white opacity-0 shadow transition-opacity hover:bg-black/80 group-hover:opacity-100"
+                          title="Play album"
+                        >
+                          <Play size={16} className="translate-x-px" />
+                        </button>
+                      </div>
+                      <div className="min-w-0 pb-2.5">
+                        <button
+                          onClick={() => onOpenAlbum(album)}
+                          className="block w-full truncate text-left text-sm font-medium hover:underline"
+                          title={album.title}
+                        >
+                          {album.title}
+                          {!mbHidden && <MbDot state={album.mb_state} className="ml-1.5 -translate-y-px" />}
+                        </button>
+                        <p className="truncate text-xs text-muted-foreground">{album.year ?? " "}</p>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
       <TrackEditDialog
         trackId={editTrackId}
         libraryId={libraryId}

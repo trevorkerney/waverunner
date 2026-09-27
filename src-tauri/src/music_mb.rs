@@ -36,6 +36,22 @@ pub(crate) fn pass_running() -> bool {
     RUNNING.load(Ordering::SeqCst)
 }
 
+/// Has the running pass been asked to stop? Phases outside this module
+/// (membership.rs) skip their remaining work on it like the ones here.
+pub(crate) fn pass_cancelled() -> bool {
+    CANCEL.load(Ordering::SeqCst)
+}
+
+/// "Artist — Album" for the pass's progress line on album phases (user's
+/// call, 2026-09-27: the bare title didn't say whose); the title alone
+/// for an album with no credit.
+fn album_progress_label(artist: Option<&str>, title: &str) -> String {
+    match artist.map(str::trim).filter(|a| !a.is_empty()) {
+        Some(a) => format!("{a} \u{2014} {title}"),
+        None => title.to_string(),
+    }
+}
+
 /// How many user-initiated commands are waiting on MusicBrainz right now
 /// (a match apply, a dialog search). The background prefetch loops share the
 /// one request gate and would otherwise queue a click behind their own
@@ -159,7 +175,7 @@ pub fn set_mb_app(app: AppHandle) {
 /// transient failure — each backoff emits `mb-busy` so open dialogs can say
 /// why their spinner is slow. Cancellation (skip-remaining) aborts the waits.
 /// Pacing lives HERE (the gate above), pre-send — callers add no sleeps.
-async fn mb_get(
+pub(crate) async fn mb_get(
     client: &reqwest::Client,
     url: url::Url,
 ) -> Result<reqwest::Response, String> {
@@ -196,7 +212,7 @@ async fn mb_get(
     unreachable!("loop always returns by the last attempt")
 }
 
-fn mb_client() -> Result<reqwest::Client, String> {
+pub(crate) fn mb_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .user_agent(format!(
             "waverunner/{} (https://github.com/trevorkerney/waverunner)",
@@ -289,6 +305,7 @@ pub fn spawn_enrich(app: AppHandle, library_id: String) {
                 artists_updated: 0,
                 pending_review: 0,
                 skipped: false,
+                failed: 0,
             };
             for iteration in 1..=3u32 {
                 let _ = app.emit(
@@ -301,6 +318,9 @@ pub fn spawn_enrich(app: AppHandle, library_id: String) {
                 total.artists_updated += outcome.artists_updated;
                 total.pending_review = outcome.pending_review;
                 total.skipped = outcome.skipped;
+                // Distinct items over the whole pass (a later sweep's success
+                // clears a row, but the count is what the strip showed).
+                total.failed = outcome.failed;
                 if outcome.skipped
                     || (outcome.albums_matched == 0 && outcome.artists_updated == 0)
                 {
@@ -348,6 +368,7 @@ pub fn spawn_enrich(app: AppHandle, library_id: String) {
                         "processed": outcome.albums_processed,
                         "pendingReview": outcome.pending_review,
                         "skipped": outcome.skipped,
+                        "failed": outcome.failed,
                     }),
                 );
             }
@@ -432,6 +453,9 @@ pub struct MusicMatchState {
     pub pending_suggestions: i64,
     pub unmatched: i64,
     pub matched: i64,
+    /// Items whose last request failed (mb_fetch_failure) — the queue
+    /// banner's retry bucket, one line plus the list.
+    pub failed_requests: i64,
 }
 
 /// Snapshot of a library's matching state, for the wizard's election screen
@@ -530,6 +554,12 @@ pub async fn music_match_state(
     .await
     .map_err(|e| e.to_string())?;
     let by = |k: &str| counts.iter().find(|(s, _)| s == k).map(|(_, n)| *n).unwrap_or(0);
+    let (failed_requests,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM mb_fetch_failure WHERE library_id = ?")
+            .bind(&library_id)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| e.to_string())?;
     Ok(MusicMatchState {
         running: RUNNING.load(Ordering::SeqCst),
         unchecked,
@@ -538,6 +568,7 @@ pub async fn music_match_state(
         pending_suggestions,
         unmatched: by("notfound"),
         matched: by("matched"),
+        failed_requests,
     })
 }
 
@@ -549,6 +580,9 @@ pub struct EnrichOutcome {
     pub pending_review: i64,
     /// True when the pass ended early via music_match_skip.
     pub skipped: bool,
+    /// Items whose request failed on their last try this pass — still
+    /// queued (mb_fetch_failure), said at the finish, retried next pass.
+    pub failed: usize,
 }
 
 /// The full pass, in dependency order: album matching (credits/type/year gap
@@ -574,6 +608,10 @@ async fn enrich(app: &AppHandle, library_id: &str) -> Result<EnrichOutcome, Stri
     let artists_updated = artists_updated + harvested;
     let fetch_failed: std::collections::HashSet<i64> =
         fetch_failed.union(&harvest_failed).copied().collect();
+    // Band membership for every identified artist without a fresh stamp —
+    // one request each, once (membership.rs). Folded into the harvest
+    // rather than a map step of its own (user's call, 2026-09-27).
+    crate::membership::harvest(app, &pool, &client, library_id).await?;
     // Original-date backfill for albums matched before adoption existed —
     // empties itself out after one full pass over old matches.
     backfill_group_dates(app, &pool, &client, library_id).await?;
@@ -626,6 +664,7 @@ async fn enrich(app: &AppHandle, library_id: &str) -> Result<EnrichOutcome, Stri
         artists_updated,
         pending_review: pending_suggestions + unmatched,
         skipped: CANCEL.load(Ordering::SeqCst),
+        failed: failures_this_pass(),
     })
 }
 
@@ -682,6 +721,10 @@ async fn enrich_albums(
     .fetch_all(pool)
     .await
     .map_err(|e| e.to_string())?;
+    // Failed-request rows for albums no longer in this work (settled by
+    // hand since, ignored, gone) are stale.
+    let keep: Vec<String> = albums.iter().map(|(id, ..)| id.to_string()).collect();
+    prune_fetch_failures(pool, library_id, "album-search", &keep).await?;
     if albums.is_empty() {
         return Ok((0, 0));
     }
@@ -696,7 +739,7 @@ async fn enrich_albums(
         processed = i + 1;
         let _ = app.emit(
             "music-enrich-progress",
-            serde_json::json!({ "libraryId": library_id, "phase": "albums", "done": i, "total": total, "name": title }),
+            serde_json::json!({ "libraryId": library_id, "phase": "albums", "done": i, "total": total, "name": album_progress_label(artist.as_deref(), &title) }),
         );
         // A release id in the FILES is the only certainty about which pressing
         // a copy is, so it wins outright and brings track credits with it.
@@ -728,6 +771,16 @@ async fn enrich_albums(
                     Ok(None) => {}
                     Err(e) => {
                         eprintln!("musicbrainz tagged release '{title}': {e}");
+                        record_fetch_failure(
+                            pool,
+                            library_id,
+                            "album-search",
+                            &album_id.to_string(),
+                            &format!("Release for \u{201c}{title}\u{201d}"),
+                            "albums",
+                            &e,
+                        )
+                        .await?;
                         transient = true; // unstamped, retried next pass
                     }
                 }
@@ -796,6 +849,16 @@ async fn enrich_albums(
                 Ok(_) => {}
                 Err(e) => {
                     eprintln!("musicbrainz release-group search '{t}': {e}");
+                    record_fetch_failure(
+                        pool,
+                        library_id,
+                        "album-search",
+                        &album_id.to_string(),
+                        &format!("Search for \u{201c}{title}\u{201d}"),
+                        "albums",
+                        &e,
+                    )
+                    .await?;
                     search_failed = true;
                     break;
                 }
@@ -804,6 +867,8 @@ async fn enrich_albums(
         if search_failed {
             continue; // transient — unstamped (or still notfound), retried next pass
         }
+        // The search went through, whatever it found.
+        clear_fetch_failure(pool, "album-search", &album_id.to_string()).await?;
 
         // Confident means UNAMBIGUOUS: exactly one credible group. Two albums
         // sharing a name is precisely when a machine should not choose.
@@ -1144,6 +1209,11 @@ pub async fn set_mb_id(
     .execute(pool)
     .await
     .map_err(|e| e.to_string())?;
+    // A settled identity, or an explicit "stop counting this", makes any
+    // remembered failed request for the entity moot — by hand or by pass.
+    if matches!(field, MB_RELEASE_GROUP | MB_ARTIST | MB_IGNORED) {
+        clear_entity_fetch_failures(pool, entity_id).await?;
+    }
     Ok(())
 }
 
@@ -2324,6 +2394,177 @@ fn clear_pass_caches() {
     if let Some(m) = RELEASE_FETCH_CACHE.get() {
         m.lock().unwrap().clear();
     }
+    if let Some(s) = FAILED_THIS_PASS.get() {
+        s.lock().unwrap().clear();
+    }
+}
+
+// ── Failed requests ────────────────────────────────────────────────────
+// A request that fails is not a result: the item stays where it was and
+// the next pass tries it again. What was missing was the SAYING of it
+// (user's call, 2026-09-27): mb_fetch_failure keeps one row per item whose
+// last try failed, the queue banner lists them under its Run button, the
+// running strip counts them live, the finish line reports them — and
+// nothing retries on its own. A row goes when the item's request later
+// succeeds (any pass, any path), when a person settles the item another
+// way (a match or an Ignore — set_mb_id clears), or when a phase starts
+// and the item is no longer its work (prune). `attempts` counts passes in
+// a row, not sweeps: the set below remembers what this pass already
+// recorded, so a second sweep's failure updates the row without ticking it.
+static FAILED_THIS_PASS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::OnceLock::new();
+
+/// Distinct items whose request failed in the running pass so far.
+pub(crate) fn failures_this_pass() -> usize {
+    FAILED_THIS_PASS
+        .get()
+        .and_then(|s| s.lock().ok().map(|s| s.len()))
+        .unwrap_or(0)
+}
+
+/// `kind`s: album-search, artist-evidence, group-credits, artist-search,
+/// album-dates, membership — one per phase, so each phase prunes its own.
+pub(crate) async fn record_fetch_failure(
+    pool: &SqlitePool,
+    library_id: &str,
+    kind: &str,
+    target: &str,
+    label: &str,
+    phase: &str,
+    error: &str,
+) -> Result<(), String> {
+    let first_this_pass = FAILED_THIS_PASS
+        .get_or_init(Default::default)
+        .lock()
+        .map(|mut s| s.insert(format!("{kind}|{target}")))
+        .unwrap_or(true);
+    let sql = if first_this_pass {
+        "INSERT INTO mb_fetch_failure (library_id, kind, target, label, phase, error, attempts, last_failed_at)
+         VALUES (?, ?, ?, ?, ?, ?, 1, datetime('now'))
+         ON CONFLICT(library_id, kind, target) DO UPDATE SET
+           label = excluded.label, phase = excluded.phase, error = excluded.error,
+           attempts = mb_fetch_failure.attempts + 1, last_failed_at = excluded.last_failed_at"
+    } else {
+        "INSERT INTO mb_fetch_failure (library_id, kind, target, label, phase, error, attempts, last_failed_at)
+         VALUES (?, ?, ?, ?, ?, ?, 1, datetime('now'))
+         ON CONFLICT(library_id, kind, target) DO UPDATE SET
+           label = excluded.label, phase = excluded.phase, error = excluded.error,
+           last_failed_at = excluded.last_failed_at"
+    };
+    sqlx::query(sql)
+        .bind(library_id)
+        .bind(kind)
+        .bind(target)
+        .bind(label)
+        .bind(phase)
+        .bind(error)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    // The running strip's live count.
+    if let Some(app) = MB_APP.get() {
+        let _ = app.emit(
+            "music-enrich-failure",
+            serde_json::json!({ "libraryId": library_id, "failed": failures_this_pass() }),
+        );
+    }
+    Ok(())
+}
+
+/// The item's request went through: its failed-request row is history.
+pub(crate) async fn clear_fetch_failure(
+    pool: &SqlitePool,
+    kind: &str,
+    target: &str,
+) -> Result<(), String> {
+    sqlx::query("DELETE FROM mb_fetch_failure WHERE kind = ? AND target = ?")
+        .bind(kind)
+        .bind(target)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// An entity a person or the pass has settled (matched, ignored): its
+/// failed-request rows are moot whichever phase wrote them.
+async fn clear_entity_fetch_failures(pool: &SqlitePool, entity_id: i64) -> Result<(), String> {
+    sqlx::query(
+        "DELETE FROM mb_fetch_failure
+         WHERE kind IN ('album-search', 'artist-evidence', 'artist-search', 'album-dates')
+           AND target = ?",
+    )
+    .bind(entity_id.to_string())
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// A phase starting: rows of its kind for items outside its current work
+/// list are stale (settled by hand between passes, merged away, deleted)
+/// and go — the list is the truth of what the phase will try.
+pub(crate) async fn prune_fetch_failures(
+    pool: &SqlitePool,
+    library_id: &str,
+    kind: &str,
+    keep: &[String],
+) -> Result<(), String> {
+    let rows: Vec<(String,)> =
+        sqlx::query_as("SELECT target FROM mb_fetch_failure WHERE library_id = ? AND kind = ?")
+            .bind(library_id)
+            .bind(kind)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    let keep: std::collections::HashSet<&str> = keep.iter().map(|s| s.as_str()).collect();
+    for (target,) in rows {
+        if !keep.contains(target.as_str()) {
+            clear_fetch_failure(pool, kind, &target).await?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+pub struct FetchFailureRow {
+    pub kind: String,
+    pub target: String,
+    pub label: String,
+    pub phase: String,
+    pub error: String,
+    pub attempts: i64,
+    pub last_failed_at: String,
+}
+
+/// The queue banner's failed-request list: most-repeated first.
+#[tauri::command]
+pub async fn get_fetch_failures(
+    state: State<'_, AppState>,
+    library_id: String,
+) -> Result<Vec<FetchFailureRow>, String> {
+    let rows: Vec<(String, String, String, String, String, i64, String)> = sqlx::query_as(
+        "SELECT kind, target, label, phase, error, attempts, last_failed_at
+         FROM mb_fetch_failure WHERE library_id = ?
+         ORDER BY attempts DESC, label COLLATE NOCASE",
+    )
+    .bind(&library_id)
+    .fetch_all(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .map(|(kind, target, label, phase, error, attempts, last_failed_at)| FetchFailureRow {
+            kind,
+            target,
+            label,
+            phase,
+            error,
+            attempts,
+            last_failed_at,
+        })
+        .collect())
 }
 
 /// One release group by id — cached for the duration of a pass.
@@ -2586,7 +2827,7 @@ const PLACEHOLDER_ARTIST_MBIDS: &[&str] = &[
     "7e84f845-ac16-41fe-9ff8-df12eb32af55", // MusicBrainz Test Artist
 ];
 
-fn is_placeholder_artist(mbid: &str) -> bool {
+pub(crate) fn is_placeholder_artist(mbid: &str) -> bool {
     PLACEHOLDER_ARTIST_MBIDS.iter().any(|p| p.eq_ignore_ascii_case(mbid))
 }
 
@@ -3710,6 +3951,9 @@ async fn enrich_artist_mbids(
             !exhausted.contains(&(*id, key.clone()))
         })
         .collect();
+    // Failed-request rows for artists no longer in this work are stale.
+    let keep: Vec<String> = candidates.iter().map(|(id, ..)| id.to_string()).collect();
+    prune_fetch_failures(pool, library_id, "artist-evidence", &keep).await?;
     if candidates.is_empty() {
         return Ok((0, std::collections::HashSet::new()));
     }
@@ -3741,6 +3985,8 @@ async fn enrich_artist_mbids(
     // artist leaning on one of these gets shielded from the suggestion sweep
     // this pass and derived next pass instead.
     let mut failed_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // What each failed key's fetch said, for the failed-request record.
+    let mut failed_errors: HashMap<String, String> = HashMap::new();
     let mut fetch_failed: std::collections::HashSet<i64> = std::collections::HashSet::new();
     let mut updated = 0usize;
 
@@ -3776,6 +4022,7 @@ async fn enrich_artist_mbids(
                         Err(e) => {
                             eprintln!("artist identity: group {gid} fetch failed: {e}");
                             failed_keys.insert(gid.clone());
+                            failed_errors.insert(gid.clone(), e);
                             (Vec::new(), HashMap::new())
                         }
                     };
@@ -3804,6 +4051,7 @@ async fn enrich_artist_mbids(
                         Err(e) => {
                             eprintln!("artist identity: release {rid} fetch failed: {e}");
                             failed_keys.insert(rid.clone());
+                            failed_errors.insert(rid.clone(), e);
                             (Vec::new(), HashMap::new())
                         }
                     };
@@ -3821,12 +4069,30 @@ async fn enrich_artist_mbids(
                 || rid.as_ref().is_some_and(|r| failed_keys.contains(r));
             if key_failed {
                 fetch_failed.insert(*artist_id);
+                let key = gid.as_ref().or(rid.as_ref()).cloned().unwrap_or_default();
+                let err = failed_errors
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_else(|| "evidence fetch failed".to_string());
+                record_fetch_failure(
+                    pool,
+                    library_id,
+                    "artist-evidence",
+                    &artist_id.to_string(),
+                    &format!("Credits proving \u{201c}{title}\u{201d}"),
+                    "artist-ids",
+                    &err,
+                )
+                .await?;
             } else if let Some(key) = gid.as_ref().or(rid.as_ref()) {
                 // Genuinely empty credit — walking it again is pointless.
                 mark_exhausted(pool, *artist_id, key).await?;
+                clear_fetch_failure(pool, "artist-evidence", &artist_id.to_string()).await?;
             }
             continue;
         }
+        // The evidence came through — whatever it proves, the request did.
+        clear_fetch_failure(pool, "artist-evidence", &artist_id.to_string()).await?;
 
         // Stamp EVERY still-unidentified candidate this credit names, not
         // just the artist that prompted the fetch.
@@ -3907,8 +4173,11 @@ async fn harvest_group_credits(
     // Group-matched albums still crediting an MBID-less artist. Albums with a
     // RELEASE match are excluded — their track credits were already harvested
     // by enrich_artist_mbids from the release itself.
-    let albums: Vec<(i64, String)> = sqlx::query_as(
-        "SELECT al.id, al.title FROM album al
+    let albums: Vec<(i64, String, Option<String>)> = sqlx::query_as(
+        "SELECT al.id, al.title,
+                (SELECT ac.name FROM album_artist_credit ac
+                 WHERE ac.album_id = al.id ORDER BY ac.position LIMIT 1)
+         FROM album al
          JOIN media_entry me ON me.id = al.id
          WHERE me.library_id = ?
            AND EXISTS (SELECT 1 FROM field_override f
@@ -3945,7 +4214,7 @@ async fn harvest_group_credits(
     }
     let mut order: Vec<String> = Vec::new();
     let mut groups: HashMap<String, GroupWork> = HashMap::new();
-    for (album_id, title) in &albums {
+    for (album_id, title, artist) in &albums {
         let Some((gid, _)) = mb_id(pool, *album_id, MB_RELEASE_GROUP).await? else {
             continue;
         };
@@ -3976,7 +4245,10 @@ async fn harvest_group_credits(
         }
         let entry = groups.entry(gid.clone()).or_insert_with(|| {
             order.push(gid.clone());
-            GroupWork { title: title.clone(), wanted: std::collections::HashSet::new() }
+            GroupWork {
+                title: album_progress_label(artist.as_deref(), title),
+                wanted: std::collections::HashSet::new(),
+            }
         });
         entry.wanted.extend(wanted.into_iter().map(|(id,)| id));
     }
@@ -3999,6 +4271,8 @@ async fn harvest_group_credits(
         names_by_artist.insert(*artist_id, names.into_iter().map(|(n,)| n).collect());
     }
 
+    // Failed-request rows for groups no longer in this work are stale.
+    prune_fetch_failures(pool, library_id, "group-credits", &order).await?;
     let total = order.len();
     let mut stamped: std::collections::HashSet<i64> = std::collections::HashSet::new();
     let mut fetch_failed: std::collections::HashSet<i64> = std::collections::HashSet::new();
@@ -4022,10 +4296,21 @@ async fn harvest_group_credits(
         // the suggestion sweep (same as enrich_artist_mbids) — a retry next
         // pass may still derive them; never fail the phase over one request.
         let mut failed = false;
+        let mut last_err = String::new();
         let mut releases = match releases_in_group(client, gid).await {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("credit harvest: group {gid} release list failed: {e}");
+                record_fetch_failure(
+                    pool,
+                    library_id,
+                    "group-credits",
+                    gid,
+                    &format!("Credits on \u{201c}{}\u{201d}", work.title),
+                    "artist-credits",
+                    &e,
+                )
+                .await?;
                 fetch_failed
                     .extend(work.wanted.iter().filter(|id| !stamped.contains(id)));
                 continue;
@@ -4050,6 +4335,7 @@ async fn harvest_group_credits(
                         release.release_id
                     );
                     failed = true;
+                    last_err = e;
                     continue;
                 }
             };
@@ -4093,6 +4379,16 @@ async fn harvest_group_credits(
         }
         if failed {
             fetch_failed.extend(work.wanted.iter().filter(|id| !stamped.contains(id)));
+            record_fetch_failure(
+                pool,
+                library_id,
+                "group-credits",
+                gid,
+                &format!("Credits on \u{201c}{}\u{201d}", work.title),
+                "artist-credits",
+                &last_err,
+            )
+            .await?;
         } else if !CANCEL.load(Ordering::SeqCst) {
             // The walk ran to its budget cleanly and these artists were never
             // named — this group is exhausted for them. One row per pair;
@@ -4100,6 +4396,7 @@ async fn harvest_group_credits(
             for id in work.wanted.iter().filter(|id| !stamped.contains(id)) {
                 mark_exhausted(pool, *id, gid).await?;
             }
+            clear_fetch_failure(pool, "group-credits", gid).await?;
         }
     }
     Ok((updated, fetch_failed))
@@ -4357,6 +4654,9 @@ async fn suggest_artist_matches(
     .fetch_all(pool)
     .await
     .map_err(|e| e.to_string())?;
+    // Failed-request rows for artists no longer in this work are stale.
+    let keep: Vec<String> = artists.iter().map(|(id, _)| id.to_string()).collect();
+    prune_fetch_failures(pool, library_id, "artist-search", &keep).await?;
     if artists.is_empty() {
         return Ok(0);
     }
@@ -4380,9 +4680,20 @@ async fn suggest_artist_matches(
             Ok(rows) => rows,
             Err(e) => {
                 eprintln!("artist suggestion search '{title}': {e}");
+                record_fetch_failure(
+                    pool,
+                    library_id,
+                    "artist-search",
+                    &artist_id.to_string(),
+                    &format!("Search for \u{201c}{title}\u{201d}"),
+                    "artist-search",
+                    &e,
+                )
+                .await?;
                 continue;
             }
         };
+        clear_fetch_failure(pool, "artist-search", &artist_id.to_string()).await?;
         // Candidates are artists actually ANSWERING to this name (title or
         // alias), not high scorers: MB's relevance ranking puts famous
         // partial matches above obscure exact ones — a score bar on "Castro"
@@ -4400,6 +4711,16 @@ async fn suggest_artist_matches(
             match discography_evidence(pool, client, artist_id, &credible).await {
                 Err(e) => {
                     eprintln!("artist discography evidence '{title}': {e}");
+                    record_fetch_failure(
+                        pool,
+                        library_id,
+                        "artist-search",
+                        &artist_id.to_string(),
+                        &format!("Shelves check for \u{201c}{title}\u{201d}"),
+                        "artist-search",
+                        &e,
+                    )
+                    .await?;
                     continue;
                 }
                 Ok(Some(ev)) => {
@@ -4455,8 +4776,11 @@ async fn backfill_group_dates(
     // (an undone adoption) excludes that field from the selection, since the
     // adoption below would refuse it and the album would be refetched on
     // every pass.
-    let rows: Vec<(i64, String, String)> = sqlx::query_as(
-        "SELECT DISTINCT al.id, al.title, f.value FROM album al
+    let rows: Vec<(i64, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT DISTINCT al.id, al.title, f.value,
+                (SELECT ac.name FROM album_artist_credit ac
+                 WHERE ac.album_id = al.id ORDER BY ac.position LIMIT 1)
+         FROM album al
          JOIN media_entry me ON me.id = al.id
          JOIN field_override f ON f.entity_id = al.id
               AND f.field = 'mb_release_group_id' AND f.value IS NOT NULL AND f.value <> ''
@@ -4478,25 +4802,39 @@ async fn backfill_group_dates(
     .fetch_all(pool)
     .await
     .map_err(|e| e.to_string())?;
+    // Failed-request rows for albums no longer in this work are stale.
+    let keep: Vec<String> = rows.iter().map(|(id, ..)| id.to_string()).collect();
+    prune_fetch_failures(pool, library_id, "album-dates", &keep).await?;
     if rows.is_empty() {
         return Ok(());
     }
     let total = rows.len();
-    for (i, (album_id, title, group_id)) in rows.into_iter().enumerate() {
+    for (i, (album_id, title, group_id, artist)) in rows.into_iter().enumerate() {
         if CANCEL.load(Ordering::SeqCst) {
             break;
         }
         let _ = app.emit(
             "music-enrich-progress",
-            serde_json::json!({ "libraryId": library_id, "phase": "dates", "done": i, "total": total, "name": title }),
+            serde_json::json!({ "libraryId": library_id, "phase": "dates", "done": i, "total": total, "name": album_progress_label(artist.as_deref(), &title) }),
         );
         let group = match fetch_release_group(client, &group_id).await {
             Ok(g) => g,
             Err(e) => {
                 eprintln!("group date backfill '{title}': {e}");
+                record_fetch_failure(
+                    pool,
+                    library_id,
+                    "album-dates",
+                    &album_id.to_string(),
+                    &format!("Release date for \u{201c}{title}\u{201d}"),
+                    "dates",
+                    &e,
+                )
+                .await?;
                 continue;
             }
         };
+        clear_fetch_failure(pool, "album-dates", &album_id.to_string()).await?;
         let has_mb_date: bool = sqlx::query_as::<_, (i64,)>(
             "SELECT EXISTS(SELECT 1 FROM field_override
                            WHERE entity_id = ? AND field = 'release_date' AND tier = 'mb')",
@@ -4554,8 +4892,10 @@ async fn backfill_pin_tracks(
     client: &reqwest::Client,
     library_id: &str,
 ) -> Result<(), String> {
-    let rows: Vec<(i64, String, String, String)> = sqlx::query_as(
-        "SELECT DISTINCT rm.album_id, al.title, rm.folder_path, rm.mb_release_id
+    let rows: Vec<(i64, String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT DISTINCT rm.album_id, al.title, rm.folder_path, rm.mb_release_id,
+                (SELECT ac.name FROM album_artist_credit ac
+                 WHERE ac.album_id = al.id ORDER BY ac.position LIMIT 1)
          FROM release_match rm
          JOIN album al ON al.id = rm.album_id
          JOIN media_entry me ON me.id = al.id
@@ -4585,13 +4925,13 @@ async fn backfill_pin_tracks(
         return Ok(());
     }
     let total = rows.len();
-    for (i, (album_id, title, folder, mb_release_id)) in rows.into_iter().enumerate() {
+    for (i, (album_id, title, folder, mb_release_id, artist)) in rows.into_iter().enumerate() {
         if CANCEL.load(Ordering::SeqCst) {
             break;
         }
         let _ = app.emit(
             "music-enrich-progress",
-            serde_json::json!({ "libraryId": library_id, "phase": "titles", "done": i, "total": total, "name": title }),
+            serde_json::json!({ "libraryId": library_id, "phase": "titles", "done": i, "total": total, "name": album_progress_label(artist.as_deref(), &title) }),
         );
         // A staged album's tracks are about to be rewritten by the rescan
         // that applies its directive — leave it for the pass after.
@@ -7022,6 +7362,21 @@ pub async fn mb_apply_entity_match(
                 .execute(pool)
                 .await
                 .map_err(|e| e.to_string())?;
+            // Band membership for the page right away — the pass would get
+            // to it, but whoever just said who this is wants to see the
+            // members now. Best effort: never fails the match.
+            if !is_placeholder_artist(&mbid) {
+                if let Ok(client) = mb_client() {
+                    match crate::membership::fetch(&client, &mbid).await {
+                        Ok(f) => {
+                            if let Err(e) = crate::membership::store(pool, &mbid, &f).await {
+                                eprintln!("membership store {mbid}: {e}");
+                            }
+                        }
+                        Err(e) => eprintln!("membership fetch {mbid}: {e}"),
+                    }
+                }
+            }
             // Adopt a display name. Default: MB's canonical name (the tag
             // spelling lives on as an alias, identity survives rescans, the
             // user's own rename wins). With preferred_name — the user ticked

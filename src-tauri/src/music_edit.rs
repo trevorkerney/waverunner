@@ -1238,7 +1238,16 @@ pub async fn set_release_cover(
     cover: Option<String>,
 ) -> Result<(), String> {
     crate::music_mb::ensure_release_not_matching(&state.app_db, release_id).await?;
-    let pool = &state.app_db;
+    write_release_cover(&state.app_db, release_id, cover).await
+}
+
+/// The pick itself, for callers inside the app (add_cover pins the cover
+/// already showing before a new file can take its place).
+pub(crate) async fn write_release_cover(
+    pool: &SqlitePool,
+    release_id: i64,
+    cover: Option<String>,
+) -> Result<(), String> {
     let row: Option<(i64, String, i64)> =
         sqlx::query_as("SELECT album_id, folder_path, is_default FROM album_release WHERE id = ?")
             .bind(release_id)
@@ -2321,6 +2330,33 @@ async fn album_credit_names(pool: &SqlitePool, album_id: i64) -> Result<Vec<Stri
     .collect())
 }
 
+/// Write an album's credit list as a user-tier override — the same write
+/// Edit album's Artists field makes (set_album_fields, "artist_credits"),
+/// pool-level so a combine can stamp the keeper's album artist once its
+/// own refusal checks have passed. Newly credited names get pages, the
+/// credit spine is re-stamped, and a real change enqueues the album's
+/// credit re-check for the next pass.
+pub(crate) async fn write_album_credits(
+    pool: &SqlitePool,
+    library_id: &str,
+    album_id: i64,
+    names: &[String],
+) -> Result<(), String> {
+    let before = album_credit_names(pool, album_id).await?;
+    let stored = serde_json::to_string(names).map_err(|e| e.to_string())?;
+    upsert_override(pool, album_id, "artist_credits", &stored).await?;
+    reapply_album_overrides(pool, album_id).await?;
+    let after = album_credit_names(pool, album_id).await?;
+    for name in &after {
+        crate::music::resolve_or_create_artist(pool, library_id, name).await?;
+    }
+    crate::music::resolve_credit_ids(pool, library_id).await?;
+    if after != before {
+        crate::music_mb::enqueue_album_credit_recheck(pool, library_id, album_id).await?;
+    }
+    Ok(())
+}
+
 #[derive(Serialize)]
 pub struct ArtistEditView {
     pub id: i64,
@@ -2520,9 +2556,25 @@ async fn album_tag_identity(
     library_id: &str,
     album_id: i64,
 ) -> Result<(String, String), String> {
-    // The file that NAMES the album: first track of the first disc of the
-    // default release — the scanner's identity is the majority album tag of
-    // that disc alone. An arbitrary row once picked a disc-2 file whose tag
+    // The scanner's own record first (album_identity, written at every scan
+    // since 2026-09-27): a merged album's identity is its keeper's, which no
+    // single file carries once the poured-in tracks sort ahead of the
+    // keeper's own — the first file of a merged compilation belongs to a
+    // folded-in fragment, and keying on it found no directives to undo.
+    if let Some((artist, title)) = sqlx::query_as::<_, (String, String)>(
+        "SELECT artist, title FROM album_identity WHERE album_id = ?",
+    )
+    .bind(album_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?
+    {
+        return Ok((artist, title));
+    }
+    // Rows from before the table existed (until their next rescan): the file
+    // that NAMES the album — first track of the first disc of the default
+    // release — the scanner's identity is the majority album tag of that
+    // disc alone. An arbitrary row once picked a disc-2 file whose tag
     // spelled the title differently ("HIStory- … (Disc 2)" vs "HIStory: …
     // (Disc 1)"), and the directive it keyed never matched anything.
     let (rel,): (String,) = sqlx::query_as(
@@ -2603,6 +2655,12 @@ pub struct CombineAlbumInfo {
     /// Display cover (cached path), for the option row's thumbnail.
     pub cover: Option<String>,
     pub editions: Vec<CombineEdition>,
+    /// Matched to MusicBrainz: its credits are MB's (a rescan never clobbers
+    /// them) — the album-artist choice isn't offered on such a keeper.
+    pub mb_matched: bool,
+    /// The user has set its credits by hand (a user-tier artist_credits
+    /// override) — likewise not offered; the edit stands.
+    pub credits_edited: bool,
 }
 
 #[tauri::command]
@@ -2613,13 +2671,17 @@ pub async fn get_combine_info(
     let pool = &state.app_db;
     let mut out = Vec::with_capacity(album_ids.len());
     for id in album_ids {
-        let Some((title, artist, library_id, folder_path, selected_cover, release_date)) =
-            sqlx::query_as::<_, (String, Option<String>, String, String, Option<String>, Option<String>)>(
+        let Some((title, artist, library_id, folder_path, selected_cover, release_date, mb_matched, credits_edited)) =
+            sqlx::query_as::<_, (String, Option<String>, String, String, Option<String>, Option<String>, i64, i64)>(
                 "SELECT al.title,
                         (SELECT GROUP_CONCAT(name, ' · ') FROM (
                              SELECT ac.name FROM album_artist_credit ac
                              WHERE ac.album_id = al.id ORDER BY ac.position)),
-                        me.library_id, al.folder_path, al.selected_cover, al.release_date
+                        me.library_id, al.folder_path, al.selected_cover, al.release_date,
+                        EXISTS (SELECT 1 FROM mb_credit_fetch f
+                                WHERE f.album_id = al.id AND f.status = 'matched'),
+                        EXISTS (SELECT 1 FROM field_override fo
+                                WHERE fo.entity_id = al.id AND fo.field = 'artist_credits' AND fo.tier = 'user')
                  FROM album al
                  JOIN media_entry me ON me.id = al.id
                  WHERE al.id = ?",
@@ -2744,6 +2806,8 @@ pub async fn get_combine_info(
             genres,
             cover,
             editions,
+            mb_matched: mb_matched != 0,
+            credits_edited: credits_edited != 0,
         });
     }
     Ok(out)
@@ -2772,6 +2836,10 @@ pub async fn combine_albums_multi(
     mode: String,
     // Which keeper edition a merge lands in (its folder). None = default.
     target_release_folder: Option<String>,
+    // The combined album's artist credit, when the dialog's Album-artist
+    // choice differs from the keeper's own ("Various Artists" for a
+    // compilation split across one-artist albums). None = the keeper's.
+    album_artist: Option<String>,
 ) -> Result<(), String> {
     crate::music_mb::ensure_not_matching(&state.app_db, &library_id).await?;
     let pool = &state.app_db;
@@ -3018,6 +3086,16 @@ pub async fn combine_albums_multi(
         return Err("These albums are already combined".to_string());
     }
 
+    // The album-artist answer lands first, and only now: every refusal
+    // above has passed, so it can't strand a credit on a keeper whose
+    // combine was turned down — and it must precede the staging, since
+    // staged is immutable and the keeper is part of the staging. A
+    // user-tier credit on the keeper, carried through the rescan like
+    // its title.
+    if let Some(name) = album_artist.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        write_album_credits(pool, &library_id, target_id, &[name.to_string()]).await?;
+    }
+
     if !merge_folders.is_empty() {
         let into = keeper_folder
             .clone()
@@ -3184,6 +3262,134 @@ pub async fn combine_albums_multi(
         ),
     )
     .await?;
+    Ok(())
+}
+
+/// One album of a suspected split compilation, in track order — the album
+/// holding the folder's first track leads, and is the combine's keeper.
+#[derive(Serialize)]
+pub struct SplitCompilationAlbum {
+    pub id: i64,
+    pub title: String,
+    /// The album's credit line (owners, " · "-joined), as the combine dialog
+    /// shows it.
+    pub artist: Option<String>,
+}
+
+/// A folder whose files carry ONE album title under several album artists,
+/// and so scanned as several one-artist albums: a compilation whose tags
+/// name each track's artist as the album artist. Three or more albums
+/// under three or more distinct credits — two is a split album or a
+/// collaboration, not a compilation.
+#[derive(Serialize)]
+pub struct SplitCompilation {
+    pub folder_path: String,
+    pub title: String,
+    pub albums: Vec<SplitCompilationAlbum>,
+    pub artist_count: i64,
+    pub track_count: i64,
+}
+
+/// The metadata center's split-compilation cards (Albums tab, top): every
+/// (folder, title) holding three or more single-edition albums with three
+/// or more distinct credits, minus the folders dismissed as separate on
+/// purpose (compilation_dismiss).
+#[tauri::command]
+pub async fn split_compilations(
+    state: State<'_, AppState>,
+    library_id: String,
+) -> Result<Vec<SplitCompilation>, String> {
+    let pool = &state.app_db;
+    // Real, single-edition albums only: loose containers and sounds have
+    // no tag identity to combine on, and an album with editions elsewhere
+    // is an album in its own right, not a fragment of this folder. The
+    // slot of each album's first track orders the fragments.
+    let rows: Vec<(String, i64, String, Option<String>, i64, i64)> = sqlx::query_as(
+        "SELECT ar.folder_path, al.id, al.title,
+                (SELECT GROUP_CONCAT(name, ' · ') FROM (
+                     SELECT ac.name FROM album_artist_credit ac
+                     WHERE ac.album_id = al.id ORDER BY ac.position)),
+                COALESCE((SELECT MIN(COALESCE(t.disc_number, 1) * 100000 + COALESCE(t.track_number, 99999))
+                          FROM track t JOIN track_release tr ON tr.track_id = t.id
+                          WHERE tr.release_id = ar.id), 9999999999),
+                (SELECT COUNT(*) FROM track_release tr WHERE tr.release_id = ar.id)
+         FROM album_release ar
+         JOIN album al ON al.id = ar.album_id
+         JOIN media_entry me ON me.id = al.id
+         WHERE me.library_id = ?1
+           AND (SELECT COUNT(*) FROM album_release x WHERE x.album_id = al.id) = 1
+           AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = al.id)
+           AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = al.id)
+           AND NOT EXISTS (SELECT 1 FROM compilation_dismiss d
+                           WHERE d.library_id = ?1 AND d.folder_path = ar.folder_path COLLATE NOCASE)
+         ORDER BY ar.folder_path COLLATE NOCASE, 5, al.id",
+    )
+    .bind(&library_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // Grouped by (folder, title), both case-blind; the first row of a group
+    // (its first track's album) names the card.
+    let mut groups: Vec<(String, String, SplitCompilation, std::collections::HashSet<String>)> =
+        Vec::new();
+    for (folder, id, title, artist, _slot, tracks) in rows {
+        let fkey = folder.to_lowercase();
+        let tkey = title.trim().to_lowercase();
+        let idx = match groups.iter().position(|(f, t, _, _)| *f == fkey && *t == tkey) {
+            Some(i) => i,
+            None => {
+                groups.push((
+                    fkey,
+                    tkey,
+                    SplitCompilation {
+                        folder_path: folder,
+                        title: title.clone(),
+                        albums: Vec::new(),
+                        artist_count: 0,
+                        track_count: 0,
+                    },
+                    std::collections::HashSet::new(),
+                ));
+                groups.len() - 1
+            }
+        };
+        let (_, _, group, credits) = &mut groups[idx];
+        // Distinct NAMED credits — an uncredited fragment joins the card
+        // but proves nothing about how many artists there are.
+        if let Some(a) = artist.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            credits.insert(a.to_lowercase());
+        }
+        group.track_count += tracks;
+        group.albums.push(SplitCompilationAlbum { id, title, artist });
+    }
+    Ok(groups
+        .into_iter()
+        .filter_map(|(_, _, mut group, credits)| {
+            group.artist_count = credits.len() as i64;
+            (group.albums.len() >= 3 && credits.len() >= 3).then_some(group)
+        })
+        .collect())
+}
+
+/// The standing no for a split-compilation card: the albums in this folder
+/// are separate on purpose. Keyed by folder, so the card never returns for
+/// it — whatever else lands there later.
+#[tauri::command]
+pub async fn dismiss_split_compilation(
+    state: State<'_, AppState>,
+    library_id: String,
+    folder_path: String,
+) -> Result<(), String> {
+    sqlx::query(
+        "INSERT INTO compilation_dismiss (library_id, folder_path) VALUES (?, ?)
+         ON CONFLICT(library_id, folder_path) DO UPDATE SET dismissed_at = datetime('now')",
+    )
+    .bind(&library_id)
+    .bind(&folder_path)
+    .execute(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 

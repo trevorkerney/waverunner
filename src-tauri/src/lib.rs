@@ -6,6 +6,7 @@ mod img_protocol;
 pub mod interactive;
 mod interactive_session;
 mod jobs;
+mod membership;
 mod watch;
 mod mp3_frames;
 mod mpv;
@@ -152,6 +153,7 @@ pub fn run() {
             commands::set_library_setting,
             notes::get_note,
             notes::set_note,
+            music_mb::get_fetch_failures,
             music_mb::mb_set_ignored,
             commands::get_app_version,
             commands::get_file_size,
@@ -323,6 +325,8 @@ pub fn run() {
             music_edit::split_album_release,
             music_edit::separate_merged_folders,
             music_edit::merge_album_release,
+            music_edit::split_compilations,
+            music_edit::dismiss_split_compilation,
             music_art::music_fetch_artist_image,
             commands::set_library_setup_stage,
             commands::complete_library_setup,

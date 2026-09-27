@@ -1462,6 +1462,33 @@ async fn write_album_tag_tier(
     Ok(())
 }
 
+/// The scanner's identity of an album, as the combine directives are matched
+/// on it (key_matches): album artist + title, lowercased. `album_identity`
+/// is the durable record of it, so the actions that need "which album is
+/// this" (combine staging, the absorbed list, edition splits, the rescan's
+/// row claim) read it there instead of from a file. A merged album's identity
+/// is its keeper's (identity_override) — the one thing no single file of it
+/// need carry.
+pub(crate) fn scanned_identity(album: &ScannedAlbum) -> (String, String) {
+    (album_artist_of(album).to_lowercase(), album_title_of(album).to_lowercase())
+}
+
+async fn write_album_identity(
+    pool: &SqlitePool,
+    album_id: i64,
+    album: &ScannedAlbum,
+) -> Result<(), String> {
+    let (artist, title) = scanned_identity(album);
+    sqlx::query("INSERT OR REPLACE INTO album_identity (album_id, artist, title) VALUES (?, ?, ?)")
+        .bind(album_id)
+        .bind(artist)
+        .bind(title)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// The album's TAG-tier values as the scanner derives them from a scanned
 /// album — the one derivation shared by the rescan (above) and the tag
 /// writer, which re-reads the files it wrote and stores exactly what the
@@ -1632,6 +1659,7 @@ async fn insert_album(
     write_album_credits(pool, album_entry_id, album, true).await?;
     link_album_genres(pool, album_entry_id, album).await?;
     write_album_tag_tier(pool, library_id, album_entry_id, album).await?;
+    write_album_identity(pool, album_entry_id, album).await?;
     sync_music_covers(
         pool,
         library_id,
@@ -1798,6 +1826,7 @@ async fn reconcile_album(
     // so the credit guards below read the album as unmatched on this same
     // rescan and rebuild everything from tags — not one cycle late.
     write_album_tag_tier(pool, library_id, album_entry_id, album).await?;
+    write_album_identity(pool, album_entry_id, album).await?;
 
     // Credits for MB-matched albums are authoritative — a rescan's tag re-parse
     // must not clobber them (the stamp keeps the fetch from re-running).
@@ -4359,15 +4388,52 @@ pub async fn rescan_music_library(
     let original_track_ids: HashSet<i64> = db_tracks.iter().map(|(id, _, _)| *id).collect();
     let mut existing_tracks: HashMap<String, i64> =
         db_tracks.into_iter().map(|(id, p, _)| (p, id)).collect();
+    // Each DB album's scanner identity from its last scan (album_identity).
+    // Rows from before the table existed have none and claim on files alone.
+    let db_identity: HashMap<i64, (String, String)> = sqlx::query_as::<_, (i64, String, String)>(
+        "SELECT ai.album_id, ai.artist, ai.title FROM album_identity ai
+         JOIN media_entry me ON me.id = ai.album_id WHERE me.library_id = ?",
+    )
+    .bind(library_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .into_iter()
+    .map(|(id, artist, title)| (id, (artist, title)))
+    .collect();
+    // The identity of every album THIS scan found, per release folder — so a
+    // claim can tell a candidate that belongs to another scanned album in
+    // the same folder from one that is free to take.
+    let mut scanned_idents_by_folder: HashMap<String, HashSet<(String, String)>> = HashMap::new();
+    for album in artists.iter().flat_map(|a| a.albums.iter()).chain(orphans.albums.iter()) {
+        let ident = scanned_identity(album);
+        for r in &album.releases {
+            scanned_idents_by_folder
+                .entry(r.folder_rel.clone())
+                .or_default()
+                .insert(ident.clone());
+        }
+    }
 
     let mut seen_album_ids: HashSet<i64> = HashSet::new();
     let mut next_order = next_artist_order(pool, library_id).await?;
 
-    // Which existing album a scanned album IS. A lone unclaimed candidate in
-    // its folders claims directly (retitled tags keep their history). With
-    // several candidates (same-folder multi-album), the entry owning the most
-    // of this album's files wins — no shared files means a genuinely new
-    // album in a shared folder, inserted fresh.
+    // Which existing album a scanned album IS. IDENTITY FIRST (2026-09-27):
+    // the candidate whose scanner identity — album artist + title, as the
+    // combine directives key on them — is this album's IS this album. The
+    // same-folder multi-album case forced it: a compilation merged out of
+    // thirteen one-artist fragments sharing one folder had thirteen
+    // candidates each owning one of its files, a thirteen-way tie on file
+    // count, and an arbitrary winner — which swept the keeper's row, and
+    // with it the user's Various Artists credit and every other override on
+    // it. A candidate whose identity ANOTHER scanned album in the folder
+    // carries belongs to that album and is left for it (the fragments
+    // returning after an undo each find their own row). With no identity to
+    // go on — rows from before album_identity existed, or a retitled tag — a
+    // lone candidate claims directly (retitled tags keep their history), and
+    // among several the entry owning the most of this album's files wins,
+    // lowest id on a tie; no shared files means a genuinely new album in a
+    // shared folder, inserted fresh.
     let claim_album = |album: &ScannedAlbum, seen: &HashSet<i64>| -> Option<i64> {
         let mut cands: Vec<i64> = Vec::new();
         for r in &album.releases {
@@ -4378,6 +4444,24 @@ pub async fn rescan_music_library(
                     }
                 }
             }
+        }
+        let mine = scanned_identity(album);
+        let exact: Vec<i64> =
+            cands.iter().copied().filter(|id| db_identity.get(id) == Some(&mine)).collect();
+        if exact.len() == 1 {
+            return exact.first().copied();
+        }
+        if exact.len() > 1 {
+            cands = exact;
+        } else {
+            cands.retain(|id| match db_identity.get(id) {
+                Some(ident) => !album.releases.iter().any(|r| {
+                    scanned_idents_by_folder
+                        .get(&r.folder_rel)
+                        .is_some_and(|s| s.contains(ident))
+                }),
+                None => true,
+            });
         }
         if cands.len() <= 1 {
             return cands.first().copied();
@@ -4392,7 +4476,11 @@ pub async fn rescan_music_library(
                 }
             }
         }
-        votes.into_iter().max_by_key(|(_, n)| *n).map(|(id, _)| id)
+        // Most files, then the lowest id — never the hash map's order.
+        votes
+            .into_iter()
+            .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)))
+            .map(|(id, _)| id)
     };
 
     for artist in artists {
@@ -4929,7 +5017,48 @@ pub struct ArtistDetail {
     pub loose_tracks: Vec<TrackView>,
     /// User-written biography (nothing fills this automatically yet).
     pub biography: Option<String>,
+    /// Band membership (MusicBrainz "member of band"): this group's members,
+    /// current first, former after with their years — by MBID, linked where
+    /// the library has the person. Empty for people and unfetched groups.
+    pub members: Vec<crate::membership::MemberView>,
+    /// The groups this artist is in, each with the group's albums when the
+    /// group is in the library — a section of its own on the page; the
+    /// albums stay the group's and never count here (user's call).
+    pub member_of: Vec<MemberOfView>,
 }
+
+#[derive(Debug, Serialize)]
+pub struct MemberOfView {
+    pub group: crate::membership::MemberView,
+    pub albums: Vec<AlbumCard>,
+}
+
+/// An artist's own albums (credited, or credited to one of their personas),
+/// real albums only — the artist page's Releases, and a group's albums on
+/// a member's page. Bind the artist id.
+const ARTIST_ALBUM_ROWS_SQL: &str =
+    "SELECT al.id, al.title, al.release_date, al.folder_path, al.selected_cover,
+            (SELECT COUNT(*) FROM media_entry t WHERE t.parent_id = al.id),
+            (SELECT COUNT(*) FROM album_release ar WHERE ar.album_id = al.id),
+            COALESCE((SELECT SUM(t.runtime) FROM track t
+                      JOIN media_entry me2 ON me2.id = t.id
+                      JOIN track_release tr ON tr.track_id = t.id
+                      JOIN album_release ar2 ON ar2.id = tr.release_id
+                      WHERE me2.parent_id = al.id AND ar2.is_default = 1), 0)
+     FROM album al
+     JOIN media_entry me ON me.id = al.id
+     WHERE EXISTS (SELECT 1 FROM album_artist_credit ac
+                   WHERE ac.album_id = al.id
+                     AND (ac.artist_id = ?1
+                          -- An alter ego's records are this artist's
+                          -- records: same human, so they belong in
+                          -- the discography rather than the
+                          -- appears-on shelf below.
+                          OR ac.artist_id IN (SELECT persona_id FROM artist_persona
+                                              WHERE parent_id = ?1)))
+       AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = al.id)
+       AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = al.id)
+     ORDER BY al.sort_order, al.release_date, al.sort_title COLLATE NOCASE";
 
 async fn covers_for(
     pool: &SqlitePool,
@@ -5214,14 +5343,15 @@ pub async fn get_artist_detail(
     entry_id: i64,
 ) -> Result<ArtistDetail, String> {
     let pool = &state.app_db;
-    let (library_id, title, folder_path, selected_cover, biography): (
+    let (library_id, title, folder_path, selected_cover, biography, mbid): (
         String,
         String,
         String,
+        Option<String>,
         Option<String>,
         Option<String>,
     ) = sqlx::query_as(
-        "SELECT me.library_id, a.title, a.folder_path, a.selected_cover, a.biography
+        "SELECT me.library_id, a.title, a.folder_path, a.selected_cover, a.biography, a.musicbrainz_id
          FROM artist a JOIN media_entry me ON me.id = a.id WHERE a.id = ?",
     )
     .bind(entry_id)
@@ -5230,34 +5360,11 @@ pub async fn get_artist_detail(
     .map_err(|e| e.to_string())?;
 
     let album_rows: Vec<(i64, String, Option<String>, String, Option<String>, i64, i64, i64)> =
-        sqlx::query_as(
-            "SELECT al.id, al.title, al.release_date, al.folder_path, al.selected_cover,
-                    (SELECT COUNT(*) FROM media_entry t WHERE t.parent_id = al.id),
-                    (SELECT COUNT(*) FROM album_release ar WHERE ar.album_id = al.id),
-                    COALESCE((SELECT SUM(t.runtime) FROM track t
-                              JOIN media_entry me2 ON me2.id = t.id
-                              JOIN track_release tr ON tr.track_id = t.id
-                              JOIN album_release ar2 ON ar2.id = tr.release_id
-                              WHERE me2.parent_id = al.id AND ar2.is_default = 1), 0)
-             FROM album al
-             JOIN media_entry me ON me.id = al.id
-             WHERE EXISTS (SELECT 1 FROM album_artist_credit ac
-                           WHERE ac.album_id = al.id
-                             AND (ac.artist_id = ?1
-                                  -- An alter ego's records are this artist's
-                                  -- records: same human, so they belong in
-                                  -- the discography rather than the
-                                  -- appears-on shelf below.
-                                  OR ac.artist_id IN (SELECT persona_id FROM artist_persona
-                                                      WHERE parent_id = ?1)))
-               AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = al.id)
-               AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = al.id)
-             ORDER BY al.sort_order, al.release_date, al.sort_title COLLATE NOCASE",
-        )
-        .bind(entry_id)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| e.to_string())?;
+        sqlx::query_as(ARTIST_ALBUM_ROWS_SQL)
+            .bind(entry_id)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| e.to_string())?;
 
     // Album-level credits for the per-album artist lines — every album has
     // rows now, so the owner argument is only a mid-scan/rowless fallback.
@@ -5370,6 +5477,41 @@ pub async fn get_artist_detail(
     let loose_tracks = loose_tracks_for(pool, &library_id, Some(entry_id)).await?;
     track_count += loose_tracks.len() as i64;
 
+    // Band membership — a lens beside the credits, never a change to them.
+    // A group this artist is in shows its albums here as context; they stay
+    // the group's (not in this page's counts).
+    let (members, groups) =
+        crate::membership::for_artist(pool, &library_id, mbid.as_deref()).await?;
+    let mut member_of = Vec::with_capacity(groups.len());
+    for group in groups {
+        let mut cards = Vec::new();
+        if let Some(gid) = group.artist_id {
+            let rows: Vec<(i64, String, Option<String>, String, Option<String>, i64, i64, i64)> =
+                sqlx::query_as(ARTIST_ALBUM_ROWS_SQL)
+                    .bind(gid)
+                    .fetch_all(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            for (id, atitle, release_date, folder, sel, tracks, releases, runtime) in rows {
+                cards.push(AlbumCard {
+                    id,
+                    title: atitle,
+                    year: release_date.as_ref().map(|d| d.chars().take(4).collect()),
+                    release_date,
+                    covers: covers_for(pool, &library_id, &folder).await?,
+                    selected_cover: sel,
+                    track_count: tracks,
+                    release_count: releases,
+                    runtime_secs: runtime,
+                    artist_title: Some(group.name.clone()),
+                    mb_state: album_dots.get(&id).map(|s| s.to_string()),
+                    artists: album_artists(id, Some((group.name.as_str(), gid))),
+                });
+            }
+        }
+        member_of.push(MemberOfView { group, albums: cards });
+    }
+
     // Folder art first, fetched images appended after — gap-fill precedence.
     let mut covers = covers_for(pool, &library_id, &folder_path).await?;
     covers.extend(covers_for(pool, &library_id, &crate::music_art::artist_fetch_rel(entry_id)).await?);
@@ -5385,6 +5527,8 @@ pub async fn get_artist_detail(
         appears_on,
         loose_tracks,
         biography,
+        members,
+        member_of,
     })
 }
 
@@ -6320,7 +6464,16 @@ pub async fn get_release_covers(
     album_id: i64,
     release_id: Option<i64>,
 ) -> Result<ReleaseCovers, String> {
-    let pool = &state.app_db;
+    release_covers(&state.app_db, album_id, release_id).await
+}
+
+/// The command's body, for callers inside the app too (add_cover reads the
+/// shown cover before adding, to pin it).
+pub(crate) async fn release_covers(
+    pool: &SqlitePool,
+    album_id: i64,
+    release_id: Option<i64>,
+) -> Result<ReleaseCovers, String> {
     let (library_id, album_folder): (String, String) = sqlx::query_as(
         "SELECT me.library_id, al.folder_path FROM album al
          JOIN media_entry me ON me.id = al.id WHERE al.id = ?",

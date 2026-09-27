@@ -498,21 +498,16 @@ export function AlbumEditDialog({ albumId, libraryId, open, onOpenChange, onSave
   const [busy, setBusy] = useState(false);
   // A pass on the library holds every write here (the backend refuses it).
   const locked = useMatchLock(libraryId);
-  // Combines undone from this dialog (staged; the row leaves the list).
+  // Combines marked for undo in this dialog. Nothing is written at the
+  // click (user's call, 2026-09-27): the row is struck and reads "save to
+  // apply", Save stages every un-combine with the other edits, and Cancel
+  // forgets them.
   const [undoneCombines, setUndoneCombines] = useState<Set<number>>(new Set());
   const bodyRef = useRef<HTMLDivElement | null>(null);
   const { stage, skeletonSeen, shown, contentVisible } = useHandoff(!!view, bodyRef);
 
-  const undoCombine = async (combineId: number, name: string) => {
-    try {
-      await invoke("undo_album_combine", { combineId });
-      setUndoneCombines((s) => new Set(s).add(combineId));
-      toast(`Un-combine of “${name}” staged — it applies on the next rescan`);
-      notifyPendingWorkChanged();
-    } catch (e) {
-      toast.error(String(e));
-    }
-  };
+  const undoCombine = (combineId: number) =>
+    setUndoneCombines((s) => new Set(s).add(combineId));
 
   useEffect(() => {
     if (!open) {
@@ -586,6 +581,19 @@ export function AlbumEditDialog({ albumId, libraryId, open, onOpenChange, onSave
       }
       if (note.trim() !== noteInitial) {
         await invoke("set_note", { kind: "entry", subjectId: albumId, text: note.trim() });
+      }
+      // The un-combines LAST: each one stages the album for rescan, and
+      // staged is immutable — a field written after it would be refused.
+      for (const combineId of undoneCombines) {
+        await invoke("undo_album_combine", { combineId });
+      }
+      if (undoneCombines.size > 0) {
+        toast(
+          undoneCombines.size === 1
+            ? "Un-combine staged — it applies on the next rescan"
+            : `${undoneCombines.size} un-combines staged — they apply on the next rescan`,
+        );
+        notifyPendingWorkChanged();
       }
       onSaved();
       onOpenChange(false);
@@ -796,8 +804,8 @@ export function AlbumEditDialog({ albumId, libraryId, open, onOpenChange, onSave
               // body, and the Undo links walked off the right edge.
               <div className="grid grid-cols-[minmax(0,1fr)] gap-1.5">
                 <Label>Combined albums</Label>
-                {/* Fixed 28px rows; an undone row stays (struck) so the
-                    frame never moves while the dialog is open. */}
+                {/* Fixed 28px rows; a row marked for undo stays (struck) so
+                    the frame never moves while the dialog is open. */}
                 <div className="flex min-w-0 flex-col">
                   {view.absorbed.map((a) => {
                     const undone = undoneCombines.has(a.combine_id);
@@ -810,19 +818,19 @@ export function AlbumEditDialog({ albumId, libraryId, open, onOpenChange, onSave
                           {a.name}
                         </span>
                         <span className="shrink-0 text-[11px] text-muted-foreground">
-                          {a.mode === "merge" ? "merged in" : "as a release"}
+                          {undone
+                            ? `${a.mode === "merge" ? "unmerging" : "separating"} · save to apply`
+                            : a.mode === "merge"
+                              ? "merged in"
+                              : "as a release"}
                         </span>
-                        {undone ? (
-                          <span className="shrink-0 text-[11px] text-muted-foreground">
-                            un-combine staged
-                          </span>
-                        ) : (
+                        {!undone && (
                           <button
                             type="button"
                             disabled={busy}
-                            onClick={() => void undoCombine(a.combine_id, a.name)}
+                            onClick={() => undoCombine(a.combine_id)}
                             className="shrink-0 text-[11px] underline underline-offset-2 hover:text-foreground"
-                            title="Back to its own album on the next rescan"
+                            title="Back to its own album on the next rescan — staged when you save"
                           >
                             Undo
                           </button>
@@ -906,6 +914,10 @@ export function ArtistEditDialog({ artistId, libraryId, open, onOpenChange, onSa
   const [view, setView] = useState<ArtistEditView | null>(null);
   const [name, setName] = useState("");
   const [bio, setBio] = useState("");
+  // The user's note on the artist (entry_note): its own store, saved on
+  // its own, never touched by Clear overrides.
+  const [note, setNote] = useState("");
+  const [noteInitial, setNoteInitial] = useState("");
   const [busy, setBusy] = useState(false);
   // A pass on the library holds every write here (the backend refuses it).
   const locked = useMatchLock(libraryId);
@@ -941,9 +953,12 @@ export function ArtistEditDialog({ artistId, libraryId, open, onOpenChange, onSa
     (async () => {
       try {
         const v = await invoke<ArtistEditView>("get_artist_edit", { artistId });
+        const n = await invoke<string | null>("get_note", { kind: "entry", subjectId: artistId });
         setView(v);
         setName(v.title);
         setBio(v.biography ?? "");
+        setNote(n ?? "");
+        setNoteInitial(n ?? "");
       } catch (e) {
         toast.error(String(e));
         onOpenChange(false);
@@ -961,6 +976,11 @@ export function ArtistEditDialog({ artistId, libraryId, open, onOpenChange, onSa
     try {
       if (Object.keys(fields).length > 0) {
         await invoke("set_artist_fields", { artistId, fields });
+      }
+      // The note is its own store (entry_note), not a field override —
+      // saved beside the fields, never part of Clear overrides.
+      if (note.trim() !== noteInitial) {
+        await invoke("set_note", { kind: "entry", subjectId: artistId, text: note.trim() });
       }
       onSaved();
       onOpenChange(false);
@@ -989,8 +1009,8 @@ export function ArtistEditDialog({ artistId, libraryId, open, onOpenChange, onSa
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       {/* Static: 136 + 94 name (+ its two-line note) + 16 + 138 biography
-          (5 rows) + 16 + 32 fetch row = 432px. */}
-      <DialogContent size="md" height="27rem">
+          (5 rows) + 16 + 118 note (4 rows) + 16 + 32 fetch row = 566px. */}
+      <DialogContent size="md" height="35.375rem">
         <DialogHeader>
           <DialogTitle>Edit artist</DialogTitle>
         </DialogHeader>
@@ -1016,6 +1036,20 @@ export function ArtistEditDialog({ artistId, libraryId, open, onOpenChange, onSa
                 placeholder="Shown on the artist page."
               />
             </div>
+            <div className="grid gap-1.5">
+              <Label htmlFor="are-note">Note</Label>
+              {/* The user's own note (user's call, 2026-09-27: edited here,
+                  not on the page). Kept apart from the biography, which is
+                  fetched-data territory. Fixed rows: the frame is static. */}
+              <textarea
+                id="are-note"
+                value={note}
+                onChange={(e) => setNote(e.target.value)}
+                rows={4}
+                className="w-full resize-none rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-xs outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50"
+                placeholder="Anything worth remembering about this artist…"
+              />
+            </div>
             <div className="flex items-center justify-between gap-4">
               <p className="text-xs text-muted-foreground">
                 Look up a photo on Wikidata (via MusicBrainz identity), falling back to Deezer.
@@ -1035,6 +1069,8 @@ export function ArtistEditDialog({ artistId, libraryId, open, onOpenChange, onSa
               <Skeleton className="h-3 w-2/3" />
             </div>
             <FieldSkeleton field="h-[118px]" />
+            {/* The note: four rows. */}
+            <FieldSkeleton field="h-[98px]" />
             <div className="flex items-center justify-between gap-4">
               <Skeleton className="h-3 w-2/3" />
               <Skeleton className="h-8 w-24" />

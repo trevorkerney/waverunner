@@ -426,7 +426,12 @@ export function MainContent({
     },
     [selectedLibrary, albumSelect, toggleAlbumSelect],
   );
-  const combineSelected = useCallback(async (targetReleaseFolder: string | null, title: string | null, discs: DiscName[]) => {
+  const combineSelected = useCallback(async (
+    targetReleaseFolder: string | null,
+    title: string | null,
+    discs: DiscName[],
+    albumArtist: string | null,
+  ) => {
     if (!albumSelect || albumSelect.keeperId == null || albumSelect.picked.length < 2) return;
     const { libraryId, picked, keeperId, mode } = albumSelect;
     setAlbumSelect((s) => (s ? { ...s, busy: true } : s));
@@ -444,12 +449,15 @@ export function MainContent({
       for (const d of discs) {
         await invoke("set_disc_title", { releaseId: d.releaseId, discNo: d.discNo, title: d.title });
       }
+      // The album-artist answer rides along: the backend writes it on the
+      // keeper once the combine's own checks pass, before staging.
       await invoke("combine_albums_multi", {
         libraryId,
         sourceIds: picked.filter((p) => p.id !== keeperId).map((p) => p.id),
         targetId: keeperId,
         mode,
         targetReleaseFolder,
+        albumArtist,
       });
       setAlbumSelect(null);
       // STAGED: the directive applies on the next rescan, batched with any
@@ -2364,7 +2372,9 @@ export function MainContent({
         onKeeper={(id) => setAlbumSelect((s) => (s ? { ...s, keeperId: id } : s))}
         onMode={(mode) => setAlbumSelect((s) => (s ? { ...s, mode } : s))}
         onOpenChange={(o) => setAlbumSelect((s) => (s ? { ...s, configuring: o } : s))}
-        onConfirm={(targetReleaseFolder, title, discs) => void combineSelected(targetReleaseFolder, title, discs)}
+        onConfirm={(targetReleaseFolder, title, discs, albumArtist) =>
+          void combineSelected(targetReleaseFolder, title, discs, albumArtist)
+        }
       />
 
       <EditCharacterNameDialog
