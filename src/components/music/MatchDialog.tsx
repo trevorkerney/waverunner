@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { toast } from "sonner";
+import { toast } from "@/lib/toast";
 import {
   Dialog,
   DialogBody,
@@ -80,6 +80,9 @@ export interface MbStatus {
   /** User declared the album deliberately partial — mb-side gaps are
    *  expected, not a problem. */
   partial: boolean;
+  /** Albums: another separate album on the same release group. The two
+   *  combine on their own once both hold a release match. */
+  same_group: { album_id: number; title: string } | null;
   /** The viewed release carries the user's "no MusicBrainz counterpart"
    *  declaration — resolved, nothing matched, nothing to do. */
   declared_none: boolean;
@@ -267,6 +270,9 @@ export function MatchDialog({
   // an album replaces bad-tag credits, which can dissolve the name entirely.
   const [albumLeads, setAlbumLeads] = useState<ArtistAlbumLead[] | null>(null);
   const [leadAlbum, setLeadAlbum] = useState<number | null>(null);
+  // Did the open lead's dialog apply (or change) a match? Then closing it
+  // closes this dialog too — the artist is settled through the album.
+  const leadApplied = useRef(false);
   // An album match just applied in THIS dialog session: surface the one
   // non-obvious consequence — artists the credits prove settle on the next
   // matching pass, not instantly (new credit pages are created after the
@@ -904,6 +910,15 @@ export function MatchDialog({
                 ? ` — ${status.context}`
                 : ""}
           </DialogDescription>
+          {/* Two separate albums on one release group (his ask, 2026-10-03):
+              said where the release gets picked, because the pick is what
+              makes them combine. */}
+          {status?.same_group && (
+            <p className="text-xs text-amber-300">
+              Same release group as “{status.same_group.title}” — once both have a release
+              matched, they combine into one album as separate releases.
+            </p>
+          )}
         </DialogHeader>
 
         {/* -mx-1/px-1: the scroll container clips at its box edge, which cut
@@ -1565,7 +1580,10 @@ export function MatchDialog({
                       variant="outline"
                       className="shrink-0 gap-1.5"
                       disabled={busy !== null}
-                      onClick={() => setLeadAlbum(l.album_id)}
+                      onClick={() => {
+                        leadApplied.current = false;
+                        setLeadAlbum(l.album_id);
+                      }}
                     >
                       <Search size={13} />
                       Match
@@ -1601,9 +1619,13 @@ export function MatchDialog({
       </DialogContent>
     </Dialog>
 
-    {/* An album lead opens the full album dialog on top of this one; when it
-        closes, the artist status reloads — a harvested credit may have
-        identified this very artist, and matched leads drop off the list. */}
+    {/* An album lead opens the full album dialog on top of this one. If a
+        match was applied in it, the job is done — the artist is identified
+        through the album (the release's credits, or the next pass's credit
+        harvest), so this dialog closes with it instead of coming back as
+        "Not matched" over an empty search (his confusion, 2026-10-04): both
+        pop in one batch, one exit. Closed without applying anything, the
+        artist status reloads and the leads refresh as before. */}
     {leadAlbum != null && (
       <MatchDialog
         kind="album"
@@ -1612,10 +1634,18 @@ export function MatchDialog({
         onOpenChange={(o) => {
           if (!o) {
             setLeadAlbum(null);
-            load().catch(() => {});
+            if (leadApplied.current) {
+              leadApplied.current = false;
+              onOpenChange(false); // no toast (his call): the page says it
+            } else {
+              load().catch(() => {});
+            }
           }
         }}
-        onChanged={onChanged}
+        onChanged={() => {
+          leadApplied.current = true;
+          onChanged?.();
+        }}
       />
     )}
     </>

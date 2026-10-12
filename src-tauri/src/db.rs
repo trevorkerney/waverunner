@@ -730,6 +730,15 @@ const MIGRATIONS: &[Migration] = &[
              FROM mb_credit_fetch f JOIN media_entry me ON me.id = f.album_id",
         ],
     },
+    Migration {
+        id: 43,
+        app_version: "1.0.0-alpha.12.5",
+        description: "album_combine.auto — directives the app staged itself (same release group)",
+        requires_table: Some("album_combine"),
+        // Undoing an auto-staged combine must mean "not these two" for good
+        // (album_combine_reject); a hand-staged one undoes without a trace.
+        statements: &["ALTER TABLE album_combine ADD COLUMN auto INTEGER NOT NULL DEFAULT 0"],
+    },
 ];
 
 /// Copy the database beside itself before the first migration of a run
@@ -2095,24 +2104,6 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .execute(&pool)
     .await?;
 
-    // ── Split-compilation dismissals ──────────────────────────────────
-    // A folder whose files carry one album title under several album
-    // artists scans as several one-artist albums; the metadata center
-    // offers to combine them as Various Artists (split_compilations). A
-    // row here is the standing "no, these are separate albums" for that
-    // folder — the card never comes back for it.
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS compilation_dismiss (
-            library_id TEXT NOT NULL,
-            folder_path TEXT NOT NULL,
-            dismissed_at TEXT NOT NULL DEFAULT (datetime('now')),
-            PRIMARY KEY (library_id, folder_path),
-            FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
     // ── Album scanner identity ────────────────────────────────────────
     // The (album artist, title) pair the scanner grouped each album on,
     // lowercased — the key combine directives are matched with. Written at
@@ -2290,6 +2281,45 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             target_folder TEXT,
             source_name TEXT,
             target_name TEXT,
+            -- 1 when the app staged this itself: two proven matches to one
+            -- MusicBrainz release group (music_edit::auto_combine_same_group).
+            -- Migration 43.
+            auto INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // ── Auto-combine rejections ───────────────────────────────────────
+    // An auto-staged combine the user undid: these two albums stay separate
+    // on purpose, and the app never stages them again. Keyed on the tag
+    // identities the directive itself was keyed on, so it survives rescans
+    // and the albums' ids.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS album_combine_reject (
+            library_id TEXT NOT NULL,
+            source_artist TEXT NOT NULL,
+            source_title TEXT NOT NULL,
+            target_artist TEXT NOT NULL,
+            target_title TEXT NOT NULL,
+            PRIMARY KEY (library_id, source_artist, source_title, target_artist, target_title),
+            FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // ── Duplicate-album dismissals ────────────────────────────────────
+    // "Keep both" on a File-problems duplicate card. The key is a digest of
+    // the albums' sorted track content hashes — the thing that made them
+    // duplicates — so it survives rescans, retags and moves.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS album_duplicate_dismiss (
+            library_id TEXT NOT NULL,
+            key TEXT NOT NULL,
+            dismissed_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (library_id, key),
             FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE
         )",
     )

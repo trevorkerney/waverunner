@@ -2842,7 +2842,34 @@ pub async fn combine_albums_multi(
     album_artist: Option<String>,
 ) -> Result<(), String> {
     crate::music_mb::ensure_not_matching(&state.app_db, &library_id).await?;
-    let pool = &state.app_db;
+    stage_album_combine(
+        &state.app_db,
+        library_id,
+        source_ids,
+        target_id,
+        mode,
+        target_release_folder,
+        album_artist,
+        false,
+    )
+    .await
+}
+
+/// The combine itself, shared by the command and the app's own staging
+/// (`auto_combine_same_group`, which runs inside a matching pass, so the
+/// pass guard lives in the command). `auto` marks the directives as the
+/// app's: undoing one of those is a standing rejection of the pair.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn stage_album_combine(
+    pool: &SqlitePool,
+    library_id: String,
+    source_ids: Vec<i64>,
+    target_id: i64,
+    mode: String,
+    target_release_folder: Option<String>,
+    album_artist: Option<String>,
+    auto: bool,
+) -> Result<(), String> {
     if !matches!(mode.as_str(), "merge" | "versions") {
         return Err(format!("Invalid combine mode: {mode}"));
     }
@@ -3205,8 +3232,8 @@ pub async fn combine_albums_multi(
         let res = sqlx::query(
             "INSERT INTO album_combine
              (library_id, source_artist, source_title, target_artist, target_title, mode,
-              target_folder, source_name, target_name)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              target_folder, source_name, target_name, auto)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&library_id)
         .bind(src_artist)
@@ -3217,6 +3244,7 @@ pub async fn combine_albums_multi(
         .bind(&merge_target_folder)
         .bind(src_name)
         .bind(&tgt_name)
+        .bind(auto as i64)
         .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
@@ -3252,8 +3280,9 @@ pub async fn combine_albums_multi(
             "target_album_id": target_id,
         }),
         &format!(
-            "Combine {} into \u{201c}{tgt_name}\u{201d}{}",
+            "Combine {} into \u{201c}{tgt_name}\u{201d}{}{}",
             combined.join(", "),
+            if auto { " as a separate release — same MusicBrainz release group" } else { "" },
             if drops_match {
                 " — clears its MusicBrainz match; rematch after the rescan"
             } else {
@@ -3265,133 +3294,167 @@ pub async fn combine_albums_multi(
     Ok(())
 }
 
-/// One album of a suspected split compilation, in track order — the album
-/// holding the folder's first track leads, and is the combine's keeper.
-#[derive(Serialize)]
-pub struct SplitCompilationAlbum {
-    pub id: i64,
-    pub title: String,
-    /// The album's credit line (owners, " · "-joined), as the combine dialog
-    /// shows it.
-    pub artist: Option<String>,
-}
-
-/// A folder whose files carry ONE album title under several album artists,
-/// and so scanned as several one-artist albums: a compilation whose tags
-/// name each track's artist as the album artist. Three or more albums
-/// under three or more distinct credits — two is a split album or a
-/// collaboration, not a compilation.
-#[derive(Serialize)]
-pub struct SplitCompilation {
-    pub folder_path: String,
-    pub title: String,
-    pub albums: Vec<SplitCompilationAlbum>,
-    pub artist_count: i64,
-    pub track_count: i64,
-}
-
-/// The metadata center's split-compilation cards (Albums tab, top): every
-/// (folder, title) holding three or more single-edition albums with three
-/// or more distinct credits, minus the folders dismissed as separate on
-/// purpose (compilation_dismiss).
-#[tauri::command]
-pub async fn split_compilations(
-    state: State<'_, AppState>,
-    library_id: String,
-) -> Result<Vec<SplitCompilation>, String> {
-    let pool = &state.app_db;
-    // Real, single-edition albums only: loose containers and sounds have
-    // no tag identity to combine on, and an album with editions elsewhere
-    // is an album in its own right, not a fragment of this folder. The
-    // slot of each album's first track orders the fragments.
-    let rows: Vec<(String, i64, String, Option<String>, i64, i64)> = sqlx::query_as(
-        "SELECT ar.folder_path, al.id, al.title,
-                (SELECT GROUP_CONCAT(name, ' · ') FROM (
-                     SELECT ac.name FROM album_artist_credit ac
-                     WHERE ac.album_id = al.id ORDER BY ac.position)),
-                COALESCE((SELECT MIN(COALESCE(t.disc_number, 1) * 100000 + COALESCE(t.track_number, 99999))
-                          FROM track t JOIN track_release tr ON tr.track_id = t.id
-                          WHERE tr.release_id = ar.id), 9999999999),
-                (SELECT COUNT(*) FROM track_release tr WHERE tr.release_id = ar.id)
-         FROM album_release ar
-         JOIN album al ON al.id = ar.album_id
+/// Two albums proven to be one MusicBrainz release group are one album in
+/// several releases — the app's own model — so the app stages that combine
+/// itself (user's call, 2026-10-03: "combine automatically only when
+/// proven"). Runs after a RELEASE match lands on `album_id`, by hand or by
+/// the pass, so both paths behave the same. Proven = release-matched, on
+/// BOTH sides: the track list was checked against a pressing, so neither is
+/// a fragment (one stray track scanned as its own album must never be
+/// stacked as a "release") and neither is a title-only guess. A group match
+/// alone never triggers it (his correction, same day): the group pick is
+/// the moment before the release pick, and staging there froze the album
+/// under the user's hands. The album that held the group first is the
+/// keeper. Never re-staged once undone (album_combine_reject). Returns the
+/// toast line when something was staged; every reason not to is a silent
+/// Ok(None) — a match must never fail over this.
+pub(crate) async fn auto_combine_same_group(
+    pool: &SqlitePool,
+    library_id: &str,
+    album_id: i64,
+) -> Result<Option<String>, String> {
+    let Some((group_id, _)) =
+        crate::music_mb::mb_id(pool, album_id, crate::music_mb::MB_RELEASE_GROUP).await?
+    else {
+        return Ok(None);
+    };
+    // Other real albums of the library resolved to the same group, oldest
+    // first — the oldest held it first and keeps the card.
+    let others: Vec<(i64,)> = sqlx::query_as(
+        "SELECT al.id FROM album al
          JOIN media_entry me ON me.id = al.id
-         WHERE me.library_id = ?1
-           AND (SELECT COUNT(*) FROM album_release x WHERE x.album_id = al.id) = 1
+         WHERE me.library_id = ? AND al.id <> ?
            AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = al.id)
            AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = al.id)
-           AND NOT EXISTS (SELECT 1 FROM compilation_dismiss d
-                           WHERE d.library_id = ?1 AND d.folder_path = ar.folder_path COLLATE NOCASE)
-         ORDER BY ar.folder_path COLLATE NOCASE, 5, al.id",
+           AND NOT EXISTS (SELECT 1 FROM field_override i
+                           WHERE i.entity_id = al.id AND i.field = 'mb_ignored' AND i.value = '1')
+           AND COALESCE((SELECT value FROM field_override
+                         WHERE entity_id = al.id AND field = 'mb_release_group_id' AND tier = 'user'),
+                        (SELECT value FROM field_override
+                         WHERE entity_id = al.id AND field = 'mb_release_group_id' AND tier = 'mb'),
+                        '') = ?
+         ORDER BY al.id",
     )
-    .bind(&library_id)
+    .bind(library_id)
+    .bind(album_id)
+    .bind(&group_id)
     .fetch_all(pool)
     .await
     .map_err(|e| e.to_string())?;
-
-    // Grouped by (folder, title), both case-blind; the first row of a group
-    // (its first track's album) names the card.
-    let mut groups: Vec<(String, String, SplitCompilation, std::collections::HashSet<String>)> =
-        Vec::new();
-    for (folder, id, title, artist, _slot, tracks) in rows {
-        let fkey = folder.to_lowercase();
-        let tkey = title.trim().to_lowercase();
-        let idx = match groups.iter().position(|(f, t, _, _)| *f == fkey && *t == tkey) {
-            Some(i) => i,
-            None => {
-                groups.push((
-                    fkey,
-                    tkey,
-                    SplitCompilation {
-                        folder_path: folder,
-                        title: title.clone(),
-                        albums: Vec::new(),
-                        artist_count: 0,
-                        track_count: 0,
-                    },
-                    std::collections::HashSet::new(),
-                ));
-                groups.len() - 1
-            }
-        };
-        let (_, _, group, credits) = &mut groups[idx];
-        // Distinct NAMED credits — an uncredited fragment joins the card
-        // but proves nothing about how many artists there are.
-        if let Some(a) = artist.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            credits.insert(a.to_lowercase());
-        }
-        group.track_count += tracks;
-        group.albums.push(SplitCompilationAlbum { id, title, artist });
+    if others.is_empty() {
+        return Ok(None);
     }
-    Ok(groups
-        .into_iter()
-        .filter_map(|(_, _, mut group, credits)| {
-            group.artist_count = credits.len() as i64;
-            (group.albums.len() >= 3 && credits.len() >= 3).then_some(group)
-        })
-        .collect())
+    let release_matched = |id: i64| async move {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS (SELECT 1 FROM release_match WHERE album_id = ? AND mb_release_id <> '')",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .map(|v| v != 0)
+        .map_err(|e| e.to_string())
+    };
+    if !release_matched(album_id).await? || is_staged_for_rescan(pool, album_id).await? {
+        return Ok(None);
+    }
+    let (src_artist, src_title) = album_tag_identity(pool, library_id, album_id).await?;
+    for (keeper_id,) in others {
+        if !release_matched(keeper_id).await? || is_staged_for_rescan(pool, keeper_id).await? {
+            continue;
+        }
+        let (tgt_artist, tgt_title) = album_tag_identity(pool, library_id, keeper_id).await?;
+        let rejected: i64 = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM album_combine_reject
+                            WHERE library_id = ?
+                              AND ((source_artist = ? AND source_title = ? AND target_artist = ? AND target_title = ?)
+                                OR (source_artist = ? AND source_title = ? AND target_artist = ? AND target_title = ?)))",
+        )
+        .bind(library_id)
+        .bind(&src_artist)
+        .bind(&src_title)
+        .bind(&tgt_artist)
+        .bind(&tgt_title)
+        .bind(&tgt_artist)
+        .bind(&tgt_title)
+        .bind(&src_artist)
+        .bind(&src_title)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        if rejected != 0 {
+            continue;
+        }
+        let names: Vec<(String,)> = sqlx::query_as(
+            "SELECT title FROM album WHERE id IN (?, ?) ORDER BY CASE id WHEN ? THEN 0 ELSE 1 END",
+        )
+        .bind(album_id)
+        .bind(keeper_id)
+        .bind(album_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        // The combine's own refusals (already combined, a loop on file, …)
+        // are reasons to leave it alone, not errors of the match.
+        match stage_album_combine(
+            pool,
+            library_id.to_string(),
+            vec![album_id],
+            keeper_id,
+            "versions".to_string(),
+            None,
+            None,
+            true,
+        )
+        .await
+        {
+            Ok(()) => {
+                let src_name = names.first().map(|(t,)| t.as_str()).unwrap_or("album");
+                let tgt_name = names.get(1).map(|(t,)| t.as_str()).unwrap_or("album");
+                return Ok(Some(format!(
+                    "\u{201c}{src_name}\u{201d} is the same MusicBrainz release group as \u{201c}{tgt_name}\u{201d} — combined as a separate release, staged for the next rescan. Undo it in the staged changes if they should stay apart."
+                )));
+            }
+            Err(e) => {
+                eprintln!("[auto-combine] {src_title} → {tgt_title} not staged: {e}");
+                return Ok(None);
+            }
+        }
+    }
+    Ok(None)
 }
 
-/// The standing no for a split-compilation card: the albums in this folder
-/// are separate on purpose. Keyed by folder, so the card never returns for
-/// it — whatever else lands there later.
-#[tauri::command]
-pub async fn dismiss_split_compilation(
-    state: State<'_, AppState>,
-    library_id: String,
-    folder_path: String,
-) -> Result<(), String> {
+/// Undoing an auto-staged combine (staged or landed) is the standing answer
+/// "not these two": remembered by tag identity so the app never stages the
+/// pair again. A hand-staged combine's undo leaves no trace.
+async fn remember_auto_combine_rejection(pool: &SqlitePool, combine_id: i64) -> Result<(), String> {
+    let row: Option<(String, i64, String, String, String, String)> = sqlx::query_as(
+        "SELECT library_id, auto, source_artist, source_title, target_artist, target_title
+         FROM album_combine WHERE id = ?",
+    )
+    .bind(combine_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let Some((library_id, auto, sa, st, ta, tt)) = row else { return Ok(()) };
+    if auto == 0 {
+        return Ok(());
+    }
     sqlx::query(
-        "INSERT INTO compilation_dismiss (library_id, folder_path) VALUES (?, ?)
-         ON CONFLICT(library_id, folder_path) DO UPDATE SET dismissed_at = datetime('now')",
+        "INSERT OR IGNORE INTO album_combine_reject
+         (library_id, source_artist, source_title, target_artist, target_title)
+         VALUES (?, ?, ?, ?, ?)",
     )
     .bind(&library_id)
-    .bind(&folder_path)
-    .execute(&state.app_db)
+    .bind(&sa)
+    .bind(&st)
+    .bind(&ta)
+    .bind(&tt)
+    .execute(pool)
     .await
     .map_err(|e| e.to_string())?;
     Ok(())
 }
+
 
 /// Is this entity frozen by a staged rescan action? True for split-source
 /// artists and combine-source albums (both DISSOLVE when the rescan applies),
@@ -3633,6 +3696,7 @@ pub async fn unstage_pending_change(state: State<'_, AppState>, id: i64) -> Resu
         "album_combine" => {
             for cid in p["ids"].as_array().into_iter().flatten() {
                 if let Some(cid) = cid.as_i64() {
+                    remember_auto_combine_rejection(pool, cid).await?;
                     sqlx::query("DELETE FROM album_combine WHERE id = ?")
                         .bind(cid)
                         .execute(pool)
@@ -3847,6 +3911,7 @@ pub async fn undo_album_combine(
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "That combine no longer exists".to_string())?;
     let snapshot = combine_row_snapshot(pool, combine_id).await?;
+    remember_auto_combine_rejection(pool, combine_id).await?;
     sqlx::query("DELETE FROM album_combine WHERE id = ?")
         .bind(combine_id)
         .execute(pool)
@@ -4152,4 +4217,147 @@ async fn album_title_for(pool: &SqlitePool, album_id: i64) -> Result<String, Str
         .await
         .map_err(|e| e.to_string())
         .map(|r| r.map(|(t,)| t).unwrap_or_default())
+}
+
+// ---------------------------------------------------------------------------
+// Duplicate albums (File problems)
+// ---------------------------------------------------------------------------
+
+/// One album of a duplicate set, as the File-problems card shows it.
+#[derive(Serialize)]
+pub struct DuplicateAlbum {
+    pub id: i64,
+    pub title: String,
+    /// The credit line as the album carries it (" / " between names).
+    pub credit: String,
+    pub folder_path: String,
+    pub track_count: i64,
+}
+
+/// Albums whose files are the same media: every track's content hash
+/// (the media region, so retagging doesn't change it) matches one for one.
+#[derive(Serialize)]
+pub struct DuplicateGroup {
+    /// Digest of the sorted hashes — what "Keep both" is keyed on.
+    pub key: String,
+    pub albums: Vec<DuplicateAlbum>,
+}
+
+/// Sets of albums that are byte-for-byte the same recordings (user's ask,
+/// 2026-10-03): a copy left behind, flagged and never touched — the fix is
+/// deleting a folder at the source and rescanning. Hash identity only, no
+/// metadata test: the same files under different tags are the more
+/// interesting duplicate, not a different case. Albums with any unhashed
+/// track (scanned before hashing existed) can't be judged and are skipped.
+#[tauri::command]
+pub async fn get_duplicate_albums(
+    state: State<'_, AppState>,
+    library_id: String,
+) -> Result<Vec<DuplicateGroup>, String> {
+    let pool = &state.app_db;
+    let rows: Vec<(i64, Option<String>)> = sqlx::query_as(
+        "SELECT me.parent_id, t.audio_hash FROM track t
+         JOIN media_entry me ON me.id = t.id
+         WHERE me.library_id = ? AND me.parent_id IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = me.parent_id)
+           AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = me.parent_id)",
+    )
+    .bind(&library_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let mut hashes: HashMap<i64, Option<Vec<String>>> = HashMap::new();
+    for (album_id, hash) in rows {
+        let slot = hashes.entry(album_id).or_insert_with(|| Some(Vec::new()));
+        match (slot.as_mut(), hash.filter(|h| !h.is_empty())) {
+            (Some(v), Some(h)) => v.push(h),
+            _ => *slot = None, // one unhashed track: the album can't be judged
+        }
+    }
+    let mut by_key: HashMap<String, Vec<i64>> = HashMap::new();
+    for (album_id, list) in hashes {
+        let Some(mut list) = list else { continue };
+        if list.is_empty() {
+            continue;
+        }
+        list.sort();
+        let key = format!("{:016x}", xxhash_rust::xxh3::xxh3_64(list.join("\n").as_bytes()));
+        by_key.entry(key).or_default().push(album_id);
+    }
+    let dismissed: std::collections::HashSet<String> = sqlx::query_as::<_, (String,)>(
+        "SELECT key FROM album_duplicate_dismiss WHERE library_id = ?",
+    )
+    .bind(&library_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .into_iter()
+    .map(|(k,)| k)
+    .collect();
+
+    let mut groups: Vec<DuplicateGroup> = Vec::new();
+    for (key, mut ids) in by_key {
+        if ids.len() < 2 || dismissed.contains(&key) {
+            continue;
+        }
+        ids.sort();
+        let mut albums = Vec::new();
+        for id in ids {
+            let row: Option<(String, String, i64)> = sqlx::query_as(
+                "SELECT al.title, al.folder_path,
+                        (SELECT COUNT(*) FROM media_entry t WHERE t.parent_id = al.id)
+                 FROM album al WHERE al.id = ?",
+            )
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            let Some((title, folder_path, track_count)) = row else { continue };
+            let credit: Vec<(String,)> = sqlx::query_as(
+                "SELECT name FROM album_artist_credit WHERE album_id = ? ORDER BY position",
+            )
+            .bind(id)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            albums.push(DuplicateAlbum {
+                id,
+                title,
+                credit: credit.into_iter().map(|(n,)| n).collect::<Vec<_>>().join(" / "),
+                folder_path,
+                track_count,
+            });
+        }
+        if albums.len() >= 2 {
+            groups.push(DuplicateGroup { key, albums });
+        }
+    }
+    groups.sort_by(|a, b| {
+        a.albums[0]
+            .title
+            .to_lowercase()
+            .cmp(&b.albums[0].title.to_lowercase())
+            .then(a.key.cmp(&b.key))
+    });
+    Ok(groups)
+}
+
+/// "Keep both": the duplicate set is intentional; the card never returns
+/// for these same files (the key is their hashes, not their rows).
+#[tauri::command]
+pub async fn dismiss_duplicate_albums(
+    state: State<'_, AppState>,
+    library_id: String,
+    key: String,
+) -> Result<(), String> {
+    sqlx::query(
+        "INSERT INTO album_duplicate_dismiss (library_id, key) VALUES (?, ?)
+         ON CONFLICT(library_id, key) DO UPDATE SET dismissed_at = datetime('now')",
+    )
+    .bind(&library_id)
+    .bind(&key)
+    .execute(&state.app_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }

@@ -10,7 +10,7 @@ import {
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { toast } from "sonner";
+import { toast } from "@/lib/toast";
 import { runBulkMatch, type BulkRunConfig } from "@/components/tmdbMatchEngine";
 import { latestEnrichProgress } from "@/hooks/enrichProgress";
 import type { Library } from "@/types";
@@ -555,6 +555,15 @@ export function LibraryRunsProvider({ children }: { children: ReactNode }) {
       const { libraryId, failed } = e.payload;
       update(libraryId, (r) => (r?.kind === "match" ? { ...r, failed } : r));
     });
+    // A match (by hand or by the pass) proved two albums are one MusicBrainz
+    // release group, and the app staged their combine itself: said once,
+    // here, so both paths toast the same line.
+    const unAutoCombine = listen<{ libraryId: string; message: string }>(
+      "music-auto-combine",
+      (e) => {
+        toast.info(e.payload.message);
+      },
+    );
     const unDone = listen<{ libraryId: string; error?: string; failed?: number }>(
       "music-enrich-done",
       (e) => {
@@ -578,6 +587,7 @@ export function LibraryRunsProvider({ children }: { children: ReactNode }) {
       unIteration.then((fn) => fn());
       unProgress.then((fn) => fn());
       unFailure.then((fn) => fn());
+      unAutoCombine.then((fn) => fn());
       unDone.then((fn) => fn());
     };
   }, [finishRun, libMeta, update]);

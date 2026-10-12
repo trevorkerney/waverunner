@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { FolderOpen } from "lucide-react";
-import { toast } from "sonner";
+import { toast } from "@/lib/toast";
 import { ContextMenuItem } from "../ui/context-menu";
 
 /** "Reveal in Explorer" context-menu item: opens the track's source folder

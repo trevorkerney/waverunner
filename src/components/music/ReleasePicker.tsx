@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { toast } from "sonner";
+import { toast } from "@/lib/toast";
 import { Disc3, Ellipsis, FolderOpen, Merge, NotebookPen, Pencil, Scissors, Star } from "lucide-react";
 import { ConfirmDialog } from "../ConfirmDialog";
 import { NoteDialog } from "../NoteDialog";

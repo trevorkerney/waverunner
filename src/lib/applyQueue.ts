@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from "react";
-import { toast } from "sonner";
+import { toast } from "@/lib/toast";
 
 /** The metadata page's apply queue.
  *
@@ -39,11 +39,17 @@ interface Snapshot {
    *  must STAY hidden until then, or it pops back for the beat between
    *  the item leaving the queue and the new review landing. The page
    *  clears these once its refresh has the data (clearSettledApplies). */
-  settled: QueuedApply[];
+  settled: SettledApply[];
+}
+
+/** A settled item remembers WHEN, so a refresh can tell whether its data
+ *  already reflects the apply (see clearSettledApplies). */
+export interface SettledApply extends QueuedApply {
+  settledAt: number;
 }
 
 let items: QueuedApply[] = [];
-let settled: QueuedApply[] = [];
+let settled: SettledApply[] = [];
 let runningId: number | null = null;
 let nextId = 1;
 let snapshot: Snapshot = { items, runningId, settled };
@@ -55,10 +61,15 @@ function emit() {
 }
 
 /** The page's refresh has landed — the settled items' cards are gone from
- *  the data itself now, so the hide can stop. */
-export function clearSettledApplies(libraryId: string) {
-  if (!settled.some((i) => i.libraryId === libraryId)) return;
-  settled = settled.filter((i) => i.libraryId !== libraryId);
+ *  the data itself now, so the hide can stop. `dataAsOf` is when that
+ *  refresh STARTED: only items settled before it are in its data. A refresh
+ *  that began earlier and landed after the apply would otherwise lift the
+ *  hide with stale data, and the row flashed back until the drain refresh
+ *  landed (his "goes away, comes back, goes away", 2026-10-04). */
+export function clearSettledApplies(libraryId: string, dataAsOf = Infinity) {
+  const gone = (i: SettledApply) => i.libraryId === libraryId && i.settledAt <= dataAsOf;
+  if (!settled.some(gone)) return;
+  settled = settled.filter((i) => !gone(i));
   emit();
 }
 
@@ -102,7 +113,7 @@ async function pump() {
       try {
         await item.run();
         // Stays hidden until the page's refresh shows it gone for real.
-        settled = [...settled, item];
+        settled = [...settled, { ...item, settledAt: performance.now() }];
       } catch (e) {
         // The card comes back (it's no longer hidden once the item leaves)
         // and the error names the decision it was for.

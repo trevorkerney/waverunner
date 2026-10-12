@@ -34,6 +34,9 @@ const Toaster = ({ ...props }: ToasterProps) => {
           "--border-radius": "var(--radius)",
         } as React.CSSProperties
       }
+      // Info / warning / error toasts stay until dismissed (src/lib/toast.ts),
+      // so every toast carries the way to dismiss it.
+      closeButton
       toastOptions={{
         classNames: {
           toast: "cn-toast",

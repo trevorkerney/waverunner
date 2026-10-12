@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { toast } from "sonner";
+import { toast } from "@/lib/toast";
 import { Sparkles } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -394,7 +394,6 @@ function MatchRunning({ run, className = "" }: { run: MatchRun; className?: stri
           <p className="truncate text-xs text-muted-foreground">
             {p?.name ?? "Starting…"}
             {p?.etaSecs != null ? ` · ${fmtEta(p.etaSecs)}` : ""}
-            {" · "}edits wait until the pass finishes
           </p>
         </div>
         {music && (

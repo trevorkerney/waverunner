@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { toast } from "sonner";
+import { toast } from "@/lib/toast";
 import { useLibraryRuns } from "@/hooks/libraryRuns";
 import { MATCH_STAGES } from "@/components/LibraryRunUi";
 import { LibraryAttentionBadge } from "@/components/music/PendingWork";

@@ -17,7 +17,7 @@ import { collectPageState, requestPageRestore, type MetadataPageState } from "@/
 import { Toaster } from "@/components/ui/sonner";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import { toast } from "sonner";
+import { toast } from "@/lib/toast";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { Library, MediaEntry, EntriesResponse, BreadcrumbItem, ViewSpec, PersonInfo, PersonSummary, PersonRole, PlaylistSummary, PlaylistsResponse, PlaylistContents, SortPreset, LibraryCounts, GenreSummary, EntryWatchFlags, MusicQueueItem } from "@/types";
@@ -3168,6 +3168,7 @@ function App() {
             musicPlaying={musicState.isActive && musicState.isPlaying}
             metadataFocus={mbReviewFocus}
             onOpenMusicAlbumFromMetadata={openMusicAlbumFromCenter}
+            onOpenMusicAlbumsFromMetadata={(libraryId) => selectView({ kind: "albums", libraryId })}
             hasLibraries={libraries.length > 0}
             onMetadataChanged={(libraryId) => {
               // A match/undo landed on the page — same recipe as a rescan:

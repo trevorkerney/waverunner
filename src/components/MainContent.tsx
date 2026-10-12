@@ -82,7 +82,7 @@ import {
   UserMinus,
 } from "lucide-react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
-import { toast } from "sonner";
+import { toast } from "@/lib/toast";
 import { Library, MediaEntry, BreadcrumbItem, MovieDetail, MovieDetailUpdate, SeasonInfo, EpisodeInfo, ShowDetail, SeasonDetailLocal, EpisodeDetailLocal, TmdbSeasonDetail, TmdbEpisodeDetail, TmdbShowFieldSelection, TmdbSeasonFieldSelection, TmdbEpisodeFieldSelection, CastUpdateInfo, CastInfo, RatingInfo, ViewSpec, PersonInfo, PersonDetail, PersonSummary, PersonRole, PlaylistSummary, GenreSummary, SortPreset, WatchState, EpisodeWatchInfo, ContinueTarget, ShowEpisodeFlat, MusicQueueItem, MusicAlbumCard, MusicAlbumDetail } from "@/types";
 import { queueFromRelease, defaultRelease } from "@/components/music/musicQueue";
 import { scopeKeyFor, viewCacheKey } from "@/lib/complications";
@@ -288,6 +288,8 @@ interface MainContentProps {
   onMetadataChanged?: (libraryId: string) => void;
   /** Metadata page album links: open the album, switched onto a release. */
   onOpenMusicAlbumFromMetadata?: (albumId: number, title: string, releaseId: number | null, trackId?: number) => void;
+  /** Metadata page's "Fix the library's shape" Go: the library's Albums page. */
+  onOpenMusicAlbumsFromMetadata?: (libraryId: string) => void;
   /** Any library exists — Home shows the "create one" landing otherwise. */
   hasLibraries: boolean;
 }
@@ -366,6 +368,7 @@ export function MainContent({
   metadataFocus,
   onMetadataChanged,
   onOpenMusicAlbumFromMetadata,
+  onOpenMusicAlbumsFromMetadata,
   hasLibraries,
 }: MainContentProps) {
   // Album SELECTION MODE — entered from a card's context menu, exited with
@@ -1582,6 +1585,7 @@ export function MainContent({
               onOpenMusicAlbumFromMetadata?.(albumId, title, releaseId, trackId)
             }
             onOpenArtist={(artistId, name) => onOpenMusicArtist?.(artistId, name)}
+            onOpenAlbums={() => onOpenMusicAlbumsFromMetadata?.(activeView.libraryId)}
           />
         </div>
       </main>

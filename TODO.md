@@ -6,6 +6,18 @@
 
 ## bugs / needs fixing
 
+FIX THE DAMN SCROLL JUMPING. HOWEVER. REDESIGN EVERYTHING IF NECESSARY. the only thing that will stop me at this point is seeing that the issue doesnt happen on prod and its just a dev thing, but idk about that.
+
+tracks page needs scroll gutter thing so page isnt moved by appearing/disappearing scrollbar
+
+on tracks page, i should be able to type in song name (or part of it) and then album and/or artist name (OR PART OF THEM) to further narrow the search ALSO i should be able to search without punctuation, like if I type 'wont' it should show results with "won't"
+
+very long members lists on artists page look pretty funny. look at earth, wind & fire for example
+
+titles of albums on artist page in grid view arent breaking to new lines. they arte being cut off with ellipsis. they should show the title like other grid pages.
+
+make step text in matching banner in metadata page not be cut off with ellipis
+
 cover picker doesnt seem to be updating based on release picker on artist page in detail view
 
 on matching banner, add artist name at the beginning plus a long dash, and remove 'edits wait until the pass finishes'
@@ -103,6 +115,10 @@ i noticed an album rename didnt update its location until refresh OR go away and
 
 
 ## changes / small new features
+
+add something, on import, to combine and merge albums that are in the same album folder. albums that are not high but not low confident matches could be shown to the user in a post scan modal where new content is added. consider.
+
+track playlists vs album playlists
 
 LISTENBRAINZ
 

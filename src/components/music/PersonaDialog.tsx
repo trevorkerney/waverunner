@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { toast } from "sonner";
+import { toast } from "@/lib/toast";
 import { Dialog, DialogBody, DialogContent, DialogHeader, DialogTitle } from "../ui/dialog";
 import { FadeIn, SkeletonRows, useSkeletonDelay } from "../ui/skeleton";
 import { Button } from "../ui/button";

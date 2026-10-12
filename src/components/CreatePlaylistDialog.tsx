@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { toast } from "sonner";
+import { toast } from "@/lib/toast";
 import { NameDialog } from "@/components/NameDialog";
 
 interface CreatePlaylistDialogProps {

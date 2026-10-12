@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useDeselectOnBackgroundClick } from "./useTrackSelection";
-import { toast } from "sonner";
+import { toast } from "@/lib/toast";
 import { Play, Disc3, Pencil, ListPlus, ListStart, ListEnd, ListChecks, HardDriveDownload } from "lucide-react";
 import { RenameDialog } from "../RenameDialog";
 import { Spinner } from "../ui/spinner";

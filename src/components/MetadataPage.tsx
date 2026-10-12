@@ -16,6 +16,7 @@ export function MetadataPage({
   onChanged,
   onOpenAlbum,
   onOpenArtist,
+  onOpenAlbums,
 }: {
   libraryId: string;
   /** null while the library list hasn't caught up (a library the wizard just
@@ -26,6 +27,8 @@ export function MetadataPage({
   onChanged: () => void;
   onOpenAlbum: (albumId: number, title: string, releaseId: number | null, trackId?: number) => void;
   onOpenArtist: (artistId: number, name: string) => void;
+  /** The guide's shape row: the library's Albums page. */
+  onOpenAlbums: () => void;
 }) {
   // Switching libraries while mounted refetches. Not on mount: the center
   // fetches on its own mount, and bumping here too meant every arrival ran
@@ -77,6 +80,7 @@ export function MetadataPage({
         onChanged={onChanged}
         onOpenAlbum={onOpenAlbum}
         onOpenArtist={onOpenArtist}
+        onOpenAlbums={onOpenAlbums}
         focus={focus}
       />
     </div>

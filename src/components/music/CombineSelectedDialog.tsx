@@ -13,6 +13,9 @@ import {
 import { Button } from "../ui/button";
 import { Spinner } from "../ui/spinner";
 import { commonTitle, stripDiscSuffix } from "@/lib/commonTitle";
+/** "Various Artists" — the credit a compilation carries; the matching pass
+ *  scopes such an album by Various Artists' MusicBrainz id. */
+const VARIOUS_ARTISTS = "Various Artists";
 import { MATCH_LOCK_TITLE, useMatchLock } from "@/hooks/libraryRuns";
 
 export interface AlbumSelection {
@@ -106,10 +109,6 @@ const ARTIST_BLOCK_PX = 34 + 30 * 2;
 // albums by two artists ask the album-artist question, so that block is
 // part of the cap.
 const CAP_PX = BASE_PX + ROW_PX * 2 + ARTIST_BLOCK_PX + TITLE_BLOCK_PX + discBlockPx(2);
-
-/** "Various Artists" — the credit a compilation carries; the matching pass
- *  scopes such an album by Various Artists' MusicBrainz id. */
-export const VARIOUS_ARTISTS = "Various Artists";
 
 /** Distinct credit lines among the picked albums, case-blind. */
 function distinctArtists(info: AlbumInfo[] | null): string[] {

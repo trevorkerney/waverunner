@@ -6,7 +6,7 @@ import { useGridWindow } from "@/hooks/useGridWindow";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { toast } from "sonner";
+import { toast } from "@/lib/toast";
 import {
   Dialog,
   DialogBody,
@@ -31,7 +31,7 @@ import {
 } from "@/components/ui/tooltip";
 import { MatchDialog } from "./MatchDialog";
 import { SplitArtistDialog } from "./EditDialogs";
-import { CombineSelectedDialog, VARIOUS_ARTISTS, type AlbumSelection } from "./CombineSelectedDialog";
+import { CombineSelectedDialog, type AlbumSelection } from "./CombineSelectedDialog";
 import { notifyPendingWorkChanged, passItemCount, passItemsLabel, usePendingWork } from "./PendingWork";
 import { WindowedList } from "./WindowedList";
 import {
@@ -47,7 +47,14 @@ import {
   takePageRestore,
   type MetadataPageState,
 } from "@/lib/pageState";
-import { IdentityDialog, type IdentityMode } from "./IdentityDialog";
+import { LinkArtistDialog } from "./LinkArtistDialog";
+import { PersonaDialog } from "./PersonaDialog";
+
+/** Which of the two identity dialogs a row button opens: "same" = the merge
+ *  (LinkArtistDialog), "persona" = PersonaDialog. One dialog per job (his
+ *  call, 2026-10-04 — the tabbed three-in-one is gone); Split has always
+ *  opened the split editor straight from its own row button. */
+type IdentityMode = "same" | "persona";
 import { MATCH_LOCK_TITLE, useLibraryRuns, useMatchLock } from "@/hooks/libraryRuns";
 import { MatchRunStrip } from "@/components/LibraryRunUi";
 
@@ -140,6 +147,9 @@ interface MbAlbumRow {
   /** First release still lacking a pin or a declared-none row — where the
    *  title link lands. null when every release is resolved. */
   focus_release_id: number | null;
+  /** Another separate album on the same release group — they combine on
+   *  their own once both hold a release match; until then, the chip. */
+  same_group: { album_id: number; title: string } | null;
 }
 
 interface MbChange {
@@ -203,18 +213,6 @@ interface MbReview {
   changes: MbChange[];
 }
 
-/** A folder whose files carry one album title under several album artists
- *  and so scanned as several one-artist albums — a compilation tagged with
- *  each track's artist as the album artist (split_compilations). Albums in
- *  track order; the first is the combine's keeper. */
-interface SplitCompilation {
-  folder_path: string;
-  title: string;
-  albums: { id: number; title: string; artist: string | null }[];
-  artist_count: number;
-  track_count: number;
-}
-
 export interface MusicMatchState {
   running: boolean;
   /** Albums never asked about — NOT the artist-scoped retries (those have
@@ -239,6 +237,21 @@ interface ScanIssueRow {
   reason: string;
 }
 
+/** Albums whose files are the same media (every track's content hash
+ *  matches) — a copy left behind. Flagged under File problems, never
+ *  touched: the fix is a folder deleted at the source, then a rescan. */
+interface DuplicateAlbum {
+  id: number;
+  title: string;
+  credit: string;
+  folder_path: string;
+  track_count: number;
+}
+interface DuplicateGroup {
+  key: string;
+  albums: DuplicateAlbum[];
+}
+
 /** Everything one refresh fetches, kept per library after the page unmounts.
  *  Arriving again paints the last picture at once and refetches behind it
  *  (the fetch is seven calls, the review alone walking every artist and
@@ -254,7 +267,7 @@ interface CenterSnapshot {
   issues: ScanIssueRow[];
   unlinked: UnlinkedCredit[];
   clusters: IdentityCluster[];
-  splitCompilations: SplitCompilation[];
+  duplicates: DuplicateGroup[];
   onlineEnabled: boolean;
   /** A matching pass has completed for this library (library_setting
    *  mb_pass_ran) — until it has, the map leads with step 0: run it. */
@@ -266,84 +279,9 @@ const centerCache = new Map<string, CenterSnapshot>();
 // carries Ignore / Un-ignore itself. (Each node used to wrap its own
 // context menu for the same two actions — 2.3K menu roots on arrival.)
 const STAGED_HINT = "Staged for rescan — undo the staged change to edit";
-
-/** One suspected split compilation (Albums tab, top, red): the fragments'
- *  credits in track order and one answer — combine as Various Artists — or
- *  the standing no. Red like the unmatched list, not amber like the
- *  suggestion cards: nothing here can match as it stands, and no pass will
- *  mend it. */
-function SplitCompilationCard({
-  group,
-  busy,
-  busyKey,
-  onCombine,
-  onDismiss,
-  onOpenAlbum,
-}: {
-  group: SplitCompilation;
-  busy: boolean;
-  busyKey: string | null;
-  onCombine: (g: SplitCompilation) => void;
-  onDismiss: (g: SplitCompilation) => void;
-  onOpenAlbum?: (albumId: number, title: string, releaseId: number | null) => void;
-}) {
-  const leaf = group.folder_path.split(/[\\/]/).filter(Boolean).pop() ?? group.folder_path;
-  const keeper = group.albums[0];
-  const credits = group.albums.map((a) => a.artist ?? "no artist");
-  return (
-    <div className="rounded-md border border-red-500/30 p-3">
-      <div className="mb-2 flex items-center justify-between gap-3">
-        <p className="min-w-0 truncate text-sm font-medium">
-          <Combine size={14} className="mr-1.5 inline text-muted-foreground" />
-          {/* The title opens the first fragment's page — the tracks say
-              what this is faster than the credits do. */}
-          {onOpenAlbum ? (
-            <button
-              type="button"
-              className="underline-offset-2 hover:underline"
-              title="Open the first album’s page"
-              onClick={() => onOpenAlbum(keeper.id, keeper.title, null)}
-            >
-              {group.title}
-            </button>
-          ) : (
-            group.title
-          )}
-          <span className="text-muted-foreground">
-            {" "}
-            — one compilation, {group.albums.length} albums?
-          </span>
-        </p>
-        <button
-          type="button"
-          disabled={busy}
-          onClick={() => onDismiss(group)}
-          title="Leave these as separate albums — the suggestion never returns for this folder"
-          className="shrink-0 text-[11px] text-muted-foreground underline underline-offset-2 hover:text-foreground disabled:pointer-events-none disabled:opacity-50"
-        >
-          {busyKey === `split-dismiss:${group.folder_path}` ? "…" : "they’re separate albums"}
-        </button>
-      </div>
-      <p className="text-xs text-muted-foreground">
-        {group.albums.length} albums by {group.artist_count} different artists share the folder “
-        {leaf}” — {group.track_count} tracks under one title. The files most likely name each
-        track’s artist as the album artist.
-      </p>
-      {/* Wraps rather than truncates: every credit stays readable on the
-          card itself, so no tooltip (his call). */}
-      <p className="mt-1 text-xs text-muted-foreground/70">{credits.join(" · ")}</p>
-      <div className="mt-2 flex flex-wrap items-center gap-2">
-        <Button size="sm" className="gap-1.5" disabled={busy} onClick={() => onCombine(group)}>
-          {busyKey === `split:${group.folder_path}` && <Spinner className="size-3" />}
-          Combine as Various Artists
-        </Button>
-        <span className="text-[11px] text-muted-foreground">
-          Staged for the next rescan — one track list, credited to Various Artists.
-        </span>
-      </div>
-    </div>
-  );
-}
+/** Decision controls while a click's apply or the page's refresh is in
+ *  flight (busy, not a pass): the hover text that says why. */
+const PAGE_BUSY_TITLE = "The page is updating — one moment";
 
 function AlbumChip({
   al,
@@ -551,6 +489,9 @@ interface MetadataCenterProps {
   onOpenAlbum?: (albumId: number, title: string, releaseId: number | null, trackId?: number) => void;
   /** An artist name was clicked: open their page. Same host rule. */
   onOpenArtist?: (artistId: number, name: string) => void;
+  /** The guide's shape row: open the library's Albums page (the real one,
+   *  not this page's Albums tab) — where rows get combined. */
+  onOpenAlbums?: () => void;
   /** Land on this pane and card instead of the map; a new nonce re-lands. */
   focus?: CenterFocus | null;
 }
@@ -558,7 +499,6 @@ interface MetadataCenterProps {
 type PaneId =
   | "sources"
   | "map"
-  | "structure"
   | "albums"
   | "artists"
   | "credits"
@@ -1011,13 +951,6 @@ function sortGroupCandidates<
   );
 }
 
-/** A tag name that reads as several artists in one — separators, "feat",
- *  "Various". A hint only (no automatic splitting, user rule): such a name
- *  is no MusicBrainz artist, so the albums are the way to identify them. */
-function looksJoint(title: string): boolean {
-  return /[,&/]|\band\b|\bfeat\.?\b|\bft\.?\b|\bvs\.?\b|^various\b/i.test(title);
-}
-
 const ArtistRow = memo(function ArtistRow({
   a,
   first,
@@ -1028,15 +961,19 @@ const ArtistRow = memo(function ArtistRow({
   onPersona,
   onOpen,
   disabled,
-  note,
+  locked,
+  lockTitle,
   matchAlbumId,
   onMatchAlbum,
 }: {
   a: MbArtistRow;
   first: boolean;
   onMatch: (id: number) => void;
-  /** An amber aside after the name (a hint about the better route). */
-  note?: string;
+  /** The page is busy (an apply, its refresh, a pass): every decision
+   *  control greys out, with `lockTitle` as the hover text — unlike
+   *  `disabled`, which is this row's own reason (its cluster card first). */
+  locked?: boolean;
+  lockTitle?: string;
   /** Via-album rows: the one unmatched album a Match-album click opens. */
   matchAlbumId?: number;
   onMatchAlbum?: (albumId: number) => void;
@@ -1058,6 +995,8 @@ const ArtistRow = memo(function ArtistRow({
    *  manual actions unlock once it's gone (hover explains). */
   disabled?: boolean;
 }) {
+  const off = disabled || locked;
+  const lockHint = locked && !disabled ? lockTitle ?? PAGE_BUSY_TITLE : undefined;
   // Disabled buttons swallow pointer events, so the hover hint rides a
   // wrapper span around each one.
   const withHint = (btn: React.ReactNode, key: string) =>
@@ -1096,9 +1035,6 @@ const ArtistRow = memo(function ArtistRow({
             not on MusicBrainz — match their albums
           </span>
         )}
-        {note && a.state !== "notfound" && (
-          <span className="ml-1.5 text-[11px] text-amber-300/90">{note}</span>
-        )}
       </span>
       {/* Via-album rows lead with the route that works: the one unmatched
           album's match dialog. The artist actions stay, after it. */}
@@ -1109,7 +1045,8 @@ const ArtistRow = memo(function ArtistRow({
             size="sm"
             variant="ghost"
             className="h-6 shrink-0 gap-1 px-2 text-xs text-amber-300 hover:text-amber-200"
-            disabled={disabled}
+            disabled={off}
+            title={lockHint}
             onClick={() => onMatchAlbum(matchAlbumId)}
           >
             <Disc3 size={12} />
@@ -1127,7 +1064,8 @@ const ArtistRow = memo(function ArtistRow({
           className={`h-6 shrink-0 gap-1 px-2 text-xs ${
             a.state === "matched" ? "text-emerald-400 hover:text-emerald-300" : ""
           }`}
-          disabled={disabled}
+          disabled={off}
+          title={lockHint}
           onClick={() => onMatch(a.artist_id)}
         >
           {a.state === "matched" ? (
@@ -1151,7 +1089,8 @@ const ArtistRow = memo(function ArtistRow({
             size="sm"
             variant="ghost"
             className="h-6 shrink-0 gap-1 px-2 text-xs"
-            disabled={disabled}
+            disabled={off}
+            title={lockHint}
             onClick={() => onLink(a)}
           >
             <Equal size={12} />
@@ -1167,7 +1106,8 @@ const ArtistRow = memo(function ArtistRow({
             size="sm"
             variant="ghost"
             className="h-6 shrink-0 gap-1 px-2 text-xs"
-            disabled={disabled}
+            disabled={off}
+            title={lockHint}
             onClick={() => onPersona(a)}
           >
             <VenetianMask size={12} />
@@ -1182,7 +1122,8 @@ const ArtistRow = memo(function ArtistRow({
             size="sm"
             variant="ghost"
             className="h-6 shrink-0 gap-1 px-2 text-xs"
-            disabled={disabled}
+            disabled={off}
+            title={lockHint}
             onClick={() => onSplit(a)}
           >
             <Scissors size={12} />
@@ -1197,7 +1138,8 @@ const ArtistRow = memo(function ArtistRow({
             size="sm"
             variant="ghost"
             className="h-6 shrink-0 gap-1 px-2 text-xs"
-            disabled={disabled}
+            disabled={off}
+            title={lockHint}
             onClick={() => onIgnore(a)}
           >
             <CircleSlash size={12} />
@@ -1216,7 +1158,9 @@ const AlbumRow = memo(function AlbumRow({
   onIgnore,
   onCombine,
   onOpen,
+  onOpenSibling,
   locked,
+  lockTitle: lockTitleProp,
 }: {
   a: MbAlbumRow;
   first: boolean;
@@ -1227,13 +1171,17 @@ const AlbumRow = memo(function AlbumRow({
   onCombine?: (a: MbAlbumRow) => void;
   /** Title click → the album page (on the release still needing a pick). */
   onOpen?: (a: MbAlbumRow) => void;
-  /** A pass is running on the library: the three decision buttons grey out
-   *  (the page's rule — every decision waits for the fresh picture); the
-   *  title link stays, it's browsing. */
+  /** The same-group chip's sibling link. */
+  onOpenSibling?: (albumId: number, title: string) => void;
+  /** The page is busy — a pass running, or an apply / its refresh in
+   *  flight: the three decision buttons grey out (the page's rule — every
+   *  decision waits for the fresh picture); the title link stays, it's
+   *  browsing. `lockTitle` says which. */
   locked?: boolean;
+  lockTitle?: string;
 }) {
   const identified = a.state === "release" || a.state === "album";
-  const lockTitle = locked ? MATCH_LOCK_TITLE : undefined;
+  const lockTitle = locked ? lockTitleProp ?? MATCH_LOCK_TITLE : undefined;
   return (
     <div className={`flex items-center gap-1.5 px-3 py-1.5 text-sm ${first ? "" : "border-t"}`}>
       <span className="min-w-0 flex-1 truncate">
@@ -1255,6 +1203,28 @@ const AlbumRow = memo(function AlbumRow({
             {[a.gap_ours > 0 && `${a.gap_ours} unmatched`, a.gap_mb > 0 && `${a.gap_mb} missing`]
               .filter(Boolean)
               .join(" · ")}
+          </span>
+        )}
+        {/* Two separate albums on one release group (his ask, 2026-10-03):
+            they combine on their own once both hold a release match; until
+            then the row says what the pass is waiting on. */}
+        {a.same_group && (
+          <span
+            className="ml-1.5 text-[11px] text-amber-300"
+            title="Both albums resolve to one MusicBrainz release group. Once each has a release matched, they combine into one album as separate releases."
+          >
+            same release group as{" "}
+            {onOpenSibling ? (
+              <button
+                type="button"
+                className="underline-offset-2 hover:underline"
+                onClick={() => onOpenSibling(a.same_group!.album_id, a.same_group!.title)}
+              >
+                “{a.same_group.title}”
+              </button>
+            ) : (
+              `“${a.same_group.title}”`
+            )}
           </span>
         )}
       </span>
@@ -1353,6 +1323,7 @@ export function MetadataCenter({
   onRunPass,
   onOpenAlbum,
   onOpenArtist,
+  onOpenAlbums,
   focus,
 }: MetadataCenterProps) {
   // Album/artist-row title links. undefined (not a no-op) when the host
@@ -1364,6 +1335,11 @@ export function MetadataCenter({
       onOpenAlbum
         ? (a: MbAlbumRow) => onOpenAlbum(a.album_id, a.title, a.focus_release_id)
         : undefined,
+    [onOpenAlbum],
+  );
+  // The same-group chip's link: the sibling album's page, no release focus.
+  const openSibling = useMemo(
+    () => (onOpenAlbum ? (id: number, title: string) => onOpenAlbum(id, title, null) : undefined),
     [onOpenAlbum],
   );
   const openArtistRow = useMemo(
@@ -1379,9 +1355,7 @@ export function MetadataCenter({
   const [fallbacks, setFallbacks] = useState<TagFallbackRow[]>(() => cached?.fallbacks ?? []);
   const [issues, setIssues] = useState<ScanIssueRow[]>(() => cached?.issues ?? []);
   const [unlinked, setUnlinked] = useState<UnlinkedCredit[]>(() => cached?.unlinked ?? []);
-  const [splitComps, setSplitComps] = useState<SplitCompilation[]>(
-    () => cached?.splitCompilations ?? [],
-  );
+  const [duplicates, setDuplicates] = useState<DuplicateGroup[]>(() => cached?.duplicates ?? []);
   // The two work queues, live (see usePendingWork): staged directives a
   // rescan will apply, and applied matches a matching pass has yet to cash
   // in. Two cheap queries, refetched on every event that changes them — the
@@ -1397,12 +1371,18 @@ export function MetadataCenter({
   // shifts under the user later when an apply lands.
   const applyQueue = useApplyQueue();
   const queuedForLib = applyQueue.items.filter((i) => i.libraryId === libraryId);
+  const settledForLib = applyQueue.settled.filter((i) => i.libraryId === libraryId);
   // Hidden = queued OR applied-but-not-yet-refreshed (the store keeps the
   // latter until this page's refresh lands — see clearSettledApplies).
-  const hiddenApplies = [
-    ...queuedForLib,
-    ...applyQueue.settled.filter((i) => i.libraryId === libraryId),
-  ];
+  const hiddenApplies = [...queuedForLib, ...settledForLib];
+  // The drain refresh is the one render that MOVES the page (sections
+  // appear, rows shift) — and it used to be the same render that put every
+  // button back, so a click aimed during the apply landed on whatever had
+  // slid under the pointer (his misclick, 2026-10-04). `settling` holds the
+  // lock (and the banner, as "Refreshing…") from the last apply through
+  // the refresh, its paint, and a short grace after it.
+  const [settling, setSettling] = useState(false);
+  const settleToken = useRef(0);
   const queuedSuggestionIds = new Set(
     hiddenApplies.map((i) => i.target.suggestionId).filter((id): id is number => id != null),
   );
@@ -1427,7 +1407,7 @@ export function MetadataCenter({
   // counts (user's call, 2026-09-26): the backend refuses every decision
   // meanwhile, and the pass rewrites what the cards show — decisions wait
   // for the fresh picture. Browsing (tabs, Go, the map) stays.
-  const busy = busyKey !== null || running;
+  const busy = busyKey !== null || running || settling;
   // Pass progress is NOT rendered here — the match modal owns it. The center
   // only keeps the completion listener (silent refresh) and the running flag
   // (button states + the rail's "open the modal" pointer).
@@ -1450,11 +1430,10 @@ export function MetadataCenter({
     artistId: number | null;
     mode: IdentityMode;
     suggested: { id: number; name: string } | null;
-    row: MbArtistRow | null;
   } | null>(null);
   const openIdentity = useCallback(
     (row: MbArtistRow, mode: IdentityMode) =>
-      setIdentitySource({ name: row.title, artistId: row.artist_id, mode, suggested: null, row }),
+      setIdentitySource({ name: row.title, artistId: row.artist_id, mode, suggested: null }),
     [],
   );
   // The two row-button shapes, stable for the memo rows.
@@ -1564,9 +1543,12 @@ export function MetadataCenter({
   }, [libraryId]);
 
   async function refreshOnce() {
+    // When this refresh's data is "as of": an apply that settles after this
+    // moment is not in it, and its card stays hidden until the next one.
+    const startedAt = performance.now();
     if (!hasReview.current) setLoading(true);
     try {
-      const [rev, ms, fb, iss, unl, ls, clus, split] = await Promise.all([
+      const [rev, ms, fb, iss, unl, ls, clus, dups] = await Promise.all([
         invoke<MbReview>("mb_get_review", { libraryId }),
         invoke<MusicMatchState>("music_match_state", { libraryId }),
         invoke<TagFallbackRow[]>("get_music_tag_fallbacks", { libraryId }),
@@ -1574,7 +1556,7 @@ export function MetadataCenter({
         invoke<UnlinkedCredit[]>("get_unlinked_credits", { libraryId }),
         invoke<Record<string, string>>("get_library_settings", { libraryId }),
         invoke<IdentityCluster[]>("mb_identity_clusters", { libraryId }),
-        invoke<SplitCompilation[]>("split_compilations", { libraryId }),
+        invoke<DuplicateGroup[]>("get_duplicate_albums", { libraryId }),
       ]);
       const snapshot: CenterSnapshot = {
         review: rev,
@@ -1583,7 +1565,7 @@ export function MetadataCenter({
         issues: iss,
         unlinked: unl,
         clusters: clus,
-        splitCompilations: split,
+        duplicates: dups,
         onlineEnabled: ls["online_metadata"] !== "off",
         passRan: ls["mb_pass_ran"] === "1",
       };
@@ -1594,12 +1576,14 @@ export function MetadataCenter({
       setIssues(iss);
       setUnlinked(unl);
       setClusters(clus);
-      setSplitComps(split);
+      setDuplicates(dups);
       setOnlineEnabled(snapshot.onlineEnabled);
       setPassRan(snapshot.passRan);
-      // The new review no longer holds what the queue applied — the hide
-      // on those cards can stop (same tick as the data, so no flash).
-      clearSettledApplies(libraryId);
+      // The new review no longer holds what the queue applied BEFORE it
+      // started — the hide on those cards can stop (same tick as the data,
+      // so no flash). Anything settled since stays hidden for the refresh
+      // that will actually show it gone.
+      clearSettledApplies(libraryId, startedAt);
       // A refresh follows every mutation this page makes; the queues (here
       // and on the sidebar badge / library strip) refetch off this.
       notifyPendingWorkChanged();
@@ -1632,7 +1616,21 @@ export function MetadataCenter({
     });
     const onDrained = (e: Event) => {
       if ((e as CustomEvent<{ libraryId: string }>).detail?.libraryId !== libraryId) return;
-      refresh();
+      // Locked through the refresh, the paint of its result, and ~400ms
+      // more: long enough for a click already in motion to land on a
+      // disabled control and for the eye to catch the new layout. A
+      // second drain inside the window restarts it (the token).
+      const token = ++settleToken.current;
+      setSettling(true);
+      void refresh().finally(() => {
+        requestAnimationFrame(() =>
+          requestAnimationFrame(() => {
+            window.setTimeout(() => {
+              if (settleToken.current === token) setSettling(false);
+            }, 400);
+          }),
+        );
+      });
       onChanged?.();
     };
     window.addEventListener("waverunner:apply-queue-drained", onDrained);
@@ -1760,29 +1758,6 @@ export function MetadataCenter({
           : "Kept separate.",
       );
     });
-  // Split-compilation card: one click stages the merge of every fragment
-  // into the first (its first track's album) as Various Artists — the
-  // credit lands on the keeper now, the merge on the next rescan. The
-  // backend's refusals (a shared disc/track slot) come back as the toast.
-  const combineSplit = (g: SplitCompilation) =>
-    run(`split:${g.folder_path}`, async () => {
-      const [keeper, ...rest] = g.albums;
-      await invoke("combine_albums_multi", {
-        libraryId,
-        sourceIds: rest.map((a) => a.id),
-        targetId: keeper.id,
-        mode: "merge",
-        targetReleaseFolder: null,
-        albumArtist: VARIOUS_ARTISTS,
-      });
-      toast(`Combine staged — “${g.title}” becomes one Various Artists album on the next rescan`);
-    });
-  // The standing no: these are separate albums; the card never returns
-  // for this folder.
-  const dismissSplit = (g: SplitCompilation) =>
-    run(`split-dismiss:${g.folder_path}`, () =>
-      invoke("dismiss_split_compilation", { libraryId, folderPath: g.folder_path }),
-    );
   const undo = (batchId: number) =>
     run(`undo:${batchId}`, () => invoke("mb_undo_batch", { libraryId, batchId }));
   const recheck = (albumId: number) =>
@@ -1945,11 +1920,6 @@ export function MetadataCenter({
       !queuedAlbumIds.has(a.album_id) &&
       albumMatches(a),
   );
-  // Split-compilation cards (the Structure pane): gone once any fragment is
-  // staged (its combine landed) or queued.
-  const splitPending = splitComps.filter(
-    (g) => !g.albums.some((a) => stagedLockedIds.has(a.id) || queuedAlbumIds.has(a.id)),
-  );
   const albumsIdentified = albums.filter(
     (a) => (a.state === "release" || a.state === "album") && albumMatches(a),
   );
@@ -1977,21 +1947,8 @@ export function MetadataCenter({
   );
   // Every unmatched owner is a main artist, one-album owners included (the
   // "better matched through their album" section that split them off was
-  // retired 2026-09-27 — user's call). The per-artist unmatched-album map
-  // survives only for the joint-name hint on a row.
-  const unmatchedAlbumsByArtist = useMemo(() => {
-    const m = new Map<number, MbAlbumRow[]>();
-    for (const al of albums) {
-      if (al.state !== "notfound" && al.state !== "unchecked") continue;
-      if (al.ignored || stagedLockedIds.has(al.album_id)) continue;
-      for (const id of al.artist_ids) {
-        const list = m.get(id);
-        if (list) list.push(al);
-        else m.set(id, [al]);
-      }
-    }
-    return m;
-  }, [albums, stagedLockedIds]);
+  // retired 2026-09-27 — user's call; the joint-name row hint that outlived
+  // it went 2026-10-04).
   const artistsUnmatchedFeatures = artistsUnmatched.filter(
     (a) => a.album_count === 0 && notStagedSplit(a),
   );
@@ -2035,11 +1992,10 @@ export function MetadataCenter({
     if (!review) return;
     if (
       (pane === "credits" && unlinked.length === 0) ||
-      (pane === "gaps" && review.gaps.length === 0) ||
-      (pane === "structure" && splitPending.length === 0)
+      (pane === "gaps" && review.gaps.length === 0)
     )
       setPane(onlineEnabled ? "map" : "files");
-  }, [pane, review, unlinked, onlineEnabled, splitPending.length]);
+  }, [pane, review, unlinked, onlineEnabled]);
   // Opted out: every MusicBrainz-backed pane is hidden — a stale selection
   // (or a just-flipped setting) redirects to the local ground.
   useEffect(() => {
@@ -2591,11 +2547,15 @@ export function MetadataCenter({
   );
   const mapReds = artists.filter(artistRed).length + albums.filter(albumRed).length;
   // Completion share over the same population the map colors (ignored
-  // entities are out of both sides, per doctrine). floor() so 100 can only
-  // ever mean literally nothing red — 99.9% done still reads 99%.
+  // entities are out of both sides, per doctrine). One decimal (his ask,
+  // 2026-10-05), floored at that place so 100 can only ever mean literally
+  // nothing red — 99.97% done still reads 99.9% — and plain "100" then.
   const mapTotal =
     artists.filter((a) => !a.ignored).length + albums.filter((a) => !a.ignored).length;
-  const mapPct = mapTotal === 0 ? 100 : Math.floor(((mapTotal - mapReds) / mapTotal) * 100);
+  const mapPct =
+    mapTotal === 0 || mapReds === 0
+      ? "100"
+      : (Math.floor(((mapTotal - mapReds) / mapTotal) * 1000) / 10).toFixed(1);
 
   // FLIP for the decision cards: resolving one slides the rest up into the
   // gap instead of snapping (shared recipe — see useFlipList).
@@ -2639,14 +2599,6 @@ export function MetadataCenter({
   // disappears rather than sitting permanently "unfinished".
   // The map keeps the top slot — the whole-library picture, with the guided
   // steps and the how-it-works primer living right on it.
-  // The library's SHAPE (user's call, 2026-09-27): rows the scan cut wrong,
-  // to fix BEFORE any matching — a match is keyed to the rows it was made
-  // on, and a combine dissolves them. Local work (no MusicBrainz), so it
-  // shows with online metadata off too; exists only while it has something.
-  const structureNav =
-    splitPending.length > 0
-      ? [{ id: "structure" as const, label: "Structure", count: 0, alert: splitPending.length }]
-      : [];
   const NAV: { id: PaneId; label: string; count: number; warn?: number; alert?: number }[] = [
     // Sources first (user's call, 2026-09-11): where every value came from —
     // tags, MusicBrainz, edits — per album and loose track. Reference, not
@@ -2661,7 +2613,6 @@ export function MetadataCenter({
             // map's whole promise (nothing red), a count is just noise.
             count: 0,
           },
-          ...structureNav,
           {
             id: "artists" as const,
             label: "Artists",
@@ -2694,7 +2645,7 @@ export function MetadataCenter({
             ).length,
           },
         ]
-      : structureNav),
+      : []),
     ...(unlinked.length > 0
       ? [
           {
@@ -2717,8 +2668,8 @@ export function MetadataCenter({
     {
       id: "files",
       label: "File problems",
-      count: fallbacks.length + issues.length,
-      warn: issues.length,
+      count: fallbacks.length + issues.length + duplicates.length,
+      warn: issues.length + duplicates.length,
     },
   ];
   // History is pinned to the nav's bottom, apart from the work sections — a
@@ -2914,6 +2865,72 @@ export function MetadataCenter({
             />
           </div>
 
+          {/* The vocabulary (his ask, 2026-10-04): MusicBrainz's ladder —
+              artist → release group → release → track — and which of the
+              library's things each rung is matched to. Collapsed like the
+              doctrine below it; read once, then the words in every card
+              make sense. */}
+          <details className="rounded-md border px-3 py-2">
+            <summary className="cursor-pointer select-none text-sm font-medium">
+              How MusicBrainz works
+            </summary>
+            <div className="mt-2 space-y-3 text-xs text-muted-foreground">
+              <p>
+                MusicBrainz describes music as a ladder of four things, each owned by the one
+                above it. Matching is lining your library up with that ladder, one rung at a time.
+              </p>
+              <ul className="list-disc space-y-1 pl-4">
+                <li>
+                  <span className="text-foreground">Artist</span> — a person or group with one
+                  permanent id, whatever the tags spell. Your{" "}
+                  <span className="text-foreground">artist page</span> matches one of these. The
+                  match brings the canonical name, aliases, members and member-of lines, and
+                  unlocks the artist’s discography for the album step.
+                </li>
+                <li>
+                  <span className="text-foreground">Release group</span> — the album as a work:
+                  “Thriller”, with its original release date and type (album, EP, single,
+                  compilation…), regardless of how many times it was issued. Your{" "}
+                  <span className="text-foreground">album card</span> matches one of these. The
+                  card takes the group’s title, date and type, and the card’s artists are
+                  identified from the group’s credit.
+                </li>
+                <li>
+                  <span className="text-foreground">Release</span> — one issue of that group: the
+                  1982 LP, the 2001 CD, the 2016 remaster, each with its own track list, country,
+                  label and cover art. Each{" "}
+                  <span className="text-foreground">release of your album</span> (each edition the
+                  card holds) matches one of these. This is the match that proves the files: the
+                  track list is checked against yours, the release’s credits replace the tags’,
+                  feature artists are found, and the release keeps its own year and cover.
+                </li>
+                <li>
+                  <span className="text-foreground">Track</span> — one slot on a release, pointing
+                  at a recording that may appear on many releases. Your{" "}
+                  <span className="text-foreground">tracks</span> match these through the release:
+                  titles and per-track credits come from the matched release; durations always
+                  stay the file’s own.
+                </li>
+              </ul>
+              <p>
+                That ladder is why the steps run top-down. An artist match narrows the album step
+                to that artist’s groups; a group match says which album it is but proves nothing
+                about the files; a release match is the only one that checks every track. Until
+                the release is picked, an album shows as{" "}
+                <span className="text-foreground">matched to a group</span> and its track list is
+                unverified. Two of your albums that match the same group are the same album in two
+                releases, and combine into one card once both are release-matched.
+              </p>
+              <p>
+                Compilations are release groups credited to{" "}
+                <span className="text-foreground">Various Artists</span>, a real MusicBrainz artist
+                that stands for “many”; the per-track credits live on the release. A joint credit
+                (“A & B”) is not an artist in MusicBrainz — it is two artists on one credit, which
+                is what Split is for.
+              </p>
+            </div>
+          </details>
+
           {/* The doctrine: every name and every album ends in one of a
               handful of states, and the grind has an order. Collapsed by
               default so veterans never scroll past it twice. */}
@@ -2924,11 +2941,12 @@ export function MetadataCenter({
             <div className="mt-2 space-y-3 text-xs text-muted-foreground">
               <p>
                 Work top-down:{" "}
-                <span className="text-foreground">artists with several albums first</span> — each
-                one identified unlocks their whole discography for the next pass —{" "}
-                <span className="text-foreground">then albums</span> (an artist with a single
-                album is identified through it — a matched release proves everyone credited on
-                it),{" "}
+                <span className="text-foreground">artists first</span> — every artist credited on
+                an album or a loose track, one album or twenty; each one identified unlocks their
+                whole discography for the next pass —{" "}
+                <span className="text-foreground">then albums</span> (a matched release also
+                proves everyone credited on it, so an artist you skipped can still be settled by
+                their album),{" "}
                 <span className="text-foreground">then exact releases</span>. Feature artists are
                 filled in automatically as releases are matched; matching them directly is almost
                 never needed.
@@ -3022,6 +3040,21 @@ export function MetadataCenter({
               </p>
             </div>
           </details>
+          {/* The one rule above every step (his ask, 2026-10-04): a match
+              or an edit made on a guess does damage a pass then builds on;
+              Ignore is the honest answer when you can't tell. Prominent
+              and permanent — it applies to everything on this page. */}
+          <div className="flex items-start gap-3 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2">
+            <TriangleAlert size={16} className="mt-0.5 shrink-0 text-amber-300" />
+            <div className="min-w-0">
+              <p className="text-sm font-medium text-amber-200">Only match or change what you’re sure of</p>
+              <p className="text-xs text-muted-foreground">
+                A wrong match stamps credits, dates and track titles, and the next pass builds on
+                it. When you can’t tell, use Ignore instead: an ignored artist or album stops
+                counting, and you can come back to it any time.
+              </p>
+            </div>
+          </div>
           {mapReds === 0 ? (
             <div className="flex items-center gap-3 rounded-md border border-emerald-500/40 bg-emerald-500/5 px-3 py-2">
               <CircleCheck size={16} className="shrink-0 text-emerald-400" />
@@ -3029,7 +3062,7 @@ export function MetadataCenter({
                 Nothing left to match — every artist and album is matched or ignored.
               </p>
             </div>
-          ) : guideStep0 || guideStage !== 0 || splitPending.length > 0 ? (
+          ) : (
             <div className="overflow-hidden rounded-md border">
               {guideStep0 && (
                 <div className="flex items-center gap-3 bg-accent/40 px-3 py-2">
@@ -3076,35 +3109,39 @@ export function MetadataCenter({
                   )}
                 </div>
               )}
-              {/* The shape step (user's call, 2026-09-27): numberless, above
-                  step 1, only while there is something to fix. Its Go never
-                  waits for the pass — it's what the pass should come after.
-                  Highlighted as the current thing unless step 0 is. */}
-              {splitPending.length > 0 && (
-                <div
-                  className={`flex items-center gap-3 px-3 py-2 ${guideStep0 ? "border-t" : "bg-accent/40"}`}
-                >
-                  <span className="flex size-5 shrink-0 items-center justify-center rounded-full border border-red-500/60 text-red-400">
-                    <Combine size={11} />
-                  </span>
-                  <div className="min-w-0 flex-1">
-                    <p className="text-sm font-medium">
-                      Fix the library’s shape
-                      <span className="font-normal text-muted-foreground">
-                        {" "}
-                        — {splitPending.length} left
-                      </span>
+              {/* The shape step (user's call, 2026-09-27 / 2026-10-03):
+                  numberless, above step 1, always there — no detector
+                  behind it, just the reminder and a Go to the library's
+                  ALBUMS PAGE (the sidebar's, not this page's Albums tab),
+                  where rows get combined. Its Go never waits for the pass:
+                  it's what the pass should come after. */}
+              <div className={`flex items-center gap-3 px-3 py-2.5 ${guideStep0 ? "border-t" : ""}`}>
+                <span className="size-5 shrink-0" />
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-medium">Fix the library’s shape</p>
+                  <div className="space-y-1 text-xs text-muted-foreground">
+                    <p>
+                      The scan can’t always confidently tell when multiple album releases are all
+                      part of the same release group — also, sometimes tracks that should be on the
+                      same album release have different album/album-artist tags, which waverunner
+                      interprets as different albums.
                     </p>
-                    <p className="text-xs text-muted-foreground">
-                      Albums the scan cut into pieces. Combine them before matching anything: a
-                      match is keyed to the rows it was made on, and a combine dissolves them.
+                    <p>
+                      Go to the albums page and use the right-click context menu on albums to select
+                      and merge albums as necessary.
+                    </p>
+                    <p>
+                      Merged albums match on their own, and a match made on a fragment is lost
+                      when you merge it later — so do this first.
                     </p>
                   </div>
-                  <Button size="sm" variant="outline" className="shrink-0" onClick={() => goTo("structure")}>
+                </div>
+                {onOpenAlbums && (
+                  <Button size="sm" variant="outline" className="shrink-0" onClick={onOpenAlbums}>
                     Go
                   </Button>
-                </div>
-              )}
+                )}
+              </div>
               {(
                 [
                   [
@@ -3113,7 +3150,7 @@ export function MetadataCenter({
                     guideOwnerLeft,
                     clusterOwners.length + artistSuggestionsOwners.length,
                     "artists",
-                    "Artists with several unmatched albums first — each one identified unlocks all of them for automatic matching on the next pass. An artist with a single album is matched through that album in step 2.",
+                    "Every artist credited on an album or a loose track, one album or twenty — each one identified unlocks their whole discography for automatic matching on the next pass, and narrows step 2 to their release groups.",
                   ],
                   [
                     2,
@@ -3121,7 +3158,7 @@ export function MetadataCenter({
                     guideAlbumsLeft,
                     albumSuggestions.length,
                     "albums",
-                    "Matched albums prove the artists credited on them — one-album artists included — so pick exact releases where you can.",
+                    "Matched albums prove the artists credited on them — an artist you skipped in step 1 is settled by their album here — so pick exact releases where you can.",
                   ],
                   [
                     3,
@@ -3143,9 +3180,9 @@ export function MetadataCenter({
               ).map(([n, title, left, ready, target, desc]) => (
                 <Fragment key={n}>
                 <div
-                  className={`flex items-center gap-3 px-3 py-2 ${
-                    n > 1 || guideStep0 || splitPending.length > 0 ? "border-t" : ""
-                  } ${guideCurrent === n ? "bg-accent/40" : ""}`}
+                  className={`flex items-center gap-3 border-t px-3 py-2 ${
+                    guideCurrent === n ? "bg-accent/40" : ""
+                  }`}
                 >
                   <span
                     className={`flex size-5 shrink-0 items-center justify-center rounded-full border text-[11px] ${
@@ -3270,11 +3307,6 @@ export function MetadataCenter({
               {/* No pass button here — the queue banner at the top owns it.
                   (This whole checklist section is due for a redesign.) */}
             </div>
-          ) : (
-            <p className="text-sm text-muted-foreground">
-              {mapReds} unmatched — click a node below to match it, or to ignore what should
-              stop counting.
-            </p>
           )}
 
           {/* Legend. */}
@@ -3323,47 +3355,6 @@ export function MetadataCenter({
             <FeatureStrip artists={featureArtists} lockedIds={stagedLockedIds} onMatchArtist={setMatchArtist} />
           )}
         </section>
-      )}
-
-      {/* The library's SHAPE (user's call, 2026-09-27): rows the scan cut
-          wrong, fixed before any matching — a match is keyed to the rows it
-          was made on, and a combine dissolves them. Red throughout: nothing
-          here can match as it stands, and no pass mends it. The pane exists
-          only while it has something; spelling clusters stay on Artists. */}
-      {pane === "structure" && (
-      <section>
-        <div className="mb-4 flex items-center gap-2">
-          <h3 className="text-base font-semibold uppercase tracking-wide text-muted-foreground">
-            <span className="text-xl text-foreground">{splitPending.length}</span>{" "}
-            {splitPending.length === 1 ? "fix" : "fixes"} before matching
-          </h3>
-        </div>
-        {splitPending.length > 0 && (
-          <div className="mb-8" id="sec-structure-split">
-            <h4 className="mb-0.5 flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-red-400">
-              <Combine size={14} />
-              Split compilations ({splitPending.length})
-            </h4>
-            <p className="mb-1.5 text-xs text-muted-foreground">
-              One folder, one album title, several album artists — the scan made an album per
-              artist. Combining merges them into one album credited to Various Artists.
-            </p>
-            <div className="space-y-2">
-              {splitPending.map((g) => (
-                <SplitCompilationCard
-                  key={g.folder_path}
-                  group={g}
-                  busy={busy}
-                  busyKey={busyKey}
-                  onCombine={combineSplit}
-                  onDismiss={dismissSplit}
-                  onOpenAlbum={onOpenAlbum}
-                />
-              ))}
-            </div>
-          </div>
-        )}
-      </section>
       )}
 
       {/* Where the library stands. Every number is a tally of `albums` below,
@@ -3430,7 +3421,9 @@ export function MetadataCenter({
                   onIgnore={ignoreAlbum}
                   onCombine={startCombine}
                   onOpen={openAlbumRow}
-                  locked={running}
+                  onOpenSibling={openSibling}
+                  locked={busy}
+                  lockTitle={running ? MATCH_LOCK_TITLE : PAGE_BUSY_TITLE}
                 />
               )}
             />
@@ -3462,7 +3455,9 @@ export function MetadataCenter({
                   onMatch={setMatchAlbum}
                   onCombine={startCombine}
                   onOpen={openAlbumRow}
-                  locked={running}
+                  onOpenSibling={openSibling}
+                  locked={busy}
+                  lockTitle={running ? MATCH_LOCK_TITLE : PAGE_BUSY_TITLE}
                 />
               )}
             />
@@ -3487,7 +3482,9 @@ export function MetadataCenter({
                   onMatch={setMatchAlbum}
                   onCombine={startCombine}
                   onOpen={openAlbumRow}
-                  locked={running}
+                  onOpenSibling={openSibling}
+                  locked={busy}
+                  lockTitle={running ? MATCH_LOCK_TITLE : PAGE_BUSY_TITLE}
                 />
               )}
             />
@@ -3555,9 +3552,15 @@ export function MetadataCenter({
                 <CircleSlash size={14} />
                 Unmatched artists with albums or loose tracks ({artistsUnmatchedOwners.length})
               </h4>
+              <p className="mb-0.5 text-xs text-muted-foreground">
+                Every artist credited on an album or a loose track and not yet identified — one
+                album or twenty. Each one identified unlocks their whole discography for automatic
+                matching on the next pass.
+              </p>
               <p className="mb-1.5 text-xs text-muted-foreground">
-                Several unmatched albums each, or loose tracks only — each one identified unlocks
-                their whole discography for automatic matching on the next pass.
+                Occasionally, it’s easier to match an artist’s album first and let its credits
+                identify them — especially when the album credits many artists. The Match dialog
+                offers that route when the name itself turns up nothing.
               </p>
               <WindowedList
                 items={[...artistsUnmatchedOwners].sort(readyFirst)}
@@ -3572,16 +3575,8 @@ export function MetadataCenter({
                         a={a}
                         first
                         disabled={!!sug}
-                        // Only while there ARE albums left to match through:
-                        // an artist whose albums are all matched already
-                        // (a real band name with an "and" in it) gets no
-                        // advice that can't be followed.
-                        note={
-                          looksJoint(a.title) &&
-                          (unmatchedAlbumsByArtist.get(a.artist_id)?.length ?? 0) > 0
-                            ? "looks like several artists — match their albums instead"
-                            : undefined
-                        }
+                        locked={busy}
+                  lockTitle={running ? MATCH_LOCK_TITLE : PAGE_BUSY_TITLE}
                         onMatch={setMatchArtist}
                         onOpen={openArtistRow}
                         onSplit={setSplitArtist}
@@ -3646,6 +3641,8 @@ export function MetadataCenter({
                         a={a}
                         first
                         disabled={!!sug}
+                        locked={busy}
+                  lockTitle={running ? MATCH_LOCK_TITLE : PAGE_BUSY_TITLE}
                         onMatch={setMatchArtist}
                         onOpen={openArtistRow}
                         onSplit={setSplitArtist}
@@ -3676,6 +3673,8 @@ export function MetadataCenter({
                   <ArtistRow
                     a={a}
                     first={i === 0}
+                    locked={busy}
+                  lockTitle={running ? MATCH_LOCK_TITLE : PAGE_BUSY_TITLE}
                     onMatch={setMatchArtist}
                     onOpen={openArtistRow}
                     onPersona={openIdentityPersona}
@@ -3737,7 +3736,6 @@ export function MetadataCenter({
                         u.near_miss_id != null && u.near_miss_title
                           ? { id: u.near_miss_id, name: u.near_miss_title }
                           : null,
-                      row: null,
                     })
                   }
                 >
@@ -3976,6 +3974,81 @@ export function MetadataCenter({
         </Collapsible>
       )}
 
+      {/* Duplicate albums (user's ask, 2026-10-03): the same recordings
+          twice, by content hash — a copy left behind. A pointer, not an
+          action: waverunner never deletes files, and stacking a duplicate
+          as a release adds nothing. "Keep both" is the standing answer. */}
+      {pane === "files" && duplicates.length > 0 && (
+        <Collapsible
+          title={`Duplicate albums (${duplicates.length})`}
+          note="Albums whose files are the same recordings — every track's content matches, whatever the tags say. waverunner never deletes files: remove one folder at the source, then rescan."
+          open
+          onToggle={() => {}}
+        >
+          {duplicates.map((g, gi) => {
+            const first = g.albums[0];
+            const sameTags = g.albums.every(
+              (a) => a.title === first.title && a.credit === first.credit,
+            );
+            return (
+              <div key={g.key} className={`px-3 py-2 ${gi > 0 ? "border-t" : ""}`}>
+                <div className="mb-1.5 flex items-center justify-between gap-3">
+                  <p className="min-w-0 truncate text-sm font-medium">
+                    {first.title}
+                    <span className="font-normal text-muted-foreground">
+                      {" "}
+                      — {g.albums.length} copies, {sameTags ? "identical" : "same files, different tags"}
+                    </span>
+                  </p>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="shrink-0 gap-1.5"
+                    disabled={busy}
+                    title="Both copies are meant to be here — this card never returns for these files"
+                    onClick={() =>
+                      run(`dup:${g.key}`, () =>
+                        invoke("dismiss_duplicate_albums", { libraryId, key: g.key }),
+                      )
+                    }
+                  >
+                    {busyKey === `dup:${g.key}` && <Spinner className="size-3" />}
+                    Keep both
+                  </Button>
+                </div>
+                <div className="overflow-hidden rounded-md border">
+                  {g.albums.map((a, i) => (
+                    <div key={a.id} className={`px-2 py-1.5 ${i > 0 ? "border-t" : ""}`}>
+                      <div className="flex min-w-0 items-baseline gap-2 text-sm">
+                        {onOpenAlbum ? (
+                          <button
+                            type="button"
+                            className="min-w-0 truncate text-left underline-offset-2 hover:underline"
+                            title="Open this album’s page"
+                            onClick={() => onOpenAlbum(a.id, a.title, null)}
+                          >
+                            {a.title}
+                          </button>
+                        ) : (
+                          <span className="min-w-0 truncate">{a.title}</span>
+                        )}
+                        <span className="shrink-0 text-[11px] text-muted-foreground">
+                          {a.credit || "no artist"} · {a.track_count}{" "}
+                          {a.track_count === 1 ? "track" : "tracks"}
+                        </span>
+                      </div>
+                      <span className="block min-w-0 break-all font-mono text-xs text-muted-foreground">
+                        {a.folder_path}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+        </Collapsible>
+      )}
+
 
       {/* Applied-changes log — an action per row, newest first, collapsed to a
           recent window. The label carries the album; the kinds line says what
@@ -4046,7 +4119,7 @@ export function MetadataCenter({
           Every matched album's track list agrees with its release.
         </p>
       )}
-      {pane === "files" && fallbacks.length === 0 && issues.length === 0 && (
+      {pane === "files" && fallbacks.length === 0 && issues.length === 0 && duplicates.length === 0 && (
         <p className="py-8 text-center text-sm text-muted-foreground">
           Every file read cleanly and carried the tags it needed.
         </p>
@@ -4111,12 +4184,11 @@ export function MetadataCenter({
             }}
           />
         )}
-      {identitySource && (
-          <IdentityDialog
+      {identitySource && identitySource.mode === "same" && (
+          <LinkArtistDialog
             libraryId={libraryId}
             sourceName={identitySource.name}
             sourceArtistId={identitySource.artistId}
-            initialMode={identitySource.mode}
             suggested={identitySource.suggested}
             onOpenChange={(o) => !o && setIdentitySource(null)}
             onDone={() => {
@@ -4124,15 +4196,20 @@ export function MetadataCenter({
               onChanged?.();
             }}
             queue={queueForArtist(identitySource.artistId)}
-            onSplit={
-              identitySource.row
-                ? () => {
-                    const row = identitySource.row!;
-                    setIdentitySource(null);
-                    setSplitArtist(row);
-                  }
-                : undefined
-            }
+          />
+        )}
+      {/* Persona needs a page of its own; the row buttons that open it only
+          exist on artist rows, so the id is always there. */}
+      {identitySource && identitySource.mode === "persona" && identitySource.artistId != null && (
+          <PersonaDialog
+            libraryId={libraryId}
+            personaId={identitySource.artistId}
+            personaName={identitySource.name}
+            onOpenChange={(o) => !o && setIdentitySource(null)}
+            onDone={() => {
+              refresh();
+              onChanged?.();
+            }}
           />
         )}
       {matchArtist != null && (
@@ -4288,12 +4365,14 @@ export function MetadataCenter({
           the pane above takes whatever height is left. */}
       {/* Decisions applying in the background. Neutral tone; the running
           item spins, the waiting ones can still be pulled back. */}
-      {queuedForLib.length > 0 && (
+      {(queuedForLib.length > 0 || settledForLib.length > 0 || settling) && (
         <div className="shrink-0 border-t bg-muted/30 px-4 py-3">
           <div className="flex items-center gap-3">
             <Spinner className="size-3.5 shrink-0 text-muted-foreground" />
             <p className="min-w-0 flex-1 text-sm">
-              Applying {queuedForLib.length} {queuedForLib.length === 1 ? "match" : "matches"}…
+              {queuedForLib.length > 0
+                ? `Applying ${queuedForLib.length} ${queuedForLib.length === 1 ? "match" : "matches"}…`
+                : "Refreshing the page…"}
             </p>
           </div>
           <ul className="-mr-4 mt-1 max-h-[70px] space-y-0.5 overflow-y-auto pl-[26px] pr-72">

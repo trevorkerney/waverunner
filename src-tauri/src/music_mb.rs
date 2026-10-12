@@ -318,8 +318,8 @@ pub fn spawn_enrich(app: AppHandle, library_id: String) {
                 total.artists_updated += outcome.artists_updated;
                 total.pending_review = outcome.pending_review;
                 total.skipped = outcome.skipped;
-                // Distinct items over the whole pass (a later sweep's success
-                // clears a row, but the count is what the strip showed).
+                // Items still failing at the end — a later sweep's success
+                // took the rest off; these are exactly the rows left queued.
                 total.failed = outcome.failed;
                 if outcome.skipped
                     || (outcome.albums_matched == 0 && outcome.artists_updated == 0)
@@ -580,8 +580,8 @@ pub struct EnrichOutcome {
     pub pending_review: i64,
     /// True when the pass ended early via music_match_skip.
     pub skipped: bool,
-    /// Items whose request failed on their last try this pass — still
-    /// queued (mb_fetch_failure), said at the finish, retried next pass.
+    /// Items whose request failed this pass and never went through after —
+    /// still queued (mb_fetch_failure), said at the finish, retried next pass.
     pub failed: usize,
 }
 
@@ -1213,6 +1213,14 @@ pub async fn set_mb_id(
     // remembered failed request for the entity moot — by hand or by pass.
     if matches!(field, MB_RELEASE_GROUP | MB_ARTIST | MB_IGNORED) {
         clear_entity_fetch_failures(pool, entity_id).await?;
+    }
+    // An identity also retires "ignored" (user's call, 2026-10-04): the flag
+    // meant "not on MusicBrainz, stop counting this", and an id — picked by
+    // hand, resolved by the pass, or stamped from a matched release's
+    // credit — proves otherwise. Left in place it would only resurface on a
+    // later unmatch, dropping the entity to ignored instead of red.
+    if matches!(field, MB_RELEASE_GROUP | MB_ARTIST) && !value.is_empty() {
+        clear_mb_id(pool, entity_id, MB_IGNORED).await?;
     }
     Ok(())
 }
@@ -2397,6 +2405,9 @@ fn clear_pass_caches() {
     if let Some(s) = FAILED_THIS_PASS.get() {
         s.lock().unwrap().clear();
     }
+    if let Some(s) = STILL_FAILING.get() {
+        s.lock().unwrap().clear();
+    }
 }
 
 // ── Failed requests ────────────────────────────────────────────────────
@@ -2415,12 +2426,64 @@ static FAILED_THIS_PASS: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashSet<String>>,
 > = std::sync::OnceLock::new();
 
-/// Distinct items whose request failed in the running pass so far.
+/// Items that failed in this pass and have NOT gone through since — what
+/// the strip counts and the finish toast reports (2026-09-29). A later
+/// sweep's success takes an item back off: the old count kept every item
+/// that failed even once, and a pass whose sweeps recovered all eighteen
+/// still told him eighteen were queued when none were.
+static STILL_FAILING: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::OnceLock::new();
+
+/// Items whose request failed in the running pass and is still failing.
 pub(crate) fn failures_this_pass() -> usize {
-    FAILED_THIS_PASS
+    STILL_FAILING
         .get()
         .and_then(|s| s.lock().ok().map(|s| s.len()))
         .unwrap_or(0)
+}
+
+/// Tell the running strip its live count changed.
+/// After a release match lands (by hand or by the pass): stage the
+/// same-release-group combine when both sides are release-matched, and tell
+/// the UI so it can toast. Never fails the match — a staging problem is
+/// logged and swallowed.
+async fn notify_auto_combine(pool: &SqlitePool, library_id: &str, album_id: i64) {
+    match crate::music_edit::auto_combine_same_group(pool, library_id, album_id).await {
+        Ok(Some(message)) => {
+            if let Some(app) = MB_APP.get() {
+                let _ = app.emit(
+                    "music-auto-combine",
+                    serde_json::json!({ "libraryId": library_id, "message": message }),
+                );
+            }
+        }
+        Ok(None) => {}
+        Err(e) => eprintln!("[auto-combine] album {album_id}: {e}"),
+    }
+}
+
+fn emit_failure_count(library_id: &str) {
+    if let Some(app) = MB_APP.get() {
+        let _ = app.emit(
+            "music-enrich-failure",
+            serde_json::json!({ "libraryId": library_id, "failed": failures_this_pass() }),
+        );
+    }
+}
+
+/// A failure row went (success, settle, prune): off the live count, and the
+/// strip told, when the running pass had counted it.
+fn forget_still_failing(key: &str) {
+    let removed = STILL_FAILING
+        .get()
+        .and_then(|s| s.lock().ok().map(|mut s| s.remove(key)))
+        .unwrap_or(false);
+    if removed {
+        if let Some(lib) = pass_library() {
+            emit_failure_count(&lib);
+        }
+    }
 }
 
 /// `kind`s: album-search, artist-evidence, group-credits, artist-search,
@@ -2434,11 +2497,15 @@ pub(crate) async fn record_fetch_failure(
     phase: &str,
     error: &str,
 ) -> Result<(), String> {
+    let key = format!("{kind}|{target}");
     let first_this_pass = FAILED_THIS_PASS
         .get_or_init(Default::default)
         .lock()
-        .map(|mut s| s.insert(format!("{kind}|{target}")))
+        .map(|mut s| s.insert(key.clone()))
         .unwrap_or(true);
+    if let Ok(mut s) = STILL_FAILING.get_or_init(Default::default).lock() {
+        s.insert(key);
+    }
     let sql = if first_this_pass {
         "INSERT INTO mb_fetch_failure (library_id, kind, target, label, phase, error, attempts, last_failed_at)
          VALUES (?, ?, ?, ?, ?, ?, 1, datetime('now'))
@@ -2463,12 +2530,7 @@ pub(crate) async fn record_fetch_failure(
         .await
         .map_err(|e| e.to_string())?;
     // The running strip's live count.
-    if let Some(app) = MB_APP.get() {
-        let _ = app.emit(
-            "music-enrich-failure",
-            serde_json::json!({ "libraryId": library_id, "failed": failures_this_pass() }),
-        );
-    }
+    emit_failure_count(library_id);
     Ok(())
 }
 
@@ -2484,6 +2546,7 @@ pub(crate) async fn clear_fetch_failure(
         .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
+    forget_still_failing(&format!("{kind}|{target}"));
     Ok(())
 }
 
@@ -2499,6 +2562,11 @@ async fn clear_entity_fetch_failures(pool: &SqlitePool, entity_id: i64) -> Resul
     .execute(pool)
     .await
     .map_err(|e| e.to_string())?;
+    // The pass itself settles entities too (an artist identified by the
+    // harvest after its evidence fetch failed) — off the live count.
+    for kind in ["album-search", "artist-evidence", "artist-search", "album-dates"] {
+        forget_still_failing(&format!("{kind}|{entity_id}"));
+    }
     Ok(())
 }
 
@@ -3274,6 +3342,9 @@ async fn apply_group(
         )
         .await?;
     }
+    // No auto-combine here: a group match proves nothing about the track
+    // list, and staging on the group pick froze the album right before the
+    // release pick. apply_release is where it runs.
     Ok(())
 }
 
@@ -3524,6 +3595,7 @@ async fn apply_release(
         )
         .await?;
     }
+    notify_auto_combine(pool, library_id, album_id).await;
     Ok(())
 }
 
@@ -5699,6 +5771,63 @@ pub struct MbAlbumRow {
     /// "pick a release" opens on the release that needs picking. None when
     /// every release is resolved.
     pub focus_release_id: Option<i64>,
+    /// Another separate album of the library resolved to the same release
+    /// group — the pass combines the two once both hold a release match
+    /// (auto_combine_same_group); until then this names the sibling.
+    pub same_group: Option<SameGroup>,
+}
+
+/// The other album sharing a release group (see MbAlbumRow::same_group).
+#[derive(Debug, Clone, Serialize)]
+pub struct SameGroup {
+    pub album_id: i64,
+    pub title: String,
+}
+
+/// For every real, non-ignored album whose resolved release group another
+/// such album also holds: the first other one (lowest id). One query for
+/// the whole library — the review and the match dialog both read it.
+pub(crate) async fn same_group_siblings(
+    pool: &SqlitePool,
+    library_id: &str,
+) -> Result<HashMap<i64, SameGroup>, String> {
+    let rows: Vec<(i64, String, String)> = sqlx::query_as(
+        "SELECT al.id, al.title,
+                COALESCE((SELECT value FROM field_override
+                          WHERE entity_id = al.id AND field = 'mb_release_group_id' AND tier = 'user'),
+                         (SELECT value FROM field_override
+                          WHERE entity_id = al.id AND field = 'mb_release_group_id' AND tier = 'mb'),
+                         '') AS g
+         FROM album al
+         JOIN media_entry me ON me.id = al.id
+         WHERE me.library_id = ?
+           AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = al.id)
+           AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = al.id)
+           AND NOT EXISTS (SELECT 1 FROM field_override ig
+                           WHERE ig.entity_id = al.id AND ig.field = 'mb_ignored')
+           AND g <> ''
+         ORDER BY al.id",
+    )
+    .bind(library_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let mut by_group: HashMap<String, Vec<(i64, String)>> = HashMap::new();
+    for (id, title, g) in rows {
+        by_group.entry(g).or_default().push((id, title));
+    }
+    let mut out = HashMap::new();
+    for members in by_group.into_values() {
+        if members.len() < 2 {
+            continue;
+        }
+        for (id, _) in &members {
+            if let Some((sid, stitle)) = members.iter().find(|(o, _)| o != id) {
+                out.insert(*id, SameGroup { album_id: *sid, title: stitle.clone() });
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Artists and where they stand. An artist's MusicBrainz id only ever comes
@@ -6006,6 +6135,7 @@ pub async fn mb_get_review(state: State<'_, AppState>, library_id: String) -> Re
     .fetch_all(pool)
     .await
     .map_err(|e| e.to_string())?;
+    let mut siblings = same_group_siblings(pool, &library_id).await?;
     let albums = album_rows
         .into_iter()
         .map(
@@ -6026,6 +6156,7 @@ pub async fn mb_get_review(state: State<'_, AppState>, library_id: String) -> Re
                     releases,
                     resolved_releases,
                     focus_release_id,
+                    same_group: siblings.remove(&album_id),
                 }
             },
         )
@@ -6466,6 +6597,9 @@ pub struct MbStatus {
     /// The viewed release carries the user's "no MusicBrainz counterpart"
     /// declaration — resolved, but nothing is (or will be) matched.
     pub declared_none: bool,
+    /// Albums only: another separate album on the same release group — the
+    /// two combine on their own once both hold a release match.
+    pub same_group: Option<SameGroup>,
 }
 
 /// The library an entity belongs to. Every album, artist and track is a
@@ -6707,10 +6841,16 @@ pub async fn mb_status(
         (None, 0, 0, 0, false)
     };
 
+    let library_id = library_of(pool, entity_id).await?;
+    let same_group = if kind == "album" {
+        same_group_siblings(pool, &library_id).await?.remove(&entity_id)
+    } else {
+        None
+    };
     Ok(MbStatus {
         kind,
         entity_id,
-        library_id: library_of(pool, entity_id).await?,
+        library_id,
         title,
         context,
         context_mbid,
@@ -6729,6 +6869,7 @@ pub async fn mb_status(
         staged,
         partial,
         declared_none,
+        same_group,
     })
 }
 
