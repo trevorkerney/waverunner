@@ -4,6 +4,11 @@
 //! action per album / track / artist, and a preview of every per-file
 //! change before a byte is touched.
 //!
+//! The fields are the registry's (tag_fields): every file-backed field a
+//! track carries in the tag layer is written from its effective value, the
+//! file's own frames named by the registry. App-only fields (release
+//! membership, identity tokens) have no frame and are never written.
+//!
 //! The tiered store is what tells a waverunner write apart from an external
 //! retag. Every written file is re-read, and what it NOW says is stored at
 //! the tag tier without the retag invalidation (set_tag_tier_quiet), so the
@@ -14,18 +19,13 @@
 //! tag, so an edit that differs from MB must survive or MB would paint over
 //! the value that's now in the file.
 //!
-//! Album-level fields go to the files the scanner derives them from: title
-//! and date to the DEFAULT release only (other releases keep their own —
-//! that's what makes them releases), genres, album artists and the
-//! release-group id to every release, the pinned release id to its own
-//! folder. Album fields are pushed at all only when a tier above the tags
-//! disagrees with them: a file whose genre differs from the album's union is
-//! not wrong, and normalizing it would be a change nobody asked for.
-//!
-//! Identity keys follow the files: a write that changes an album's tag
-//! identity re-keys the album_combine directives that named it. Stacked
-//! ID3v2 files are refused — editors and the reader see different blocks,
-//! and which one lofty rewrites is untested.
+//! The album's own title (the card's — a rename, or MusicBrainz's group
+//! title) goes to the DEFAULT release's files only, and only when a tier
+//! above the tags disagrees with them (other releases keep their own —
+//! that's what makes them releases); the release-group id likewise to every
+//! release, the pinned release id to its own folder. Stacked ID3v2 files are
+//! refused — editors and the reader see different blocks, and which one
+//! lofty rewrites is untested.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -39,6 +39,7 @@ use sqlx::SqlitePool;
 use tauri::State;
 
 use crate::music::{ScannedAlbum, ScannedRelease, ScannedTrack};
+use crate::tag_fields::{self, Shape};
 use crate::AppState;
 
 /// Whether the user has opted this library into tag writing. Absent = off:
@@ -121,6 +122,13 @@ impl Val {
     fn opt(s: Option<&str>) -> Val {
         Val::text(s.unwrap_or_default())
     }
+    /// From a field's stored form, by its registry shape.
+    fn from_stored(key: &str, stored: &str) -> Val {
+        match tag_fields::field(key).map(|d| d.shape) {
+            Some(Shape::List) => Val::List(tag_fields::stored_to_list(stored)),
+            _ => Val::text(stored),
+        }
+    }
     fn display(&self) -> String {
         match self {
             Val::Text(t) => t.clone().unwrap_or_default(),
@@ -150,22 +158,16 @@ fn same(key: &str, a: &Val, b: &Val) -> bool {
     }
 }
 
-fn label(key: &str) -> &'static str {
+/// The writer's two extra keys beside the registry: artist ids the scanner
+/// doesn't carry on ScannedTrack.
+const MB_ARTIST_KEY: &str = "mb_artist";
+const MB_ALBUM_ARTIST_KEY: &str = "mb_album_artist";
+
+fn label(key: &str) -> String {
     match key {
-        "title" => "Title",
-        "credits" => "Artists",
-        "track_number" => "Track number",
-        "disc_number" => "Disc number",
-        "album" => "Album",
-        "album_artists" => "Album artists",
-        "date" => "Date",
-        "genres" => "Genres",
-        "mb_recording" => "MusicBrainz recording id",
-        "mb_artist" => "MusicBrainz artist id",
-        "mb_release_group" => "MusicBrainz release group id",
-        "mb_release" => "MusicBrainz release id",
-        "mb_album_artist" => "MusicBrainz album artist id",
-        _ => "Field",
+        MB_ARTIST_KEY => "MusicBrainz artist id".to_string(),
+        MB_ALBUM_ARTIST_KEY => "MusicBrainz album artist id".to_string(),
+        other => tag_fields::field(other).map(|d| d.label.to_string()).unwrap_or_else(|| "Field".to_string()),
     }
 }
 
@@ -196,26 +198,9 @@ fn read_one(abs: &Path, rel: &str) -> Result<FileRead, String> {
 /// as the scanner sees it).
 fn current(key: &str, t: &ScannedTrack, extra: &ExtraIds) -> Val {
     match key {
-        "title" => Val::text(&t.title),
-        "credits" => Val::List(t.credits.clone()),
-        "track_number" => Val::Text(t.track_number.map(|n| n.to_string())),
-        "disc_number" => Val::Text(Some(t.disc_number.to_string())),
-        "album" => Val::text(&t.album),
-        "album_artists" => Val::List(if t.album_artist_credits.len() >= 2 {
-            t.album_artist_credits.clone()
-        } else if t.album_artist.is_empty() {
-            Vec::new()
-        } else {
-            vec![t.album_artist.clone()]
-        }),
-        "date" => Val::opt(t.date.as_deref()),
-        "genres" => Val::List(t.genres.clone()),
-        "mb_recording" => Val::opt(t.mb_recording_id.as_deref()),
-        "mb_release" => Val::opt(t.mb_release_id.as_deref()),
-        "mb_release_group" => Val::opt(t.mb_release_group_id.as_deref()),
-        "mb_artist" => Val::opt(extra.0.as_deref()),
-        "mb_album_artist" => Val::opt(extra.1.as_deref()),
-        _ => Val::Text(None),
+        MB_ARTIST_KEY => Val::opt(extra.0.as_deref()),
+        MB_ALBUM_ARTIST_KEY => Val::opt(extra.1.as_deref()),
+        other => Val::from_stored(other, &tag_fields::get(t, other)),
     }
 }
 
@@ -260,9 +245,6 @@ struct Job {
     /// Raw reads (pre-split), by track id. Refreshed after each write.
     reads: HashMap<i64, ScannedTrack>,
     extras: HashMap<i64, ExtraIds>,
-    /// Lowercased (album artist, album) tag identity before writing —
-    /// the album_combine key this album answers to.
-    identity_before: Option<(String, String)>,
     notes: Vec<String>,
 }
 
@@ -384,7 +366,7 @@ fn assemble(meta: &AlbumMeta, files: &[PreparedFile], reads: &HashMap<i64, Scann
         folder_abs: meta.folder_abs.clone(),
         releases,
         default_release: meta.default_release,
-        identity_override: None,
+        key: String::new(),
     };
     let mut out = crate::music::apply_artist_splits(splits, vec![album], &mut []);
     out.pop().expect("one album in, one out")
@@ -399,13 +381,6 @@ fn tracks_by_rel(album: &ScannedAlbum) -> HashMap<String, &ScannedTrack> {
         .collect()
 }
 
-fn identity_of(album: &ScannedAlbum) -> (String, String) {
-    (
-        crate::music::album_artist_of(album).to_lowercase(),
-        crate::music::album_title_of(album).to_lowercase(),
-    )
-}
-
 /// The album-level intents that apply to a file, given the album's resolved
 /// values and where they're written.
 struct AlbumIntents {
@@ -414,39 +389,23 @@ struct AlbumIntents {
 }
 
 async fn album_intents(pool: &SqlitePool, ctx: &Ctx, album_id: i64, notes: &mut Vec<String>) -> Result<AlbumIntents, String> {
-    let (title, release_date): (String, Option<String>) =
-        sqlx::query_as("SELECT title, release_date FROM album WHERE id = ?")
-            .bind(album_id)
-            .fetch_one(pool)
-            .await
-            .map_err(|e| e.to_string())?;
-    let genres: Vec<String> = sqlx::query_as::<_, (String,)>(
-        "SELECT g.name FROM album_genre ag JOIN genre g ON g.id = ag.genre_id
-         WHERE ag.album_id = ? ORDER BY g.name",
+    let (title,): (String,) = sqlx::query_as("SELECT title FROM album WHERE id = ?")
+        .bind(album_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    let first_artist: Option<i64> = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT artist_id FROM album_artist_credit WHERE album_id = ? ORDER BY position LIMIT 1",
     )
     .bind(album_id)
-    .fetch_all(pool)
+    .fetch_optional(pool)
     .await
     .map_err(|e| e.to_string())?
-    .into_iter()
-    .map(|(g,)| g)
-    .collect();
-    let credit_rows: Vec<(String, Option<i64>)> = sqlx::query_as(
-        "SELECT name, artist_id FROM album_artist_credit WHERE album_id = ? ORDER BY position",
-    )
-    .bind(album_id)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| e.to_string())?;
-    let first_artist = credit_rows.first().and_then(|(_, id)| *id);
-    let credits: Vec<String> = credit_rows
-        .into_iter()
-        .map(|(n, id)| credit_name(n, id, &ctx.titles))
-        .collect();
+    .flatten();
 
-    // The gate: an album field is pushed only when a tier above the tags
-    // holds something different. Missing tag tier (pre-tier data) = unknown
-    // = push, and the per-file diff decides.
+    // The gate: the album's title is pushed only when a tier above the tags
+    // holds something different (a rename, MusicBrainz's group title).
+    // Missing tag tier = unknown = push, and the per-file diff decides.
     let tag = crate::music_edit::tier_values(pool, album_id, crate::music_edit::TIER_TAG).await?;
     let user = crate::music_edit::tier_values(pool, album_id, crate::music_mb::TIER_USER).await?;
     let differs = |field: &str, resolved: &str| tag.get(field).map(|t| t != resolved).unwrap_or(true);
@@ -455,17 +414,6 @@ async fn album_intents(pool: &SqlitePool, ctx: &Ctx, album_id: i64, notes: &mut 
     let mut all = Vec::new();
     if differs("title", &title) {
         default_only.push(("album", Val::text(&title)));
-    }
-    if differs("release_date", release_date.as_deref().unwrap_or("")) {
-        default_only.push(("date", Val::opt(release_date.as_deref())));
-    }
-    let genres_json = serde_json::to_string(&genres).map_err(|e| e.to_string())?;
-    if differs("genres", &genres_json) {
-        all.push(("genres", Val::List(genres)));
-    }
-    let credits_json = serde_json::to_string(&credits).map_err(|e| e.to_string())?;
-    if differs("artist_credits", &credits_json) {
-        all.push(("album_artists", Val::List(credits)));
     }
     if user.contains_key("album_type") {
         notes.push("Album type has no tag — it stays in waverunner.".to_string());
@@ -476,6 +424,7 @@ async fn album_intents(pool: &SqlitePool, ctx: &Ctx, album_id: i64, notes: &mut 
         let (shared,): (i64,) = sqlx::query_as(
             "SELECT COUNT(DISTINCT fo.entity_id) FROM field_override fo
              JOIN media_entry me ON me.id = fo.entity_id
+             JOIN album al ON al.id = fo.entity_id
              WHERE me.library_id = ? AND fo.field = 'mb_release_group_id' AND fo.value = ?
                AND fo.tier IN ('user', 'mb') AND fo.entity_id <> ?",
         )
@@ -490,24 +439,37 @@ async fn album_intents(pool: &SqlitePool, ctx: &Ctx, album_id: i64, notes: &mut 
                 "Release-group id not written: another album in this library is matched to the same group, and a rescan folds albums whose files share one.".to_string(),
             );
         } else {
-            all.push(("mb_release_group", Val::text(&group)));
+            all.push(("mb_release_group_id", Val::text(&group)));
         }
     }
     if let Some(id) = mb_artist_of(pool, first_artist).await? {
-        all.push(("mb_album_artist", Val::text(&id)));
+        all.push((MB_ALBUM_ARTIST_KEY, Val::text(&id)));
     }
     Ok(AlbumIntents { default_only, all })
 }
 
-/// A track's own intents (title, credits, numbers, its recording and
-/// artist ids).
+/// A track's own intents: every file-backed registry field's effective
+/// value (user > mb > tag, from the stored tiers), credits and album
+/// artists spelled with their artists' CURRENT names (renames propagate),
+/// plus the recording and artist ids.
 async fn track_intents(pool: &SqlitePool, ctx: &Ctx, track_id: i64) -> Result<Vec<(&'static str, Val)>, String> {
-    let (title, track_number, disc_number): (String, Option<i64>, Option<i64>) =
-        sqlx::query_as("SELECT title, track_number, disc_number FROM track WHERE id = ?")
-            .bind(track_id)
-            .fetch_one(pool)
-            .await
-            .map_err(|e| e.to_string())?;
+    let tiers = crate::music_edit::all_tiers(pool, track_id).await?;
+    let mut out: Vec<(&'static str, Val)> = Vec::new();
+    for def in tag_fields::FIELDS {
+        if def.app_only || matches!(def.key, "mb_release_group_id" | "mb_release_id") {
+            continue; // the album-level intents carry the ids with their guards
+        }
+        let t = tiers.get(def.key).cloned().unwrap_or_default();
+        // A field no tier says anything about is left alone — only an
+        // explicit value (even an explicit "") is an intent.
+        if t.0.is_none() && t.1.is_none() && t.2.is_none() {
+            continue;
+        }
+        let eff = crate::music_edit::effective(&t);
+        out.push((def.key, Val::from_stored(def.key, &eff)));
+    }
+    // Credits and album artists: the stamped rows, through the artists'
+    // current titles.
     let credit_rows: Vec<(String, Option<i64>)> = sqlx::query_as(
         "SELECT name, artist_id FROM track_credit WHERE track_id = ? ORDER BY position",
     )
@@ -520,17 +482,29 @@ async fn track_intents(pool: &SqlitePool, ctx: &Ctx, track_id: i64) -> Result<Ve
         .into_iter()
         .map(|(n, id)| credit_name(n, id, &ctx.titles))
         .collect();
-    let mut out = vec![
-        ("title", Val::text(&title)),
-        ("credits", Val::List(credits)),
-        ("track_number", Val::Text(track_number.filter(|n| *n > 0).map(|n| n.to_string()))),
-        ("disc_number", Val::Text(Some(disc_number.filter(|n| *n > 0).unwrap_or(1).to_string()))),
-    ];
-    if let Some((rec, _)) = crate::music_mb::mb_id(pool, track_id, crate::music_mb::MB_RECORDING).await? {
-        out.push(("mb_recording", Val::text(&rec)));
+    if let Some(slot) = out.iter_mut().find(|(k, _)| *k == "credits") {
+        slot.1 = Val::List(credits);
+    } else if !credits.is_empty() {
+        out.push(("credits", Val::List(credits)));
+    }
+    if let Some(slot) = out.iter_mut().find(|(k, _)| *k == "album_artists") {
+        if let Val::List(names) = &slot.1 {
+            // Resolve each name to its page's current title, alias-aware.
+            let (by_lower, _) = crate::music::artist_resolution_maps(pool, &ctx.library_id).await?;
+            let mapped: Vec<String> = names
+                .iter()
+                .map(|n| {
+                    by_lower
+                        .get(&n.to_lowercase())
+                        .and_then(|id| ctx.titles.get(id).cloned())
+                        .unwrap_or_else(|| n.clone())
+                })
+                .collect();
+            slot.1 = Val::List(mapped);
+        }
     }
     if let Some(id) = mb_artist_of(pool, first_artist).await? {
-        out.push(("mb_artist", Val::text(&id)));
+        out.push((MB_ARTIST_KEY, Val::text(&id)));
     }
     Ok(out)
 }
@@ -542,7 +516,7 @@ fn diff(intents: &[(&'static str, Val)], t: &ScannedTrack, extra: &ExtraIds) -> 
             let from = current(key, t, extra);
             (!same(key, &from, to)).then(|| TagChange {
                 field: key.to_string(),
-                label: label(key).to_string(),
+                label: label(key),
                 from: from.display(),
                 to: to.display(),
             })
@@ -646,7 +620,6 @@ async fn prepare_album(pool: &SqlitePool, ctx: &Ctx, album_id: i64, only_track: 
 
     let album_fields = only_track.is_none();
     let album = assemble(&meta, &files, &raw, &ctx.splits);
-    let identity_before = album_fields.then(|| identity_of(&album));
     let by_rel = tracks_by_rel(&album);
     let album_int = if album_fields {
         Some(album_intents(pool, ctx, album_id, &mut notes).await?)
@@ -662,7 +635,7 @@ async fn prepare_album(pool: &SqlitePool, ctx: &Ctx, album_id: i64, only_track: 
             }
             intents.extend(ai.all.iter().cloned());
             if let Some(pin) = &meta.releases[f.release_idx].pin {
-                intents.push(("mb_release", Val::text(pin)));
+                intents.push(("mb_release_id", Val::text(pin)));
             }
         }
         if let (Some(t), Some(extra)) = (by_rel.get(&f.rel), extras.get(&f.track_id)) {
@@ -677,7 +650,6 @@ async fn prepare_album(pool: &SqlitePool, ctx: &Ctx, album_id: i64, only_track: 
         files,
         reads: raw,
         extras,
-        identity_before,
         notes,
     })
 }
@@ -740,7 +712,6 @@ async fn prepare_loose(pool: &SqlitePool, ctx: &Ctx, track_ids: &[i64]) -> Resul
         files,
         reads: raw,
         extras,
-        identity_before: None,
         notes: Vec::new(),
     })
 }
@@ -754,19 +725,16 @@ async fn is_loose_container(pool: &SqlitePool, album_id: i64) -> Result<bool, St
     Ok(row.is_some())
 }
 
-/// Resolve a scope to its jobs. Staged albums are skipped with a note —
-/// the rescan that applies their directive rewrites what these files
-/// mean, so writing them now would race it.
+/// Resolve a scope to its jobs.
 async fn prepare(pool: &SqlitePool, scope: &str, id: i64) -> Result<(String, Vec<Job>, Vec<String>), String> {
     let library_id = library_of(pool, id).await?;
     if !library_tag_writing(pool, &library_id).await? {
         return Err("Tag writing is off for this library — turn it on in the library's settings.".to_string());
     }
     let ctx = context(pool, &library_id).await?;
-    let mut notes = Vec::new();
+    let notes = Vec::new();
     match scope {
         "album" => {
-            crate::music_edit::ensure_not_staged(pool, id).await?;
             let (title,): (String,) = sqlx::query_as("SELECT title FROM album WHERE id = ?")
                 .bind(id)
                 .fetch_one(pool)
@@ -786,14 +754,12 @@ async fn prepare(pool: &SqlitePool, scope: &str, id: i64) -> Result<(String, Vec
             let job = if is_loose_container(pool, parent).await? {
                 prepare_loose(pool, &ctx, &[id]).await?
             } else {
-                crate::music_edit::ensure_not_staged(pool, parent).await?;
                 prepare_album(pool, &ctx, parent, Some(id)).await?
             };
             let title = if title.is_empty() { job.files.first().map(|f| f.file_name.clone()).unwrap_or_default() } else { title };
             Ok((title, vec![job], notes))
         }
         "artist" => {
-            crate::music_edit::ensure_not_staged(pool, id).await?;
             let (title,): (String,) = sqlx::query_as("SELECT title FROM artist WHERE id = ?")
                 .bind(id)
                 .fetch_one(pool)
@@ -813,11 +779,7 @@ async fn prepare(pool: &SqlitePool, scope: &str, id: i64) -> Result<(String, Vec
             .await
             .map_err(|e| e.to_string())?;
             let mut jobs = Vec::new();
-            for (album_id, album_title) in album_ids {
-                if crate::music_edit::is_staged_for_rescan(pool, album_id).await? {
-                    notes.push(format!("“{album_title}” is staged for the next rescan — skipped."));
-                    continue;
-                }
+            for (album_id, _album_title) in album_ids {
                 jobs.push(prepare_album(pool, &ctx, album_id, None).await?);
             }
             let loose: Vec<i64> = sqlx::query_as::<_, (i64,)>(
@@ -874,19 +836,6 @@ fn plan_of(title: String, jobs: &[Job], mut notes: Vec<String>) -> TagWritePlan 
 // ---------------------------------------------------------------------------
 
 fn apply_intents(tag: &mut Tag, intents: &[(&'static str, Val)]) {
-    let text_key = |key: &str| -> Option<ItemKey> {
-        Some(match key {
-            "mb_recording" => ItemKey::MusicBrainzRecordingId,
-            "mb_artist" => ItemKey::MusicBrainzArtistId,
-            "mb_release_group" => ItemKey::MusicBrainzReleaseGroupId,
-            "mb_release" => ItemKey::MusicBrainzReleaseId,
-            "mb_album_artist" => ItemKey::MusicBrainzReleaseArtistId,
-            "date" => ItemKey::RecordingDate,
-            "album_artists" => ItemKey::AlbumArtist,
-            "genres" => ItemKey::Genre,
-            _ => return None,
-        })
-    };
     for (key, val) in intents {
         match (*key, val) {
             ("title", Val::Text(t)) => match t {
@@ -918,25 +867,34 @@ fn apply_intents(tag: &mut Tag, intents: &[(&'static str, Val)]) {
                     }
                 }
             }
-            (k, Val::List(items)) => {
-                if let Some(ik) = text_key(k) {
-                    tag.remove_key(&ik);
-                    if !items.is_empty() {
-                        tag.insert_text(ik, items.join("; "));
-                    }
-                }
+            (MB_ARTIST_KEY, Val::Text(t)) => write_text(tag, ItemKey::MusicBrainzArtistId, t.as_deref()),
+            (MB_ALBUM_ARTIST_KEY, Val::Text(t)) => {
+                write_text(tag, ItemKey::MusicBrainzReleaseArtistId, t.as_deref())
             }
-            (k, Val::Text(t)) => {
-                if let Some(ik) = text_key(k) {
-                    match t {
-                        Some(s) => {
-                            tag.insert_text(ik, s.clone());
+            (k, v) => {
+                let Some(def) = tag_fields::field(k) else { continue };
+                match (&def.write, v) {
+                    (tag_fields::Write::Text(ik), Val::Text(t)) => write_text(tag, ik.clone(), t.as_deref()),
+                    (tag_fields::Write::Int(ik), Val::Text(t)) => write_text(tag, ik.clone(), t.as_deref()),
+                    (tag_fields::Write::List(ik), Val::List(items)) => {
+                        tag.remove_key(ik);
+                        if !items.is_empty() {
+                            tag.insert_text(ik.clone(), items.join("; "));
                         }
-                        None => tag.remove_key(&ik),
                     }
+                    _ => {}
                 }
             }
         }
+    }
+}
+
+fn write_text(tag: &mut Tag, key: ItemKey, value: Option<&str>) {
+    match value {
+        Some(s) => {
+            tag.insert_text(key, s.to_string());
+        }
+        None => tag.remove_key(&key),
     }
 }
 
@@ -987,18 +945,9 @@ fn write_file(abs: &Path, intents: &[(&'static str, Val)]) -> Result<(), String>
 /// Store what the file now says at the track's tag tier (no invalidation),
 /// drop edits it made redundant, and mirror the tag-side recording id.
 async fn sync_track_tier(pool: &SqlitePool, track_id: i64, t: &ScannedTrack) -> Result<usize, String> {
-    crate::music_edit::set_tag_tier_quiet(
-        pool,
-        track_id,
-        &[
-            ("title", t.title.clone()),
-            ("credits", serde_json::to_string(&t.credits).map_err(|e| e.to_string())?),
-            ("track_number", t.track_number.map(|n| n.to_string()).unwrap_or_default()),
-            ("disc_number", t.disc_number.to_string()),
-        ],
-    )
-    .await?;
-    let dropped = crate::music_edit::drop_redundant_user_edits(pool, track_id, crate::music_edit::track_fields()).await?;
+    crate::music_edit::set_tag_tier_quiet(pool, track_id, &t.tag_tier).await?;
+    let keys: Vec<&str> = tag_fields::tag_keys().collect();
+    let dropped = crate::music_edit::drop_redundant_user_edits(pool, track_id, &keys).await?;
     sqlx::query("UPDATE track_meta SET mb_recording_id = ? WHERE track_id = ?")
         .bind(&t.mb_recording_id)
         .bind(track_id)
@@ -1006,24 +955,6 @@ async fn sync_track_tier(pool: &SqlitePool, track_id: i64, t: &ScannedTrack) -> 
         .await
         .map_err(|e| e.to_string())?;
     Ok(dropped.len())
-}
-
-async fn rekey_combines(pool: &SqlitePool, library_id: &str, before: &(String, String), after: &(String, String)) -> Result<(), String> {
-    for (a_col, t_col) in [("source_artist", "source_title"), ("target_artist", "target_title")] {
-        sqlx::query(&format!(
-            "UPDATE album_combine SET {a_col} = ?, {t_col} = ?
-             WHERE library_id = ? AND {a_col} = ? AND {t_col} = ?"
-        ))
-        .bind(&after.0)
-        .bind(&after.1)
-        .bind(library_id)
-        .bind(&before.0)
-        .bind(&before.1)
-        .execute(pool)
-        .await
-        .map_err(|e| e.to_string())?;
-    }
-    Ok(())
 }
 
 async fn execute(pool: &SqlitePool, ctx: &Ctx, job: &mut Job, out: &mut TagWriteOutcome) -> Result<(), String> {
@@ -1099,12 +1030,6 @@ async fn execute(pool: &SqlitePool, ctx: &Ctx, job: &mut Job, out: &mut TagWrite
             out.edits_dropped += crate::music_edit::drop_redundant_user_edits(pool, meta.album_id, crate::music_edit::album_fields())
                 .await?
                 .len();
-            if let Some(before) = &job.identity_before {
-                let after = identity_of(album);
-                if *before != after {
-                    rekey_combines(pool, &ctx.library_id, before, &after).await?;
-                }
-            }
         }
     }
     Ok(())

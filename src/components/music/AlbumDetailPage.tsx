@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useDeselectOnBackgroundClick } from "./useTrackSelection";
 import { toast } from "@/lib/toast";
-import { Play, Disc3, Pencil, ListPlus, ListStart, ListEnd, ListChecks, HardDriveDownload } from "lucide-react";
+import { Play, Disc3, Pencil, ListPlus, ListStart, ListEnd, ListChecks, HardDriveDownload, SquareCheckBig, X } from "lucide-react";
 import { RenameDialog } from "../RenameDialog";
 import { Spinner } from "../ui/spinner";
 import { Skeleton, useSkeletonDelay } from "../ui/skeleton";
@@ -14,6 +14,7 @@ import {
   ContextMenuItem,
 } from "../ui/context-menu";
 import { TrackEditDialog, AlbumEditDialog } from "./EditDialogs";
+import { BulkEditDialog } from "./BulkEditDialog";
 import { MatchDialog, MbStatusChip } from "./MatchDialog";
 import { NoteBlock } from "../NoteBlock";
 import { MoveToCollectionDialog } from "./MoveToCollectionDialog";
@@ -118,12 +119,22 @@ export function AlbumDetailPage({
   const [writeScope, setWriteScope] = useState<TagWriteScope | null>(null);
   const [loading, setLoading] = useState(true);
   const [releaseId, setReleaseId] = useState<number | null>(null);
-  // Single click selects a row; double click (or the hover play button) plays.
+  // Single click selects a row; double click (or the hover play button)
+  // plays. Ctrl/Cmd-click toggles rows into a multi-selection and
+  // Shift-click extends it from the anchor (the last plain click) — the
+  // bulk editor works on the selection.
   const [selectedTrackId, setSelectedTrackId] = useState<number | null>(null);
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(() => new Set());
   // Document-level so "background" includes the page space BELOW a short
   // track list — a container-scoped handler ends where the content does.
-  useDeselectOnBackgroundClick(useCallback(() => setSelectedTrackId(null), []));
+  useDeselectOnBackgroundClick(
+    useCallback(() => {
+      setSelectedTrackId(null);
+      setSelectedIds(new Set());
+    }, []),
+  );
   const [editTrackId, setEditTrackId] = useState<number | null>(null);
+  const [bulkOpen, setBulkOpen] = useState(false);
   const [editAlbumOpen, setEditAlbumOpen] = useState(false);
   // Sound collections: track being moved to another collection (or to loose).
   const [moveFor, setMoveFor] = useState<{ id: number; title: string } | null>(null);
@@ -156,6 +167,7 @@ export function AlbumDetailPage({
       setDetail(null);
       setReleaseId(null);
       setSelectedTrackId(null);
+      setSelectedIds(new Set());
       lastTitleRef.current = null;
     }
     invoke<MusicAlbumDetail>("get_album_detail", { entryId })
@@ -220,6 +232,7 @@ export function AlbumDetailPage({
     if (focusRequest.trackId != null) {
       const trackId = focusRequest.trackId;
       setSelectedTrackId(trackId);
+      setSelectedIds(new Set([trackId]));
       requestAnimationFrame(() => {
         document
           .querySelector(`[data-music-track-id="${trackId}"]`)
@@ -243,6 +256,49 @@ export function AlbumDetailPage({
     }
     return [...byDisc.entries()].sort((a, b) => a[0] - b[0]);
   }, [release]);
+  // The rows in the order the page lists them — Shift ranges and the bulk
+  // editor's renumbering both follow it.
+  const orderedIds = useMemo(() => discs.flatMap(([, tracks]) => tracks.map((t) => t.id)), [discs]);
+  const selectedInOrder = useMemo(
+    () => orderedIds.filter((id) => selectedIds.has(id)),
+    [orderedIds, selectedIds],
+  );
+
+  /** Row click: plain selects just this row; Ctrl/Cmd toggles it; Shift
+   *  selects the run from the anchor to it. */
+  const clickRow = (e: React.MouseEvent, id: number) => {
+    if (e.shiftKey && selectedTrackId != null && orderedIds.includes(selectedTrackId)) {
+      const a = orderedIds.indexOf(selectedTrackId);
+      const b = orderedIds.indexOf(id);
+      const [lo, hi] = a < b ? [a, b] : [b, a];
+      setSelectedIds((s) => {
+        const next = e.ctrlKey || e.metaKey ? new Set(s) : new Set<number>();
+        for (const x of orderedIds.slice(lo, hi + 1)) next.add(x);
+        return next;
+      });
+      return;
+    }
+    if (e.ctrlKey || e.metaKey) {
+      setSelectedIds((s) => {
+        const next = new Set(s);
+        if (next.has(id)) next.delete(id);
+        else next.add(id);
+        return next;
+      });
+      setSelectedTrackId(id);
+      return;
+    }
+    setSelectedTrackId(id);
+    setSelectedIds(new Set([id]));
+  };
+  /** Right-click: a row outside the selection becomes the selection; one
+   *  inside keeps it (the menu then acts on all of them). */
+  const contextRow = (id: number) => {
+    if (!selectedIds.has(id)) {
+      setSelectedTrackId(id);
+      setSelectedIds(new Set([id]));
+    }
+  };
 
   if (loading || !detail) {
     return (
@@ -448,6 +504,47 @@ export function AlbumDetailPage({
         </div>
       </div>
 
+      {/* The selection strip: shows once two or more rows are picked, and
+          carries the bulk editor. Select all / clear beside it. */}
+      {selectedIds.size >= 2 && (
+        <div className="mb-2 flex items-center gap-3 rounded-md border border-primary/25 bg-primary/5 px-3 py-1.5 text-xs">
+          <SquareCheckBig size={13} className="shrink-0 text-primary" />
+          <span className="min-w-0 flex-1 truncate">
+            {selectedIds.size} of {orderedIds.length} tracks selected
+          </span>
+          <button
+            type="button"
+            disabled={locked}
+            title={locked ? MATCH_LOCK_TITLE : undefined}
+            onClick={() => setBulkOpen(true)}
+            className="flex shrink-0 items-center gap-1 underline underline-offset-2 hover:text-foreground disabled:opacity-40"
+          >
+            <Pencil size={12} />
+            Edit {selectedIds.size} tracks…
+          </button>
+          {selectedIds.size < orderedIds.length && (
+            <button
+              type="button"
+              onClick={() => setSelectedIds(new Set(orderedIds))}
+              className="shrink-0 underline underline-offset-2 hover:text-foreground"
+            >
+              Select all
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => {
+              setSelectedIds(new Set());
+              setSelectedTrackId(null);
+            }}
+            className="flex shrink-0 items-center gap-1 text-muted-foreground hover:text-foreground"
+            title="Clear selection"
+          >
+            <X size={13} />
+          </button>
+        </div>
+      )}
+
       {/* Track list */}
       {discs.map(([discNo, tracks]) => (
         <div key={discNo} className="mb-4">
@@ -478,17 +575,20 @@ export function AlbumDetailPage({
             {tracks.map((t) => {
               const queueIndex = release!.tracks.indexOf(t);
               const isCurrent = currentTrackId === t.id;
-              const isSelected = selectedTrackId === t.id;
+              const isSelected = selectedIds.has(t.id);
               // Every row names its artist — even when it's the album artist.
               const trackArtist = t.artist_name ?? detail.artist_title;
+              // The menu acts on the whole selection when this row is in a
+              // multi-selection.
+              const inBulk = selectedIds.size >= 2 && selectedIds.has(t.id);
               return (
                 <ContextMenu key={t.id}>
                   <ContextMenuTrigger
                     render={
                       <button
                         data-music-track-id={t.id}
-                        onClick={() => setSelectedTrackId(t.id)}
-                        onContextMenu={() => setSelectedTrackId(t.id)}
+                        onClick={(e) => clickRow(e, t.id)}
+                        onContextMenu={() => contextRow(t.id)}
                         onDoubleClick={() => playFrom(queueIndex)}
                         className={`group flex w-full items-center gap-3 rounded-md px-2 py-1.5 text-left ${
                           isSelected ? "bg-accent" : "hover:bg-accent/50"
@@ -585,10 +685,17 @@ export function AlbumDetailPage({
                         Move to collection…
                       </ContextMenuItem>
                     )}
-                    <ContextMenuItem onClick={() => setEditTrackId(t.id)}>
-                      <Pencil size={14} />
-                      Edit metadata
-                    </ContextMenuItem>
+                    {inBulk ? (
+                      <ContextMenuItem onClick={() => setBulkOpen(true)}>
+                        <Pencil size={14} />
+                        Edit {selectedIds.size} tracks…
+                      </ContextMenuItem>
+                    ) : (
+                      <ContextMenuItem onClick={() => setEditTrackId(t.id)}>
+                        <Pencil size={14} />
+                        Edit metadata
+                      </ContextMenuItem>
+                    )}
                     {tagWriting && (
                       <ContextMenuItem onClick={() => setWriteScope({ kind: "track", id: t.id })}>
                         <HardDriveDownload size={14} />
@@ -637,6 +744,25 @@ export function AlbumDetailPage({
           if (!o) setEditTrackId(null);
         }}
         onSaved={handleSaved}
+      />
+      <BulkEditDialog
+        libraryId={detail.library_id}
+        trackIds={selectedInOrder}
+        releases={detail.releases.map((r) => ({
+          id: r.id,
+          label: r.label,
+          folder: r.folder,
+          folder_path: r.folder_path,
+        }))}
+        open={bulkOpen}
+        onOpenChange={setBulkOpen}
+        onSaved={() => {
+          // The tracks may have moved albums or releases — the selection
+          // no longer names rows on this page.
+          setSelectedIds(new Set());
+          setSelectedTrackId(null);
+          handleSaved();
+        }}
       />
       <AlbumEditDialog
         albumId={editAlbumOpen ? entryId : null}

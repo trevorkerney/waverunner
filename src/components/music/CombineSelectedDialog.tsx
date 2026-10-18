@@ -61,9 +61,9 @@ interface MergedDisc {
   suggested: string;
 }
 
-/** A disc name to write on the keeper's edition before the combine. */
+/** A disc name for the merged track list — written, in the combine's own
+ *  write, onto every track landing on that disc number. */
 export interface DiscName {
-  releaseId: number;
   discNo: number;
   /** "" clears an earlier rename. */
   title: string;
@@ -329,8 +329,8 @@ export function CombineSelectedDialog({
         <DialogHeader>
           <DialogTitle>Combine {picked.length} albums</DialogTitle>
           <DialogDescription>
-            The albums become one. Your files are never touched, and the combine
-            is remembered through every future rescan.
+            The albums become one, right away. Your files are never touched, and the
+            combine survives every future rescan.
           </DialogDescription>
         </DialogHeader>
 
@@ -597,7 +597,7 @@ export function CombineSelectedDialog({
                 for (const d of mergedDiscs) {
                   const value = (discNames[d.disc_no] ?? "").trim();
                   if (value !== d.keeperExisting) {
-                    discs.push({ releaseId: targetEdition.release_id, discNo: d.disc_no, title: value });
+                    discs.push({ discNo: d.disc_no, title: value });
                   }
                 }
               }

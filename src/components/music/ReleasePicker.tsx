@@ -13,7 +13,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from "../ui/dialog";
-import { notifyPendingWorkChanged } from "./PendingWork";
 import { MATCH_LOCK_TITLE, useMatchLock } from "@/hooks/libraryRuns";
 import { releaseCover } from "./musicQueue";
 import type { MusicAlbumDetail, MusicRelease } from "../../types";
@@ -66,7 +65,7 @@ export function ReleasePicker({
   const locked = useMatchLock(detail.library_id);
   // Merge and separate ask first (user's call, 2026-09-26): both are one
   // click on a small icon in a row of them, and both reshape the album on
-  // the next rescan. The confirm names what folds into what.
+  // the spot. The confirm names what folds into what.
   const [confirm, setConfirm] = useState<{ kind: "merge" | "split"; release: MusicRelease } | null>(
     null,
   );
@@ -88,11 +87,14 @@ export function ReleasePicker({
       toast.error(String(err));
     }
   };
+  // Both apply on the spot (the tag layer's release_key / identity token)
+  // and are undone from the Metadata page's History.
   const merge = async (r: MusicRelease) => {
     try {
       await invoke<string>("merge_album_release", { releaseId: r.id, intoReleaseId: releaseId });
-      toast("Merge staged — it applies on the next rescan");
-      notifyPendingWorkChanged();
+      toast.success("Merged — one track list. Undo from History on the Metadata page.");
+      setOpen(false);
+      onChanged();
     } catch (err) {
       toast.error(String(err));
     }
@@ -100,8 +102,9 @@ export function ReleasePicker({
   const split = async (r: MusicRelease) => {
     try {
       await invoke<string>("split_album_release", { releaseId: r.id });
-      toast("Separation staged — it applies on the next rescan");
-      notifyPendingWorkChanged();
+      toast.success("Separated into its own album. Undo from History on the Metadata page.");
+      setOpen(false);
+      onChanged();
     } catch (err) {
       toast.error(String(err));
     }
@@ -118,8 +121,8 @@ export function ReleasePicker({
         title={confirm?.kind === "split" ? "Separate this release?" : "Merge releases?"}
         message={
           confirm?.kind === "split"
-            ? `“${confirm ? releaseLabel(confirm.release) : ""}” becomes its own album. Files stay put; it applies on the next rescan and can be undone until then.`
-            : `“${confirm ? releaseLabel(confirm.release) : ""}” merges into “${releaseLabel(release)}” — one track list. Files stay put; it applies on the next rescan and can be undone until then.`
+            ? `“${confirm ? releaseLabel(confirm.release) : ""}” becomes its own album. Files stay put; it applies now and can be undone from History.`
+            : `“${confirm ? releaseLabel(confirm.release) : ""}” merges into “${releaseLabel(release)}” — one track list. Files stay put; it applies now and can be undone from History.`
         }
         lines={3}
         confirmLabel={confirm?.kind === "split" ? "Separate" : "Merge"}
@@ -351,7 +354,7 @@ export function ReleasePicker({
                           title={
                             locked
                               ? MATCH_LOCK_TITLE
-                              : `Merge into “${releaseLabel(release)}” — one track list (staged — applies on the next rescan)`
+                              : `Merge into “${releaseLabel(release)}” — one track list`
                           }
                           className={iconButton}
                           onClick={(e) => {
@@ -368,7 +371,7 @@ export function ReleasePicker({
                         title={
                           locked
                             ? MATCH_LOCK_TITLE
-                            : "Separate into its own album (staged — applies on the next rescan)"
+                            : "Separate into its own album"
                         }
                         className={iconButton}
                         onClick={(e) => {

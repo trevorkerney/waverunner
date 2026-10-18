@@ -1435,9 +1435,9 @@ function App() {
       if (v && v.libraryId === libraryId) {
         // Land on the Metadata page (user's call, 2026-09-26): after a
         // scan — the first one or any rescan — the work is there: the
-        // first pass to run, what the staged changes did, and the video
-        // match question, which rides above that page only. Through the
-        // ref, since selectView is declared further down.
+        // first pass to run, and the video match question, which rides
+        // above that page only. Through the ref, since selectView is
+        // declared further down.
         openMetadataRef.current(libraryId);
       }
       afterLibraryChanged(lib);

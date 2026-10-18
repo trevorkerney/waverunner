@@ -120,6 +120,8 @@ add something, on import, to combine and merge albums that are in the same album
 
 track playlists vs album playlists
 
+allow movies and tv episodes to have multiple versions the user can pick from. when clicking play on anything with multiple versions, pull up modal for user to pick from. when automatically going to an episode after the previous one, bring up that modal with versions to pick from. maybe add default versions and delays for the episode picker modal after automatically going to an episode after the previous one, so that the default automatically plays after no input after a few seconds. etc
+
 LISTENBRAINZ
 
 exclusive audio mode setting

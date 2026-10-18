@@ -237,10 +237,17 @@ export function useGridWindow({
     measuredCountRef.current = 0;
     fallbackRef.current = mean;
     columnsRef.current = newColumns;
-    if (populated) {
-      scrollToIndex(anchorItem, delta);
-      forceRangeRef.current = true;
-    }
+    if (populated) scrollToIndex(anchorItem, delta);
+    // ALWAYS re-slice, anchored or not (2026-10-17). The render that just
+    // committed picked its items with the OLD column count, and CSS has
+    // already flowed them into the new columns: the DOM holds a different
+    // number of rows than the arithmetic assumes. Left alone, the "still
+    // serves" test below answers from that arithmetic, passes, and nothing
+    // re-renders — the viewport sits in blank padding under a too-short
+    // slice until a scroll forces a rebuild. The cover-size slider hit
+    // this on every tick that changed the column count (the size reset
+    // forgets the heights first, so the anchored path above never ran).
+    forceRangeRef.current = true;
   };
 
   /** Read the live column count + gap off the grid; true when either changed. */
@@ -332,13 +339,18 @@ export function useGridWindow({
     let remeasured = false;
     if (opts.measure) {
       const a = measureColumns();
-      const b = measureRows();
+      // After a re-flow the DOM's rows are the OLD column layout; their
+      // heights belong to no row of the new one, so they aren't recorded
+      // this pass — the re-slice below renders the new rows, and the next
+      // pass measures those.
+      const b = forceRangeRef.current ? false : measureRows();
       remeasured = a || b;
     }
     // After a column re-flow the rendered slice is in the OLD rows: treat it
     // as serving nothing so the new one is built now, not on the next scroll.
-    const forced = forceRangeRef.current;
-    forceRangeRef.current = false;
+    // A frozen grid (a drag in progress) keeps the flag for its next settle.
+    const forced = !frozen && forceRangeRef.current;
+    if (!frozen) forceRangeRef.current = false;
     const next = frozen
       ? null
       : nextRange(forced ? { start: 0, end: 0 } : renderedRangeRef.current) ??

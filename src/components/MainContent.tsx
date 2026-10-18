@@ -121,7 +121,7 @@ const EMPTY_ALBUM_SELECTION: AlbumSelection = {
   busy: false,
   configuring: false,
 };
-import { PendingWorkStrip, notifyPendingWorkChanged } from "@/components/music/PendingWork";
+import { PendingWorkStrip } from "@/components/music/PendingWork";
 import { EditCharacterNameDialog, type CharacterEditTarget } from "@/components/EditCharacterNameDialog";
 import { TmdbPersonSearchDialog } from "@/components/TmdbPersonSearchDialog";
 import { ArtistsGrid } from "@/components/music/ArtistsGrid";
@@ -439,21 +439,15 @@ export function MainContent({
     const { libraryId, picked, keeperId, mode } = albumSelect;
     setAlbumSelect((s) => (s ? { ...s, busy: true } : s));
     try {
-      // The title nudge's answer FIRST: a user-tier title on the keeper,
-      // carried through the rescan. It must land before the combine is
-      // staged — staged is immutable, and the keeper is part of the
-      // staging, so a title written after it is refused.
+      // The title nudge's answer first: a user-tier title on the keeper's
+      // own row — the row the combined album keeps.
       if (title) {
         await invoke("set_album_fields", { albumId: keeperId, fields: { title } });
       }
-      // Disc names likewise: folder-keyed on the keeper's edition, which is
-      // the merged release's key after the rescan — names for the discs the
-      // other albums bring show up when their tracks land.
-      for (const d of discs) {
-        await invoke("set_disc_title", { releaseId: d.releaseId, discNo: d.discNo, title: d.title });
-      }
-      // The album-artist answer rides along: the backend writes it on the
-      // keeper once the combine's own checks pass, before staging.
+      // The combine itself, applied on the spot: identity token (and, for a
+      // merge, release membership and disc names) written onto the tracks,
+      // the album regrouped by a scoped rescan before this returns. The
+      // album-artist answer rides along the same write.
       await invoke("combine_albums_multi", {
         libraryId,
         sourceIds: picked.filter((p) => p.id !== keeperId).map((p) => p.id),
@@ -461,17 +455,22 @@ export function MainContent({
         mode,
         targetReleaseFolder,
         albumArtist,
+        discNames: discs.map((d) => ({ disc_no: d.discNo, title: d.title })),
       });
       setAlbumSelect(null);
-      // STAGED: the directive applies on the next rescan, batched with any
-      // other staged changes (the metadata center's pending banner offers it).
-      toast("Combine staged — it applies on the next rescan");
-      notifyPendingWorkChanged();
+      toast.success(
+        mode === "merge"
+          ? `Combined ${picked.length} albums into one track list. Undo from History on the Metadata page.`
+          : `Combined ${picked.length} albums as separate releases. Undo from History on the Metadata page.`,
+      );
+      // Same recipe as a rescan landing: the grid drops the folded cards,
+      // counts and open pages refetch.
+      onMetadataChanged?.(libraryId);
     } catch (err) {
       toast.error(String(err));
       setAlbumSelect((s) => (s ? { ...s, busy: false } : s));
     }
-  }, [albumSelect]);
+  }, [albumSelect, onMetadataChanged]);
   useEffect(() => {
     if (!albumSelect || albumSelect.busy) return;
     const onKey = (e: KeyboardEvent) => {
@@ -1744,9 +1743,9 @@ export function MainContent({
       {selectedLibrary && (
         <>
   
-          {/* Deferred-work strip: staged rescan changes and matches awaiting
-              a pass, with their actions — visible on every page of a music
-              library so queued work is never a surprise. */}
+          {/* Deferred-work strip: matches awaiting a pass, with its action —
+              visible on every page of a music library so queued work is
+              never a surprise. */}
           {selectedLibrary.format === "music" && (
             <PendingWorkStrip libraryId={selectedLibrary.id} />
           )}

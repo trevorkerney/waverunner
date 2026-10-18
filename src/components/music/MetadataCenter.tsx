@@ -257,9 +257,9 @@ interface DuplicateGroup {
  *  (the fetch is seven calls, the review alone walking every artist and
  *  album — the whole arrival wait). Nothing invalidates it: the silent
  *  refetch on every arrival, and the refreshes every mutation already
- *  triggers, keep it honest. The two work queues (staged changes, pending
- *  pass) are NOT in here: they come live from usePendingWork, so the
- *  banners never show a stale queue while the review reloads. */
+ *  triggers, keep it honest. The pass queue is NOT in here: it comes live
+ *  from usePendingWork, so the banner never shows a stale queue while the
+ *  review reloads. */
 interface CenterSnapshot {
   review: MbReview;
   matchState: MusicMatchState;
@@ -278,24 +278,21 @@ const centerCache = new Map<string, CenterSnapshot>();
 // Map nodes are plain buttons: a click opens the match dialog, which
 // carries Ignore / Un-ignore itself. (Each node used to wrap its own
 // context menu for the same two actions — 2.3K menu roots on arrival.)
-const STAGED_HINT = "Staged for rescan — undo the staged change to edit";
 /** Decision controls while a click's apply or the page's refresh is in
  *  flight (busy, not a pass): the hover text that says why. */
 const PAGE_BUSY_TITLE = "The page is updating — one moment";
 
 function AlbumChip({
   al,
-  locked,
   onOpen,
 }: {
   al: MbAlbumRow;
-  locked: boolean;
   onOpen: (albumId: number) => void;
 }) {
   return (
     <button
-      onClick={() => !locked && onOpen(al.album_id)}
-      title={locked ? `${al.title} · ${STAGED_HINT}` : al.title}
+      onClick={() => onOpen(al.album_id)}
+      title={al.title}
       className={`max-w-48 truncate rounded border px-1.5 py-0.5 text-[11px] transition-colors hover:brightness-125 ${
         al.ignored
           ? "border-transparent bg-muted text-muted-foreground"
@@ -323,15 +320,11 @@ function AlbumChip({
 const MapRow = memo(function MapRow({
   artist,
   albums,
-  locked,
-  lockedIds,
   onMatchArtist,
   onMatchAlbum,
 }: {
   artist: MbArtistRow;
   albums: MbAlbumRow[];
-  locked: boolean;
-  lockedIds: Set<number>;
   onMatchArtist: (artistId: number) => void;
   onMatchAlbum: (albumId: number) => void;
 }) {
@@ -339,8 +332,8 @@ const MapRow = memo(function MapRow({
   return (
     <div className="flex items-start gap-2">
       <button
-        onClick={() => !locked && onMatchArtist(a.artist_id)}
-        title={locked ? `${a.title} · ${STAGED_HINT}` : a.title}
+        onClick={() => onMatchArtist(a.artist_id)}
+        title={a.title}
         className={`flex w-44 shrink-0 items-center gap-1.5 rounded px-1.5 py-0.5 text-left text-xs transition-colors hover:bg-accent/50 ${
           a.ignored ? "text-muted-foreground" : ""
         }`}
@@ -358,7 +351,7 @@ const MapRow = memo(function MapRow({
       </button>
       <div className="flex min-w-0 flex-1 flex-wrap gap-1">
         {albums.map((al) => (
-          <AlbumChip key={al.album_id} al={al} locked={lockedIds.has(al.album_id)} onOpen={onMatchAlbum} />
+          <AlbumChip key={al.album_id} al={al} onOpen={onMatchAlbum} />
         ))}
       </div>
     </div>
@@ -375,11 +368,9 @@ const NO_ARTISTS: MbArtistRow[] = [];
  *  element — the whole arrival wait on a cached visit). */
 const FeatureStrip = memo(function FeatureStrip({
   artists,
-  lockedIds,
   onMatchArtist,
 }: {
   artists: MbArtistRow[];
-  lockedIds: Set<number>;
   onMatchArtist: (artistId: number) => void;
 }) {
   return (
@@ -389,12 +380,11 @@ const FeatureStrip = memo(function FeatureStrip({
       </h4>
       <div className="flex flex-wrap gap-1">
         {artists.map((a) => {
-          const locked = lockedIds.has(a.artist_id);
           return (
             <button
               key={a.artist_id}
-              onClick={() => !locked && onMatchArtist(a.artist_id)}
-              title={locked ? `${a.title} · ${STAGED_HINT}` : a.title}
+              onClick={() => onMatchArtist(a.artist_id)}
+              title={a.title}
               className={`flex max-w-48 items-center gap-1.5 rounded border px-1.5 py-0.5 text-[11px] transition-colors hover:brightness-125 ${
                 a.ignored
                   ? "border-transparent bg-muted text-muted-foreground"
@@ -420,14 +410,12 @@ const FeatureStrip = memo(function FeatureStrip({
 const MapWall = memo(function MapWall({
   rows,
   albumsByArtist,
-  lockedIds,
   onMatchArtist,
   onMatchAlbum,
   resetKey,
 }: {
   rows: MbArtistRow[];
   albumsByArtist: Map<number, MbAlbumRow[]>;
-  lockedIds: Set<number>;
   onMatchArtist: (artistId: number) => void;
   onMatchAlbum: (albumId: number) => void;
   resetKey: string;
@@ -452,8 +440,6 @@ const MapWall = memo(function MapWall({
           key={a.artist_id}
           artist={a}
           albums={albumsByArtist.get(a.artist_id) ?? NO_ALBUMS}
-          locked={lockedIds.has(a.artist_id)}
-          lockedIds={lockedIds}
           onMatchArtist={onMatchArtist}
           onMatchAlbum={onMatchAlbum}
         />
@@ -470,10 +456,6 @@ interface MetadataCenterProps {
    *  suggestion resolved, or a re-run pass landing) so the host can refresh
    *  the pages behind this panel. */
   onChanged?: () => void;
-  /** A directive needing a rescan was written (artist split). Hosts that ARE
-   *  a wizard run the rescan themselves; without this the request goes out as
-   *  the sidebar window event, which is refused while a wizard is open. */
-  onRescanNeeded?: (libraryId: string) => void;
   /** Reports the pending-decision count after every load — the wizard shows
    *  it beside Finish as a pointer (never a gate). */
   onDecisionsChange?: (pending: number) => void;
@@ -785,7 +767,7 @@ function ClusterCard({
   /** Merge every spelling into the survivor, then open the split editor on
    *  it — for joint names ("Drake & Lil Wayne" / "Drake, Lil Wayne"): the
    *  merge makes the other spellings aliases, and a split is keyed by every
-   *  alias, so one staged split then covers all of them. Offered on every
+   *  alias, so one split then covers all of them. Offered on every
    *  cluster (user's call — no guessing from the text which ones are joint). */
   onMergeAndSplit: (cluster: IdentityCluster, survivorId: number) => void;
   onDismiss: (cluster: IdentityCluster) => void;
@@ -912,7 +894,7 @@ function ClusterCard({
             variant="outline"
             className="gap-1.5"
             disabled={busy || effSurvivor == null}
-            title="Merge the spellings, then split the result into its members (staged for the next rescan)"
+            title="Merge the spellings, then split the result into its members"
             onClick={() => onMergeAndSplit(cluster, effSurvivor as number)}
           >
             <Scissors size={12} />
@@ -1310,6 +1292,9 @@ const KIND_WORD: Record<string, string> = {
   track_match: "track match",
   suggestion_rejected: "declined",
   mb_ignored: "ignored",
+  layer_edit: "tag edit",
+  album_fields: "album fields",
+  artist_split: "artist split",
 };
 const KIND_LABELS = (kinds: string[]) =>
   kinds.map((k) => KIND_WORD[k] ?? k).join(", ");
@@ -1318,7 +1303,6 @@ export function MetadataCenter({
   libraryId,
   reloadKey = 0,
   onChanged,
-  onRescanNeeded,
   onDecisionsChange,
   onRunPass,
   onOpenAlbum,
@@ -1356,12 +1340,11 @@ export function MetadataCenter({
   const [issues, setIssues] = useState<ScanIssueRow[]>(() => cached?.issues ?? []);
   const [unlinked, setUnlinked] = useState<UnlinkedCredit[]>(() => cached?.unlinked ?? []);
   const [duplicates, setDuplicates] = useState<DuplicateGroup[]>(() => cached?.duplicates ?? []);
-  // The two work queues, live (see usePendingWork): staged directives a
-  // rescan will apply, and applied matches a matching pass has yet to cash
-  // in. Two cheap queries, refetched on every event that changes them — the
-  // banners they drive must not wait on (or lag behind) the review fetch.
+  // The pass queue, live (see usePendingWork): applied matches a matching
+  // pass has yet to cash in. Cheap queries, refetched on every event that
+  // changes them — the banner they drive must not wait on (or lag behind)
+  // the review fetch.
   const {
-    rescan: pending,
     pass: pendingPass,
     buckets: passBuckets,
     failures: passFailures,
@@ -1724,10 +1707,10 @@ export function MetadataCenter({
     });
   // "Merge & split": the split editor opens FIRST on the survivor; nothing
   // happens until the members are confirmed, and cancel does nothing at
-  // all (user's call). On confirm the merge runs, then the split is staged
-  // — the merge turns the other spellings into aliases, and a split
-  // directive is keyed by every name the artist answers to, so the one
-  // staged split catches "Drake & Lil Wayne" AND "Drake, Lil Wayne".
+  // all (user's call). On confirm the merge runs, then the split applies
+  // — the merge turns the other spellings into aliases, and a split rule
+  // is keyed by every name the artist answers to, so the one split
+  // catches "Drake & Lil Wayne" AND "Drake, Lil Wayne".
   const [mergeSplit, setMergeSplit] = useState<{ cluster: IdentityCluster; survivorId: number } | null>(
     null,
   );
@@ -1894,14 +1877,6 @@ export function MetadataCenter({
   };
 
   const albums = review?.albums ?? NO_ALBUMS;
-  // A staged split/combine has already decided these entities' fate — they
-  // dissolve when the rescan applies. Their rows leave the work lists and
-  // every edit locks until then (or until the staging is undone): a match or
-  // ignore made now would be silently discarded with the entity.
-  const stagedLockedIds = useMemo(() => new Set(pending.flatMap((p) => p.locked_ids)), [pending]);
-  const stagedSplitNames = new Set(
-    pending.filter((p) => p.kind === "artist_split").map((p) => p.target),
-  );
   // Ignored entities have left the counting: the tallies (and the unmatched
   // work lists) only see what still wants matching. The map is where gray
   // lives and gets un-ignored.
@@ -1916,7 +1891,6 @@ export function MetadataCenter({
     (a) =>
       (a.state === "notfound" || a.state === "unchecked") &&
       !a.ignored &&
-      !stagedLockedIds.has(a.album_id) &&
       !queuedAlbumIds.has(a.album_id) &&
       albumMatches(a),
   );
@@ -1936,22 +1910,16 @@ export function MetadataCenter({
     (a) =>
       a.state !== "matched" && !a.ignored && artistMatches(a) && !queuedArtistIds.has(a.artist_id),
   );
-  const notStagedSplit = (a: MbArtistRow) =>
-    !stagedSplitNames.has(a.title.toLowerCase()) && !stagedLockedIds.has(a.artist_id);
   // The guide's stage-1/stage-3 boundary, made visible in the page structure:
   // owners unlock albums, features get unlocked BY albums. Split on the same
   // predicate the guide counts with, so its "N left" agrees with the header
   // its Go button lands on.
-  const artistsUnmatchedOwners = artistsUnmatched.filter(
-    (a) => a.album_count > 0 && notStagedSplit(a),
-  );
+  const artistsUnmatchedOwners = artistsUnmatched.filter((a) => a.album_count > 0);
   // Every unmatched owner is a main artist, one-album owners included (the
   // "better matched through their album" section that split them off was
   // retired 2026-09-27 — user's call; the joint-name row hint that outlived
   // it went 2026-10-04).
-  const artistsUnmatchedFeatures = artistsUnmatched.filter(
-    (a) => a.album_count === 0 && notStagedSplit(a),
-  );
+  const artistsUnmatchedFeatures = artistsUnmatched.filter((a) => a.album_count === 0);
   const artistsIdentified = artists.filter((a) => a.state === "matched" && artistMatches(a));
   const artistsMatched = artists.filter((a) => a.state === "matched").length;
 
@@ -2104,29 +2072,20 @@ export function MetadataCenter({
   // on the next pass), 2: the albums themselves (matched albums prove their
   // credited artists), 3: feature-only leftovers. Rescans and passes advance
   // the stages on their own; the guide is a lens, not a gate.
-  // Staged rows are excluded everywhere the LISTS exclude them — a count
-  // must agree with the list its Go button lands on (staged splits/combines
-  // dissolve on the next rescan; their rows already left the work lists).
   // Stage 1 counts every unmatched owner, one-album owners included.
   const guideOwnerLeft = artists.filter(
-    (a) => a.state !== "matched" && !a.ignored && a.album_count > 0 && notStagedSplit(a),
+    (a) => a.state !== "matched" && !a.ignored && a.album_count > 0,
   ).length;
   const guideAlbumsLeft = albums.filter(
-    (a) =>
-      a.state !== "release" &&
-      a.state !== "album" &&
-      !a.ignored &&
-      !stagedLockedIds.has(a.album_id),
+    (a) => a.state !== "release" && a.state !== "album" && !a.ignored,
   ).length;
   // Stage 3: albums matched to a group whose release(s) still need picking
   // (state "album" = group known, release not) — the exact-pressing pick
   // that brings the track list and credits.
-  const guideReleasesLeft = albums.filter(
-    (a) => a.state === "album" && !a.ignored && !stagedLockedIds.has(a.album_id),
-  ).length;
+  const guideReleasesLeft = albums.filter((a) => a.state === "album" && !a.ignored).length;
   const guideFeatureLeft = artistSuggestions.filter((s) => {
     const row = artists.find((a) => a.artist_id === s.payload.artist_id);
-    return !row ? true : !row.ignored && row.album_count === 0 && notStagedSplit(row);
+    return !row ? true : !row.ignored && row.album_count === 0;
   }).length;
   const guideStage =
     guideOwnerLeft > 0
@@ -2199,8 +2158,8 @@ export function MetadataCenter({
           artist + title scanned as one album with versions (tags as truth —
           the scan can't tell an EP from a retail album by tags), and
           MusicBrainz has two albums of that name. One match can't cover
-          both; Separate (the album page's versions picker) splits them for
-          the next rescan, and each then matches on its own. */}
+          both; Separate (the album page's versions picker) splits them on
+          the spot, and each then matches on its own. */}
       {(s.payload.library_versions ?? 1) > 1 && (s.payload.groups ?? []).length > 1 && (
         <p className="mt-1 text-xs text-amber-300/90">
           {s.payload.library_versions} versions here and {(s.payload.groups ?? []).length} albums
@@ -2543,7 +2502,7 @@ export function MetadataCenter({
   const ownerRows = useMemo(() => artists.filter((a) => albumsByArtist.has(a.artist_id)), [artists, albumsByArtist]);
   const featureArtists = useMemo(() => artists.filter((a) => !albumsByArtist.has(a.artist_id)), [artists, albumsByArtist]);
   const albumChip = (al: MbAlbumRow) => (
-    <AlbumChip key={al.album_id} al={al} locked={stagedLockedIds.has(al.album_id)} onOpen={setMatchAlbum} />
+    <AlbumChip key={al.album_id} al={al} onOpen={setMatchAlbum} />
   );
   const mapReds = artists.filter(artistRed).length + albums.filter(albumRed).length;
   // Completion share over the same population the map colors (ignored
@@ -2617,17 +2576,13 @@ export function MetadataCenter({
             id: "artists" as const,
             label: "Artists",
             count: artists.length,
-            // Staged-split rows are hidden from the pane's lists — keep the
-            // rail's numbers agreeing with what the click reveals.
             // Red = unmatched owners (the main list); amber = the
             // feature-only names — the pane's own section colours.
             alert: artists.filter(
-              (a) =>
-                a.state !== "matched" && !a.ignored && a.album_count > 0 && notStagedSplit(a),
+              (a) => a.state !== "matched" && !a.ignored && a.album_count > 0,
             ).length,
             warn: artists.filter(
-              (a) =>
-                a.state !== "matched" && !a.ignored && notStagedSplit(a) && a.album_count === 0,
+              (a) => a.state !== "matched" && !a.ignored && a.album_count === 0,
             ).length,
           },
           {
@@ -2635,14 +2590,9 @@ export function MetadataCenter({
             label: "Albums",
             count: albums.length,
             alert: albums.filter(
-              (a) =>
-                (a.state === "notfound" || a.state === "unchecked") &&
-                !a.ignored &&
-                !stagedLockedIds.has(a.album_id),
+              (a) => (a.state === "notfound" || a.state === "unchecked") && !a.ignored,
             ).length,
-            warn: albums.filter(
-              (a) => a.state === "album" && !a.ignored && !stagedLockedIds.has(a.album_id),
-            ).length,
+            warn: albums.filter((a) => a.state === "album" && !a.ignored).length,
           },
         ]
       : []),
@@ -2677,8 +2627,8 @@ export function MetadataCenter({
   const historyCount = review?.changes.length ?? 0;
 
   // Above the tabs only the opt-out notice remains (user's call, 2026-09-26:
-  // the work banners — apply queue, pass queue, staged changes — live in a
-  // footer under the pane, so the top reserves no space for them). With it
+  // the work banners — apply queue, pass queue — live in a footer under
+  // the pane, so the top reserves no space for them). With it
   // absent, the tabs sit flush at the top: no spacer, no rule.
   const bannersAbove = !!review && !onlineEnabled;
 
@@ -2714,8 +2664,8 @@ export function MetadataCenter({
           </Button>
         </div>
       )}
-    {/* Same border the nav/pane divider uses, closing the header (and the
-        staged-changes banner, when present) off from the columns. The spacing
+    {/* Same border the nav/pane divider uses, closing the header off from
+        the columns. The spacing
         under the line lives INSIDE the nav (padding, not row padding) so the
         nav's border-r runs all the way up to touch it — and the pane's pt is
         scroll-container padding, so scrolled content passes flush beneath
@@ -3100,11 +3050,10 @@ export function MetadataCenter({
                       size="sm"
                       variant="outline"
                       className="shrink-0"
-                      disabled={busy || pending.length > 0}
-                      title={pending.length > 0 ? "Staged changes need a rescan first" : undefined}
+                      disabled={busy}
                       onClick={rerunMatching}
                     >
-                      {pending.length > 0 ? "Rescan first" : "Run pass now"}
+                      Run pass now
                     </Button>
                   )}
                 </div>
@@ -3302,8 +3251,7 @@ export function MetadataCenter({
                   matches, never-examined albums, or artists it can derive.
                   (The queue alone isn't the test — artist matches and
                   accepted cards don't enqueue, yet they're exactly what a
-                  pass cashes in.) Staged changes keep the row visible in its
-                  rescan-first form. */}
+                  pass cashes in.) */}
               {/* No pass button here — the queue banner at the top owns it.
                   (This whole checklist section is due for a redesign.) */}
             </div>
@@ -3335,7 +3283,6 @@ export function MetadataCenter({
           <MapWall
             rows={ownerRows}
             albumsByArtist={albumsByArtist}
-            lockedIds={stagedLockedIds}
             onMatchArtist={setMatchArtist}
             onMatchAlbum={setMatchAlbum}
             resetKey={`map|${libraryId}`}
@@ -3352,7 +3299,7 @@ export function MetadataCenter({
           {/* Artists with no albums here — features and loose-track credits.
               No children to branch, so they cluster as their own strip. */}
           {featureArtists.length > 0 && (
-            <FeatureStrip artists={featureArtists} lockedIds={stagedLockedIds} onMatchArtist={setMatchArtist} />
+            <FeatureStrip artists={featureArtists} onMatchArtist={setMatchArtist} />
           )}
         </section>
       )}
@@ -3380,8 +3327,6 @@ export function MetadataCenter({
               size="sm"
               variant="outline"
               className="shrink-0 gap-1.5"
-              disabled={pending.length > 0}
-              title={pending.length > 0 ? "Staged changes need a rescan first" : undefined}
               onClick={rerunMatching}
             >
               <RefreshCw size={13} />
@@ -4144,7 +4089,7 @@ export function MetadataCenter({
         onOpenChange={(o) => {
           if (!o) {
             setSplitArtist(null);
-            // A staged split changes the pending banner — refetch.
+            // An applied split reshapes the lists — refetch.
             refresh();
           }
         }}
@@ -4165,8 +4110,8 @@ export function MetadataCenter({
         onOpenChange={(o) => {
           if (!o) {
             setMergeSplit(null);
-            // Confirmed: a merge happened and a split is staged; cancelled:
-            // nothing did. Refetch either way — cheap, and always right.
+            // Confirmed: a merge and a split happened; cancelled: nothing
+            // did. Refetch either way — cheap, and always right.
             refresh();
             onChanged?.();
           }
@@ -4262,7 +4207,6 @@ export function MetadataCenter({
               .filter(
                 (a) =>
                   a.album_id !== combinePartnerFor?.album_id &&
-                  !stagedLockedIds.has(a.album_id) &&
                   (partnerFilter.trim() === "" ||
                     `${a.title} ${a.artist_title ?? ""}`
                       .toLowerCase()
@@ -4326,18 +4270,14 @@ export function MetadataCenter({
             // dialogs closing in one update would race for it.
             setCombinePartnerFor(null);
             try {
-              // The title nudge's answer FIRST — staged is immutable, and
-              // the keeper is part of the staging once the combine lands.
+              // The title nudge's answer first: a user-tier title on the
+              // keeper's own row — the row the combined album keeps.
               if (title) {
                 await invoke("set_album_fields", { albumId: sel.keeperId, fields: { title } });
               }
-              // Disc names likewise, keyed on the keeper's edition folder —
-              // the merged release's key after the rescan.
-              for (const d of discs) {
-                await invoke("set_disc_title", { releaseId: d.releaseId, discNo: d.discNo, title: d.title });
-              }
-              // The album-artist answer rides along: written on the keeper
-              // once the combine's own checks pass, before staging.
+              // The combine itself, applied on the spot (identity token,
+              // release membership, disc names and the album-artist answer
+              // in one write; the album regroups before this returns).
               await invoke("combine_albums_multi", {
                 libraryId,
                 sourceIds: sel.picked.filter((p) => p.id !== sel.keeperId).map((p) => p.id),
@@ -4345,9 +4285,10 @@ export function MetadataCenter({
                 mode: sel.mode,
                 targetReleaseFolder,
                 albumArtist,
+                discNames: discs.map((d) => ({ disc_no: d.discNo, title: d.title })),
               });
               setCombineSelect(null);
-              // Staged — the banner picks it up on refresh.
+              toast.success("Combined. Undo from History.");
               await refresh();
               onChanged?.();
             } catch (e) {
@@ -4360,9 +4301,8 @@ export function MetadataCenter({
       {/* THE FOOTER (user's call, 2026-09-26): every work banner lives under
           the pane, so the top reserves nothing. Top to bottom — the apply
           queue (work already ordered, landing), the matching pass (what the
-          next pass will do, or the running pass), the staged changes (what
-          the next rescan applies). Each list caps at four rows and scrolls;
-          the pane above takes whatever height is left. */}
+          next pass will do, or the running pass). Each list caps at four
+          rows and scrolls; the pane above takes whatever height is left. */}
       {/* Decisions applying in the background. Neutral tone; the running
           item spins, the waiting ones can still be pulled back. */}
       {(queuedForLib.length > 0 || settledForLib.length > 0 || settling) && (
@@ -4407,10 +4347,8 @@ export function MetadataCenter({
           artists MusicBrainz has never been asked about (the old post-scan
           question's numbers) and the queue — matches to cash in, re-checks.
           No question, no "not now": while there's work, this shows, and a
-          pass is what clears it. Staged changes gate it (same rule the
-          backend enforces): rescan first, then pass. "Unmatch" per queue
-          line rather than "Undo": nothing staged here, undoing means
-          forgetting the match. */}
+          pass is what clears it. "Unmatch" per queue line rather than
+          "Undo": undoing means forgetting the match. */}
       {onlineEnabled && !running && passWorkCount > 0 && (
         // Two rows: a header row (icon, title, the fixed controls — they
         // never scroll), then the list under it at FULL width, so its
@@ -4430,12 +4368,11 @@ export function MetadataCenter({
                 size="sm"
                 variant="outline"
                 className="shrink-0 gap-1.5"
-                disabled={busy || running || pending.length > 0}
-                title={pending.length > 0 ? "Staged changes need a rescan first" : undefined}
+                disabled={busy || running}
                 onClick={rerunMatching}
               >
                 <RefreshCw size={13} />
-                {pending.length > 0 ? "Rescan first" : running ? "Pass running…" : "Run pass now"}
+                {running ? "Pass running…" : "Run pass now"}
               </Button>
             </div>
           </div>
@@ -4538,14 +4475,14 @@ export function MetadataCenter({
           </ul>
         </div>
       )}
-      {/* Nothing queued, nothing staged, no pass running: the way to run a
-          pass anyway (user's call, 2026-09-27). A pass with an empty queue
-          still does work — every phase finds its own (band members, credit
-          harvest, dates, retries of what failed last time) — and this is
-          the only place to start one once step 0 has retired. Same frame as
-          the queue banner with one row, and the queue banner takes its
-          place the moment anything is queued. */}
-      {onlineEnabled && !running && passWorkCount === 0 && pending.length === 0 && (
+      {/* Nothing queued, no pass running: the way to run a pass anyway
+          (user's call, 2026-09-27). A pass with an empty queue still does
+          work — every phase finds its own (band members, credit harvest,
+          dates, retries of what failed last time) — and this is the only
+          place to start one once step 0 has retired. Same frame as the
+          queue banner with one row, and the queue banner takes its place
+          the moment anything is queued. */}
+      {onlineEnabled && !running && passWorkCount === 0 && (
         <div className="shrink-0 border-t bg-muted/30 px-4 py-3">
           <div className="flex items-center gap-3">
             <RefreshCw size={14} className="shrink-0 text-muted-foreground" />
@@ -4569,57 +4506,6 @@ export function MetadataCenter({
                 whatever failed last time
               </span>
             </li>
-          </ul>
-        </div>
-      )}
-      {/* Staged directives waiting for one rescan — splits, combines,
-          separates accumulate here instead of each forcing its own rescan.
-          Any rescan applies (and clears) the whole batch. Bottom of the
-          stack: the rescan gates the pass above it. */}
-      {pending.length > 0 && (
-        <div className="shrink-0 border-t bg-red-500/5 px-4 py-3">
-          <div className="flex items-center gap-3">
-            <TriangleAlert size={14} className="shrink-0 text-red-400" />
-            <p className="min-w-0 flex-1 text-sm text-red-200/90">
-              {pending.length} staged {pending.length === 1 ? "change" : "changes"} — applied by the
-              next rescan
-            </p>
-            <Button
-              size="sm"
-              variant="outline"
-              className="shrink-0 gap-1.5"
-              disabled={busy || running}
-              onClick={() => {
-                if (onRescanNeeded) onRescanNeeded(libraryId);
-                else
-                  window.dispatchEvent(
-                    new CustomEvent("waverunner:open-rescan", { detail: { libraryId } }),
-                  );
-              }}
-            >
-              <RefreshCw size={13} />
-              Rescan now
-            </Button>
-          </div>
-          {/* One line per staged action; each truncates on its own instead of
-              the whole batch collapsing into one clipped run-on. Undo reverts
-              the directive itself — nothing has applied yet, so no rescan. */}
-          <ul className="-mr-4 mt-1 max-h-[70px] space-y-0.5 overflow-y-auto pl-[26px] pr-72">
-            {pending.map((p) => (
-              <li key={p.id} className="flex min-w-0 items-baseline gap-1.5 text-xs text-muted-foreground">
-                <span className="shrink-0">•</span>
-                <span className="min-w-0 truncate">{p.label}</span>
-                <button
-                  onClick={() =>
-                    run(`unstage:${p.id}`, () => invoke("unstage_pending_change", { id: p.id }))
-                  }
-                  disabled={busy}
-                  className="shrink-0 underline underline-offset-2 hover:text-foreground disabled:pointer-events-none disabled:opacity-50"
-                >
-                  {busyKey === `unstage:${p.id}` ? "…" : "Undo"}
-                </button>
-              </li>
-            ))}
           </ul>
         </div>
       )}

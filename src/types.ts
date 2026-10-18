@@ -298,6 +298,9 @@ export interface MusicRelease {
   year: string | null;
   /** Folder leaf — the versions menu's differentiator when labels collide. */
   folder: string;
+  /** The release's folder, library-relative — what a track's release_key
+   *  names to live here (the bulk editor's "Move to release"). */
+  folder_path: string;
   /** Distinct codecs of this release's tracks ("FLAC", "WAV"). */
   codecs: string[];
   /** The files carry a MusicBrainz release id — this copy pins the release. */
@@ -310,6 +313,9 @@ export interface MusicRelease {
   /** Folder leaves you merged into this release (applied — they're no longer
    *  editions of their own). Non-empty = offer to separate them again. */
   merged_folders: string[];
+  /** Label and catalogue number, by majority of the tracks' effective tags. */
+  label_name: string | null;
+  catalog_number: string | null;
   tracks: MusicTrack[];
   /** The release's OWN title (its tracks' album tag) — null pre-rescan or
    *  untagged; fall back to the album title. */

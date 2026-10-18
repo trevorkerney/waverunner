@@ -1,852 +1,20 @@
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use std::path::Path;
 
-/// One schema change, applied exactly once and recorded.
+/// The schema has NO migrations (user's call, 2026-10-15): the CREATE
+/// statements below describe the database in full, and every table shape
+/// change bumps this epoch. A database stamped with another epoch is from
+/// before the change: it is moved aside (never deleted) and a fresh one
+/// starts in its place — libraries get re-imported.
 ///
-/// `id` orders them and is the key — NOT the app version, because two
-/// migrations can ship in one release and because "alpha.12.10" sorts before
-/// "alpha.12.4" as a string. `app_version` is a label: it lands in the
-/// schema_version row so the table reads as a history of what shipped when.
-///
-/// Statements run in order inside one transaction per migration. Keep them
-/// additive where you can — an older build ignores an unknown column the same
-/// as an unknown table, so an additive migration leaves a downgrade possible.
-/// A DROP does not, which is what the pre-migration backup is for.
-struct Migration {
-    id: i64,
-    app_version: &'static str,
-    description: &'static str,
-    /// Skip (and record as done) when this table isn't present. A migration
-    /// that only moves data out of a table is vacuously complete on a database
-    /// that never had it — which is the normal case for a table that only ever
-    /// existed in development, and the reason this field exists.
-    requires_table: Option<&'static str>,
-    statements: &'static [&'static str],
-}
+/// Epoch 1 = the tag-layer schema: waverunner's own tier of every tag
+/// (field_override over the registry in tag_fields.rs), album identity by
+/// grouping key, no staged directives (combines, splits and merges apply on
+/// the spot through a scoped rescan).
+pub const SCHEMA_EPOCH: i64 = 1;
 
-/// Adding a column and emptying the old table are kept as SEPARATE migrations
-/// on purpose: the column is needed by every database, the backfill only by
-/// the ones that have something to backfill.
-const MIGRATIONS: &[Migration] = &[
-    Migration {
-        id: 1,
-        app_version: "1.0.0-alpha.12.5",
-        description: "album.mb_release_group_id column",
-        requires_table: None,
-        statements: &["ALTER TABLE album ADD COLUMN mb_release_group_id TEXT"],
-    },
-    Migration {
-        id: 2,
-        app_version: "1.0.0-alpha.12.5",
-        description: "move album_mb into album, drop it",
-        requires_table: Some("album_mb"),
-        statements: &[
-            "UPDATE album SET mb_release_group_id =
-                (SELECT mb_release_group_id FROM album_mb WHERE album_mb.album_id = album.id)
-             WHERE EXISTS (SELECT 1 FROM album_mb WHERE album_mb.album_id = album.id)",
-            "DROP TABLE album_mb",
-        ],
-    },
-    Migration {
-        id: 3,
-        app_version: "1.0.0-alpha.12.5",
-        description: "person.biography column",
-        requires_table: None,
-        statements: &["ALTER TABLE person ADD COLUMN biography TEXT"],
-    },
-    Migration {
-        id: 4,
-        app_version: "1.0.0-alpha.12.5",
-        description: "move person_meta into person, drop it",
-        requires_table: Some("person_meta"),
-        statements: &[
-            "UPDATE person SET biography =
-                (SELECT biography FROM person_meta WHERE person_meta.person_id = person.id)
-             WHERE EXISTS (SELECT 1 FROM person_meta WHERE person_meta.person_id = person.id)",
-            "DROP TABLE person_meta",
-        ],
-    },
-    Migration {
-        id: 5,
-        app_version: "1.0.0-alpha.12.5",
-        description: "album_combine target_folder/source_name/target_name columns",
-        requires_table: None,
-        statements: &[
-            "ALTER TABLE album_combine ADD COLUMN target_folder TEXT",
-            "ALTER TABLE album_combine ADD COLUMN source_name TEXT",
-            "ALTER TABLE album_combine ADD COLUMN target_name TEXT",
-        ],
-    },
-    Migration {
-        id: 6,
-        app_version: "1.0.0-alpha.12.5",
-        description: "move album_combine_meta into album_combine, drop it",
-        requires_table: Some("album_combine_meta"),
-        statements: &[
-            "UPDATE album_combine SET
-                target_folder = (SELECT target_folder FROM album_combine_meta m WHERE m.combine_id = album_combine.id),
-                source_name   = (SELECT source_name   FROM album_combine_meta m WHERE m.combine_id = album_combine.id),
-                target_name   = (SELECT target_name   FROM album_combine_meta m WHERE m.combine_id = album_combine.id)
-             WHERE EXISTS (SELECT 1 FROM album_combine_meta m WHERE m.combine_id = album_combine.id)",
-            "DROP TABLE album_combine_meta",
-        ],
-    },
-    Migration {
-        id: 7,
-        app_version: "1.0.0-alpha.12.5",
-        description: "carry existing MusicBrainz ids into field_override",
-        requires_table: None,
-        // Until now an album's matched RELEASE id lived only on its
-        // album_release row, which every rescan deletes and rebuilds from file
-        // tags — so matches quietly lost the one fact identifying what they
-        // matched. Both ids move to the app-owned store here; without this,
-        // every already-matched album would read as unmatched after the update.
-        statements: &[
-            "INSERT OR IGNORE INTO field_override (entity_id, field, tier, value)
-             SELECT id, 'mb_release_group_id', 'mb', mb_release_group_id FROM album
-             WHERE mb_release_group_id IS NOT NULL AND mb_release_group_id <> ''",
-            "INSERT OR IGNORE INTO field_override (entity_id, field, tier, value)
-             SELECT album_id, 'mb_release_id', 'mb', mb_release_id FROM album_release
-             WHERE is_default = 1 AND mb_release_id IS NOT NULL AND mb_release_id <> ''",
-            "INSERT OR IGNORE INTO field_override (entity_id, field, tier, value)
-             SELECT id, 'mb_artist_id', 'mb', musicbrainz_id FROM artist
-             WHERE musicbrainz_id IS NOT NULL AND musicbrainz_id <> ''",
-        ],
-    },
-    Migration {
-        id: 8,
-        app_version: "1.0.0-alpha.12.5",
-        description: "group mb_change_log rows into per-action batches",
-        requires_table: None,
-        // A match logs one row per KIND of change (credits, type, date), so
-        // undoing "this album's match" meant undoing several entries. Rows are
-        // grouped into the action that wrote them: a run of consecutive rows
-        // sharing a target. Contiguity matters — two separate merges into the
-        // same artist are two actions and must not collapse into one.
-        statements: &[
-            "ALTER TABLE mb_change_log ADD COLUMN batch_id INTEGER",
-            "WITH marked AS (
-                SELECT id,
-                       CASE WHEN LAG(target_id) OVER (ORDER BY id) IS target_id
-                                 AND kind <> 'artist_merge'
-                            THEN 0 ELSE 1 END AS starts
-                FROM mb_change_log
-             ),
-             grouped AS (
-                SELECT id, SUM(starts) OVER (ORDER BY id ROWS UNBOUNDED PRECEDING) AS batch
-                FROM marked
-             )
-             UPDATE mb_change_log
-             SET batch_id = (SELECT batch FROM grouped WHERE grouped.id = mb_change_log.id)",
-        ],
-    },
-    Migration {
-        id: 9,
-        app_version: "1.0.0-alpha.12.5",
-        description: "split change batches that mix reverted and live rows",
-        requires_table: None,
-        // Batches were briefly inferred from row adjacency, which merged a
-        // re-match into the batch of the match it replaced. An action is
-        // either undone or it isn't, so a batch holding both is two actions:
-        // the reverted rows move to a fresh id (max + old, so ordering is kept
-        // and no new id can collide with an existing one).
-        statements: &[
-            "UPDATE mb_change_log
-             SET batch_id = (SELECT MAX(batch_id) FROM mb_change_log) + batch_id
-             WHERE undone = 1
-               AND batch_id IN (
-                 SELECT batch_id FROM mb_change_log
-                 GROUP BY batch_id HAVING COUNT(DISTINCT undone) > 1
-               )",
-        ],
-    },
-    Migration {
-        id: 10,
-        app_version: "1.0.0-alpha.12.5",
-        description: "music_scan_issue.is_sound",
-        requires_table: None,
-        statements: &["ALTER TABLE music_scan_issue ADD COLUMN is_sound INTEGER NOT NULL DEFAULT 0"],
-    },
-    Migration {
-        id: 11,
-        app_version: "1.0.0-alpha.12.5",
-        description: "retry artist lookups that failed on punctuation",
-        requires_table: None,
-        // Artist names were compared byte-for-byte, so MusicBrainz's
-        // typographic hyphens and apostrophes turned score-100 matches into
-        // cached misses. The comparison now normalises; drop the poisoned
-        // cache entries so those names get another look.
-        statements: &["DELETE FROM mb_artist_lookup WHERE status = 'notfound'"],
-    },
-    Migration {
-        id: 12,
-        app_version: "1.0.0-alpha.12.5",
-        description: "feat_join — comma-bearing artist names kept whole",
-        requires_table: None,
-        statements: &[
-            "CREATE TABLE IF NOT EXISTS feat_join (
-                library_id TEXT NOT NULL,
-                name TEXT NOT NULL,
-                PRIMARY KEY (library_id, name),
-                FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE
-            )",
-        ],
-    },
-    Migration {
-        id: 13,
-        app_version: "1.0.0-alpha.12.5",
-        description: "credit rows carry artist_id; every album gets credit rows",
-        requires_table: None,
-        // Credits stop being resolved by name at read time: each row gets the
-        // id of the artist it refers to, stamped once. Solo albums — which
-        // carried no credit rows and were attributed through their folder
-        // parent — get their one row here, so album↔artist membership has a
-        // single source. The LOWER() backfill is ASCII-folding; the Rust
-        // resolution pass re-stamps with proper Unicode casing on next scan.
-        // No FOREIGN KEY on artist_id (soft reference — see CREATE TABLE).
-        statements: &[
-            "ALTER TABLE track_credit ADD COLUMN artist_id INTEGER",
-            "ALTER TABLE album_artist_credit ADD COLUMN artist_id INTEGER",
-            "UPDATE track_credit SET artist_id = (
-                SELECT MIN(an.artist_id) FROM artist_names an
-                JOIN media_entry ame ON ame.id = an.artist_id
-                JOIN media_entry tme ON tme.id = track_credit.track_id
-                WHERE ame.library_id = tme.library_id
-                  AND LOWER(an.name) = LOWER(track_credit.name))",
-            "UPDATE album_artist_credit SET artist_id = (
-                SELECT MIN(an.artist_id) FROM artist_names an
-                JOIN media_entry ame ON ame.id = an.artist_id
-                JOIN media_entry alme ON alme.id = album_artist_credit.album_id
-                WHERE ame.library_id = alme.library_id
-                  AND LOWER(an.name) = LOWER(album_artist_credit.name))",
-            "INSERT INTO album_artist_credit (album_id, position, name, artist_id)
-             SELECT al.id, 0, a.title, a.id FROM album al
-             JOIN media_entry me ON me.id = al.id
-             JOIN artist a ON a.id = me.parent_id
-             WHERE NOT EXISTS (SELECT 1 FROM album_artist_credit ac WHERE ac.album_id = al.id)
-               AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = al.id)
-               AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = al.id)",
-        ],
-    },
-    Migration {
-        id: 14,
-        app_version: "1.0.0-alpha.12.5",
-        description: "retract name-derived artist matches",
-        requires_table: None,
-        // Every mb-tier artist id to date came from a name search that took
-        // MusicBrainz's first exact-name hit — which is how "God" on Yeezus
-        // matched a random artist named God. Identity now derives only from
-        // matched albums' credits (which carry per-artist MBIDs) or from the
-        // user. Retract the name-derived ids and the lookup cache; the next
-        // matching pass re-stamps every artist a matched album vouches for.
-        // User-tier matches (their decision) keep both the override and the
-        // mirrored column value.
-        statements: &[
-            "DELETE FROM field_override WHERE field = 'mb_artist_id' AND tier = 'mb'",
-            "UPDATE artist SET musicbrainz_id = NULL
-             WHERE musicbrainz_id IS NOT NULL
-               AND NOT EXISTS (SELECT 1 FROM field_override f
-                               WHERE f.entity_id = artist.id AND f.field = 'mb_artist_id')",
-            "DELETE FROM mb_artist_lookup",
-        ],
-    },
-    Migration {
-        id: 15,
-        app_version: "1.0.0-alpha.12.5",
-        description: "regenerate artist-match suggestions with exact-name candidates",
-        requires_table: None,
-        // The first cut of "Which artist is this?" picked candidates by MB
-        // search score, which ranks famous partial-name matches above obscure
-        // exact ones — "Castro" offered Cristian, Fidel, and Tommy Castro and
-        // cut every artist literally named Castro. Unanswered (pending) and
-        // silently-settled (notfound) rows regenerate under the exact-name
-        // rule on the next pass; the user's accepted/rejected decisions are
-        // answers and stand.
-        statements: &[
-            "DELETE FROM mb_suggestion
-             WHERE kind = 'artist_match' AND status IN ('pending', 'notfound')",
-        ],
-    },
-    Migration {
-        id: 16,
-        app_version: "1.0.0-alpha.12.5",
-        description: "regenerate artist-match suggestions with alias-aware candidates",
-        requires_table: None,
-        // Candidate selection now counts an ALIAS hit as answering to the
-        // name, not just the title — a renamed artist ("Hodgy Beats" →
-        // "Hodgy") answers through their alias, and title-only matching
-        // offered the bare duplicate while hiding the canonical entity.
-        // Unanswered/silently-settled rows regenerate on the next pass;
-        // answered ones stand.
-        statements: &[
-            "DELETE FROM mb_suggestion
-             WHERE kind = 'artist_match' AND status IN ('pending', 'notfound')",
-        ],
-    },
-    Migration {
-        id: 17,
-        app_version: "1.0.0-alpha.12.5",
-        description: "regenerate artist-match suggestions from a deep search",
-        requires_table: None,
-        // The sweep searched MB with limit 10, and MB orders by FAME — an
-        // exact-name obscure artist can sit at #12 behind famous partial
-        // matches and never reach the filter ("Castro" showed two of its
-        // three namesakes). The sweep now searches a page of 50. Same
-        // regeneration rule as 15/16: answers stand.
-        statements: &[
-            "DELETE FROM mb_suggestion
-             WHERE kind = 'artist_match' AND status IN ('pending', 'notfound')",
-        ],
-    },
-    Migration {
-        id: 18,
-        app_version: "1.0.0-alpha.12.5",
-        description: "regenerate artist-match suggestions with alias-field search",
-        requires_table: None,
-        // MB's artist: search field matches names only — entities answering
-        // through an ALIAS were never returned at all, so a renamed artist's
-        // canonical entity ("Hodgy", alias "Hodgy Beats") lost to its bare
-        // duplicate by absence. The query now includes alias:. Same
-        // regeneration rule as 15–17: answers stand; unanswered and
-        // silently-settled rows re-ask on the next pass.
-        statements: &[
-            "DELETE FROM mb_suggestion
-             WHERE kind = 'artist_match' AND status IN ('pending', 'notfound')",
-        ],
-    },
-    Migration {
-        id: 19,
-        app_version: "1.0.0-alpha.12.5",
-        description: "regenerate artist-match suggestions without the score floor",
-        requires_table: None,
-        // The OR alias: query dilutes lucene scores, and search_artists'
-        // score>=50 floor silently cut obscure exact-name artists from the
-        // lineups (Castro's namesakes vanished). The floor is gone — the
-        // exact name/alias filter is the gatekeeper. Same regeneration rule
-        // as 15–18: answers stand.
-        statements: &[
-            "DELETE FROM mb_suggestion
-             WHERE kind = 'artist_match' AND status IN ('pending', 'notfound')",
-        ],
-    },
-    Migration {
-        id: 20,
-        app_version: "1.0.0-alpha.12.5",
-        description: "albums live on their credit rows — drop the artist parent",
-        requires_table: Some("album_artist_credit"),
-        // The artist→album parent edge is retired: membership on artist pages
-        // is album_artist_credit alone. Backfill a solo credit row (stamped
-        // with the parent's id) for any album that still lacks rows, then
-        // null the parent on every real album. Loose containers KEEP their
-        // parent — they're per-artist infrastructure, not credited albums.
-        statements: &[
-            "INSERT INTO album_artist_credit (album_id, position, name, artist_id)
-             SELECT al.id, 0, a.title, a.id FROM album al
-             JOIN media_entry me ON me.id = al.id
-             JOIN artist a ON a.id = me.parent_id
-             WHERE NOT EXISTS (SELECT 1 FROM album_artist_credit ac WHERE ac.album_id = al.id)
-               AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = al.id)
-               AND NOT EXISTS (SELECT 1 FROM sound_album sa WHERE sa.album_id = al.id)",
-            "UPDATE media_entry SET parent_id = NULL
-             WHERE id IN (SELECT al.id FROM album al
-                          JOIN media_entry me2 ON me2.id = al.id
-                          WHERE me2.parent_id IS NOT NULL
-                            AND NOT EXISTS (SELECT 1 FROM loose_album la WHERE la.album_id = al.id))",
-        ],
-    },
-    Migration {
-        id: 21,
-        app_version: "1.0.0-alpha.12.5",
-        description: "retract guessed images for unidentified artists",
-        requires_table: Some("artist_image_fetch"),
-        // The image sweep used to run for UNMATCHED artists too, where the
-        // Deezer fallback is a name search — a same-named stranger's face on
-        // an unidentified page. The sweep now requires an MBID; this clears
-        // the guessed results (fetched rows + one-shot stamps) for artists
-        // still unidentified, so they re-enter the queue the pass after
-        // they're matched. A fetched image the user explicitly SELECTED is
-        // kept — picking it made it a user choice, not a guess.
-        statements: &[
-            "DELETE FROM cached_images
-             WHERE origin = 'fetched'
-               AND entry_folder_path LIKE '_fetched/artists/%'
-               AND EXISTS (SELECT 1 FROM artist a
-                           WHERE a.id = CAST(SUBSTR(entry_folder_path, 18) AS INTEGER)
-                             AND (a.musicbrainz_id IS NULL OR a.musicbrainz_id = '')
-                             AND (a.selected_cover IS NULL
-                                  OR a.selected_cover <> cached_images.source_filename))",
-            "DELETE FROM artist_image_fetch
-             WHERE status <> 'has-own'
-               AND artist_id IN (SELECT a.id FROM artist a
-                                 WHERE a.musicbrainz_id IS NULL OR a.musicbrainz_id = '')",
-        ],
-    },
-    Migration {
-        id: 22,
-        app_version: "1.0.0-alpha.12.5",
-        description: "staged changes become undoable (kind/target/payload columns)",
-        requires_table: Some("pending_change"),
-        // Existing rows keep the defaults: kind '' marks a legacy row whose
-        // directive can't be reverted from here — un-staging one only removes
-        // the label.
-        statements: &[
-            "ALTER TABLE pending_change ADD COLUMN kind TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE pending_change ADD COLUMN target TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE pending_change ADD COLUMN payload TEXT NOT NULL DEFAULT '{}'",
-        ],
-    },
-    Migration {
-        id: 23,
-        app_version: "1.0.0-alpha.12.5",
-        description: "pending_pass queue — matches waiting for a matching pass, backfilled",
-        requires_table: Some("album_artist_credit"),
-        // The backfill derives what the queue would already contain had it
-        // existed: matched albums whose credits still name an unidentified,
-        // non-ignored artist — exactly the matches a pass has yet to cash in.
-        statements: &[
-            "CREATE TABLE IF NOT EXISTS pending_pass (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                library_id TEXT NOT NULL,
-                target TEXT NOT NULL DEFAULT '',
-                label TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE
-            )",
-            "INSERT INTO pending_pass (library_id, target, label)
-             SELECT me.library_id, CAST(al.id AS TEXT), 'Match \u{201c}' || al.title || '\u{201d}'
-             FROM album al
-             JOIN media_entry me ON me.id = al.id
-             WHERE EXISTS (SELECT 1 FROM field_override o
-                           WHERE o.entity_id = al.id
-                             AND o.field IN ('mb_release_id', 'mb_release_group_id')
-                             AND o.value IS NOT NULL AND o.value <> '')
-               AND EXISTS (
-                 SELECT 1 FROM artist a
-                 WHERE (a.musicbrainz_id IS NULL OR a.musicbrainz_id = '')
-                   AND NOT EXISTS (SELECT 1 FROM field_override oa
-                                   WHERE oa.entity_id = a.id AND oa.field = 'mb_artist_id'
-                                     AND oa.value IS NOT NULL AND oa.value <> '')
-                   AND NOT EXISTS (SELECT 1 FROM field_override ig
-                                   WHERE ig.entity_id = a.id AND ig.field = 'mb_ignored')
-                   AND (a.id IN (SELECT ac.artist_id FROM album_artist_credit ac
-                                 WHERE ac.album_id = al.id AND ac.artist_id IS NOT NULL)
-                     OR a.id IN (SELECT tc.artist_id FROM track_credit tc
-                                 JOIN media_entry tme ON tme.id = tc.track_id
-                                 WHERE tme.parent_id = al.id AND tc.artist_id IS NOT NULL)))",
-        ],
-    },
-    Migration {
-        id: 24,
-        app_version: "1.0.0-alpha.12.5",
-        description: "track.audio_hash — content fingerprint for rescan identity migration",
-        requires_table: Some("track"),
-        // Backfilled by the next rescan (the scanner hashes every file it
-        // reads); NULL until then just means no rescue hint yet.
-        statements: &["ALTER TABLE track ADD COLUMN audio_hash TEXT"],
-    },
-    Migration {
-        id: 25,
-        app_version: "1.0.0-alpha.12.5",
-        description: "movie/episode content fingerprints (+ size/mtime gate) for rescan identity",
-        requires_table: Some("movie"),
-        // Backfilled by the next video rescan. The size/mtime pair is the
-        // gate: unchanged means the stored hash still describes the file, so
-        // a rescan re-reads nothing and stays as fast as it is today.
-        statements: &[
-            "ALTER TABLE movie ADD COLUMN content_hash TEXT",
-            "ALTER TABLE movie ADD COLUMN content_size INTEGER",
-            "ALTER TABLE movie ADD COLUMN content_mtime INTEGER",
-            "ALTER TABLE episode ADD COLUMN content_hash TEXT",
-            "ALTER TABLE episode ADD COLUMN content_size INTEGER",
-            "ALTER TABLE episode ADD COLUMN content_mtime INTEGER",
-            "ALTER TABLE show ADD COLUMN content_hash TEXT",
-            "ALTER TABLE show ADD COLUMN content_size INTEGER",
-            "ALTER TABLE show ADD COLUMN content_mtime INTEGER",
-        ],
-    },
-    Migration {
-        id: 26,
-        app_version: "1.0.0-alpha.12.5",
-        description: "artist_alias.kind — misspelling (fix tags at source) vs nickname (intended)",
-        requires_table: Some("artist_alias"),
-        // 'misspelling' is the nagging default: the alias's literal spelling
-        // still appearing in credits surfaces a fix-at-source card. The user
-        // demotes intended monikers ("God" → Kanye) to 'nickname', which
-        // resolves identically but never nags.
-        statements: &["ALTER TABLE artist_alias ADD COLUMN kind TEXT NOT NULL DEFAULT 'misspelling'"],
-    },
-    Migration {
-        id: 27,
-        app_version: "1.0.0-alpha.12.5",
-        description: "alias kind 'variant' — neutral until the user declares; machine rows re-kinded",
-        requires_table: Some("artist_alias"),
-        // Migration 26's default claimed INTENT ("this spelling is wrong")
-        // for rows the automatic same-MBID merge created — a claim only a
-        // human can make ("Yasiin Bey" is not a misspelling of "Mos Def").
-        // Everything becomes neutral 'variant'; 'misspelling' now only ever
-        // comes from an explicit user declaration. Every insert path names
-        // the kind explicitly, so the old column default is inert.
-        statements: &["UPDATE artist_alias SET kind = 'variant' WHERE kind = 'misspelling'"],
-    },
-    Migration {
-        id: 28,
-        app_version: "1.0.0-alpha.12.5",
-        description: "track content_size/content_mtime — the rescan gate music never had",
-        requires_table: Some("track"),
-        // Same shape as migration 25 gave video: an unchanged (size, mtime)
-        // pair means the stored audio_hash still describes the file, so a
-        // rescan skips re-reading the audio region entirely. NULL until the
-        // next scan stamps it — those rows hash once more, then gate forever.
-        statements: &[
-            "ALTER TABLE track ADD COLUMN content_size INTEGER",
-            "ALTER TABLE track ADD COLUMN content_mtime INTEGER",
-        ],
-    },
-    Migration {
-        id: 29,
-        app_version: "1.0.0-alpha.12.5",
-        description: "album_release_pref — user labels + chosen default for an album's releases",
-        requires_table: Some("album_release"),
-        // Folder-keyed because album_release rows are rebuilt (new ids) every
-        // rescan; prefs re-apply on top at each album's reconcile tail.
-        statements: &["CREATE TABLE IF NOT EXISTS album_release_pref (
-            album_id INTEGER NOT NULL,
-            folder_path TEXT NOT NULL,
-            label TEXT,
-            is_default INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (album_id, folder_path),
-            FOREIGN KEY (album_id) REFERENCES album(id) ON DELETE CASCADE
-        )"],
-    },
-    Migration {
-        id: 30,
-        app_version: "1.0.0-alpha.12.5",
-        description: "per-release MusicBrainz matches — each release pins its own pressing",
-        requires_table: Some("album_release"),
-        // The release id moves from one album-level field_override slot to a
-        // folder-keyed row per release. Existing matches migrate onto the
-        // release whose FILES carry that id (the honest owner), else the
-        // default release. album_match_gap gains the same folder scope (PK
-        // change = rebuild; diffs recompute at the next apply/re-check).
-        statements: &[
-            "CREATE TABLE IF NOT EXISTS release_match (
-                album_id INTEGER NOT NULL,
-                folder_path TEXT NOT NULL,
-                mb_release_id TEXT NOT NULL,
-                tier TEXT NOT NULL DEFAULT 'mb',
-                PRIMARY KEY (album_id, folder_path),
-                FOREIGN KEY (album_id) REFERENCES album(id) ON DELETE CASCADE
-            )",
-            "INSERT OR IGNORE INTO release_match (album_id, folder_path, mb_release_id, tier)
-             SELECT f.entity_id,
-                    COALESCE(
-                      (SELECT ar.folder_path FROM album_release ar
-                       WHERE ar.album_id = f.entity_id AND ar.mb_release_id = f.value LIMIT 1),
-                      (SELECT ar.folder_path FROM album_release ar
-                       WHERE ar.album_id = f.entity_id AND ar.is_default = 1 LIMIT 1)),
-                    f.value, f.tier
-             FROM field_override f
-             WHERE f.field = 'mb_release_id' AND f.value IS NOT NULL AND f.value <> ''
-               AND EXISTS (SELECT 1 FROM album_release ar WHERE ar.album_id = f.entity_id)",
-            "DELETE FROM field_override WHERE field = 'mb_release_id'",
-            "DROP TABLE IF EXISTS album_match_gap",
-            "CREATE TABLE album_match_gap (
-                album_id INTEGER NOT NULL,
-                folder_path TEXT NOT NULL DEFAULT '',
-                side TEXT NOT NULL,
-                disc INTEGER NOT NULL,
-                position INTEGER NOT NULL,
-                title TEXT NOT NULL,
-                counterpart TEXT,
-                PRIMARY KEY (album_id, folder_path, side, disc, position),
-                FOREIGN KEY (album_id) REFERENCES album(id) ON DELETE CASCADE
-            )",
-        ],
-    },
-    Migration {
-        id: 31,
-        app_version: "1.0.0-alpha.12.5",
-        description: "track_meta.bitrate_mode — MP3 CBR/VBR verdict read from the frames",
-        requires_table: Some("track_meta"),
-        // 'cbr' | 'vbr' for MP3s (mp3_frames samples the frame headers), NULL
-        // for every other codec and until the next rescan stamps it.
-        statements: &["ALTER TABLE track_meta ADD COLUMN bitrate_mode TEXT"],
-    },
-    Migration {
-        id: 32,
-        app_version: "1.0.0-alpha.12.5",
-        description: "named discs — tag-truth disc subtitles + user disc-name prefs",
-        requires_table: Some("album_release"),
-        // Two stores, two lifetimes: release_disc_subtitle is TAG truth
-        // (DISCSUBTITLE/TSST), rebuilt with the release rows it hangs off;
-        // disc_title_pref is the user's rename, folder-keyed so it survives
-        // rescans and overlays the tag value at read time.
-        statements: &[
-            "CREATE TABLE IF NOT EXISTS release_disc_subtitle (
-                release_id INTEGER NOT NULL,
-                disc_no INTEGER NOT NULL,
-                title TEXT NOT NULL,
-                PRIMARY KEY (release_id, disc_no),
-                FOREIGN KEY (release_id) REFERENCES album_release(id) ON DELETE CASCADE
-            )",
-            "CREATE TABLE IF NOT EXISTS disc_title_pref (
-                album_id INTEGER NOT NULL,
-                folder_path TEXT NOT NULL,
-                disc_no INTEGER NOT NULL,
-                title TEXT NOT NULL,
-                PRIMARY KEY (album_id, folder_path, disc_no),
-                FOREIGN KEY (album_id) REFERENCES album(id) ON DELETE CASCADE
-            )",
-        ],
-    },
-    Migration {
-        id: 33,
-        app_version: "1.0.0-alpha.12.5",
-        description: "track_waveform — cached seekbar peaks, computed lazily on first play",
-        requires_table: Some("track"),
-        // Normalized peak bytes for the waveform seekbar, stamped with
-        // (size, mtime) so a changed file recomputes. Filled lazily by
-        // get_track_waveform — scans never touch it.
-        statements: &[
-            "CREATE TABLE IF NOT EXISTS track_waveform (
-                track_id INTEGER PRIMARY KEY,
-                peaks BLOB NOT NULL,
-                content_size INTEGER,
-                content_mtime INTEGER,
-                FOREIGN KEY (track_id) REFERENCES track(id) ON DELETE CASCADE
-            )",
-        ],
-    },
-    Migration {
-        id: 34,
-        app_version: "1.0.0-alpha.12.5",
-        description: "liked AND loved — track_loved.level, existing hearts demote to liked",
-        requires_table: Some("track_loved"),
-        // Two tiers now: 'liked' (rose outline) and 'loved' (filled). The
-        // DEFAULT demotes every pre-existing heart to liked, per user intent.
-        statements: &["ALTER TABLE track_loved ADD COLUMN level TEXT NOT NULL DEFAULT 'liked'"],
-    },
-    Migration {
-        id: 35,
-        app_version: "1.0.0-alpha.12.5",
-        description: "per-release presentation — release's own tag title + release cover pick",
-        requires_table: Some("album_release"),
-        // album_release.title: the release's OWN majority album tag, stamped
-        // by the scanner (table is rebuilt per rescan; NULL until one runs).
-        // album_release_pref.cover: the user's cover pick for one release,
-        // folder-keyed like labels so it survives rescans.
-        statements: &[
-            "ALTER TABLE album_release ADD COLUMN title TEXT",
-            "ALTER TABLE album_release_pref ADD COLUMN cover TEXT",
-        ],
-    },
-    Migration {
-        id: 36,
-        app_version: "1.0.0-alpha.12.5",
-        description: "release_match.title — the pinned pressing's own MusicBrainz title",
-        requires_table: Some("release_match"),
-        // Stored at pin time for the per-tier Sources view (the album's
-        // title always comes from the GROUP; this is the version's own).
-        // NULL for pins made before this column existed until re-pinned.
-        statements: &["ALTER TABLE release_match ADD COLUMN title TEXT"],
-    },
-    Migration {
-        id: 37,
-        app_version: "1.0.0-alpha.12.5",
-        description: "album_match_gap.length_off — the file's runtime disagrees with MB's length",
-        requires_table: Some("album_match_gap"),
-        // A same-slot title disagreement whose lengths ALSO disagree (beyond
-        // the two-second window) is probably a different song: the differ
-        // page offers no Accept for it. Rewritten with the rows on every
-        // check, so no backfill.
-        statements: &["ALTER TABLE album_match_gap ADD COLUMN length_off INTEGER NOT NULL DEFAULT 0"],
-    },
-    Migration {
-        id: 38,
-        app_version: "1.0.0-alpha.12.5",
-        description: "artist_alias: kind → source — an alias is one fact, tiered by who wrote it",
-        requires_table: Some("artist_alias"),
-        // User ruling 2026-09-20: no misspelling / nickname / variant
-        // classification — an alias is just "this spelling means that page".
-        // What matters is WHO wrote it ('mb' = a MusicBrainz match adopted
-        // the canonical name, 'user' = a rename / merge / link by hand), the
-        // same tier vocabulary the Sources view uses. Existing rows can't be
-        // told apart, so they land as 'user' — visible, never pruned.
-        statements: &[
-            "ALTER TABLE artist_alias ADD COLUMN source TEXT NOT NULL DEFAULT 'user'",
-            "ALTER TABLE artist_alias DROP COLUMN kind",
-        ],
-    },
-    Migration {
-        id: 39,
-        app_version: "1.0.0-alpha.12.5",
-        description: "pending_pass.batch_id — the change that queued a re-check, for Undo from the queue",
-        requires_table: Some("pending_pass"),
-        // NULL on existing rows (they predate the link) — those keep the
-        // "see History" fallback in the queue banner.
-        statements: &["ALTER TABLE pending_pass ADD COLUMN batch_id INTEGER"],
-    },
-    Migration {
-        id: 40,
-        app_version: "1.0.0-alpha.12.5",
-        description: "CD pre-emphasis — cue-sheet detection per release + the user's per-release override",
-        requires_table: Some("album_release"),
-        // album_release.cue_pre_emphasis: the scanner's finding (a cue in
-        // the release folder with FLAGS PRE), rebuilt with the rows.
-        // album_release_pref.pre_emphasis: the user's override, folder-keyed
-        // like the other prefs; NULL = defer to the cue. Playback applies
-        // mpv's de-emphasis filter when the effective answer is yes.
-        statements: &[
-            "ALTER TABLE album_release ADD COLUMN cue_pre_emphasis INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE album_release_pref ADD COLUMN pre_emphasis INTEGER",
-        ],
-    },
-    Migration {
-        id: 41,
-        app_version: "1.0.0-alpha.12.5",
-        description: "release_match.disc_titles — the pinned pressing's MusicBrainz medium titles",
-        requires_table: Some("release_match"),
-        // JSON [[disc, title], …] stored at pin time, one entry per medium
-        // that has a title ("Dawn to Dusk" / "Twilight to Starlight"). The
-        // mb tier of a disc's name: overlays the DISCSUBTITLE tag, the
-        // user's rename overlays it. Lives and dies with the pin (cleared
-        // when the pinned release changes). NULL for pins made before this
-        // column existed until re-pinned.
-        statements: &["ALTER TABLE release_match ADD COLUMN disc_titles TEXT"],
-    },
-    Migration {
-        id: 42,
-        app_version: "1.0.0-alpha.12.5",
-        description: "library_setting mb_pass_ran — libraries whose first matching pass already completed",
-        requires_table: Some("mb_credit_fetch"),
-        // The flag is written by every completed pass from here on; the
-        // library map's step 0 shows until it exists. Libraries that ran
-        // their passes before the flag was born have stamped albums — mark
-        // them, so the step doesn't reappear on a library that's long past
-        // it. A fresh database has no stamps and nothing is marked.
-        statements: &[
-            "INSERT OR IGNORE INTO library_setting (library_id, key, value)
-             SELECT DISTINCT me.library_id, 'mb_pass_ran', '1'
-             FROM mb_credit_fetch f JOIN media_entry me ON me.id = f.album_id",
-        ],
-    },
-    Migration {
-        id: 43,
-        app_version: "1.0.0-alpha.12.5",
-        description: "album_combine.auto — directives the app staged itself (same release group)",
-        requires_table: Some("album_combine"),
-        // Undoing an auto-staged combine must mean "not these two" for good
-        // (album_combine_reject); a hand-staged one undoes without a trace.
-        statements: &["ALTER TABLE album_combine ADD COLUMN auto INTEGER NOT NULL DEFAULT 0"],
-    },
-];
-
-/// Copy the database beside itself before the first migration of a run
-/// touches it. Cheap (a file copy) and the only real answer to a migration
-/// that turns out to be wrong about production data.
-fn backup_before_migrating(db_path: &Path, from: i64, to: i64) {
-    let backup = db_path.with_extension(format!("v{from}-to-v{to}.bak"));
-    if backup.exists() {
-        return;
-    }
-    match std::fs::copy(db_path, &backup) {
-        Ok(_) => eprintln!("[db] backed up to {}", backup.display()),
-        Err(e) => eprintln!("[db] WARNING: backup failed ({e}) — migrating anyway"),
-    }
-}
-
-/// Record every migration as applied without running any of it. For a
-/// database created moments ago by the CREATE statements, which already
-/// describe the post-migration shape.
-async fn baseline_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    ensure_schema_version(pool).await?;
-    for m in MIGRATIONS {
-        sqlx::query(
-            "INSERT OR IGNORE INTO schema_version (id, app_version, description)
-             VALUES (?, ?, ?)",
-        )
-        .bind(m.id)
-        .bind(m.app_version)
-        .bind(m.description)
-        .execute(pool)
-        .await?;
-    }
-    Ok(())
-}
-
-async fn ensure_schema_version(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS schema_version (
-            id INTEGER PRIMARY KEY,
-            app_version TEXT NOT NULL,
-            description TEXT NOT NULL,
-            applied_at TEXT NOT NULL DEFAULT (datetime('now'))
-        )",
-    )
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-/// Apply every migration above the recorded schema version, in order, each in
-/// its own transaction so a failure leaves the database on the last good one.
-async fn run_migrations(pool: &SqlitePool, db_path: &Path) -> Result<(), sqlx::Error> {
-    ensure_schema_version(pool).await?;
-
-    let current: i64 = sqlx::query_as::<_, (Option<i64>,)>("SELECT MAX(id) FROM schema_version")
-        .fetch_one(pool)
-        .await?
-        .0
-        .unwrap_or(0);
-
-    // Sorted by id, not by position: a migration written into the wrong slot
-    // in the array would otherwise run out of order, and a failure part-way
-    // could strand a lower id behind a higher recorded version.
-    let mut pending: Vec<&Migration> = MIGRATIONS.iter().filter(|m| m.id > current).collect();
-    pending.sort_by_key(|m| m.id);
-    let Some(last) = pending.last() else { return Ok(()) };
-    backup_before_migrating(db_path, current, last.id);
-
-    for m in pending {
-        // Foreign keys are enforced per-connection; a migration that rebuilds
-        // or drops a table must not trip them mid-flight.
-        sqlx::query("PRAGMA foreign_keys = OFF").execute(pool).await?;
-        let mut tx = pool.begin().await?;
-        let applicable = match m.requires_table {
-            None => true,
-            Some(table) => {
-                sqlx::query_as::<_, (i64,)>(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
-                )
-                .bind(table)
-                .fetch_one(&mut *tx)
-                .await?
-                .0 != 0
-            }
-        };
-        if applicable {
-            for stmt in m.statements {
-                sqlx::query(stmt).execute(&mut *tx).await?;
-            }
-        } else {
-            eprintln!("[db] migration {} vacuous (no {}) — recording", m.id, m.requires_table.unwrap_or(""));
-        }
-        sqlx::query("INSERT INTO schema_version (id, app_version, description) VALUES (?, ?, ?)")
-            .bind(m.id)
-            .bind(m.app_version)
-            .bind(m.description)
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        sqlx::query("PRAGMA foreign_keys = ON").execute(pool).await?;
-        eprintln!("[db] migration {} applied — {}", m.id, m.description);
-    }
-    Ok(())
-}
-
-pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
-    let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
-    let pool = SqlitePoolOptions::new()
+async fn open_pool(db_url: &str) -> Result<SqlitePool, sqlx::Error> {
+    SqlitePoolOptions::new()
         .max_connections(5)
         .after_connect(|conn, _meta| {
             Box::pin(async move {
@@ -867,19 +35,108 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
                 Ok(())
             })
         })
-        .connect(&db_url)
-        .await?;
+        .connect(db_url)
+        .await
+}
 
-    // A database with no tables yet is about to be created at the CURRENT
-    // schema, so every migration is already true of it. It gets baselined
-    // below rather than migrated — running migration 1 against it would try
-    // to drop an album_mb that never existed.
-    let fresh: bool = sqlx::query_as::<_, (i64,)>(
+/// Is this database's schema the current epoch? A database with tables but
+/// no (or another) epoch stamp predates the reset.
+async fn epoch_matches(pool: &SqlitePool) -> Result<Option<bool>, sqlx::Error> {
+    let tables: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
     )
-    .fetch_one(&pool)
-    .await?
-    .0 == 0;
+    .fetch_one(pool)
+    .await?;
+    if tables == 0 {
+        return Ok(None); // fresh
+    }
+    let has_epoch: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'schema_epoch'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if has_epoch == 0 {
+        return Ok(Some(false));
+    }
+    let epoch: Option<i64> = sqlx::query_scalar("SELECT MAX(epoch) FROM schema_epoch")
+        .fetch_one(pool)
+        .await?;
+    Ok(Some(epoch == Some(SCHEMA_EPOCH)))
+}
+
+/// Move a pre-reset database aside: `waverunner.db` → `waverunner.db.pre-epoch-N.bak`
+/// (with its -wal/-shm siblings). Nothing is deleted.
+fn move_aside(db_path: &Path) {
+    let stamp = chrono_free_stamp();
+    for suffix in ["", "-wal", "-shm"] {
+        let from = db_path.with_file_name(format!(
+            "{}{suffix}",
+            db_path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
+        ));
+        if !from.exists() {
+            continue;
+        }
+        let to = db_path.with_file_name(format!(
+            "{}.pre-epoch-{SCHEMA_EPOCH}-{stamp}.bak{suffix}",
+            db_path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
+        ));
+        match std::fs::rename(&from, &to) {
+            Ok(()) => eprintln!("[db] moved pre-reset database aside: {}", to.display()),
+            Err(e) => eprintln!("[db] WARNING: could not move {} aside: {e}", from.display()),
+        }
+    }
+}
+
+/// Seconds since the epoch, as a filename-safe stamp (no chrono dependency).
+fn chrono_free_stamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
+    let mut pool = open_pool(&db_url).await?;
+
+    // A database from before the schema reset is moved aside and replaced:
+    // its tables no longer match the code, and there is no migration path by
+    // design (see SCHEMA_EPOCH).
+    let mut fresh = match epoch_matches(&pool).await? {
+        None => true,
+        Some(true) => false,
+        Some(false) => {
+            eprintln!(
+                "[db] {} predates schema epoch {SCHEMA_EPOCH} — moving it aside and starting fresh",
+                db_path.display()
+            );
+            pool.close().await;
+            move_aside(db_path);
+            pool = open_pool(&db_url).await?;
+            true
+        }
+    };
+    if !fresh {
+        // Belt and braces: an epoch stamp with no tables behind it.
+        let tables: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        fresh = tables <= 1;
+    }
+
+    // ── Schema epoch ──────────────────────────────────────────────────
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS schema_epoch (
+            epoch INTEGER PRIMARY KEY,
+            app_version TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+    )
+    .execute(&pool)
+    .await?;
 
     // ── App-level tables ──────────────────────────────────────────────
 
@@ -1000,7 +257,6 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             name TEXT NOT NULL,
             image_path TEXT,
             tmdb_id INTEGER,
-            -- Was the person_meta side table until migration 2.
             biography TEXT
         )",
     )
@@ -1388,6 +644,9 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .execute(&pool)
     .await?;
 
+    // The album row's columns are a CACHE of resolved values (user > mb >
+    // tags, see field_override) — rewritten by the scanner on every scan,
+    // full or scoped, which is the one path that writes them.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS album (
             id INTEGER PRIMARY KEY,
@@ -1399,8 +658,8 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             release_date TEXT,
             album_type TEXT NOT NULL DEFAULT 'album',
             disc_count INTEGER,
-            -- MusicBrainz release group (the album as a work, across pressings).
-            -- Was the album_mb side table until migration 1.
+            -- MusicBrainz release group the FILES carry (tag truth); the
+            -- matched group lives in field_override.
             mb_release_group_id TEXT,
             FOREIGN KEY (id) REFERENCES media_entry(id) ON DELETE CASCADE
         )",
@@ -1408,6 +667,8 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .execute(&pool)
     .await?;
 
+    // Same cache rule as album: title, numbers and sort keys are the
+    // resolved values the scanner wrote.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS track (
             id INTEGER PRIMARY KEY,
@@ -1419,8 +680,8 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             disc_number INTEGER,
             runtime INTEGER,
             audio_hash TEXT,
-            -- Rescan gate (migration 28): unchanged pair = stored hash still
-            -- valid, the audio region is never re-read.
+            -- Rescan gate: unchanged pair = stored hash still valid, the
+            -- audio region is never re-read.
             content_size INTEGER,
             content_mtime INTEGER,
             FOREIGN KEY (id) REFERENCES media_entry(id) ON DELETE CASCADE
@@ -1470,10 +731,9 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     // One row per owned version of an album ("2011 Remaster", "Deluxe
     // Edition", ...). Our `album` = MusicBrainz "release group", our
     // `album_release` = MusicBrainz "release" (named to dodge the RELEASE
-    // SQL keyword). label NULL = the plain/unnamed version (loose files in
-    // the album folder). Most albums have exactly one row. The album/track
-    // tables shipped before this model, so version membership and MBIDs
-    // live in side tables (no ALTER migrations).
+    // SQL keyword). label NULL = the plain/unnamed version. A release is a
+    // folder by default; a track's release_key (tag layer) can put it in
+    // another folder's release. Rebuilt with fresh ids on every scan.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS album_release (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1484,13 +744,17 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             mb_release_id TEXT,
             is_default INTEGER NOT NULL DEFAULT 0,
             disc_count INTEGER NOT NULL DEFAULT 1,
-            -- The release's OWN title: majority album tag of its tracks, so a
-            -- combined-in source keeps its original name. NULL pre-rescan.
+            -- The release's OWN title: majority album tag (effective) of its
+            -- tracks, so a combined-in source keeps its original name.
             title TEXT,
             -- A cue sheet in the release folder flags its tracks PRE (CD
             -- pre-emphasis left in the rip): playback de-emphasizes unless
             -- the user's pref says otherwise. Stamped by the scanner.
             cue_pre_emphasis INTEGER NOT NULL DEFAULT 0,
+            -- Release-level facts cached from the tracks' effective tags
+            -- (majority): the label and catalogue number the header shows.
+            label_name TEXT,
+            catalog_number TEXT,
             FOREIGN KEY (album_id) REFERENCES album(id) ON DELETE CASCADE
         )",
     )
@@ -1500,7 +764,7 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     // User preferences for an album's releases — custom labels and the chosen
     // default. Keyed by FOLDER (the stable identity): album_release rows are
     // rebuilt with fresh ids on every rescan, and these get re-applied on top
-    // (apply_release_prefs at each album's reconcile tail). Migration 29.
+    // (apply_release_prefs at each album's reconcile tail).
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS album_release_pref (
             album_id INTEGER NOT NULL,
@@ -1524,8 +788,7 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
         .execute(&pool)
         .await?;
 
-    // Which release a track belongs to (track shipped without a release_id
-    // column; side table instead of ALTER).
+    // Which release a track belongs to.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS track_release (
             track_id INTEGER PRIMARY KEY,
@@ -1541,9 +804,9 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
         .execute(&pool)
         .await?;
 
-    // Per-track tag payload the frozen track table has no columns for:
-    // display artist (may differ from the album artist — features,
-    // compilations), embedded MusicBrainz ids, and technical facts.
+    // Per-track payload the track table has no columns for: display artist
+    // (may differ from the album artist — features, compilations), the
+    // embedded MusicBrainz recording id, and technical facts.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS track_meta (
             track_id INTEGER PRIMARY KEY,
@@ -1576,14 +839,12 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .await?;
 
     // ── Track artist credits ──────────────────────────────────────────
-    // Ordered credit list per track, parsed from tags at scan time: main
-    // artist(s) first, then features (from the artist tag's "feat." clause,
-    // multi-value ARTISTS frames, and "(feat. …)" title parentheticals).
-    // name is the as-credited text (what the tag said); artist_id is WHO that
-    // is — stamped by resolve_credit_ids after every pass that changes
-    // credits or artists. NULL = unresolved. Deliberately not a FOREIGN KEY:
-    // artist deletes (sweeps, merges) must not be blocked by stale stamps,
-    // which the next resolution pass heals.
+    // Ordered credit list per track (the effective `credits` field): main
+    // artist(s) first, then features. name is the as-credited text;
+    // artist_id is WHO that is — stamped by resolve_credit_ids after every
+    // pass that changes credits or artists. NULL = unresolved. Deliberately
+    // not a FOREIGN KEY: artist deletes (sweeps, merges) must not be blocked
+    // by stale stamps, which the next resolution pass heals.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS track_credit (
             track_id INTEGER NOT NULL,
@@ -1712,7 +973,7 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             -- Who wrote the redirect — the Sources view's tier vocabulary:
             -- 'mb' (a MusicBrainz match adopted the canonical name and the
             -- old spelling lives on here) or 'user' (a rename, merge or
-            -- link by hand). No classification beyond that (migration 38).
+            -- link by hand).
             source TEXT NOT NULL DEFAULT 'user',
             FOREIGN KEY (artist_id) REFERENCES artist(id) ON DELETE CASCADE
         )",
@@ -1759,9 +1020,10 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .execute(&pool)
     .await?;
 
-    // Everything the MusicBrainz pass auto-applied, with before/after values —
-    // the transparency log shown in the modal. Undo restores `before_json`
-    // and writes an mb_suppression row so the pass doesn't reapply.
+    // Everything the MusicBrainz pass auto-applied — and every decision the
+    // user made, tag-layer edits included — with before/after values: the
+    // History list. Undo restores `before_json` (and, for machine changes,
+    // writes an mb_suppression row so the pass doesn't reapply).
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS mb_change_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1775,7 +1037,7 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             -- The action that wrote this row: one match logs several rows
             -- (credits, type, date) and the review list undoes the action, not
-            -- its parts. Added by migration 8.
+            -- its parts.
             batch_id INTEGER,
             FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE
         )",
@@ -1838,7 +1100,7 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
             album_id INTEGER NOT NULL,
             -- Which release of the album this diff belongs to (folder-keyed,
             -- like every per-release store — release row ids don't survive
-            -- rescans). Migration 30.
+            -- rescans).
             folder_path TEXT NOT NULL DEFAULT '',
             side TEXT NOT NULL,
             disc INTEGER NOT NULL,
@@ -1858,9 +1120,10 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     // Per-release MusicBrainz match: WHICH pressing each release of an album
     // is. The group id stays album-level (the card IS the group); every
     // release can pin its own pressing. Folder-keyed because album_release
-    // rows are rebuilt with fresh ids on every rescan. Migration 30.
-    // title: the pinned pressing's own MB title (migration 36) — for the
-    // per-tier view; the album's title always comes from the group.
+    // rows are rebuilt with fresh ids on every rescan. title: the pinned
+    // pressing's own MB title — for the per-tier view; the album's title
+    // always comes from the group. The pressing's medium titles go to the
+    // tracks' disc_subtitle mb tier (tag_fields), not here.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS release_match (
             album_id INTEGER NOT NULL,
@@ -1875,7 +1138,9 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .execute(&pool)
     .await?;
 
-    // Tag-truth disc names (rebuilt with the release rows they hang off).
+    // Disc names as resolved per track (the effective disc_subtitle field:
+    // user rename, else the pinned pressing's medium title, else the
+    // DISCSUBTITLE tag), rebuilt with the release rows they hang off.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS release_disc_subtitle (
             release_id INTEGER NOT NULL,
@@ -1888,24 +1153,10 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .execute(&pool)
     .await?;
 
-    // User disc renames — folder-keyed, overlaying the tag value at read.
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS disc_title_pref (
-            album_id INTEGER NOT NULL,
-            folder_path TEXT NOT NULL,
-            disc_no INTEGER NOT NULL,
-            title TEXT NOT NULL,
-            PRIMARY KEY (album_id, folder_path, disc_no),
-            FOREIGN KEY (album_id) REFERENCES album(id) ON DELETE CASCADE
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
     // The user's note on ONE version of an album ("this pressing has the
-    // short Music Box Blues") — folder-keyed like the pin and disc names,
-    // so it rides combines, splits and folder moves with its version. The
-    // card-wide note is entry_note. See notes.rs.
+    // short Music Box Blues") — folder-keyed like the pin, so it rides
+    // combines, splits and folder moves with its version. The card-wide
+    // note is entry_note. See notes.rs.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS album_release_note (
             album_id INTEGER NOT NULL,
@@ -1924,8 +1175,7 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     // of these. `scrobbled` flips once the Last.fm rule trips (>=50% of the
     // track or >=4 minutes of accumulated listening, whichever comes first);
     // stats and "real listen" surfaces read only scrobbled rows. played_secs =
-    // seconds actually listened (seek jumps credit nothing; rows written
-    // before 2026-07-22 hold the old furthest-position metric). There is
+    // seconds actually listened (seek jumps credit nothing). There is
     // deliberately no resume for music.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS music_play (
@@ -1949,16 +1199,12 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
         .execute(&pool)
         .await?;
 
-    // ── Loved tracks ──────────────────────────────────────────────────
-    // Presence of a row = the track is loved. Keyed on the track id, which
-    // rescans preserve by file path — a loved track keeps its heart unless
-    // its file moves out from under it (same durability as play history).
     // Ordered album-level artist credits ("Drake · Future") — THE record of
-    // whose album this is. Every album carries rows, solo included; the
-    // media_entry parent is only where the album lives (folder position,
-    // cascade), never attribution. Fed by artist splits, multi-value
-    // album-artist tags, and MusicBrainz credits. artist_id as on
-    // track_credit: stamped by resolve_credit_ids, soft reference on purpose.
+    // whose album this is, written by the scanner from the tracks' effective
+    // album_artists. Every album carries rows, solo included; the media_entry
+    // parent is only where the album lives (folder position, cascade), never
+    // attribution. artist_id as on track_credit: stamped by
+    // resolve_credit_ids, soft reference on purpose.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS album_artist_credit (
             album_id INTEGER NOT NULL,
@@ -1973,9 +1219,8 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .await?;
 
     // Per-library settings — key/value like the app-wide `settings` table,
-    // scoped to one library. First key: 'online_metadata' ("on"/"off",
-    // absent = on) — whether this library talks to online providers at all
-    // (MusicBrainz for music, TMDB/OMDB for video).
+    // scoped to one library. Keys: 'online_metadata' ("on"/"off", absent =
+    // on), 'tag_writing' ("on"/"off"), 'mb_pass_ran' ("1").
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS library_setting (
             library_id TEXT NOT NULL,
@@ -1988,33 +1233,9 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .execute(&pool)
     .await?;
 
-    // Directives staged since the last rescan, one row per user action
-    // (split, combine, separate). The directives themselves are permanent and
-    // rescan-idempotent; these rows only record "written but not yet applied"
-    // so the UI can show what a rescan will do instead of forcing a rescan
-    // per action. Cleared when a rescan completes.
-    // kind/target/payload make a staged row UNDOABLE: kind names the directive
-    // family, target is the dedup key (staging the same split twice replaces
-    // the row instead of stacking), payload carries what the revert needs.
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS pending_change (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            library_id TEXT NOT NULL,
-            label TEXT NOT NULL,
-            kind TEXT NOT NULL DEFAULT '',
-            target TEXT NOT NULL DEFAULT '',
-            payload TEXT NOT NULL DEFAULT '{}',
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
     // Matches waiting for a matching pass to cash them in (stamp the artists
     // their credits prove). Enqueued when an album match applies, removed on
-    // unmatch, cleared wholesale by a completed pass — the pass-side twin of
-    // pending_change above.
+    // unmatch, cleared wholesale by a completed pass.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS pending_pass (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2064,9 +1285,11 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .await?;
 
     // User directive: this album-artist STRING is really several artists
-    // ("JAY-Z & Kanye West" → [JAY-Z, Kanye West]). Applied on every scan —
-    // members[0] becomes the canonical parent, the full list becomes the
-    // album's artist credits, and matching track credits split the same way.
+    // ("JAY-Z & Kanye West" → [JAY-Z, Kanye West]). A standing RULE applied
+    // on every scan (files not yet scanned included) — members[0] becomes
+    // the canonical parent, the full list becomes the album's artist
+    // credits, and matching track credits split the same way. Applied on
+    // the spot through a scoped rescan when written.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS artist_split (
             library_id TEXT NOT NULL,
@@ -2105,15 +1328,16 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .await?;
 
     // ── Album scanner identity ────────────────────────────────────────
-    // The (album artist, title) pair the scanner grouped each album on,
-    // lowercased — the key combine directives are matched with. Written at
-    // every scan. A merged album's identity is its KEEPER's, which no
-    // single file carries once the poured-in tracks sort ahead of the
-    // keeper's own; reading "the first file's tags" for it keyed the
-    // absorbed list (and the rescan's row claim) on a folded-in fragment.
+    // The grouping key the scanner filed each album under — "key:<album
+    // artist>\x1f<album>" (lowercased tags), "rg:<MusicBrainz release group>"
+    // when its releases carry one (tagged or matched), or "id:<token>" when
+    // the user's identity_key layer field set one apart (a separated
+    // edition, a combine). The rescan's row claim matches on this first;
+    // artist/title are the display pair at that scan, for the record.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS album_identity (
             album_id INTEGER PRIMARY KEY,
+            key TEXT NOT NULL,
             artist TEXT NOT NULL,
             title TEXT NOT NULL,
             FOREIGN KEY (album_id) REFERENCES media_entry(id) ON DELETE CASCADE
@@ -2123,11 +1347,11 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .await?;
 
     // ── Sounds domain (ambient/rain/etc inside a music library) ───────
-    // library_path.kind has a baked CHECK ('movie','show','music') on existing
-    // databases, so sounds bases are ordinary kind='music' rows plus a row
-    // here. The scanner stamps albums found under these bases into
-    // sound_album; music surfaces exclude sound-marked albums the same way
-    // they exclude loose containers, and the Sounds node shows only them.
+    // library_path.kind has a baked CHECK ('movie','show','music'), so sounds
+    // bases are ordinary kind='music' rows plus a row here. The scanner
+    // stamps albums found under these bases into sound_album; music surfaces
+    // exclude sound-marked albums the same way they exclude loose containers,
+    // and the Sounds node shows only them.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS sound_path (
             library_id TEXT NOT NULL,
@@ -2146,41 +1370,6 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
         "CREATE TABLE IF NOT EXISTS sound_album (
             album_id INTEGER PRIMARY KEY,
             FOREIGN KEY (album_id) REFERENCES album(id) ON DELETE CASCADE
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    // ── Album splitting (the inverse of album_combine) ────────────────
-    // A folder whose tracks must NOT group with the album their tags would
-    // put them in — the user pulled this edition out of a multi-edition
-    // album. Keyed by the RELEASE's folder (editions are folder-derived), so
-    // it survives rescans; the scanner gives such a folder its own album.
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS album_release_split (
-            library_id TEXT NOT NULL,
-            folder_path TEXT NOT NULL,
-            PRIMARY KEY (library_id, folder_path),
-            FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-
-    // ── Edition merging (the inverse of album_release_split) ─────────
-    // Two folders with identical album tags scan as two editions of one
-    // album; a row here says the edition at folder_path is instead folded
-    // INTO the edition at into_folder (one track list, discs from tags).
-    // "Merge" in the combine dialog for a same-tag pair — keyed by folder
-    // because the tags can't tell the two apart. Applied every scan.
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS album_release_merge (
-            library_id TEXT NOT NULL,
-            folder_path TEXT NOT NULL,
-            into_folder TEXT NOT NULL,
-            PRIMARY KEY (library_id, folder_path),
-            FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE
         )",
     )
     .execute(&pool)
@@ -2257,59 +1446,6 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .execute(&pool)
     .await?;
 
-    // ── Album combine directives ──────────────────────────────────────
-    // "These tag-albums are one album." Applied at scan time (both fresh
-    // scans and rescans), so combines SURVIVE rescans — scans group strictly
-    // by tags and would otherwise re-split them. Identities are lowercased
-    // TAG values (album_artist + album), not DB titles, because that's what
-    // the scanner groups by ('' artist = artist-less). mode: 'merge' (tracks
-    // fold into the target's default release, keeping disc numbers) |
-    // 'versions' (each source release becomes a version of the target).
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS album_combine (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            library_id TEXT NOT NULL,
-            source_artist TEXT NOT NULL,
-            source_title TEXT NOT NULL,
-            target_artist TEXT NOT NULL,
-            target_title TEXT NOT NULL,
-            mode TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            -- Which edition a merge pours into, plus the names as they read at
-            -- combine time (for the undo chip). Was album_combine_meta until
-            -- migration 3.
-            target_folder TEXT,
-            source_name TEXT,
-            target_name TEXT,
-            -- 1 when the app staged this itself: two proven matches to one
-            -- MusicBrainz release group (music_edit::auto_combine_same_group).
-            -- Migration 43.
-            auto INTEGER NOT NULL DEFAULT 0,
-            FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    // ── Auto-combine rejections ───────────────────────────────────────
-    // An auto-staged combine the user undid: these two albums stay separate
-    // on purpose, and the app never stages them again. Keyed on the tag
-    // identities the directive itself was keyed on, so it survives rescans
-    // and the albums' ids.
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS album_combine_reject (
-            library_id TEXT NOT NULL,
-            source_artist TEXT NOT NULL,
-            source_title TEXT NOT NULL,
-            target_artist TEXT NOT NULL,
-            target_title TEXT NOT NULL,
-            PRIMARY KEY (library_id, source_artist, source_title, target_artist, target_title),
-            FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
     // ── Duplicate-album dismissals ────────────────────────────────────
     // "Keep both" on a File-problems duplicate card. The key is a digest of
     // the albums' sorted track content hashes — the thing that made them
@@ -2375,12 +1511,16 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .execute(&pool)
     .await?;
 
-    // ── Per-field provenance overrides ────────────────────────────────
-    // The user/external tiers of the field provenance model. The tag tier
-    // lives in the regular columns (written by scans); effective value =
-    // user override, else external override, else column. tier: 'user' |
-    // 'external'. Scans never touch this table; external sources write only
-    // the 'external' tier and only where the user elected them.
+    // ── The tiered value store ────────────────────────────────────────
+    // Every value waverunner holds for a field of an entity, by who said it:
+    // 'tag' (what the file says — written by the scanner for every track
+    // field of tag_fields.rs and the album's derived fields), 'mb' (what a
+    // MusicBrainz match said), 'user' (what the user set). The effective
+    // value is user, else a non-empty mb, else tag; the entity rows' columns
+    // CACHE it, and the scanner (full or scoped) is what writes the cache —
+    // every edit runs one. A track's upper tiers are the user's own layer of
+    // tags: they go into the scan BEFORE grouping, so album membership,
+    // release membership and every derived fact see them.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS field_override (
             entity_id INTEGER NOT NULL,
@@ -2394,6 +1534,10 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     )
     .execute(&pool)
     .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_field_override_tier ON field_override(tier, field)")
+        .execute(&pool)
+        .await?;
 
     // ── Playlist tables ───────────────────────────────────────────────
 
@@ -2478,8 +1622,6 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .execute(&pool)
     .await?;
 
-    // ── Cached images ─────────────────────────────────────────────────
-
     // ── Third-party ratings (OMDB: IMDb, Rotten Tomatoes, Metacritic) ─
     // Fetched lazily the first time a detail page wants them, then cached.
     // source 'none' is a sentinel marking "fetch attempted, nothing found" so
@@ -2526,9 +1668,8 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
         .await?;
 
     // ── Rotten Tomatoes slug cache for shows ──────────────────────────
-    // Movies cache their RT slug in movie.rotten_tomatoes_id; the show table
-    // predates ratings and has no such column, so shows use this side table
-    // (no ALTER migrations).
+    // Movies cache their RT slug in movie.rotten_tomatoes_id; shows use this
+    // side table.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS rt_slug (
             entry_id INTEGER PRIMARY KEY,
@@ -2540,8 +1681,7 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .await?;
 
     // ── Favorite people ───────────────────────────────────────────────
-    // Pinned to the top of alphabetical people views. Separate table (not a
-    // column on person) so it needs no ALTER migrations.
+    // Pinned to the top of alphabetical people views.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS favorite_person (
             person_id INTEGER PRIMARY KEY,
@@ -2605,8 +1745,7 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     // Sidecar marking a movie entry as interactive: the scanner found a
     // matched manifest + info JSON pair next to the video. Filenames are
     // stored relative to the entry folder (detection is content-based, so
-    // the names vary per pack). Separate table, not a movie column — no
-    // ALTER migrations.
+    // the names vary per pack).
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS interactive_title (
             entry_id INTEGER PRIMARY KEY,
@@ -2636,8 +1775,8 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     // playback. position_secs is the resume point — NULL when there isn't one
     // (finished, or never got past the 30s noise floor). watched flips at
     // ≥95% or ≤60s remaining and is sticky across rewatches. Keyed on ids,
-    // which rescans keep stable for unchanged paths (rename on disk = history
-    // lost until file-hashing gives entries a durable identity).
+    // which rescans keep stable for unchanged paths (and, with file hashing,
+    // for renamed/moved files too).
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS movie_watch (
             entry_id INTEGER PRIMARY KEY,
@@ -2682,9 +1821,8 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .await?;
 
     // ── Selected backdrop per entry ───────────────────────────────────
-    // Separate table (not a column on movie/show) so it needs no ALTER
-    // migrations and covers any entry type that grows a backdrop later.
-    // The path references cached_images.cached_path with image_type='backdrop'.
+    // Covers any entry type that grows a backdrop. The path references
+    // cached_images.cached_path with image_type='backdrop'.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS selected_backdrop (
             entry_id INTEGER PRIMARY KEY,
@@ -2747,13 +1885,14 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .execute(&pool)
     .await?;
 
-    // ── Schema migrations ─────────────────────────────────────────────
-    // The CREATE statements above are idempotent and describe the schema as
-    // it is TODAY. Migrations carry existing databases up to that shape.
+    // ── Epoch stamp ───────────────────────────────────────────────────
+    // Written once, when the database is born at this schema.
     if fresh {
-        baseline_migrations(&pool).await?;
-    } else {
-        run_migrations(&pool, db_path).await?;
+        sqlx::query("INSERT OR IGNORE INTO schema_epoch (epoch, app_version) VALUES (?, ?)")
+            .bind(SCHEMA_EPOCH)
+            .bind(env!("CARGO_PKG_VERSION"))
+            .execute(&pool)
+            .await?;
     }
 
     Ok(pool)

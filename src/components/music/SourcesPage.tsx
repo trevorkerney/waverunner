@@ -58,7 +58,7 @@ interface ArtistIdentity {
   aliases: { name: string; source: "mb" | "user" | string }[];
   persona_of: NamedArtist | null;
   personas: NamedArtist[];
-  splits: { source: string; members: string[]; role: "source" | "member" | string; staged: boolean }[];
+  splits: { source: string; members: string[]; role: "source" | "member" | string }[];
   kept_separate: string[];
 }
 interface TierGroup {
@@ -93,12 +93,11 @@ function identityRows(id: ArtistIdentity): { key: string; label: string; cells: 
   }
   for (const s of id.splits) {
     const cells = empty();
-    const note = s.staged ? " (staged — applies on rescan)" : "";
     if (s.role === "source") {
-      cells.user.push(`${s.members.join(" · ")}${note}`);
+      cells.user.push(s.members.join(" · "));
       rows.push({ key: `split-${s.source}`, label: "Split into", cells });
     } else {
-      cells.user.push(`“${s.source}”${note}`);
+      cells.user.push(`“${s.source}”`);
       rows.push({ key: `split-${s.source}`, label: "Split from", cells });
     }
   }
@@ -131,29 +130,57 @@ interface TierMatrix {
 
 type Tier = "tag" | "mb" | "user";
 
+/** Display order: the album-level fields, then the track registry's
+ *  (tag_fields.rs) in its declaration order. Unknown fields trail. */
 const FIELD_ORDER = [
   "title",
   "artist_credits",
   "credits",
+  "album_artists",
+  "album",
   "release_date",
   "album_type",
+  "date",
   "genres",
   "track_number",
   "disc_number",
-  "mb_release_id",
+  "disc_subtitle",
+  "composer",
   "label",
+  "catalog_number",
+  "bpm",
+  "comment",
+  "lyrics",
+  "mb_recording_id",
+  "mb_release_id",
+  "mb_release_group_id",
+  "release_key",
+  "identity_key",
 ];
 const FIELD_LABEL: Record<string, string> = {
   title: "Title",
   artist_credits: "Artists",
   credits: "Artists",
+  album_artists: "Alb. artists",
+  album: "Album",
   release_date: "Date",
   album_type: "Type",
+  date: "Date",
   genres: "Genres",
   track_number: "Track",
   disc_number: "Disc",
-  mb_release_id: "Release",
+  disc_subtitle: "Disc name",
+  composer: "Composer",
   label: "Label",
+  catalog_number: "Cat. no.",
+  bpm: "BPM",
+  comment: "Comment",
+  lyrics: "Lyrics",
+  mb_recording_id: "Recording",
+  mb_release_id: "Release",
+  mb_release_group_id: "Group",
+  release_key: "In release",
+  identity_key: "Identity",
 };
 
 /** Stored text → display. Lists (credits, genres) are JSON arrays; MBIDs
@@ -194,7 +221,9 @@ function rowDisagrees(fields: Record<string, TierValue>): boolean {
 }
 
 function fieldsInOrder(fields: Record<string, TierValue>): [string, TierValue][] {
-  return FIELD_ORDER.filter((f) => f in fields).map((f) => [f, fields[f]]);
+  const known = FIELD_ORDER.filter((f) => f in fields);
+  const rest = Object.keys(fields).filter((f) => !FIELD_ORDER.includes(f)).sort();
+  return [...known, ...rest].map((f) => [f, fields[f]]);
 }
 
 /** One tier's column for one row. Every column walks the SAME field list

@@ -8037,7 +8037,11 @@ pub async fn rescan_library(
                     .iter()
                     .map(|p| (PathBuf::from(p), sound_paths.contains(p)))
                     .collect();
-                crate::music::rescan_music_library(&app, &state.app_db, &library_id, &base_paths, &cache_base, &state.cancel_creation).await?;
+                // One scan at a time per library: an edit's scoped rescan
+                // in flight finishes before the full one starts.
+                let lock = crate::music_edit::scan_lock(&library_id);
+                let _guard = lock.lock().await;
+                crate::music::rescan_music_library(Some(&app), &state.app_db, &library_id, &base_paths, &cache_base, &state.cancel_creation, None).await?;
                 // The MusicBrainz pass is NOT auto-spawned — the wizard's match
                 // step (or the metadata center) drives it, if the user elects it.
                 // Music surfaces per-file problems via music_scan_issue, not
@@ -8048,16 +8052,6 @@ pub async fn rescan_library(
         }
     }
     .await;
-
-    // Staged directives (splits, combines, separates) are applied by any
-    // successful rescan — the pending list they fed is now history.
-    if rescan_result.is_ok() {
-        sqlx::query("DELETE FROM pending_change WHERE library_id = ?")
-            .bind(&library_id)
-            .execute(&state.app_db)
-            .await
-            .map_err(|e| e.to_string())?;
-    }
 
     emit_scan_state(&app, &library_id, &lib_name, &format, false, if rescan_result.is_ok() { "finished" } else { "failed" });
     rescan_result

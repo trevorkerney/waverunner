@@ -19,6 +19,7 @@ mod music_tagwrite;
 mod notes;
 mod player;
 mod rt;
+mod tag_fields;
 mod tmdb;
 mod waveform;
 #[cfg(windows)]
@@ -306,11 +307,13 @@ pub fn run() {
             music::create_sound_collection,
             music::delete_sound_collection,
             music::move_sound_track,
+            music_edit::get_tag_fields,
             music_edit::get_track_edit,
             music_edit::search_track_artist_options,
+            music_edit::search_album_options,
             music_edit::split_artist,
             music_edit::search_artist_options,
-            music_edit::set_track_fields,
+            music_edit::apply_track_edits,
             music_edit::reset_track_fields,
             music_edit::get_album_edit,
             music_edit::set_album_fields,
@@ -320,8 +323,6 @@ pub fn run() {
             music_edit::reset_artist_fields,
             music_edit::combine_albums_multi,
             music_edit::get_combine_info,
-            music_edit::get_album_absorbed,
-            music_edit::undo_album_combine,
             music_edit::split_album_release,
             music_edit::separate_merged_folders,
             music_edit::merge_album_release,
@@ -345,7 +346,6 @@ pub fn run() {
             music_mb::mb_prefetch_releases_start,
             music_mb::mb_credit_check,
             music_mb::mb_release_group_of,
-            music_edit::unstage_pending_change,
             music_mb::mb_apply_album_match,
             music_mb::mb_undo_batch,
             music_mb::mb_recheck_album,
@@ -356,7 +356,6 @@ pub fn run() {
             music_edit::resolve_artist_choices,
             music_edit::search_credit_link_choices,
             music_edit::link_credit_name,
-            music_edit::get_pending_changes,
             music_mb::get_pending_pass,
             music_mb::get_artist_personas,
             music_mb::set_artist_persona,

@@ -2,27 +2,17 @@ import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Button } from "../ui/button";
-import { MATCH_LOCK_TITLE, useLibraryRuns } from "@/hooks/libraryRuns";
+import { useLibraryRuns } from "@/hooks/libraryRuns";
 import { useMbHidden } from "@/lib/mbVisibility";
 import { RefreshCw, Sparkles, TriangleAlert } from "lucide-react";
 
-/** The two deferred-work queues a music library carries:
- *  - staged changes a RESCAN applies (splits, combines, separations)
- *  - applied matches a MATCHING PASS cashes in (stamping the artists their
- *    credits prove)
+/** The deferred-work queue a music library carries: applied matches a
+ *  MATCHING PASS cashes in (stamping the artists their credits prove), plus
+ *  what the pass will look at on its own. (Edits, splits and combines apply
+ *  on the spot since the tag layer — nothing waits on a rescan any more.)
  *  The metadata center's banner is the full view; these pieces are the
  *  outside-the-center layer — a sidebar badge (ambient) and a library-page
- *  strip (actionable) — so deferred work is never invisible. */
-
-/** A staged directive (split, combine, separate) a rescan will apply. */
-export interface PendingRescanRow {
-  id: number;
-  label: string;
-  kind: string;
-  target: string;
-  /** Entities the directive has decided — frozen until the rescan. */
-  locked_ids: number[];
-}
+ *  strip (actionable) — so queued work is never invisible. */
 
 /** An applied match a matching pass has yet to cash in. */
 export interface PendingPassRow {
@@ -32,8 +22,8 @@ export interface PendingPassRow {
   batch_id: number | null;
 }
 
-/** Staging happens in dialogs scattered across the app — they announce it
- *  with this so every badge/strip refetches without prop threading. */
+/** Anything that changes the queue announces it with this so every
+ *  badge/strip refetches without prop threading. */
 export function notifyPendingWorkChanged() {
   window.dispatchEvent(new Event("waverunner:pending-work-changed"));
 }
@@ -83,7 +73,6 @@ export function passItemsLabel(n: number): string {
 const NO_BUCKETS: PendingPassBuckets = { uncheckedAlbums: 0, uncheckedArtists: 0, failedRequests: 0 };
 
 interface PendingSnapshot {
-  rescan: PendingRescanRow[];
   pass: PendingPassRow[];
   buckets: PendingPassBuckets;
   failures: FetchFailureRow[];
@@ -107,8 +96,7 @@ function fetchPending(libraryId: string): Promise<PendingSnapshot> {
   const running = inflight.get(libraryId);
   if (running) return running;
   const p = (async () => {
-    const [rescan, pass, ms, ls, failures] = await Promise.all([
-      invoke<PendingRescanRow[]>("get_pending_changes", { libraryId }),
+    const [pass, ms, ls, failures] = await Promise.all([
       invoke<PendingPassRow[]>("get_pending_pass", { libraryId }),
       invoke<{ unchecked: number; unchecked_artists: number; failed_requests: number }>(
         "music_match_state",
@@ -119,7 +107,6 @@ function fetchPending(libraryId: string): Promise<PendingSnapshot> {
     ]);
     const online = ls["online_metadata"] !== "off";
     const snap: PendingSnapshot = {
-      rescan,
       pass,
       buckets: online
         ? {
@@ -140,19 +127,17 @@ function fetchPending(libraryId: string): Promise<PendingSnapshot> {
   return p;
 }
 
-/** Both queues, live: fetched on mount (a few cheap queries) and again on
- *  every event that can change them. The metadata center's banners read
- *  from here too, so the badge, the strip and the banners always agree —
- *  and the banners don't wait on the center's slow review fetch. */
+/** The pass queue, live: fetched on mount (a few cheap queries) and again on
+ *  every event that can change it. The metadata center's banners read from
+ *  here too, so the badge, the strip and the banners always agree — and the
+ *  banners don't wait on the center's slow review fetch. */
 export function usePendingWork(libraryId: string | null) {
   const cached = libraryId ? lastSnapshot.get(libraryId) : undefined;
-  const [rescan, setRescan] = useState<PendingRescanRow[]>(() => cached?.rescan ?? []);
   const [pass, setPass] = useState<PendingPassRow[]>(() => cached?.pass ?? []);
   const [buckets, setBuckets] = useState<PendingPassBuckets>(() => cached?.buckets ?? NO_BUCKETS);
   const [failures, setFailures] = useState<FetchFailureRow[]>(() => cached?.failures ?? []);
   const refetch = useCallback(async () => {
     if (!libraryId) {
-      setRescan([]);
       setPass([]);
       setBuckets(NO_BUCKETS);
       setFailures([]);
@@ -162,14 +147,12 @@ export function usePendingWork(libraryId: string | null) {
     // not the previous library's rows until the fetch lands.
     const known = lastSnapshot.get(libraryId);
     if (known) {
-      setRescan(known.rescan);
       setPass(known.pass);
       setBuckets(known.buckets);
       setFailures(known.failures);
     }
     try {
       const snap = await fetchPending(libraryId);
-      setRescan(snap.rescan);
       setPass(snap.pass);
       setBuckets(snap.buckets);
       setFailures(snap.failures);
@@ -180,10 +163,9 @@ export function usePendingWork(libraryId: string | null) {
   useEffect(() => {
     void refetch();
     const onDom = () => void refetch();
-    // Staging sites dispatch pending-work-changed; rescans announce through
+    // Mutating sites dispatch pending-work-changed; rescans announce through
     // library-rescanned; applies/unmatches/undos and pass completion all emit
-    // music-enrich-done from the backend; scan-state end covers wizard
-    // rescans that clear the staged list.
+    // music-enrich-done from the backend; scan-state end covers rescans.
     window.addEventListener("waverunner:pending-work-changed", onDom);
     window.addEventListener("waverunner:library-rescanned", onDom);
     const unEnrich = listen("music-enrich-done", () => void refetch());
@@ -197,16 +179,14 @@ export function usePendingWork(libraryId: string | null) {
       unScan.then((fn) => fn());
     };
   }, [refetch]);
-  return { rescan, pass, buckets, failures, passItems: passItemCount(pass, buckets), refetch };
+  return { pass, buckets, failures, passItems: passItemCount(pass, buckets), refetch };
 }
 
-/** The sidebar's Metadata row's ONE attention slot — never two icons side by side.
- *  Priority, top first:
- *    1. staged changes waiting on a rescan (red triangle; music)
- *    2. matches waiting on a matching pass (amber triangle; music)
- *  Both open the metadata center — the full picture lives there. Silent
- *  when nothing applies. (A span, not a button: the row itself renders as a
- *  button and buttons can't nest — same trick as the row's chevron.) */
+/** The sidebar's Metadata row's ONE attention slot: matches waiting on a
+ *  matching pass (amber triangle; music). Opens the metadata center — the
+ *  full picture lives there. Silent when nothing applies. (A span, not a
+ *  button: the row itself renders as a button and buttons can't nest —
+ *  same trick as the row's chevron.) */
 export function LibraryAttentionBadge({
   libraryId,
   format,
@@ -214,17 +194,9 @@ export function LibraryAttentionBadge({
   libraryId: string;
   format: string;
 }) {
-  // Only music carries the deferred-work queues; other formats skip the fetch.
-  const { rescan, passItems } = usePendingWork(format === "music" ? libraryId : null);
-  if (rescan.length === 0 && passItems === 0) return null;
-  const urgent = rescan.length > 0;
-  const parts = [
-    rescan.length > 0 &&
-      `${rescan.length} change${rescan.length === 1 ? "" : "s"} staged for the next rescan`,
-    passItems > 0 && passItemsLabel(passItems),
-  ]
-    .filter(Boolean)
-    .join(" · ");
+  // Only music carries the pass queue; other formats skip the fetch.
+  const { passItems } = usePendingWork(format === "music" ? libraryId : null);
+  if (passItems === 0) return null;
   return (
     // h-5 matches the row's one-line text height (the same trick its chevron
     // uses), so the icon centers on the title's first line even when a long
@@ -236,12 +208,10 @@ export function LibraryAttentionBadge({
           new CustomEvent("waverunner:open-music-center", { detail: { libraryId } }),
         );
       }}
-      title={`${parts} — open Metadata`}
+      title={`${passItemsLabel(passItems)} — open Metadata`}
       // No hover treatment: it's a status mark that happens to be
       // clickable, not a button — the row it sits in already highlights.
-      className={`flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center ${
-        urgent ? "text-red-400" : "text-primary"
-      }`}
+      className="flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center text-primary"
     >
       <TriangleAlert size={13} />
     </span>
@@ -249,14 +219,11 @@ export function LibraryAttentionBadge({
 }
 
 /** The actionable layer: a one-line strip under the library's toolbar naming
- *  both queues, with the action each one wants. Rescan applies staged
- *  changes; the pass cashes in matches — and staged changes gate the pass
- *  (same rule the backend enforces), so the strip only offers what can run. */
+ *  the pass queue, with the action it wants. */
 export function PendingWorkStrip({ libraryId }: { libraryId: string }) {
-  const { rescan, passItems: passItemsAll } = usePendingWork(libraryId);
+  const { passItems: passItemsAll } = usePendingWork(libraryId);
   // "Show MusicBrainz outside this page" off: the matching-pass queue is
-  // MusicBrainz work, so it stays on the Metadata page. Staged rescan
-  // changes are the library's own and still show.
+  // MusicBrainz work, so it stays on the Metadata page.
   const mbHidden = useMbHidden(libraryId);
   const passItems = mbHidden ? 0 : passItemsAll;
   // A running pass IS the queue being worked — the strip would sit there
@@ -264,14 +231,7 @@ export function PendingWorkStrip({ libraryId }: { libraryId: string }) {
   // reading as if the click did nothing. The Metadata page shows the pass.
   const { runs } = useLibraryRuns();
   const passRunning = runs[libraryId]?.kind === "match";
-  if (passRunning || (rescan.length === 0 && passItems === 0)) return null;
-  const message = [
-    rescan.length > 0 &&
-      `${rescan.length} change${rescan.length === 1 ? "" : "s"} staged for the next rescan`,
-    passItems > 0 && passItemsLabel(passItems),
-  ]
-    .filter(Boolean)
-    .join(" · ");
+  if (passRunning || passItems === 0) return null;
   // App's run controller starts the pass; its progress lives on the Metadata
   // page, so the click goes there too — otherwise it starts silently behind
   // whatever page this strip is on.
@@ -283,57 +243,21 @@ export function PendingWorkStrip({ libraryId }: { libraryId: string }) {
       new CustomEvent("waverunner:open-match", { detail: { libraryId } }),
     );
   };
-  // Rescan-needed outranks pass-needed: red while any staged change waits
-  // (the rescan gates everything), amber once only the pass is left.
-  const urgent = rescan.length > 0;
   return (
-    <div
-      className={`flex items-center gap-3 border-b px-4 py-1.5 ${
-        urgent ? "border-red-500/30 bg-red-500/5" : "border-primary/25 bg-primary/5"
-      }`}
-    >
+    <div className="flex items-center gap-3 border-b border-primary/25 bg-primary/5 px-4 py-1.5">
       {/* Pass-waiting = the running pass's palette (primary tint, primary
           icon, plain text), so the two read as one thing. */}
-      <TriangleAlert
-        size={13}
-        className={`shrink-0 ${urgent ? "text-red-400" : "text-primary"}`}
-      />
-      <p
-        className={`min-w-0 flex-1 truncate text-xs ${
-          urgent ? "text-red-200/90" : ""
-        }`}
+      <TriangleAlert size={13} className="shrink-0 text-primary" />
+      <p className="min-w-0 flex-1 truncate text-xs">{passItemsLabel(passItems)}</p>
+      <Button
+        size="sm"
+        variant="outline"
+        className="h-6 shrink-0 gap-1.5 px-2 text-xs"
+        onClick={runPass}
       >
-        {message}
-      </p>
-      {rescan.length > 0 && (
-        <Button
-          size="sm"
-          variant="outline"
-          className="h-6 shrink-0 gap-1.5 px-2 text-xs"
-          // The pass holds the rescan (backend refuses) — it ends first.
-          disabled={passRunning}
-          title={passRunning ? MATCH_LOCK_TITLE : undefined}
-          onClick={() =>
-            window.dispatchEvent(
-              new CustomEvent("waverunner:open-rescan", { detail: { libraryId } }),
-            )
-          }
-        >
-          <RefreshCw size={12} />
-          Rescan now
-        </Button>
-      )}
-      {passItems > 0 && rescan.length === 0 && (
-        <Button
-          size="sm"
-          variant="outline"
-          className="h-6 shrink-0 gap-1.5 px-2 text-xs"
-          onClick={runPass}
-        >
-          <RefreshCw size={12} />
-          Run matching pass
-        </Button>
-      )}
+        <RefreshCw size={12} />
+        Run matching pass
+      </Button>
       <button
         type="button"
         className="shrink-0 text-xs text-muted-foreground underline underline-offset-2 hover:text-foreground"

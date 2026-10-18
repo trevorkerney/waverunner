@@ -1,8 +1,15 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
-import { notifyPendingWorkChanged } from "./PendingWork";
 import { toast } from "@/lib/toast";
+import {
+  displayStored,
+  fromStored,
+  loadTagFields,
+  sameValue,
+  toEditValue,
+  type TagFieldInfo,
+} from "@/lib/tagFields";
 import {
   Dialog,
   DialogBody,
@@ -29,9 +36,9 @@ import { Undo2, X } from "lucide-react";
 import { MATCH_LOCK_TITLE, useMatchLock } from "@/hooks/libraryRuns";
 
 /** Metadata editors — the user tier of the provenance model. Edits are stored
- *  as overrides in waverunner's database (files stay untouched) and survive
- *  rescans and MusicBrainz passes. Writing INTO the file's tags is a separate,
- *  explicit option that only appears when enabled in Settings → Audio Player. */
+ *  as overrides in waverunner's database (files stay untouched), apply on the
+ *  spot, and survive rescans and MusicBrainz passes. Writing INTO the file's
+ *  tags is a separate, explicit option (per-library tag writing). */
 
 // ---------------------------------------------------------------------------
 // Shared pieces
@@ -61,7 +68,7 @@ function FieldSkeleton({ field = "h-9" }: { field?: string }) {
 /** Existing-artist suggestions under an artist row. Portaled at fixed
  *  coordinates (like ArtistPicker's menu): the form body scrolls, and an
  *  absolute menu inside it would be clipped by that box. */
-function SuggestMenu({
+export function SuggestMenu({
   anchorEl,
   options,
   onPick,
@@ -114,9 +121,9 @@ function SuggestMenu({
 }
 
 /** One artist per row (first is the main / primary one), each with
- *  existing-artist suggestions as it's typed — the track and album editors
- *  share this. `search` is the dialog's own lookup command. */
-function ArtistRows({
+ *  existing-artist suggestions as it's typed — the track, bulk and album
+ *  editors share this. `search` is the dialog's own lookup command. */
+export function ArtistRows({
   rows,
   onChange,
   placeholders,
@@ -209,20 +216,125 @@ function ArtistRows({
   );
 }
 
+/** A track as the editor sees it (music_edit::TrackEditView): every registry
+ *  field's EFFECTIVE value (user > MusicBrainz > file) in stored form, what
+ *  the file and MusicBrainz hold, and which fields carry an edit. */
 interface TrackEditView {
   id: number;
-  title: string;
-  credits: string[];
-  track_number: number | null;
-  disc_number: number | null;
-  overridden: string[];
   file_name: string;
-  file_tags: {
-    title: string | null;
-    artists: string[];
-    track_number: number | null;
-    disc_number: number | null;
-  } | null;
+  values: Record<string, string>;
+  file_values: Record<string, string>;
+  mb_values: Record<string, string>;
+  overridden: string[];
+  album_id: number | null;
+  release_id: number | null;
+  library_id: string;
+}
+
+type FormValue = string | string[];
+
+/** Fields that share a row (two columns). */
+const PAIRED: Record<string, string> = { track_number: "disc_number", label: "catalog_number" };
+
+/** The two artist-list fields get picker rows; other lists are one per line. */
+const ARTIST_LISTS = new Set(["credits", "album_artists"]);
+
+/** The editable, file-backed fields in registry order — what the editor
+ *  shows. (Ids and the app-only membership fields are set by matching and
+ *  by structural actions, not typed.) */
+export function editableFields(all: TagFieldInfo[]): TagFieldInfo[] {
+  return all.filter((f) => f.editable && !f.app_only);
+}
+
+/** Lay the fields out: paired keys share a row, the rest stand alone. */
+export function fieldRows(fields: TagFieldInfo[]): TagFieldInfo[][] {
+  const rows: TagFieldInfo[][] = [];
+  const taken = new Set<string>();
+  for (const f of fields) {
+    if (taken.has(f.key)) continue;
+    const partnerKey = PAIRED[f.key];
+    const partner = partnerKey ? fields.find((p) => p.key === partnerKey) : undefined;
+    if (partner) {
+      rows.push([f, partner]);
+      taken.add(partner.key);
+    } else {
+      rows.push([f]);
+    }
+  }
+  return rows;
+}
+
+/** One field's control, by its declared shape. The artist lists are picker
+ *  rows (existing names suggested as typed); other lists are one per line;
+ *  long text and lists get a fixed-row textarea (the frame is static). */
+export function FieldControl({
+  def,
+  value,
+  onChange,
+  search,
+  id,
+  placeholder,
+}: {
+  def: TagFieldInfo;
+  value: FormValue;
+  onChange: (v: FormValue) => void;
+  /** Artist-name lookup for the picker rows. */
+  search: (query: string) => Promise<string[]>;
+  id?: string;
+  placeholder?: string;
+}) {
+  const textarea =
+    "w-full resize-none rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-xs outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50";
+  if (def.shape === "list" && ARTIST_LISTS.has(def.key)) {
+    const rows = Array.isArray(value) ? value : [value];
+    return (
+      <ArtistRows
+        rows={rows.length > 0 ? rows : [""]}
+        onChange={onChange}
+        placeholders={
+          def.key === "credits" ? ["Main artist", "Additional artist"] : ["Album artist", "Co-artist"]
+        }
+        search={search}
+      />
+    );
+  }
+  if (def.shape === "list") {
+    const text = Array.isArray(value) ? value.join("\n") : value;
+    return (
+      <textarea
+        id={id}
+        value={text}
+        onChange={(e) => onChange(e.target.value.split("\n"))}
+        rows={3}
+        placeholder={placeholder ?? "One per line"}
+        className={textarea}
+      />
+    );
+  }
+  const text = Array.isArray(value) ? value.join("\n") : value;
+  if (def.shape === "long_text") {
+    return (
+      <textarea
+        id={id}
+        value={text}
+        onChange={(e) => onChange(e.target.value)}
+        rows={4}
+        placeholder={placeholder}
+        className={textarea}
+      />
+    );
+  }
+  if (def.shape === "int") {
+    return (
+      <Input
+        id={id}
+        value={text}
+        onChange={(e) => onChange(e.target.value.replace(/[^0-9]/g, ""))}
+        placeholder={placeholder ?? "—"}
+      />
+    );
+  }
+  return <Input id={id} value={text} onChange={(e) => onChange(e.target.value)} placeholder={placeholder} />;
 }
 
 interface TrackEditDialogProps {
@@ -235,14 +347,15 @@ interface TrackEditDialogProps {
   onSaved: () => void;
 }
 
+/** The track editor: every editable field of the tag layer (tag_fields.rs),
+ *  by its declared shape, showing the EFFECTIVE value. A hint under a field
+ *  says what the file (and MusicBrainz) hold when they differ. Save writes
+ *  the changed fields as user-tier overrides, applied on the spot — a
+ *  changed album, album artist or disc number regroups the track at once. */
 export function TrackEditDialog({ trackId, libraryId, open, onOpenChange, onSaved }: TrackEditDialogProps) {
   const [view, setView] = useState<TrackEditView | null>(null);
-  const [title, setTitle] = useState("");
-  // One artist per row, main artist first — replaces the old free-text
-  // textarea so existing artists can be picked instead of retyped.
-  const [artistRows, setArtistRows] = useState<string[]>([""]);
-  const [trackNo, setTrackNo] = useState("");
-  const [discNo, setDiscNo] = useState("");
+  const [fields, setFields] = useState<TagFieldInfo[]>([]);
+  const [form, setForm] = useState<Record<string, FormValue>>({});
   const [busy, setBusy] = useState(false);
   // A pass on the library holds every write here (the backend refuses it).
   const locked = useMatchLock(libraryId);
@@ -261,12 +374,16 @@ export function TrackEditDialog({ trackId, libraryId, open, onOpenChange, onSave
     setView(null);
     (async () => {
       try {
-        const v = await invoke<TrackEditView>("get_track_edit", { trackId });
+        const [all, v] = await Promise.all([
+          loadTagFields(),
+          invoke<TrackEditView>("get_track_edit", { trackId }),
+        ]);
+        const editable = editableFields(all);
+        const initial: Record<string, FormValue> = {};
+        for (const f of editable) initial[f.key] = fromStored(f.shape, v.values[f.key]);
+        setFields(editable);
+        setForm(initial);
         setView(v);
-        setTitle(v.title);
-        setArtistRows(v.credits.length > 0 ? v.credits : [""]);
-        setTrackNo(v.track_number != null ? String(v.track_number) : "");
-        setDiscNo(v.disc_number != null ? String(v.disc_number) : "");
       } catch (e) {
         toast.error(String(e));
         onOpenChange(false);
@@ -277,23 +394,19 @@ export function TrackEditDialog({ trackId, libraryId, open, onOpenChange, onSave
 
   const save = async () => {
     if (!view || trackId == null) return;
-    const artists = artistRows
-      .map((s) => s.trim())
-      .filter(Boolean);
-    const fields: Record<string, unknown> = {};
-    if (title.trim() !== view.title) fields.title = title.trim();
-    if (JSON.stringify(artists) !== JSON.stringify(view.credits)) fields.credits = artists;
-    const numOf = (s: string) => {
-      const n = parseInt(s, 10);
-      return Number.isNaN(n) || n <= 0 ? null : n;
-    };
-    if (numOf(trackNo) !== view.track_number) fields.track_number = numOf(trackNo);
-    if (numOf(discNo) !== view.disc_number) fields.disc_number = numOf(discNo);
-
+    const changed: Record<string, unknown> = {};
+    for (const f of fields) {
+      const original = fromStored(f.shape, view.values[f.key]);
+      const current = form[f.key] ?? original;
+      if (!sameValue(f.shape, original, current)) changed[f.key] = toEditValue(f.shape, current);
+    }
     setBusy(true);
     try {
-      if (Object.keys(fields).length > 0) {
-        await invoke("set_track_fields", { trackId, fields });
+      if (Object.keys(changed).length > 0) {
+        await invoke("apply_track_edits", {
+          libraryId: view.library_id,
+          edits: [{ track_id: trackId, fields: changed }],
+        });
       }
       onSaved();
       onOpenChange(false);
@@ -318,13 +431,29 @@ export function TrackEditDialog({ trackId, libraryId, open, onOpenChange, onSave
     }
   };
 
-  const ft = view?.file_tags;
+  /** "File tag: …" / "MusicBrainz: …" under a field whose tiers disagree
+   *  with what's typed. */
+  const hints = (f: TagFieldInfo) => {
+    if (!view) return null;
+    const current = displayStored(f.shape, JSON.stringify(toEditValue(f.shape, form[f.key] ?? "")));
+    const shown = (stored: string | undefined) => displayStored(f.shape, stored);
+    const file = view.file_values[f.key];
+    const mb = view.mb_values[f.key];
+    const lines: string[] = [];
+    const norm = (s: string) => s.trim().toLowerCase();
+    if (file !== undefined && norm(shown(file)) !== norm(current)) lines.push(`File tag: ${shown(file) || "(none)"}`);
+    if (mb !== undefined && mb !== "" && norm(shown(mb)) !== norm(current)) lines.push(`MusicBrainz: ${shown(mb)}`);
+    if (lines.length === 0) return null;
+    return <p className="truncate text-xs text-muted-foreground">{lines.join(" · ")}</p>;
+  };
+
+  const search = (query: string) => invoke<string[]>("search_track_artist_options", { trackId, query });
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      {/* Static: the usual track (one artist row + its file-tag line) plus
-          a little room; more rows scroll. (27.75rem scrolled by a hair.) */}
-      <DialogContent size="md" height="30rem">
+      {/* Static (modal rule): the registry has more fields than fit — the
+          body scrolls. lg wide so paired fields and the hints have room. */}
+      <DialogContent size="lg" height="xl">
         <DialogHeader>
           <DialogTitle>Edit track</DialogTitle>
         </DialogHeader>
@@ -334,55 +463,35 @@ export function TrackEditDialog({ trackId, libraryId, open, onOpenChange, onSave
             <p className="truncate font-mono text-xs text-muted-foreground" title={view.file_name}>
               {view.file_name}
             </p>
-            <div className="grid gap-1.5">
-              <Label htmlFor="te-title">Title</Label>
-              <Input
-                id="te-title"
-                value={title}
-                onChange={(e) => setTitle(e.target.value)}
-                placeholder={ft?.title ?? "Untitled"}
-              />
-              {ft && (ft.title ?? "") !== title.trim() && (
-                <p className="text-xs text-muted-foreground">File tag: {ft.title ?? "(none)"}</p>
-              )}
-            </div>
-            <div className="grid gap-1.5">
-              <Label>Artists (main artist first)</Label>
-              <ArtistRows
-                rows={artistRows}
-                onChange={setArtistRows}
-                placeholders={["Main artist", "Additional artist"]}
-                search={(query) =>
-                  invoke<string[]>("search_track_artist_options", { trackId, query })
-                }
-              />
-              {ft && ft.artists.length > 0 && (
-                <p className="text-xs text-muted-foreground">File tag: {ft.artists.join(", ")}</p>
-              )}
-            </div>
-            <div className="grid grid-cols-2 gap-3">
-              <div className="grid gap-1.5">
-                <Label htmlFor="te-track">Track #</Label>
-                <Input
-                  id="te-track"
-                  value={trackNo}
-                  onChange={(e) => setTrackNo(e.target.value.replace(/[^0-9]/g, ""))}
-                  placeholder={ft?.track_number != null ? String(ft.track_number) : "—"}
-                />
+            {fieldRows(fields).map((row) => (
+              <div key={row[0].key} className={row.length === 2 ? "grid grid-cols-2 gap-3" : "grid gap-1.5"}>
+                {row.map((f) => (
+                  <div key={f.key} className="grid min-w-0 gap-1.5">
+                    <Label htmlFor={`te-${f.key}`}>
+                      {f.label}
+                      {f.key === "credits" && (
+                        <span className="ml-1 font-normal text-muted-foreground">(main artist first)</span>
+                      )}
+                      {view.overridden.includes(f.key) && (
+                        <span className="ml-1 font-normal text-muted-foreground">· edited</span>
+                      )}
+                    </Label>
+                    <FieldControl
+                      def={f}
+                      id={`te-${f.key}`}
+                      value={form[f.key] ?? (f.shape === "list" ? [] : "")}
+                      onChange={(v) => setForm((s) => ({ ...s, [f.key]: v }))}
+                      search={search}
+                      placeholder={f.key === "title" ? "Untitled" : undefined}
+                    />
+                    {hints(f)}
+                  </div>
+                ))}
               </div>
-              <div className="grid gap-1.5">
-                <Label htmlFor="te-disc">Disc #</Label>
-                <Input
-                  id="te-disc"
-                  value={discNo}
-                  onChange={(e) => setDiscNo(e.target.value.replace(/[^0-9]/g, ""))}
-                  placeholder={ft?.disc_number != null ? String(ft.disc_number) : "—"}
-                />
-              </div>
-            </div>
+            ))}
             <p className="text-xs text-muted-foreground">
-              Edits are saved in waverunner, not your files. Retagging a field at the source
-              replaces the edit on it.
+              Edits are saved in waverunner, not your files, and apply right away. Retagging a
+              field at the source replaces the edit on it.
             </p>
           </div>
         )}
@@ -393,13 +502,16 @@ export function TrackEditDialog({ trackId, libraryId, open, onOpenChange, onSave
             <div className="grid gap-1.5">
               <Skeleton className="h-3.5 w-40" />
               <Skeleton className="h-[30px] w-full" />
-              <Skeleton className="h-[30px] w-full" />
               <Skeleton className="h-8 w-24" />
             </div>
+            <FieldSkeleton />
+            <FieldSkeleton />
             <div className="grid grid-cols-2 gap-3">
               <FieldSkeleton />
               <FieldSkeleton />
             </div>
+            <FieldSkeleton />
+            <FieldSkeleton field="h-[74px]" />
           </div>
         )}
         </DialogBody>
@@ -452,10 +564,6 @@ interface AlbumEditView {
     /** Your override; null = go by the cue. */
     pre_emphasis_pref: boolean | null;
   }[];
-  /** Albums a combine folded into this one — shown here (and only here on
-   *  the album's side: on the surface a merged album is one album) with an
-   *  Undo each. */
-  absorbed: { combine_id: number; name: string; mode: string }[];
 }
 
 interface AlbumEditDialogProps {
@@ -498,16 +606,8 @@ export function AlbumEditDialog({ albumId, libraryId, open, onOpenChange, onSave
   const [busy, setBusy] = useState(false);
   // A pass on the library holds every write here (the backend refuses it).
   const locked = useMatchLock(libraryId);
-  // Combines marked for undo in this dialog. Nothing is written at the
-  // click (user's call, 2026-09-27): the row is struck and reads "save to
-  // apply", Save stages every un-combine with the other edits, and Cancel
-  // forgets them.
-  const [undoneCombines, setUndoneCombines] = useState<Set<number>>(new Set());
   const bodyRef = useRef<HTMLDivElement | null>(null);
   const { stage, skeletonSeen, shown, contentVisible } = useHandoff(!!view, bodyRef);
-
-  const undoCombine = (combineId: number) =>
-    setUndoneCombines((s) => new Set(s).add(combineId));
 
   useEffect(() => {
     if (!open) {
@@ -541,7 +641,6 @@ export function AlbumEditDialog({ albumId, libraryId, open, onOpenChange, onSave
         setNoteInitial(n ?? "");
         setArtistPicks(picks.length > 0 ? picks : [null]);
         setPreEmphasis(new Map(v.releases.map((r) => [r.id, r.pre_emphasis_pref])));
-        setUndoneCombines(new Set());
       } catch (e) {
         toast.error(String(e));
         onOpenChange(false);
@@ -582,19 +681,6 @@ export function AlbumEditDialog({ albumId, libraryId, open, onOpenChange, onSave
       if (note.trim() !== noteInitial) {
         await invoke("set_note", { kind: "entry", subjectId: albumId, text: note.trim() });
       }
-      // The un-combines LAST: each one stages the album for rescan, and
-      // staged is immutable — a field written after it would be refused.
-      for (const combineId of undoneCombines) {
-        await invoke("undo_album_combine", { combineId });
-      }
-      if (undoneCombines.size > 0) {
-        toast(
-          undoneCombines.size === 1
-            ? "Un-combine staged — it applies on the next rescan"
-            : `${undoneCombines.size} un-combines staged — they apply on the next rescan`,
-        );
-        notifyPendingWorkChanged();
-      }
       onSaved();
       onOpenChange(false);
     } catch (e) {
@@ -623,10 +709,10 @@ export function AlbumEditDialog({ albumId, libraryId, open, onOpenChange, onSave
     <Dialog open={open} onOpenChange={onOpenChange}>
       {/* STATIC height (user's call, 2026-09-25): the frame never grows —
           not on load (the skeleton opens at the final size), not per artist
-          row, release, or combined album. 38rem holds a one-artist,
-          one-release album with room to spare; anything longer scrolls in
-          the body. xl wide (2026-09-27): the Playback rows name a release
-          by label and folder, and at lg the switches fell off the edge. */}
+          row or release. 38rem holds a one-artist, one-release album with
+          room to spare; anything longer scrolls in the body. xl wide
+          (2026-09-27): the Playback rows name a release by label and
+          folder, and at lg the switches fell off the edge. */}
       <DialogContent size="xl" height="38rem">
         <DialogHeader>
           <DialogTitle>Edit album</DialogTitle>
@@ -798,52 +884,10 @@ export function AlbumEditDialog({ albumId, libraryId, open, onOpenChange, onSave
                 })}
               </div>
             )}
-            {view.absorbed.length > 0 && (
-              // Same minmax(0,1fr) column as the form: a row's nowrap title
-              // would otherwise size this section's auto column past the
-              // body, and the Undo links walked off the right edge.
-              <div className="grid grid-cols-[minmax(0,1fr)] gap-1.5">
-                <Label>Combined albums</Label>
-                {/* Fixed 28px rows; a row marked for undo stays (struck) so
-                    the frame never moves while the dialog is open. */}
-                <div className="flex min-w-0 flex-col">
-                  {view.absorbed.map((a) => {
-                    const undone = undoneCombines.has(a.combine_id);
-                    return (
-                      <div key={a.combine_id} className="flex h-7 min-w-0 items-center gap-2 text-sm">
-                        <span
-                          className={`min-w-0 flex-1 truncate ${undone ? "text-muted-foreground line-through" : ""}`}
-                          title={a.name}
-                        >
-                          {a.name}
-                        </span>
-                        <span className="shrink-0 text-[11px] text-muted-foreground">
-                          {undone
-                            ? `${a.mode === "merge" ? "unmerging" : "separating"} · save to apply`
-                            : a.mode === "merge"
-                              ? "merged in"
-                              : "as a release"}
-                        </span>
-                        {!undone && (
-                          <button
-                            type="button"
-                            disabled={busy}
-                            onClick={() => undoCombine(a.combine_id)}
-                            className="shrink-0 text-[11px] underline underline-offset-2 hover:text-foreground"
-                            title="Back to its own album on the next rescan — staged when you save"
-                          >
-                            Undo
-                          </button>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
             <p className="text-xs text-muted-foreground">
-              Edits are saved in waverunner, not your files, and outrank MusicBrainz. Retagging
-              a field at the source replaces the edit on it.
+              Edits are saved in waverunner, not your files, and outrank MusicBrainz. Genres and
+              artists are written onto every track of the album. Retagging a field at the source
+              replaces the edit on it.
             </p>
           </div>
         )}
@@ -1131,10 +1175,10 @@ function guessSplitMembers(name: string): string[] {
  *  the field stack run off the bottom of the dialog. */
 const MAX_SPLIT_MEMBERS = 12;
 
-/** Record a split directive for a joint-named artist entry, then kick a
- *  rescan to migrate: albums re-home under the first member (full list as
- *  the album's artist credit), matching track credits split, and the joint
- *  entry sweeps away. Rescan-proof — the directive re-applies every scan. */
+/** Record a split rule for a joint-named artist entry and apply it on the
+ *  spot: albums re-home under the members (full list as the album's artist
+ *  credit), matching track credits split, and the joint entry sweeps away.
+ *  Rescan-proof — the rule re-applies every scan; undone from History. */
 export function SplitArtistDialog({
   artistId,
   libraryId,
@@ -1150,12 +1194,12 @@ export function SplitArtistDialog({
   artistName: string;
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  /** Runs on confirm, BEFORE the split is staged — the identity card's
-   *  "Merge & split" merges the spellings here, so the split's keys include
-   *  the aliases the merge just made. Cancel never reaches it: nothing is
+  /** Runs on confirm, BEFORE the split — the identity card's "Merge &
+   *  split" merges the spellings here, so the split's keys include the
+   *  aliases the merge just made. Cancel never reaches it: nothing is
    *  merged until the members are confirmed. */
   beforeSplit?: () => Promise<void>;
-  /** Given (the metadata page), confirming hands the staging to the host's
+  /** Given (the metadata page), confirming hands the split to the host's
    *  apply queue and closes at once — the row leaves at the click. Absent,
    *  it runs here. */
   queue?: (job: { label: string; run: () => Promise<void> }) => void;
@@ -1209,24 +1253,21 @@ export function SplitArtistDialog({
       toast.error("A split needs at least two artists");
       return;
     }
-    // STAGED, not applied: the migration is a rescan, and splits batch up
-    // behind one rescan with every other staged directive instead of each
-    // forcing its own. The metadata center's pending banner shows the batch
-    // and offers the rescan.
-    const stage = async () => {
+    // Applied on the spot: the rule is recorded and a scoped rescan of the
+    // artist's albums migrates them before this returns.
+    const apply = async () => {
       if (beforeSplit) await beforeSplit();
       await invoke<string>("split_artist", { artistId, members: list });
-      toast("Split staged — it applies on the next rescan");
-      notifyPendingWorkChanged();
+      toast.success(`Split \u{201c}${artistName}\u{201d} into ${list.join(", ")}. Undo from History.`);
     };
     if (queue) {
-      queue({ label: `Split \u{201c}${artistName}\u{201d} into ${list.join(", ")}`, run: stage });
+      queue({ label: `Split \u{201c}${artistName}\u{201d} into ${list.join(", ")}`, run: apply });
       onOpenChange(false);
       return;
     }
     setBusy(true);
     try {
-      await stage();
+      await apply();
       onOpenChange(false);
     } catch (e) {
       toast.error(String(e));
@@ -1270,7 +1311,7 @@ export function SplitArtistDialog({
             <span className="font-medium text-foreground">{artistName}</span> is really these{" "}
             <span className="font-medium text-foreground">{members.length}</span> artists. Their
             joint albums credit every member — in this order — and appear on each one's page;
-            matching track credits split the same way. Staged now, applied by the next rescan,
+            matching track credits split the same way. Applied right away, undone from History,
             and it survives every rescan after.
           </p>
           {/* Long member lists scroll rather than pushing the footer off screen.
@@ -1350,7 +1391,7 @@ export function SplitArtistDialog({
             title={locked ? MATCH_LOCK_TITLE : undefined}
             onClick={apply}
           >
-            {busy ? "Staging…" : "Stage split"}
+            {busy ? "Splitting…" : "Split"}
           </Button>
         </DialogFooter>
       </DialogContent>

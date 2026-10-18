@@ -556,7 +556,7 @@ export function LibraryRunsProvider({ children }: { children: ReactNode }) {
       update(libraryId, (r) => (r?.kind === "match" ? { ...r, failed } : r));
     });
     // A match (by hand or by the pass) proved two albums are one MusicBrainz
-    // release group, and the app staged their combine itself: said once,
+    // release group, and the regroup folded them into one album: said once,
     // here, so both paths toast the same line.
     const unAutoCombine = listen<{ libraryId: string; message: string }>(
       "music-auto-combine",

@@ -66,9 +66,6 @@ export interface MbStatus {
   searched_not_found: boolean;
   /** User said "stop counting this" — named explicitly, not just unmatched. */
   ignored: boolean;
-  /** A staged rescan action will dissolve this entity — the dialog names the
-   *  state and hides every mutating control. */
-  staged: boolean;
   /** Albums: releases of the card holding their own pinned pressing / total
    *  releases. The "2 of 4 versions resolved" line. Declared-no-MB releases
    *  count as resolved. */
@@ -141,13 +138,10 @@ const CONTEXT_LABEL: Record<MbEntityKind, string> = {
 /** One-line summary of where this entity stands with MusicBrainz. Shared with
  *  the inline status chips so both read the same. */
 export function mbStateOf(s: MbStatus | null): {
-  state: "matched" | "partial" | "mismatch" | "notfound" | "none" | "ignored" | "staged" | "declared";
+  state: "matched" | "partial" | "mismatch" | "notfound" | "none" | "ignored" | "declared";
   label: string;
 } {
   if (!s) return { state: "none", label: "Not matched" };
-  // Staged beats everything: whatever else is true, this entity is about to
-  // be replaced, and that's the fact that matters.
-  if (s.staged) return { state: "staged", label: "Staged for rescan" };
   // The user declared this release has no MB counterpart: resolved (green),
   // but the release itself is never worded as "matched" — that would be a
   // lie. The album half only claims matched when the group actually is.
@@ -344,9 +338,9 @@ export function MatchDialog({
         // Search the prefilled name at once (user's call, 2026-09-26): an
         // unmatched artist, loose track, or album with no discography to
         // browse opens on its candidates, not on a filled field and a Go
-        // button. Matched, ignored, staged or declared entities open on
-        // their status; a group-matched album opens on its releases.
-        if (cancelled || s.mbid || s.ignored || s.staged || s.declared_none) return;
+        // button. Matched, ignored or declared entities open on their
+        // status; a group-matched album opens on its releases.
+        if (cancelled || s.mbid || s.ignored || s.declared_none) return;
         if (kind === "album") {
           if (s.release_group_id) return;
           const canBrowse = (s.credited_artists ?? []).some(
@@ -382,7 +376,7 @@ export function MatchDialog({
   // unmatched so the "match their releases instead" hint can appear the
   // moment identification fails. Local DB, no network. Re-runs when status
   // reloads (a lead matched through the nested dialog drops off the list).
-  const wantLeads = kind === "artist" && !!status && !status.mbid && !status.staged;
+  const wantLeads = kind === "artist" && !!status && !status.mbid;
   useEffect(() => {
     if (!open || !wantLeads) {
       setAlbumLeads(null);
@@ -405,12 +399,11 @@ export function MatchDialog({
   // group-matched album (and refetched if an apply/unmatch changes the group).
   const groupId = kind === "album" ? (status?.release_group_id ?? null) : null;
   // Discography browsing: album unmatched but a credited artist IS matched.
-  // Nothing browses (or fetches) while staged — the dialog is read-only then.
   // Identified credits are the browse targets; "All" unions their pages
   // (a joint album may sit under either member).
   const browseTargets = useMemo(
     () =>
-      kind === "album" && !groupId && !status?.staged && !status?.declared_none
+      kind === "album" && !groupId && !status?.declared_none
         ? (status?.credited_artists ?? [])
             .filter((c): c is { name: string; mbid: string } => !!c.mbid)
             .filter((c) => c.mbid.toLowerCase() !== VARIOUS_ARTISTS_MBID)
@@ -579,7 +572,7 @@ export function MatchDialog({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, activeKey]);
   useEffect(() => {
-    if (!open || !groupId || status?.staged || status?.declared_none) {
+    if (!open || !groupId || status?.declared_none) {
       setGroupReleases(null);
       return;
     }
@@ -850,7 +843,6 @@ export function MatchDialog({
     kind === "artist" &&
     !!status &&
     !status.mbid &&
-    !status.staged &&
     (status.searched_not_found || (results !== null && !searching && results.length === 0)) &&
     (albumLeads?.length ?? 0) > 0;
   const st = mbStateOf(status);
@@ -866,7 +858,7 @@ export function MatchDialog({
   const StateIcon =
     st.state === "matched" || st.state === "declared"
       ? CircleCheck
-      : st.state === "mismatch" || st.state === "staged"
+      : st.state === "mismatch"
         ? TriangleAlert
         : CircleSlash;
   // Same vocabulary as the library map: green matched (and declared-no-MB —
@@ -875,17 +867,14 @@ export function MatchDialog({
   const stateColor =
     st.state === "matched" || st.state === "declared"
       ? "text-emerald-400"
-      : st.state === "mismatch" || st.state === "partial" || st.state === "staged"
+      : st.state === "mismatch" || st.state === "partial"
         ? "text-amber-400"
         : st.state === "ignored"
           ? "text-muted-foreground"
           : "text-red-400";
-  // Staged = immutable everywhere in this dialog: search, browse, pickers,
-  // and Unmatch all hide; the status card explains the way out.
-  const stagedLock = !!status?.staged;
-  // Declared-no-MB hides the search/browse/pickers too — there is nothing to
-  // look for. Softer than the staged lock: Reconsider reopens everything.
-  const resolvedLock = stagedLock || !!status?.declared_none;
+  // Declared-no-MB hides the search/browse/pickers — there is nothing to
+  // look for. Reconsider reopens everything.
+  const resolvedLock = !!status?.declared_none;
 
   return (
     <>
@@ -1002,7 +991,7 @@ export function MatchDialog({
               )}
               {/* Multi-version cards: matching is PER VERSION — say which one
                   this dialog is about and how the card stands overall. */}
-              {kind === "album" && (status?.total_releases ?? 0) > 1 && !stagedLock && (
+              {kind === "album" && (status?.total_releases ?? 0) > 1 && (
                 <p className="mt-0.5 text-[11px] text-muted-foreground">
                   {releaseLabel ? (
                     <>
@@ -1011,13 +1000,6 @@ export function MatchDialog({
                     </>
                   ) : null}
                   {status!.matched_releases} of {status!.total_releases} versions resolved
-                </p>
-              )}
-              {stagedLock && (
-                <p className="mt-0.5 text-[11px] text-muted-foreground">
-                  A staged change (split or combine) replaces this on the next rescan — matching
-                  and editing are locked until it applies. To edit now, undo the staged change in
-                  the metadata center’s banner.
                 </p>
               )}
             </div>
@@ -1029,7 +1011,7 @@ export function MatchDialog({
                   about MusicBrainz identity, so it belongs beside the id and
                   the unmatch. Tracks are excluded — the counts and work lists
                   it exempts you from are album/artist ones. */}
-              {kind !== "track" && !stagedLock && !status?.mbid && !status?.release_group_id && (
+              {kind !== "track" && !status?.mbid && !status?.release_group_id && (
                 status?.ignored ? (
                   <Button
                     size="sm"
@@ -1057,7 +1039,7 @@ export function MatchDialog({
               {/* "No MB release": the release-level truth-teller for pressings
                   MusicBrainz will never list (unofficial remasters, bootlegs).
                   Green resolved, never worded as matched. */}
-              {kind === "album" && !stagedLock && !status?.mbid && (
+              {kind === "album" && !status?.mbid && (
                 status?.declared_none ? (
                   <Button
                     size="sm"
@@ -1085,7 +1067,6 @@ export function MatchDialog({
               {/* "The missing tracks are supposed to be missing" — melts the
                   mb-side gap warning into a green matched state. */}
               {kind === "album" &&
-                !stagedLock &&
                 status?.mbid &&
                 (status.gap_mb > 0 || status.partial) && (
                   <Button
@@ -1099,7 +1080,7 @@ export function MatchDialog({
                     {status.partial ? "No longer partial" : "Deliberately partial"}
                   </Button>
                 )}
-              {(status?.mbid || status?.release_group_id) && !stagedLock && (
+              {(status?.mbid || status?.release_group_id) && (
                 <Button
                   size="sm"
                   variant="ghost"
@@ -1703,14 +1684,14 @@ export function MbStatusChip({
   const st = mbStateOf(status);
   // Same traffic light as the metadata center's lists and the library map:
   // green identified, amber one step short (album known but not the release,
-  // track lists disagreeing, staged), red unmatched. Grey is ONLY "ignored" —
-  // the state where nothing is wrong because you said so.
+  // track lists disagreeing), red unmatched. Grey is ONLY "ignored" — the
+  // state where nothing is wrong because you said so.
   const tone =
     st.state === "matched" || st.state === "declared"
       ? "border-emerald-500/40 text-emerald-300"
       : st.state === "ignored"
         ? "border-border text-muted-foreground"
-        : st.state === "partial" || st.state === "mismatch" || st.state === "staged"
+        : st.state === "partial" || st.state === "mismatch"
           ? "border-amber-500/40 text-amber-300"
           : "border-red-500/40 text-red-400";
 
