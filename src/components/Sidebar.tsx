@@ -288,7 +288,7 @@ export function Sidebar({
                 );
               }
               // A paused first-time import (its scan was stopped, or the app
-              // died mid-scan): amber alert, click resumes the scan. Libraries
+              // died mid-scan): gold alert, click resumes the scan. Libraries
               // paused at the MATCH question are ordinary rows — browsable,
               // with the question as a banner on their page.
               if (lib.setup_stage === "scan") {
@@ -301,7 +301,7 @@ export function Sidebar({
                       >
                         <span className="flex w-full items-start gap-1 py-1.5 pr-2 pl-1 text-sm font-medium text-sidebar-foreground/90">
                           <span className="flex h-5 w-4 flex-shrink-0 items-center justify-center">
-                            <CircleAlert size={12} className="text-amber-400" />
+                            <CircleAlert size={12} className="text-primary" />
                           </span>
                           <span className="min-w-0 flex-1 break-words">{lib.name}</span>
                         </span>

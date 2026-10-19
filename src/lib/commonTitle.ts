@@ -30,12 +30,14 @@ export function stripDiscSuffix(title: string): string | null {
 }
 
 /** A leading disc number on a remainder — "Disc 1: Dawn to Dusk", "CD2 -",
- *  "2." — the part a disc's own name never needs. A number word or a roman
- *  numeral only counts with a disc word in front ("One" can open a real
- *  name; "I" opens "I Am…"); a bare one- or two-digit number counts on its
- *  own, a longer one is a year ("2017 Stereo Mix"). */
+ *  "2.", and bracketed, "(Disc 1) Jupiter" / "[CD 2] Mars" (user's ask,
+ *  2026-10-18: the brackets rode into the disc names) — the part a disc's
+ *  own name never needs. A number word or a roman numeral only counts with
+ *  a disc word in front ("One" can open a real name; "I" opens "I Am…"); a
+ *  bare one- or two-digit number counts on its own, a longer one is a year
+ *  ("2017 Stereo Mix"). */
 const LEADING_DISC =
-  /^(?:(?:disc|disk|cd|vol\.?|volume|part|pt\.?|no\.?|side)\s*(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|[ivx]+)|\d{1,2})\b[\s:.\-–—,]*/i;
+  /^[(\[]?\s*(?:(?:disc|disk|cd|vol\.?|volume|part|pt\.?|no\.?|side)\s*(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|[ivx]+)|\d{1,2})\b\s*[)\]]?[\s:.\-–—,]*/i;
 
 /** Tokens a title can't END on: articles, connectives, and the lead-ins
  *  that only introduce a number ("…, Vol." / "… - Disc"). */

@@ -21,6 +21,39 @@ export interface EntriesResponse {
   /** Albums/Sounds views only: loose-track count for the header button —
    *  riding the grid payload keeps the button in the grid's render commit. */
   loose_count?: number | null;
+  /** Music Albums view only: the shape hints (albums that look like one
+   *  album) — riding the payload so the banner and the card pills render
+   *  WITH the grid instead of pushing it down a beat later. */
+  shape_hints?: ShapeHintLite[] | null;
+}
+
+/** A disc number an album's tracks take in a suggested merge. */
+export interface ShapeDiscAssign {
+  album_id: number;
+  disc_no: number;
+}
+
+/** A shape hint (albums that look like one album, music_shape.rs) with its
+ *  members as ids only — the grid payload's form. The review dialog fetches
+ *  the hydrated members when opened. */
+export interface ShapeHintLite {
+  /** Digest of the member set — what a dismissal is keyed on. */
+  key: string;
+  kind: "split_folder" | "discs" | "editions" | string;
+  mode: "merge" | "versions";
+  confidence: "high" | "medium";
+  reason: string;
+  /** The album artist the evidence names (a shared main artist, Various
+   *  Artists), or null for the keeper's own. */
+  album_artist: string | null;
+  /** A title for the combined album (a box folder's name) when the
+   *  members' titles can't supply one; null = the dialog's own vote. */
+  title: string | null;
+  /** Mode merge: the disc number each member's tracks take with the
+   *  combine (a box tagged all disc 1, numbered by folder order); null =
+   *  the discs as tagged. */
+  disc_map: ShapeDiscAssign[] | null;
+  member_ids: number[];
 }
 
 export interface SortPreset {

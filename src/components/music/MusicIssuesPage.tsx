@@ -57,7 +57,7 @@ export function MusicIssuesPage({ libraryId }: MusicIssuesPageProps) {
   return (
     <div className="px-6 pb-8">
       <div className="flex items-center gap-2 py-5">
-        <TriangleAlert size={18} className="text-amber-500" />
+        <TriangleAlert size={18} className="text-primary" />
         <h1 className="font-heading text-xl font-bold">Needs attention</h1>
         <span className="text-sm text-muted-foreground">({issues.length})</span>
       </div>

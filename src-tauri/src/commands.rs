@@ -194,6 +194,12 @@ pub struct EntriesResponse {
     /// fetch pops in on its own beat). None everywhere else.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loose_count: Option<i64>,
+    /// Music Albums view only: the shape hints (albums that look like one
+    /// album, music_shape.rs) — riding the payload so the banner and the
+    /// card pills render WITH the grid instead of pushing it down a beat
+    /// later. None everywhere else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape_hints: Option<Vec<crate::music_shape::ShapeHintLite>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1591,6 +1597,7 @@ pub async fn get_entries(
                 selected_preset_id,
                 presets,
                 loose_count: None,
+                shape_hints: None,
             }
         }
         "music" => {
@@ -1726,6 +1733,13 @@ pub async fn get_entries(
                 .fetch_one(&state.app_db)
                 .await
                 .map_err(|e| e.to_string())?;
+                // The shape hints ride along for the Albums page (not the
+                // Sounds page — virtual collections have no tag shape).
+                let shape_hints = if sounds {
+                    None
+                } else {
+                    Some(crate::music_shape::lite_hints(&state.app_db, &library_id).await?)
+                };
                 return Ok(EntriesResponse {
                     entries,
                     sort_mode,
@@ -1733,6 +1747,7 @@ pub async fn get_entries(
                     selected_preset_id: None,
                     presets: Vec::new(),
                     loose_count: Some(loose_count),
+                    shape_hints,
                 });
             }
 
@@ -2015,6 +2030,7 @@ pub async fn get_entries(
                 selected_preset_id: None,
                 presets: Vec::new(),
                 loose_count: None,
+                shape_hints: None,
             }
         }
         _ => {

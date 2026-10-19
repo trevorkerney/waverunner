@@ -862,13 +862,13 @@ export function MatchDialog({
         ? TriangleAlert
         : CircleSlash;
   // Same vocabulary as the library map: green matched (and declared-no-MB —
-  // resolved is resolved), amber partial (mismatch / release unknown), red
+  // resolved is resolved), gold partial (mismatch / release unknown), red
   // unmatched, gray ignored.
   const stateColor =
     st.state === "matched" || st.state === "declared"
       ? "text-emerald-400"
       : st.state === "mismatch" || st.state === "partial"
-        ? "text-amber-400"
+        ? "text-primary"
         : st.state === "ignored"
           ? "text-muted-foreground"
           : "text-red-400";
@@ -903,7 +903,7 @@ export function MatchDialog({
               said where the release gets picked, because the pick is what
               makes them combine. */}
           {status?.same_group && (
-            <p className="text-xs text-amber-300">
+            <p className="text-xs text-primary">
               Same release group as “{status.same_group.title}” — once both have a release
               matched, they combine into one album as separate releases.
             </p>
@@ -1436,7 +1436,7 @@ export function MatchDialog({
             (status?.total_releases ?? 0) > 1 &&
             results != null &&
             results.length > 1 && (
-              <p className="rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-[11px] text-amber-200/90">
+              <p className="rounded-md border border-primary/30 bg-primary/5 px-3 py-2 text-[11px] text-primary/90">
                 {status!.total_releases} versions here and {results.length} albums on MusicBrainz
                 answer to this name. If your versions are different albums that share a name,
                 close this and use Separate in the album's versions picker first — each then
@@ -1472,7 +1472,7 @@ export function MatchDialog({
                       <span className="block break-words text-sm">
                         {c.title}
                         {c.kind === "release" && (
-                          <span className="ml-1.5 text-[11px] text-amber-300">one release</span>
+                          <span className="ml-1.5 text-[11px] text-primary">one release</span>
                         )}
                         {c.mbid === status?.mbid && (
                           <span className="ml-1.5 text-[11px] text-emerald-400">current</span>
@@ -1683,7 +1683,7 @@ export function MbStatusChip({
   }
   const st = mbStateOf(status);
   // Same traffic light as the metadata center's lists and the library map:
-  // green identified, amber one step short (album known but not the release,
+  // green identified, gold one step short (album known but not the release,
   // track lists disagreeing), red unmatched. Grey is ONLY "ignored" — the
   // state where nothing is wrong because you said so.
   const tone =
@@ -1692,7 +1692,7 @@ export function MbStatusChip({
       : st.state === "ignored"
         ? "border-border text-muted-foreground"
         : st.state === "partial" || st.state === "mismatch"
-          ? "border-amber-500/40 text-amber-300"
+          ? "border-primary/40 text-primary"
           : "border-red-500/40 text-red-400";
 
   return (

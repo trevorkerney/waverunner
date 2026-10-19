@@ -33,6 +33,7 @@ import { MatchDialog } from "./MatchDialog";
 import { SplitArtistDialog } from "./EditDialogs";
 import { CombineSelectedDialog, type AlbumSelection } from "./CombineSelectedDialog";
 import { notifyPendingWorkChanged, passItemCount, passItemsLabel, usePendingWork } from "./PendingWork";
+import { fetchShapeHints } from "./ShapeHints";
 import { WindowedList } from "./WindowedList";
 import {
   applyQueueHas,
@@ -272,6 +273,9 @@ interface CenterSnapshot {
   /** A matching pass has completed for this library (library_setting
    *  mb_pass_ran) — until it has, the map leads with step 0: run it. */
   passRan: boolean;
+  /** Open shape hints (albums that look like one album): the guide's
+   *  shape step shows only while there are some. */
+  shapeHintCount: number;
 }
 const centerCache = new Map<string, CenterSnapshot>();
 
@@ -299,13 +303,13 @@ function AlbumChip({
           : al.state === "release"
             ? "border-emerald-500/60 bg-emerald-500/20 text-emerald-200"
             : al.state === "album"
-              ? "border-amber-500/60 bg-amber-500/10 text-amber-200"
+              ? "border-primary/60 bg-primary/10 text-primary"
               : "border-red-500/60 bg-transparent text-red-300"
       }`}
     >
       {al.title}
       {/* Multi-version cards say how much of the release stage is done —
-          amber with 1/3 instead of a green that rounds up. */}
+          gold with 1/3 instead of a green that rounds up. */}
       {al.releases > 1 && !al.ignored && (
         <span className="opacity-75"> · {al.resolved_releases}/{al.releases}</span>
       )}
@@ -771,7 +775,7 @@ function ClusterCard({
    *  cluster (user's call — no guessing from the text which ones are joint). */
   onMergeAndSplit: (cluster: IdentityCluster, survivorId: number) => void;
   onDismiss: (cluster: IdentityCluster) => void;
-  /** Section colour: owners (albums here) red, feature-only amber. */
+  /** Section colour: owners (albums here) red, feature-only gold. */
   tone: "owner" | "feature";
 }) {
   const pages = cluster.members.filter((m) => m.artist_id != null);
@@ -801,7 +805,7 @@ function ClusterCard({
   return (
     <div
       data-flip-id={`cluster-${cluster.key}`}
-      className={`rounded-md border p-3 ${tone === "owner" ? "border-red-500/30" : "border-amber-500/30"}`}
+      className={`rounded-md border p-3 ${tone === "owner" ? "border-red-500/30" : "border-primary/30"}`}
     >
       <div className="mb-2 flex items-center justify-between gap-3">
         <p className="min-w-0 text-sm font-medium">
@@ -818,7 +822,7 @@ function ClusterCard({
           title="Each spelling is a separate artist — one without a page gets its own"
           className="shrink-0 text-[11px] text-muted-foreground underline underline-offset-2 hover:text-foreground disabled:pointer-events-none disabled:opacity-50"
         >
-          {busyKey === `dismiss:${cluster.key}` ? "…" : "they’re different artists"}
+          {busyKey === `dismiss:${cluster.key}` ? <Spinner className="size-3" /> : "they’re different artists"}
         </button>
       </div>
       <div className="mb-2 overflow-hidden rounded-md border">
@@ -1013,7 +1017,7 @@ const ArtistRow = memo(function ArtistRow({
         {/* The pass searched this name and MusicBrainz had nothing — the
             artist route is a dead end, so point at the other one. */}
         {a.state === "notfound" && a.album_count > 0 && (
-          <span className="ml-1.5 text-[11px] text-amber-300/90">
+          <span className="ml-1.5 text-[11px] text-primary/90">
             not on MusicBrainz — match their albums
           </span>
         )}
@@ -1026,7 +1030,7 @@ const ArtistRow = memo(function ArtistRow({
           <Button
             size="sm"
             variant="ghost"
-            className="h-6 shrink-0 gap-1 px-2 text-xs text-amber-300 hover:text-amber-200"
+            className="h-6 shrink-0 gap-1 px-2 text-xs text-primary hover:text-primary"
             disabled={off}
             title={lockHint}
             onClick={() => onMatchAlbum(matchAlbumId)}
@@ -1181,7 +1185,7 @@ const AlbumRow = memo(function AlbumRow({
         )}
         {a.artist_title && <span className="text-muted-foreground"> — {a.artist_title}</span>}
         {(a.gap_ours > 0 || a.gap_mb > 0) && (
-          <span className="ml-1.5 text-[11px] text-amber-300">
+          <span className="ml-1.5 text-[11px] text-primary">
             {[a.gap_ours > 0 && `${a.gap_ours} unmatched`, a.gap_mb > 0 && `${a.gap_mb} missing`]
               .filter(Boolean)
               .join(" · ")}
@@ -1192,7 +1196,7 @@ const AlbumRow = memo(function AlbumRow({
             then the row says what the pass is waiting on. */}
         {a.same_group && (
           <span
-            className="ml-1.5 text-[11px] text-amber-300"
+            className="ml-1.5 text-[11px] text-primary"
             title="Both albums resolve to one MusicBrainz release group. Once each has a release matched, they combine into one album as separate releases."
           >
             same release group as{" "}
@@ -1220,7 +1224,7 @@ const AlbumRow = memo(function AlbumRow({
           a.state === "release"
             ? "text-emerald-400 hover:text-emerald-300"
             : a.state === "album"
-              ? "text-amber-300 hover:text-amber-200"
+              ? "text-primary hover:text-primary"
               : ""
         }`}
         disabled={locked}
@@ -1340,6 +1344,7 @@ export function MetadataCenter({
   const [issues, setIssues] = useState<ScanIssueRow[]>(() => cached?.issues ?? []);
   const [unlinked, setUnlinked] = useState<UnlinkedCredit[]>(() => cached?.unlinked ?? []);
   const [duplicates, setDuplicates] = useState<DuplicateGroup[]>(() => cached?.duplicates ?? []);
+  const [shapeHintCount, setShapeHintCount] = useState<number>(() => cached?.shapeHintCount ?? 0);
   // The pass queue, live (see usePendingWork): applied matches a matching
   // pass has yet to cash in. Cheap queries, refetched on every event that
   // changes them — the banner they drive must not wait on (or lag behind)
@@ -1531,7 +1536,7 @@ export function MetadataCenter({
     const startedAt = performance.now();
     if (!hasReview.current) setLoading(true);
     try {
-      const [rev, ms, fb, iss, unl, ls, clus, dups] = await Promise.all([
+      const [rev, ms, fb, iss, unl, ls, clus, dups, shape] = await Promise.all([
         invoke<MbReview>("mb_get_review", { libraryId }),
         invoke<MusicMatchState>("music_match_state", { libraryId }),
         invoke<TagFallbackRow[]>("get_music_tag_fallbacks", { libraryId }),
@@ -1540,6 +1545,8 @@ export function MetadataCenter({
         invoke<Record<string, string>>("get_library_settings", { libraryId }),
         invoke<IdentityCluster[]>("mb_identity_clusters", { libraryId }),
         invoke<DuplicateGroup[]>("get_duplicate_albums", { libraryId }),
+        // Best-effort: the shape step is a pointer, never a gate.
+        fetchShapeHints(libraryId).then((s) => s.hints.length).catch(() => 0),
       ]);
       const snapshot: CenterSnapshot = {
         review: rev,
@@ -1551,6 +1558,7 @@ export function MetadataCenter({
         duplicates: dups,
         onlineEnabled: ls["online_metadata"] !== "off",
         passRan: ls["mb_pass_ran"] === "1",
+        shapeHintCount: shape,
       };
       centerCache.set(libraryId, snapshot);
       setReview(rev);
@@ -1560,6 +1568,7 @@ export function MetadataCenter({
       setUnlinked(unl);
       setClusters(clus);
       setDuplicates(dups);
+      setShapeHintCount(shape);
       setOnlineEnabled(snapshot.onlineEnabled);
       setPassRan(snapshot.passRan);
       // The new review no longer holds what the queue applied BEFORE it
@@ -1899,7 +1908,7 @@ export function MetadataCenter({
   );
   // The identified list, split by how far the identification goes: a group
   // match names the album but not the pressing, so its track list can't be
-  // checked yet — amber, one release-pick away from green.
+  // checked yet — gold, one release-pick away from green.
   const albumsReleaseUnknown = albumsIdentified.filter((a) => a.state === "album");
   const albumsFullyIdentified = albumsIdentified.filter((a) => a.state === "release");
   const visibleChanges = (review?.changes ?? []).filter((c) => !hideUndone || !c.undone);
@@ -1936,7 +1945,7 @@ export function MetadataCenter({
   // Identity clusters split along the same owner/feature boundary as the
   // artist lists: a cluster with any member owning albums is an owner
   // question (red, up top — resolving it unlocks a discography); one whose
-  // members only appear as track credits is a feature question (amber,
+  // members only appear as track credits is a feature question (gold,
   // below the owners — usually settled once albums are matched).
   const clusterOwners = clusters.filter((c) => c.members.some((m) => m.albums > 0));
   const clusterFeatures = clusters.filter((c) => !c.members.some((m) => m.albums > 0));
@@ -2161,14 +2170,14 @@ export function MetadataCenter({
           both; Separate (the album page's versions picker) splits them on
           the spot, and each then matches on its own. */}
       {(s.payload.library_versions ?? 1) > 1 && (s.payload.groups ?? []).length > 1 && (
-        <p className="mt-1 text-xs text-amber-300/90">
+        <p className="mt-1 text-xs text-primary/90">
           {s.payload.library_versions} versions here and {(s.payload.groups ?? []).length} albums
           on MusicBrainz — if these are different albums that share a name, separate the versions
           on{" "}
           {onOpenAlbum && s.payload.album_id != null ? (
             <button
               type="button"
-              className="underline underline-offset-2 hover:text-amber-200"
+              className="underline underline-offset-2 hover:text-primary"
               onClick={() =>
                 onOpenAlbum(s.payload.album_id as number, s.payload.album_title ?? "", null)
               }
@@ -2289,7 +2298,7 @@ export function MetadataCenter({
     return (
       <div className="px-3 pb-2.5">
         <p className="text-xs text-muted-foreground">
-          <span className="mr-1.5 text-[11px] font-semibold uppercase tracking-wide text-amber-300">
+          <span className="mr-1.5 text-[11px] font-semibold uppercase tracking-wide text-primary">
             Suggestion:
           </span>
           {single
@@ -2548,7 +2557,7 @@ export function MetadataCenter({
   }
 
   // `count` is the size of the pane; `alert` (red) is the blocking work —
-  // unidentified owners / unidentified albums — and `warn` (amber) the softer
+  // unidentified owners / unidentified albums — and `warn` (gold) the softer
   // tier: feature-only names and albums awaiting a release pick. Same colors
   // as the pane's own section headings, so the rail predicts the page.
   // "Needs a decision" leads — it's required work, not reference — and it
@@ -2576,7 +2585,7 @@ export function MetadataCenter({
             id: "artists" as const,
             label: "Artists",
             count: artists.length,
-            // Red = unmatched owners (the main list); amber = the
+            // Red = unmatched owners (the main list); gold = the
             // feature-only names — the pane's own section colours.
             alert: artists.filter(
               (a) => a.state !== "matched" && !a.ignored && a.album_count > 0,
@@ -2701,7 +2710,7 @@ export function MetadataCenter({
             <span className="flex shrink-0 items-center gap-1">
               {n.id === "map" ? (
                 <span
-                  className={`text-xs tabular-nums ${mapReds > 0 ? "text-amber-300" : "text-emerald-400"}`}
+                  className={`text-xs tabular-nums ${mapReds > 0 ? "text-primary" : "text-emerald-400"}`}
                 >
                   {mapPct}%
                 </span>
@@ -2718,7 +2727,7 @@ export function MetadataCenter({
                     </span>
                   )}
                   {(n.warn ?? 0) > 0 && (
-                    <span className="flex items-center gap-0.5 text-xs tabular-nums text-amber-300">
+                    <span className="flex items-center gap-0.5 text-xs tabular-nums text-primary">
                       <TriangleAlert size={12} className="-translate-y-px" />
                       {n.warn}
                     </span>
@@ -2994,10 +3003,10 @@ export function MetadataCenter({
               or an edit made on a guess does damage a pass then builds on;
               Ignore is the honest answer when you can't tell. Prominent
               and permanent — it applies to everything on this page. */}
-          <div className="flex items-start gap-3 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2">
-            <TriangleAlert size={16} className="mt-0.5 shrink-0 text-amber-300" />
+          <div className="flex items-start gap-3 rounded-md border border-primary/25 bg-primary/5 px-3 py-2">
+            <TriangleAlert size={16} className="mt-0.5 shrink-0 text-primary" />
             <div className="min-w-0">
-              <p className="text-sm font-medium text-amber-200">Only match or change what you’re sure of</p>
+              <p className="text-sm font-medium">Only match or change what you’re sure of</p>
               <p className="text-xs text-muted-foreground">
                 A wrong match stamps credits, dates and track titles, and the next pass builds on
                 it. When you can’t tell, use Ignore instead: an ignored artist or album stops
@@ -3014,8 +3023,63 @@ export function MetadataCenter({
             </div>
           ) : (
             <div className="overflow-hidden rounded-md border">
+              {/* The shape step (user's call, 2026-09-27 / 2026-10-03, moved
+                  above step 0 on 2026-10-18 and shown only while the
+                  detector has hints): numberless, first, a count and a Go
+                  to the library's ALBUMS PAGE (the sidebar's, not this
+                  page's Albums tab), where the hints and the combine live.
+                  Its Go never waits for the pass: it's what the pass should
+                  come after. */}
+              {shapeHintCount > 0 && (
+                <div className="flex items-center gap-3 px-3 py-2.5">
+                  <span className="size-5 shrink-0" />
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm font-medium">
+                      Fix the library’s shape
+                      <span className="font-normal text-muted-foreground">
+                        {" — "}
+                        {shapeHintCount} suggested {shapeHintCount === 1 ? "combine" : "combines"}
+                      </span>
+                    </p>
+                    <div className="space-y-1 text-xs text-muted-foreground">
+                      <p>
+                        The scan can’t always confidently tell when multiple album releases are all
+                        part of the same release group — also, sometimes tracks that should be on the
+                        same album release have different album/album-artist tags, which waverunner
+                        interprets as different albums.
+                      </p>
+                      <p>
+                        Go to the albums page: the suggestions are listed under Review, and any
+                        albums can be selected and combined from the right-click menu.
+                      </p>
+                      <p>
+                        Merged albums match on their own, and a match made on a fragment is lost
+                        when you merge it later — so do this first.
+                      </p>
+                    </div>
+                  </div>
+                  {onOpenAlbums && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="shrink-0"
+                      onClick={() => {
+                        onOpenAlbums();
+                        // The Albums page opens the review list on arrival
+                        // (user's call, 2026-10-18) — it listens for this
+                        // and waits for its hints to load.
+                        window.dispatchEvent(
+                          new CustomEvent("waverunner:open-shape-review", { detail: { libraryId } }),
+                        );
+                      }}
+                    >
+                      Go
+                    </Button>
+                  )}
+                </div>
+              )}
               {guideStep0 && (
-                <div className="flex items-center gap-3 bg-accent/40 px-3 py-2">
+                <div className={`flex items-center gap-3 bg-accent/40 px-3 py-2 ${shapeHintCount > 0 ? "border-t" : ""}`}>
                   <span className="flex size-5 shrink-0 items-center justify-center rounded-full border border-primary text-[11px] text-primary">
                     0
                   </span>
@@ -3058,39 +3122,6 @@ export function MetadataCenter({
                   )}
                 </div>
               )}
-              {/* The shape step (user's call, 2026-09-27 / 2026-10-03):
-                  numberless, above step 1, always there — no detector
-                  behind it, just the reminder and a Go to the library's
-                  ALBUMS PAGE (the sidebar's, not this page's Albums tab),
-                  where rows get combined. Its Go never waits for the pass:
-                  it's what the pass should come after. */}
-              <div className={`flex items-center gap-3 px-3 py-2.5 ${guideStep0 ? "border-t" : ""}`}>
-                <span className="size-5 shrink-0" />
-                <div className="min-w-0 flex-1">
-                  <p className="text-sm font-medium">Fix the library’s shape</p>
-                  <div className="space-y-1 text-xs text-muted-foreground">
-                    <p>
-                      The scan can’t always confidently tell when multiple album releases are all
-                      part of the same release group — also, sometimes tracks that should be on the
-                      same album release have different album/album-artist tags, which waverunner
-                      interprets as different albums.
-                    </p>
-                    <p>
-                      Go to the albums page and use the right-click context menu on albums to select
-                      and merge albums as necessary.
-                    </p>
-                    <p>
-                      Merged albums match on their own, and a match made on a fragment is lost
-                      when you merge it later — so do this first.
-                    </p>
-                  </div>
-                </div>
-                {onOpenAlbums && (
-                  <Button size="sm" variant="outline" className="shrink-0" onClick={onOpenAlbums}>
-                    Go
-                  </Button>
-                )}
-              </div>
               {(
                 [
                   [
@@ -3154,7 +3185,7 @@ export function MetadataCenter({
                           cheapest clicks in the stage, so they're advertised
                           from here. */}
                       {ready > 0 && (
-                        <span className="font-normal text-amber-300"> · {ready} with suggestions</span>
+                        <span className="font-normal text-primary"> · {ready} with suggestions</span>
                       )}
                     </p>
                     <p className="text-xs text-muted-foreground">{desc}</p>
@@ -3264,7 +3295,7 @@ export function MetadataCenter({
               matched
             </span>
             <span className="flex items-center gap-1.5">
-              <span className="inline-block h-3 w-4 rounded-sm border border-amber-500/60 bg-amber-500/10" />
+              <span className="inline-block h-3 w-4 rounded-sm border border-primary/60 bg-primary/10" />
               album matched, releases unresolved (· n/m on multi-version cards)
             </span>
             <span className="flex items-center gap-1.5">
@@ -3339,7 +3370,7 @@ export function MetadataCenter({
             so these clear faster than anything in the list below. */}
         {albumSuggestions.length > 0 && (
           <div className="mb-8">
-            <h4 className="mb-1.5 flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-amber-300">
+            <h4 className="mb-1.5 flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-primary">
               <TriangleAlert size={14} />
               Uncertain matches ({albumSuggestions.length})
             </h4>
@@ -3377,10 +3408,10 @@ export function MetadataCenter({
 
         {/* Group-matched albums know WHICH album they are but not which
             release — one pick in the dialog away from green, so they get
-            their own amber shelf instead of hiding among the finished. */}
+            their own gold shelf instead of hiding among the finished. */}
         {albumsReleaseUnknown.length > 0 && (
           <div className="mb-8">
-            <h4 className="mb-1.5 flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-amber-300">
+            <h4 className="mb-1.5 flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-primary">
               <TriangleAlert size={14} />
               Unmatched releases ({albumsReleaseUnknown.length})
             </h4>
@@ -3391,7 +3422,7 @@ export function MetadataCenter({
             <WindowedList
               items={albumsReleaseUnknown}
               keyOf={(a) => a.album_id}
-              className="overflow-hidden rounded-md border border-amber-500/30"
+              className="overflow-hidden rounded-md border border-primary/30"
               resetKey={`albums-release|${libraryId}|${albumFilter}`}
               renderRow={(a, i) => (
                 <AlbumRow
@@ -3538,7 +3569,7 @@ export function MetadataCenter({
           )}
           {clusterFeatures.length > 0 && (
             <div className="mb-8" id="sec-artists-clusters-features">
-              <h4 className="mb-0.5 flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-amber-300">
+              <h4 className="mb-0.5 flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-primary">
                 <GitMerge size={14} />
                 Resolve identities — features only ({clusterFeatures.length})
               </h4>
@@ -3565,7 +3596,7 @@ export function MetadataCenter({
           )}
           {artistsUnmatchedFeatures.length > 0 && (
             <div className="mb-8" id="sec-artists-features">
-              <h4 className="mb-0.5 flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-amber-300">
+              <h4 className="mb-0.5 flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-primary">
                 <TriangleAlert size={14} />
                 Unmatched artists with only features ({artistsUnmatchedFeatures.length})
               </h4>
@@ -3576,7 +3607,7 @@ export function MetadataCenter({
               <WindowedList
                 items={[...artistsUnmatchedFeatures].sort(readyFirst)}
                 keyOf={(a) => a.artist_id}
-                className="overflow-hidden rounded-md border border-amber-500/30"
+                className="overflow-hidden rounded-md border border-primary/30"
                 resetKey={`artists-features|${libraryId}|${artistFilter}`}
                 renderRow={(a, i) => {
                   const sug = suggestionByArtist.get(a.artist_id);
@@ -3646,7 +3677,7 @@ export function MetadataCenter({
             merge: everything credited to it moves to the artist you pick, durably. Undoable from
             History.
           </p>
-          <div className="overflow-hidden rounded-md border border-amber-500/30">
+          <div className="overflow-hidden rounded-md border border-primary/30">
             {unlinked.map((u, i) => (
               <div
                 key={u.name}
@@ -3669,7 +3700,7 @@ export function MetadataCenter({
                   size="sm"
                   variant="ghost"
                   className={`h-6 shrink-0 gap-1 px-2 text-xs ${
-                    u.near_miss_id != null ? "text-amber-300 hover:text-amber-200" : ""
+                    u.near_miss_id != null ? "text-primary hover:text-primary" : ""
                   }`}
                   disabled={busy}
                   onClick={() =>
@@ -3725,11 +3756,11 @@ export function MetadataCenter({
                 <div
                   key={`${g.album_id}:${g.release_label ?? ""}`}
                   data-gap-album={g.album_id}
-                  className={`rounded-md border bg-amber-500/5 p-3 ${
+                  className={`rounded-md border bg-primary/5 p-3 ${
                     // The focused card brightens its own border rather than
                     // drawing a ring outside it — a ring sits past the box
                     // and the pane's scroll edge clipped it on the left.
-                    focus?.albumId === g.album_id ? "border-amber-400" : "border-amber-500/40"
+                    focus?.albumId === g.album_id ? "border-primary" : "border-primary/40"
                   }`}
                 >
                   <div className="flex items-start justify-between gap-3">
@@ -3759,7 +3790,7 @@ export function MetadataCenter({
                       {/* leading-none: the text's line box equals its font
                           size, so items-center truly centers it on the icon
                           instead of on a taller box with descender room. */}
-                      <span className="mt-1 flex items-center gap-1 text-xs leading-none text-amber-200/90">
+                      <span className="mt-1 flex items-center gap-1 text-xs leading-none text-primary/90">
                         <TriangleAlert size={12} className="shrink-0" />
                         {[
                           mine > 0 && `${mine} of your tracks unmatched`,
@@ -4260,7 +4291,7 @@ export function MetadataCenter({
           onOpenChange={(o) => {
             if (!o) setCombineSelect(null);
           }}
-          onConfirm={async (targetReleaseFolder, title, discs, albumArtist) => {
+          onConfirm={async (targetReleaseFolder, title, discs, albumArtist, discStarts) => {
             const sel = combineSelect;
             if (!sel || sel.keeperId == null) return;
             setCombineSelect((s) => (s ? { ...s, busy: true } : s));
@@ -4286,9 +4317,9 @@ export function MetadataCenter({
                 targetReleaseFolder,
                 albumArtist,
                 discNames: discs.map((d) => ({ disc_no: d.discNo, title: d.title })),
+                discBySource: sel.mode === "merge" && discStarts.length > 0 ? discStarts : null,
               });
               setCombineSelect(null);
-              toast.success("Combined. Undo from History.");
               await refresh();
               onChanged?.();
             } catch (e) {
@@ -4450,7 +4481,7 @@ export function MetadataCenter({
                     disabled={busy}
                     className="shrink-0 underline underline-offset-2 hover:text-foreground disabled:pointer-events-none disabled:opacity-50"
                   >
-                    {busyKey === `passunmatch:${p.id}` ? "…" : "Unmatch"}
+                    {busyKey === `passunmatch:${p.id}` ? <Spinner className="size-3" /> : "Unmatch"}
                   </button>
                 ) : p.batch_id != null ? (
                   <button
@@ -4458,7 +4489,7 @@ export function MetadataCenter({
                     disabled={busy}
                     className="shrink-0 underline underline-offset-2 hover:text-foreground disabled:pointer-events-none disabled:opacity-50"
                   >
-                    {busyKey === `undo:${p.batch_id}` ? "…" : "Undo"}
+                    {busyKey === `undo:${p.batch_id}` ? <Spinner className="size-3" /> : "Undo"}
                   </button>
                 ) : (
                   <button

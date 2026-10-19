@@ -20,7 +20,7 @@ import { Button } from "@/components/ui/button";
 import { toast } from "@/lib/toast";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { Library, MediaEntry, EntriesResponse, BreadcrumbItem, ViewSpec, PersonInfo, PersonSummary, PersonRole, PlaylistSummary, PlaylistsResponse, PlaylistContents, SortPreset, LibraryCounts, GenreSummary, EntryWatchFlags, MusicQueueItem } from "@/types";
+import { Library, MediaEntry, EntriesResponse, BreadcrumbItem, ViewSpec, PersonInfo, PersonSummary, PersonRole, PlaylistSummary, PlaylistsResponse, PlaylistContents, SortPreset, LibraryCounts, GenreSummary, EntryWatchFlags, MusicQueueItem, ShapeHintLite } from "@/types";
 import { KEYBINDS_SETTING, actionForKey, setRuntimeKeybinds } from "@/lib/playerKeybinds";
 import { viewCacheKey, scopeKeyFor } from "@/lib/complications";
 
@@ -117,6 +117,10 @@ function App() {
   // Albums/Sounds views: loose-track count for the header button — delivered
   // in the grid payload/cache so button and grid render in one commit.
   const [looseCount, setLooseCount] = useState<number | null>(null);
+  // Music Albums view: the shape hints (albums that look like one album),
+  // delivered in the grid payload/cache for the same reason — the banner
+  // and the card pills render WITH the grid.
+  const [shapeHints, setShapeHints] = useState<ShapeHintLite[] | null>(null);
   const [coverSize, setCoverSize] = useState(200);
   const coverSizeTimerRef = useRef<number | null>(null);
   const [search, setSearch] = useState("");
@@ -269,9 +273,9 @@ function App() {
   }, [playerState.isActive]);
 
   // Cache: "libraryId:parentId" -> { entries, sortMode } (library-root view only)
-  const entryCacheRef = useRef<Map<string, { entries: MediaEntry[]; sort_mode: string; selected_preset_id: number | null; presets: SortPreset[]; loose_count?: number | null }>>(new Map());
+  const entryCacheRef = useRef<Map<string, { entries: MediaEntry[]; sort_mode: string; selected_preset_id: number | null; presets: SortPreset[]; loose_count?: number | null; shape_hints?: ShapeHintLite[] | null }>>(new Map());
   // Cache: viewCacheKey(view) -> entries (non-root MediaEntry views: movies-only / shows-only / person-detail)
-  const viewEntriesCacheRef = useRef<Map<string, { entries: MediaEntry[]; sort_mode: string; selected_preset_id: number | null; presets: SortPreset[]; loose_count?: number | null }>>(new Map());
+  const viewEntriesCacheRef = useRef<Map<string, { entries: MediaEntry[]; sort_mode: string; selected_preset_id: number | null; presets: SortPreset[]; loose_count?: number | null; shape_hints?: ShapeHintLite[] | null }>>(new Map());
   // Cache: viewCacheKey(view) -> people (people-list views)
   const peopleCacheRef = useRef<Map<string, PersonSummary[]>>(new Map());
   // Top-100/All mode per people view (keyed by viewCacheKey). Persisted to the settings
@@ -1006,6 +1010,7 @@ function App() {
           setEntries([]);
           setLoading(true);
           setLooseCount(null);
+          setShapeHints(null);
           setSortMode("");
           await new Promise<void>((r) => requestAnimationFrame(() => r()));
           if (stale()) return;
@@ -1015,6 +1020,7 @@ function App() {
         setSelectedPresetId(cached.selected_preset_id);
         setPresets(cached.presets);
         setLooseCount(cached.loose_count ?? null);
+        setShapeHints(cached.shape_hints ?? null);
         setBreadcrumbs(breadcrumb);
         setLoading(false);
         if (restoreScroll) restoreScrollPosition(view.libraryId, scrollKindFor(view), breadcrumb[breadcrumb.length - 1]?.id ?? null);
@@ -1032,6 +1038,7 @@ function App() {
         // A stale count from the previous grid must not linger under the
         // spinner — the button reappears with the new grid's data.
         setLooseCount(null);
+        setShapeHints(null);
         // This view's persisted sort rides in the response — until it lands the
         // mode is UNKNOWN, and showing the previous view's (or the "alpha"
         // default) flashes a wrong label in the toolbar. "" renders as a
@@ -1044,6 +1051,7 @@ function App() {
         let selected_preset_id: number | null = null;
         let view_presets: SortPreset[] = [];
         let loose_count: number | null = null;
+        let shape_hints: ShapeHintLite[] | null = null;
         switch (view.kind) {
           case "library-root": {
             const res = await invoke<EntriesResponse>("get_entries", {
@@ -1074,6 +1082,7 @@ function App() {
             selected_preset_id = res.selected_preset_id;
             view_presets = res.presets;
             loose_count = res.loose_count ?? null;
+            shape_hints = res.shape_hints ?? null;
             break;
           }
           case "person-detail": {
@@ -1108,13 +1117,14 @@ function App() {
           }
         }
         await preloadCovers(entries);
-        cache.set(cacheKey, { entries, sort_mode, selected_preset_id, presets: view_presets, loose_count });
+        cache.set(cacheKey, { entries, sort_mode, selected_preset_id, presets: view_presets, loose_count, shape_hints });
         if (stale()) return;
         setEntries(entries);
         setSortMode(sort_mode);
         setSelectedPresetId(selected_preset_id);
         setPresets(view_presets);
         setLooseCount(loose_count);
+        setShapeHints(shape_hints);
         // In-place refreshes never touch the scroll: the grid stayed mounted and
         // the user may be mid-page — restoring a stale saved offset would jump.
         if (!inPlace) {
@@ -1252,8 +1262,10 @@ function App() {
           entries: fresh, sort_mode: fresh_sort,
           selected_preset_id: fresh_selected_preset_id, presets: fresh_presets,
           loose_count: res.loose_count ?? null,
+          shape_hints: res.shape_hints ?? null,
         });
         setLooseCount(res.loose_count ?? null);
+        setShapeHints(res.shape_hints ?? null);
       } else if (view.kind === "person-detail") {
         fresh = await invoke<MediaEntry[]>("get_entries_for_person", {
           libraryId: view.libraryId,
@@ -3114,6 +3126,7 @@ function App() {
             }}
             onOpenLooseTracks={openLooseTracks}
             looseCount={looseCount}
+            shapeHints={shapeHints}
             selectedLibrary={selectedLibrary}
             sortMode={sortMode}
             onSortModeChange={changeSortMode}

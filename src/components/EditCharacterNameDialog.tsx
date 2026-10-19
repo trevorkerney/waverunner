@@ -116,7 +116,7 @@ export function EditCharacterNameDialog({
           />
           {variantCount > 1 && (
             <RevealAfterResize>
-              <p className="text-xs text-amber-600 dark:text-amber-500">
+              <p className="text-xs text-primary">
                 This person currently has {variantCount} different character names across episodes.
                 Saving will replace all of them with the new name.
               </p>

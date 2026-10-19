@@ -524,7 +524,7 @@ export function TmdbShowMatchDialog({
                         <p className="text-sm font-medium">
                           {field.label}
                           {!field.isEmpty && (
-                            <span className="ml-1.5 text-xs font-normal text-yellow-500">
+                            <span className="ml-1.5 text-xs font-normal text-primary">
                               (has data — will overwrite)
                             </span>
                           )}

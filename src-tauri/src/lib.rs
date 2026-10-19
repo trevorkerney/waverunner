@@ -15,6 +15,7 @@ mod music_art;
 mod music_edit;
 mod music_mb;
 mod music_player;
+mod music_shape;
 mod music_tagwrite;
 mod notes;
 mod player;
@@ -328,6 +329,10 @@ pub fn run() {
             music_edit::merge_album_release,
             music_edit::get_duplicate_albums,
             music_edit::dismiss_duplicate_albums,
+            music_shape::get_album_shape_hints,
+            music_shape::dismiss_album_shape_hint,
+            music_shape::restore_album_shape_hints,
+            music_shape::refresh_album_shape_hints,
             music_art::music_fetch_artist_image,
             commands::set_library_setup_stage,
             commands::complete_library_setup,

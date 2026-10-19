@@ -277,15 +277,19 @@ async fn album_track_ids(pool: &SqlitePool, album_id: i64) -> Result<Vec<i64>, S
 
 /// Drop every mb-tier value on these tracks — an unmatch, or a match being
 /// forgotten: what MusicBrainz said about them was about another release.
-async fn clear_tracks_mb_tier(pool: &SqlitePool, track_ids: &[i64]) -> Result<(), String> {
+/// Returns how many tier rows went — zero means the tracks carried nothing
+/// from MusicBrainz, so there is nothing to regroup over.
+async fn clear_tracks_mb_tier(pool: &SqlitePool, track_ids: &[i64]) -> Result<u64, String> {
+    let mut gone = 0;
     for id in track_ids {
-        sqlx::query("DELETE FROM field_override WHERE entity_id = ? AND tier = 'mb'")
+        gone += sqlx::query("DELETE FROM field_override WHERE entity_id = ? AND tier = 'mb'")
             .bind(id)
             .execute(pool)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())?
+            .rows_affected();
     }
-    Ok(())
+    Ok(gone)
 }
 
 /// Forget the pressing pinned to one release (a merge rewrote its track
@@ -7929,6 +7933,12 @@ pub async fn mb_unmatch_entity(
     .fetch_all(pool)
     .await
     .map_err(|e| e.to_string())?;
+    // Whether the unmatch changed anything structural: an unmatched album
+    // (the pass queue's leftover "Match X" row, say) has nothing to undo,
+    // no group, no tier rows — and then no scoped rescan or credit walk
+    // should run for it (both are what made that Unmatch take seconds,
+    // 2026-10-18).
+    let mut touched = !changes.is_empty();
     for (change_id,) in changes {
         // Newest first, so each undo restores the state the one before it
         // saw. Row work only — the credit walk and the UI event come once,
@@ -7947,8 +7957,11 @@ pub async fn mb_unmatch_entity(
         .await
         .map_err(|e| e.to_string())?;
 
+    touched |= mb_id(pool, entity_id, field).await?.is_some();
     clear_mb_id(pool, entity_id, field).await?;
+    let mut album_tracks: Option<Vec<i64>> = None;
     if kind == "album" {
+        touched |= mb_id(pool, entity_id, MB_RELEASE_GROUP).await?.is_some();
         clear_mb_id(pool, entity_id, MB_RELEASE_GROUP).await?;
         sqlx::query("UPDATE album SET mb_release_group_id = NULL WHERE id = ?")
             .bind(entity_id)
@@ -7957,15 +7970,20 @@ pub async fn mb_unmatch_entity(
             .map_err(|e| e.to_string())?;
         // Every release's pin goes — full unmatch is the card-wide start-over.
         // (album_release.mb_release_id stays: it's tag truth, not match state.)
-        sqlx::query("DELETE FROM release_match WHERE album_id = ?")
+        touched |= sqlx::query("DELETE FROM release_match WHERE album_id = ?")
             .bind(entity_id)
             .execute(pool)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())?
+            .rows_affected()
+            > 0;
         // And everything the match said about the tracks.
         let tracks = album_track_ids(pool, entity_id).await?;
-        clear_tracks_mb_tier(pool, &tracks).await?;
-        queue_regroup(&library_id, entity_id);
+        touched |= clear_tracks_mb_tier(pool, &tracks).await? > 0;
+        if touched {
+            queue_regroup(&library_id, entity_id);
+        }
+        album_tracks = Some(tracks);
         sqlx::query("DELETE FROM album_match_gap WHERE album_id = ?")
             .bind(entity_id)
             .execute(pool)
@@ -8001,8 +8019,20 @@ pub async fn mb_unmatch_entity(
         .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
-    // One walk, one event, for the whole batch of undone rows.
-    finish_undo(&app, pool, &library_id).await
+    // One walk, one event, for the whole batch of undone rows. An album's
+    // credit walk covers its own tracks only; nothing structural changed →
+    // just the event, so the page refreshes.
+    match (touched, album_tracks) {
+        (false, _) => {
+            let _ = app.emit(
+                "music-enrich-done",
+                serde_json::json!({ "libraryId": library_id, "updated": 0, "albumsMatched": 0, "processed": 0, "pendingReview": 0 }),
+            );
+            Ok(())
+        }
+        (true, Some(tracks)) => finish_undo_for_tracks(&app, pool, &library_id, &tracks).await,
+        (true, None) => finish_undo(&app, pool, &library_id).await,
+    }
 }
 
 /// First stage of a two-stage unmatch: forget WHICH pressing a release is,
@@ -9501,6 +9531,19 @@ async fn finish_undo(app: &AppHandle, pool: &SqlitePool, library_id: &str) -> Re
     // Anything the undone rows changed about grouping lands now.
     flush_regroup_and_notify(pool, library_id).await?;
     crate::music::ensure_credit_artists(pool, library_id).await?;
+    let _ = app.emit(
+        "music-enrich-done",
+        serde_json::json!({ "libraryId": library_id, "updated": 0, "albumsMatched": 0, "processed": 0, "pendingReview": 0 }),
+    );
+    Ok(())
+}
+
+/// `finish_undo` for one album: the credit walk looks only at its tracks
+/// (the library-wide walk is seconds on a big library, and an album's
+/// unmatch can only have changed its own credits).
+async fn finish_undo_for_tracks(app: &AppHandle, pool: &SqlitePool, library_id: &str, tracks: &[i64]) -> Result<(), String> {
+    flush_regroup_and_notify(pool, library_id).await?;
+    crate::music::ensure_credit_artists_for(pool, library_id, tracks).await?;
     let _ = app.emit(
         "music-enrich-done",
         serde_json::json!({ "libraryId": library_id, "updated": 0, "albumsMatched": 0, "processed": 0, "pendingReview": 0 }),

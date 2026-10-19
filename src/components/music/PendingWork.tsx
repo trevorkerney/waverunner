@@ -183,7 +183,7 @@ export function usePendingWork(libraryId: string | null) {
 }
 
 /** The sidebar's Metadata row's ONE attention slot: matches waiting on a
- *  matching pass (amber triangle; music). Opens the metadata center — the
+ *  matching pass (gold triangle; music). Opens the metadata center — the
  *  full picture lives there. Silent when nothing applies. (A span, not a
  *  button: the row itself renders as a button and buttons can't nest —
  *  same trick as the row's chevron.) */

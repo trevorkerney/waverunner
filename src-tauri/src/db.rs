@@ -1462,6 +1462,52 @@ pub async fn create_app_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> 
     .execute(&pool)
     .await?;
 
+    // ── Shape hints ───────────────────────────────────────────────────
+    // Albums that look like ONE album (music_shape.rs): recomputed at the
+    // end of every scan, read by the Albums page. Keyed on the member set
+    // (a digest of the sorted album ids), so a "keep apart" answers exactly
+    // that group and a changed group is a new question.
+    // A cache, recomputed whole at every scan (and on the page's first
+    // visit): when its shape is behind the code, it's dropped and rebuilt
+    // rather than altered — nothing in it is the person's.
+    let shape_cols: Vec<(i64, String, String, i64, Option<String>, i64)> =
+        sqlx::query_as("PRAGMA table_info(album_shape_hint)").fetch_all(&pool).await?;
+    let shape_current = ["title", "disc_map"].iter().all(|want| shape_cols.iter().any(|c| &c.1 == want));
+    if !shape_cols.is_empty() && !shape_current {
+        sqlx::query("DROP TABLE album_shape_hint").execute(&pool).await?;
+    }
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS album_shape_hint (
+            library_id TEXT NOT NULL,
+            key TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            confidence TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            album_artist TEXT,
+            title TEXT,
+            disc_map TEXT,
+            folder TEXT NOT NULL DEFAULT '',
+            member_ids TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (library_id, key),
+            FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS album_shape_dismiss (
+            library_id TEXT NOT NULL,
+            key TEXT NOT NULL,
+            dismissed_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (library_id, key),
+            FOREIGN KEY (library_id) REFERENCES library(id) ON DELETE CASCADE
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     // ── TMDB match attempts ───────────────────────────────────────────
     // Outcome of the last automatic TMDB match try for a movie/show entry
     // that DIDN'T settle it: 'notfound' (no results) or 'ambiguous' (results

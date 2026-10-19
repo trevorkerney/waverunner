@@ -540,7 +540,8 @@ pub(crate) async fn apply_layer_edits(
             albums.push(id);
         }
     }
-    rescan_albums(pool, library_id, &albums).await
+    rescan_albums(pool, library_id, &albums).await?;
+    Ok(())
 }
 
 /// Undo of a "layer_edit" History row: put every (track, field) back to its
@@ -2722,11 +2723,24 @@ pub async fn reset_artist_fields(
 /// One disc of an edition: what a merge's per-disc name fields are built
 /// from — the number, and the name it already carries (tag subtitle or an
 /// earlier rename), if any.
+/// One track of a disc, for the dialog's slot preview: its number (None
+/// when untagged — such a track takes no slot, as in the merge gate) and
+/// its title, for naming a collision.
+#[derive(Serialize)]
+pub struct CombineTrack {
+    pub track_no: Option<i64>,
+    pub title: String,
+}
+
 #[derive(Serialize)]
 pub struct CombineDisc {
     pub disc_no: i64,
     pub track_count: i64,
     pub title: Option<String>,
+    /// The disc's tracks in number order — the dialog shows which slots
+    /// each album fills and where the merged disc has a gap or a collision
+    /// (user's ask, 2026-10-18).
+    pub tracks: Vec<CombineTrack>,
 }
 
 #[derive(Serialize)]
@@ -2737,6 +2751,13 @@ pub struct CombineEdition {
     pub is_default: bool,
     pub track_count: i64,
     pub discs: Vec<CombineDisc>,
+    /// The release's own title and year, and its cover (its pick, else its
+    /// own pooled art, else the album's) — the separate-releases dialog's
+    /// default-release rows show each release as the card would
+    /// (user's call, 2026-10-18).
+    pub title: Option<String>,
+    pub year: Option<String>,
+    pub cover: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -2746,8 +2767,9 @@ pub struct CombineAlbumInfo {
     /// Owning artist — two same-titled albums are otherwise indistinguishable.
     pub artist: Option<String>,
     pub track_count: i64,
-    /// What picking this album as keeper KEEPS: its year, genres, and cover
-    /// survive alongside the title — the dialog shows them per option.
+    /// Year and genres are rebuilt from the merged tags at the rescan
+    /// whichever keeper is picked — the dialog no longer shows them per
+    /// option (2026-10-18); the cover still rides the row.
     pub year: Option<String>,
     pub genres: Vec<String>,
     /// Display cover (cached path), for the option row's thumbnail.
@@ -2759,6 +2781,20 @@ pub struct CombineAlbumInfo {
     /// The user has set its credits by hand (a user-tier album_artists
     /// edit on its tracks) — likewise not offered; the edit stands.
     pub credits_edited: bool,
+    /// What rides on THIS album's row surviving as the keeper — the facts
+    /// the option rows show, where they differ (user's call, 2026-10-18).
+    /// NOT in here, because the combine carries them whichever album
+    /// keeps: notes (concatenated), year, genres and the track count
+    /// (rebuilt from the merged tags), and — as separate releases — the
+    /// release pins and preferences (re-keyed by folder). What IS the
+    /// keeper's: the album-level MusicBrainz group match; album fields set
+    /// by hand ("title", "release_date", "album_type"); and, poured into
+    /// one list, its release preferences ("cover", "default",
+    /// "pre_emphasis", "label") — the sources' are dropped with their
+    /// releases.
+    pub group_matched: bool,
+    pub edited_fields: Vec<String>,
+    pub prefs: Vec<String>,
 }
 
 #[tauri::command]
@@ -2803,9 +2839,10 @@ pub async fn get_combine_info(
         .into_iter()
         .map(|(n,)| n)
         .collect();
-        let rows: Vec<(i64, Option<String>, String, i64, i64)> = sqlx::query_as(
+        let rows: Vec<(i64, Option<String>, String, i64, i64, Option<String>, Option<String>)> = sqlx::query_as(
             "SELECT r.id, r.label, r.folder_path, r.is_default,
-                    (SELECT COUNT(*) FROM track_release tr WHERE tr.release_id = r.id)
+                    (SELECT COUNT(*) FROM track_release tr WHERE tr.release_id = r.id),
+                    r.title, r.release_date
              FROM album_release r WHERE r.album_id = ?
              ORDER BY r.is_default DESC, r.id",
         )
@@ -2849,6 +2886,15 @@ pub async fn get_combine_info(
                 .any(|l| n.len() > l.len() + 1 && n.starts_with(l.as_str()) && n.as_bytes()[l.len()] == b'_')
         };
         let in_pool = |s: &str| covers.iter().any(|(_, c)| c == s);
+        // Each release's own pick, for the per-release rows below.
+        let pref_covers: Vec<(String, String)> = sqlx::query_as(
+            "SELECT folder_path, cover FROM album_release_pref
+             WHERE album_id = ? AND cover IS NOT NULL AND cover <> ''",
+        )
+        .bind(id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
         let cover = default_pick
             .filter(|s| in_pool(s))
             .or_else(|| selected_cover.filter(|s| in_pool(s)))
@@ -2861,29 +2907,60 @@ pub async fn get_combine_info(
                 .await
                 .map_err(|e| e.to_string())?;
         let mut editions = Vec::with_capacity(rows.len());
-        for (release_id, label, folder_path, is_default, track_count) in rows {
+        for (release_id, label, folder_path, is_default, track_count, rel_title, rel_date) in rows {
+            // The release's cover as the card would show it were it the
+            // default: its own pick, else (non-default) its "{leaf}_"-
+            // prefixed pooled art, else the album's display cover.
+            let rel_leaf = leaf(&folder_path);
+            let edition_cover = pref_covers
+                .iter()
+                .find(|(f, _)| f.eq_ignore_ascii_case(&folder_path))
+                .map(|(_, c)| c.clone())
+                .filter(|c| in_pool(c))
+                .or_else(|| {
+                    if is_default != 0 {
+                        cover.clone()
+                    } else {
+                        covers
+                            .iter()
+                            .find(|(n, _)| {
+                                let n = n.to_lowercase();
+                                n.len() > rel_leaf.len() + 1
+                                    && n.starts_with(rel_leaf.as_str())
+                                    && n.as_bytes()[rel_leaf.len()] == b'_'
+                            })
+                            .map(|(_, c)| c.clone())
+                            .or_else(|| cover.clone())
+                    }
+                });
             // The edition's discs, as the merge will see them (untagged
             // disc numbers count as disc 1, like the slot check), with the
             // name each already carries.
-            let disc_rows: Vec<(i64, i64)> = sqlx::query_as(
-                "SELECT COALESCE(t.disc_number, 1), COUNT(*) FROM track t
+            let track_rows: Vec<(i64, Option<i64>, String)> = sqlx::query_as(
+                "SELECT COALESCE(t.disc_number, 1), t.track_number, t.title FROM track t
                  JOIN track_release tr ON tr.track_id = t.id
                  WHERE tr.release_id = ?
-                 GROUP BY 1 ORDER BY 1",
+                 ORDER BY 1, t.track_number IS NULL, t.track_number, t.title",
             )
             .bind(release_id)
             .fetch_all(pool)
             .await
             .map_err(|e| e.to_string())?;
             let names = crate::music::resolved_disc_titles(pool, release_id).await?;
-            let discs = disc_rows
-                .into_iter()
-                .map(|(disc_no, track_count)| CombineDisc {
-                    disc_no,
-                    track_count,
-                    title: names.iter().find(|(d, _)| *d == disc_no).map(|(_, t)| t.clone()),
-                })
-                .collect();
+            let mut discs: Vec<CombineDisc> = Vec::new();
+            for (disc_no, track_no, title) in track_rows {
+                if discs.last().map(|d| d.disc_no) != Some(disc_no) {
+                    discs.push(CombineDisc {
+                        disc_no,
+                        track_count: 0,
+                        title: names.iter().find(|(d, _)| *d == disc_no).map(|(_, t)| t.clone()),
+                        tracks: Vec::new(),
+                    });
+                }
+                let disc = discs.last_mut().expect("just pushed");
+                disc.track_count += 1;
+                disc.tracks.push(CombineTrack { track_no, title });
+            }
             editions.push(CombineEdition {
                 release_id,
                 label,
@@ -2891,7 +2968,60 @@ pub async fn get_combine_info(
                 is_default: is_default != 0,
                 track_count,
                 discs,
+                title: rel_title.filter(|t| !t.trim().is_empty()),
+                year: rel_date
+                    .map(|d| d.chars().take(4).collect::<String>())
+                    .filter(|s| !s.is_empty()),
+                cover: edition_cover,
             });
+        }
+        // What the keeper's row carries (see the struct): the album-level
+        // group match is an override on the album entity itself.
+        let (group_matched,): (i64,) = sqlx::query_as(
+            "SELECT EXISTS (SELECT 1 FROM field_override
+                            WHERE entity_id = ? AND field = 'mb_release_group_id'
+                              AND value IS NOT NULL AND value <> '')",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        let edited_fields: Vec<String> = sqlx::query_scalar(
+            "SELECT field FROM field_override
+             WHERE entity_id = ? AND tier = 'user' AND field IN ('title', 'release_date', 'album_type')
+             ORDER BY field",
+        )
+        .bind(id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        let pref_rows: Vec<(Option<String>, i64, Option<String>, Option<i64>)> = sqlx::query_as(
+            "SELECT label, is_default, cover, pre_emphasis FROM album_release_pref WHERE album_id = ?",
+        )
+        .bind(id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        let mut prefs: Vec<String> = Vec::new();
+        let mut note = |p: &str| {
+            if !prefs.iter().any(|x| x == p) {
+                prefs.push(p.to_string());
+            }
+        };
+        for (label, is_default, pref_cover, pre_emphasis) in &pref_rows {
+            if pref_cover.as_deref().is_some_and(|c| !c.is_empty()) {
+                note("cover");
+            }
+            // A default pick only means something among several releases.
+            if *is_default != 0 && editions.len() > 1 {
+                note("default");
+            }
+            if pre_emphasis.is_some() {
+                note("pre_emphasis");
+            }
+            if label.as_deref().is_some_and(|l| !l.is_empty()) {
+                note("label");
+            }
         }
         out.push(CombineAlbumInfo {
             id,
@@ -2906,6 +3036,9 @@ pub async fn get_combine_info(
             editions,
             mb_matched: mb_matched != 0,
             credits_edited: credits_edited != 0,
+            group_matched: group_matched != 0,
+            edited_fields,
+            prefs,
         });
     }
     Ok(out)
@@ -2933,6 +3066,30 @@ async fn slots_of_release(pool: &SqlitePool, release_id: i64) -> Result<HashSet<
 pub struct DiscNameArg {
     pub disc_no: i64,
     pub title: String,
+}
+
+/// mode 'merge': where an album's FIRST disc lands in the merged list; its
+/// other discs follow in order (a two-disc member given 9 lands on 9 and
+/// 10). A box ripped per album with every disc tagged 1 is numbered this
+/// way — by the folder order, or by hand in the combine dialog. Written as
+/// disc_number edits in the combine's own write.
+#[derive(Deserialize)]
+pub struct DiscAssignArg {
+    pub album_id: i64,
+    pub disc_no: i64,
+}
+
+/// The lowest disc number among a release's tracks (1 when none carry one).
+async fn first_disc_of_release(pool: &SqlitePool, release_id: i64) -> Result<i64, String> {
+    let row: (Option<i64>,) = sqlx::query_as(
+        "SELECT MIN(COALESCE(t.disc_number, 1)) FROM track t
+         JOIN track_release tr ON tr.track_id = t.id WHERE tr.release_id = ?",
+    )
+    .bind(release_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(row.0.unwrap_or(1))
 }
 
 /// Effective disc numbers (the cache column) of the given tracks; absent
@@ -3032,6 +3189,10 @@ pub async fn combine_albums_multi(
     // write as the combine (the tracks arrive together, so a name for a
     // disc another album brings can't be set on the keeper beforehand).
     disc_names: Option<Vec<DiscNameArg>>,
+    // mode 'merge': disc numbers the albums' tracks take in the merged
+    // list (see DiscAssignArg) — the keeper's target edition or a source.
+    // The collision gate judges the list as it will be after these.
+    disc_by_source: Option<Vec<DiscAssignArg>>,
 ) -> Result<(), String> {
     crate::music_mb::ensure_not_matching(&state.app_db, &library_id).await?;
     let pool = &state.app_db;
@@ -3046,6 +3207,20 @@ pub async fn combine_albums_multi(
     if sources.is_empty() {
         return Err("Pick at least two albums to combine".to_string());
     }
+    let assign: HashMap<i64, i64> = if mode == "merge" {
+        disc_by_source
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|a| a.disc_no > 0 && (a.album_id == target_id || sources.contains(&a.album_id)))
+            .map(|a| (a.album_id, a.disc_no))
+            .collect()
+    } else {
+        HashMap::new()
+    };
+    // Per album: how far its discs move (assigned first disc minus the
+    // first disc it has). Filled in the merge gate below, where each
+    // album's edition is in hand.
+    let mut shifts: HashMap<i64, i64> = HashMap::new();
 
     let title_of = |id: i64| async move {
         sqlx::query_as::<_, (String,)>("SELECT title FROM album WHERE id = ?")
@@ -3105,10 +3280,16 @@ pub async fn combine_albums_multi(
         .unwrap_or_else(|| keeper_folder.clone());
 
     if mode == "merge" {
+        if let Some(first) = assign.get(&target_id) {
+            shifts.insert(target_id, first - first_disc_of_release(pool, keeper_release.0).await?);
+        }
+        let shifted = |shifts: &HashMap<i64, i64>, album_id: i64, (d, n): (i64, i64)| -> (i64, i64) {
+            (d + shifts.get(&album_id).copied().unwrap_or(0), n)
+        };
         let mut claimed: HashMap<(i64, i64), i64> = slots_of_release(pool, keeper_release.0)
             .await?
             .into_iter()
-            .map(|slot| (slot, target_id))
+            .map(|slot| (shifted(&shifts, target_id, slot), target_id))
             .collect();
         for src in &sources {
             let src_editions = editions_of(*src).await?;
@@ -3120,7 +3301,11 @@ pub async fn combine_albums_multi(
                 ));
             }
             for (release_id, _, _) in &src_editions {
+                if let Some(first) = assign.get(src) {
+                    shifts.insert(*src, first - first_disc_of_release(pool, *release_id).await?);
+                }
                 for slot in slots_of_release(pool, *release_id).await? {
+                    let slot = shifted(&shifts, *src, slot);
                     if let Some(other) = claimed.insert(slot, *src) {
                         let (d, n) = slot;
                         return Err(format!(
@@ -3145,10 +3330,38 @@ pub async fn combine_albums_multi(
         .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
-    set_default_release_pref(pool, target_id, &keeper_default_folder).await?;
-    let mut names: Vec<String> = Vec::new();
+    // The default release. As separate releases it's the one the dialog
+    // picked — the card shows that release's cover, title and year (user's
+    // call, 2026-10-18) — and the card's cover follows it, as the album
+    // page's "make default" does. Poured into one list, the keeper's
+    // current default stays.
+    if mode == "versions" {
+        set_default_release_pref(pool, target_id, &keeper_folder).await?;
+        sqlx::query(
+            "UPDATE album SET selected_cover = (
+                SELECT p.cover FROM album_release_pref p
+                WHERE p.album_id = ? AND p.folder_path = ? COLLATE NOCASE
+                  AND p.cover IS NOT NULL AND p.cover <> '')
+             WHERE id = ?",
+        )
+        .bind(target_id)
+        .bind(&keeper_folder)
+        .bind(target_id)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    } else {
+        set_default_release_pref(pool, target_id, &keeper_default_folder).await?;
+    }
+    // Which album each track of the merged list comes from — the disc
+    // assignments and the disc names are both per album.
+    let mut album_of: HashMap<i64, i64> = HashMap::new();
+    for id in release_track_ids(pool, keeper_release.0).await? {
+        album_of.insert(id, target_id);
+    }
+    let mut names_of_sources: Vec<String> = Vec::new();
     for src in &sources {
-        names.push(format!("\u{201c}{}\u{201d}", title_of(*src).await?));
+        names_of_sources.push(format!("\u{201c}{}\u{201d}", title_of(*src).await?));
         // Folder-keyed state of the source's editions follows them: as
         // versions, the rows re-key to the keeper (pins, label and cover
         // prefs, notes, match gaps); poured into one track list, only the
@@ -3162,6 +3375,9 @@ pub async fn combine_albums_multi(
             }
         }
         let ids = album_track_ids(pool, *src).await?;
+        for id in &ids {
+            album_of.insert(*id, *src);
+        }
         let mut fields: Vec<(String, Option<String>)> =
             vec![("identity_key".to_string(), Some(token.clone()))];
         if mode == "merge" {
@@ -3178,44 +3394,51 @@ pub async fn combine_albums_multi(
             e.1.push(("album_artists".to_string(), Some(value.clone())));
         }
     }
-    // Disc names for the merged track list: the tracks that land in the
-    // keeper's target edition (its own, plus every source's), by their
-    // effective disc number. "" clears an earlier name — an explicit empty.
-    if mode == "merge" {
-        let names: HashMap<i64, String> = disc_names
+    // Where each track's disc lands: its own number, moved by its album's
+    // shift (a box ripped with every disc tagged 1, numbered by the folder
+    // order or by hand). The names below are keyed on the landing number.
+    let renumbered = shifts.values().any(|s| *s != 0);
+    let names: HashMap<i64, String> = if mode == "merge" {
+        disc_names
             .unwrap_or_default()
             .into_iter()
             .map(|d| (d.disc_no, d.title.trim().to_string()))
-            .collect();
-        if !names.is_empty() {
-            let mut landing: HashSet<i64> = release_track_ids(pool, keeper_release.0).await?.into_iter().collect();
-            for src in &sources {
-                landing.extend(album_track_ids(pool, *src).await?);
+            .collect()
+    } else {
+        HashMap::new()
+    };
+    if renumbered || !names.is_empty() {
+        let ids: Vec<i64> = album_of.keys().copied().collect();
+        let discs = track_disc_numbers(pool, &ids).await?;
+        for e in edits.iter_mut() {
+            let Some(album) = album_of.get(&e.0) else { continue };
+            let shift = shifts.get(album).copied().unwrap_or(0);
+            let disc = discs.get(&e.0).copied().unwrap_or(1) + shift;
+            if shift != 0 {
+                e.1.push(("disc_number".to_string(), Some(disc.to_string())));
             }
-            let ids: Vec<i64> = landing.iter().copied().collect();
-            let discs = track_disc_numbers(pool, &ids).await?;
-            for e in edits.iter_mut() {
-                if !landing.contains(&e.0) {
-                    continue;
-                }
-                let disc = discs.get(&e.0).copied().unwrap_or(1);
-                if let Some(title) = names.get(&disc) {
-                    e.1.push(("disc_subtitle".to_string(), Some(title.clone())));
-                }
+            if let Some(title) = names.get(&disc) {
+                e.1.push(("disc_subtitle".to_string(), Some(title.clone())));
             }
         }
     }
     let label = format!(
-        "Combine {} into \u{201c}{tgt_name}\u{201d}{}",
-        names.join(", "),
-        if mode == "merge" { " — one track list" } else { " as separate releases" }
+        "Combine {} into \u{201c}{tgt_name}\u{201d}{}{}",
+        names_of_sources.join(", "),
+        if mode == "merge" { " — one track list" } else { " as separate releases" },
+        if renumbered { ", discs renumbered" } else { "" }
     );
     apply_layer_edits(pool, &library_id, &edits, &label).await?;
     if mode == "merge" {
         // The keeper's pin on the poured-into release was a claim about the
         // old track list.
         crate::music_mb::drop_release_pin(pool, target_id, &keeper_folder).await?;
-        crate::music_mb::enqueue_pass_work(pool, &library_id, target_id).await?;
+        // The merged album is a new question for MusicBrainz: a not-found
+        // mark on the keeper (searched as a fragment) is forgotten so the
+        // next pass asks again on its own. No queue row — same rule as
+        // renames (user's call, 2026-10-18: the "Match X · Unmatch" line
+        // for an unmatched album made no sense).
+        crate::music_mb::forget_album_notfound(pool, target_id).await?;
     }
     Ok(())
 }
@@ -3316,9 +3539,11 @@ pub async fn merge_album_release(
         ),
     )
     .await?;
-    // The poured-into pin was a claim about the old track list.
+    // The poured-into pin was a claim about the old track list; a not-found
+    // mark is forgotten so the next pass asks again (no queue row — see
+    // combine_albums_multi).
     crate::music_mb::drop_release_pin(pool, album_id, &into_folder).await?;
-    crate::music_mb::enqueue_pass_work(pool, &library_id, album_id).await?;
+    crate::music_mb::forget_album_notfound(pool, album_id).await?;
     Ok(library_id)
 }
 

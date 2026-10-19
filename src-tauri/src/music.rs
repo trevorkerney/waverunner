@@ -3674,6 +3674,8 @@ pub async fn scan_music_library(
     // Sound tracks pooled loose above get their collections (folder-mimicked
     // or directive-placed).
     apply_sound_homes(pool, library_id, cache_base).await?;
+    // Albums that look like one album — the Albums page's hints.
+    crate::music_shape::refresh_hints(pool, library_id).await?;
     Ok(())
 }
 
@@ -4504,6 +4506,11 @@ pub async fn rescan_music_library(
     // them): suppressions, queue rows, id-keyed suggestion cards.
     crate::music_mb::sweep_dead_match_rows(pool, library_id).await?;
 
+    // Albums that look like one album — recomputed whole (a few queries over
+    // the album rows; cheap next to the scan) so a scoped run that merged or
+    // split something leaves the hints right too.
+    crate::music_shape::refresh_hints(pool, library_id).await?;
+
     Ok(())
 }
 
@@ -4596,28 +4603,59 @@ pub(crate) async fn sweep_orphan_artists(
     library_id: &str,
     cache_base: &Path,
 ) -> Result<usize, String> {
-    let childless: Vec<(i64, String)> = sqlx::query_as(
-        "SELECT a.id, a.folder_path FROM artist a
-         JOIN media_entry me ON me.id = a.id
-         WHERE me.library_id = ?
-           AND NOT EXISTS (SELECT 1 FROM media_entry c WHERE c.parent_id = a.id)
-           AND NOT EXISTS (
-               SELECT 1 FROM track_credit tc
-               JOIN media_entry tme ON tme.id = tc.track_id
-               JOIN artist_names an ON an.artist_id = a.id
-               WHERE tme.library_id = me.library_id AND LOWER(tc.name) = LOWER(an.name)
-           )
-           AND NOT EXISTS (
-               SELECT 1 FROM album_artist_credit ac
-               JOIN media_entry ame2 ON ame2.id = ac.album_id
-               JOIN artist_names an2 ON an2.artist_id = a.id
-               WHERE ame2.library_id = me.library_id AND LOWER(ac.name) = LOWER(an2.name)
-           )",
+    // Set arithmetic in memory, not correlated subqueries: the one-query
+    // version compared every artist's names against every credit with
+    // LOWER() on both sides (no index can serve that), 1.7K × 20K — 7.5
+    // seconds per sweep, twice per scoped rescan, which was most of what a
+    // two-album combine took (2026-10-18, measured). Four flat reads and
+    // three hash sets do the same in milliseconds.
+    let parents: HashSet<i64> = sqlx::query_as::<_, (i64,)>(
+        "SELECT DISTINCT parent_id FROM media_entry WHERE library_id = ? AND parent_id IS NOT NULL",
+    )
+    .bind(library_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .into_iter()
+    .map(|(id,)| id)
+    .collect();
+    let mut credited: HashSet<String> = HashSet::new();
+    for sql in [
+        "SELECT tc.name FROM track_credit tc JOIN media_entry me ON me.id = tc.track_id WHERE me.library_id = ?",
+        "SELECT ac.name FROM album_artist_credit ac JOIN media_entry me ON me.id = ac.album_id WHERE me.library_id = ?",
+    ] {
+        for (name,) in sqlx::query_as::<_, (String,)>(sql)
+            .bind(library_id)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            credited.insert(name.to_lowercase());
+        }
+    }
+    let names: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT an.artist_id, an.name FROM artist_names an
+         JOIN media_entry me ON me.id = an.artist_id WHERE me.library_id = ?",
     )
     .bind(library_id)
     .fetch_all(pool)
     .await
     .map_err(|e| e.to_string())?;
+    let credited_artists: HashSet<i64> = names
+        .into_iter()
+        .filter(|(_, name)| credited.contains(&name.to_lowercase()))
+        .map(|(id, _)| id)
+        .collect();
+    let childless: Vec<(i64, String)> = sqlx::query_as::<_, (i64, String)>(
+        "SELECT a.id, a.folder_path FROM artist a JOIN media_entry me ON me.id = a.id WHERE me.library_id = ?",
+    )
+    .bind(library_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .into_iter()
+    .filter(|(id, _)| !parents.contains(id) && !credited_artists.contains(id))
+    .collect();
     let swept = childless.len();
     for (id, rel) in childless {
         crate::music_art::purge_artist_images(pool, library_id, cache_base, id).await?;

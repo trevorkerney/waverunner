@@ -28,7 +28,10 @@ import { XIcon } from "lucide-react"
 // FIXED sizes. Every DialogContent declares a width (`size`) and a height
 // (`height`) from short vocabularies (or a raw CSS length). The frame is
 // exactly that; the body scrolls (DialogBody) when content is taller and
-// leaves air when it's shorter. Nothing is ever measured.
+// leaves air when it's shorter. The shell never measures; a dialog that
+// sizes itself from its content (the combine dialog) measures its own
+// parts once attached and re-declares — see OPEN_GRACE_MS and the
+// change-over's slot pre-width for how that lands without a visible step.
 //
 // The MORPH. When the dialog on show changes (child opens, child closes):
 //   1. everything in the shell fades out         (FADE_MS)
@@ -41,6 +44,13 @@ const FADE_MS = 200
 const RESIZE_MS = 200
 /** The shell's exit animation (see the popup's data-closed classes). */
 const EXIT_MS = 150
+/** A re-declare this soon after the shell first showed a dialog is applied
+ *  outright, no morph: a dialog that measures its content can only do so
+ *  once attached, which is one frame after the shell opened on its
+ *  estimate — and the enter animation (100ms, from opacity 0) is still
+ *  running then, so the snap is never seen. Later re-declares (content
+ *  that loaded, a state that grew) morph as always. */
+const OPEN_GRACE_MS = 150
 
 /** Width vocabulary. */
 const DIALOG_SIZES = {
@@ -326,15 +336,20 @@ function ModalStackProvider({ children }: { children: React.ReactNode }) {
   // shell first shows it, and animated (fade → resize → fade) when the same
   // dialog re-declares while idle.
   const declared = displayed ? sizes.get(displayed) : undefined
+  // When the shell first showed a dialog (the frame got its first size);
+  // reset by the last close, when `applied` clears. A change-over keeps
+  // the frame, so it doesn't restart the grace.
+  const openedAtRef = React.useRef(0)
   React.useEffect(() => {
     if (!displayed || !declared) return
     if (!applied) {
       setApplied(declared)
+      openedAtRef.current = performance.now()
       return
     }
     if (phase !== "idle") return
     if (applied.width === declared.width && applied.height === declared.height) return
-    if (reduced) {
+    if (reduced || performance.now() - openedAtRef.current < OPEN_GRACE_MS) {
       setApplied(declared)
       return
     }
@@ -459,6 +474,17 @@ function ModalStackProvider({ children }: { children: React.ReactNode }) {
                             opacity: hiddenMain ? 0 : 1,
                             willChange: phase === "idle" ? undefined : "opacity",
                             transition: phase === "in" ? `opacity ${FADE_MS}ms ease-in` : undefined,
+                            // Through the change-over's fade-out the
+                            // arriving content sits (invisible) in a frame
+                            // still at the LEAVING dialog's width. It takes
+                            // its own width here so it wraps — and a
+                            // content-measuring dialog measures — as it
+                            // will once the frame has resized; the resize
+                            // step reads that measurement as its target.
+                            width:
+                              phase === "out" && declared
+                                ? `min(${declared.width}, calc(100vw - 3rem))`
+                                : undefined,
                           }
                         : role === "leaving"
                           ? // A keyframe, not a transition: the role flips the

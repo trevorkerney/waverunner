@@ -93,7 +93,7 @@ function ArtistPicker({
         </span>
       </span>
       {badge && (
-        <span className="flex shrink-0 items-center gap-1 text-[11px] text-amber-300">
+        <span className="flex shrink-0 items-center gap-1 text-[11px] text-primary">
           <Sparkles size={11} />
           {badge}
         </span>

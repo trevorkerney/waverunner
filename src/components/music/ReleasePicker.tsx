@@ -249,7 +249,7 @@ export function ReleasePicker({
                           <span className="shrink-0 text-[10px] text-emerald-400">showing</span>
                         )}
                         {r.is_default && (
-                          <span className="shrink-0 text-[10px] text-amber-300">default</span>
+                          <span className="shrink-0 text-[10px] text-primary">default</span>
                         )}
                         {!r.mb_matched && r.has_mb_tag && !mbHidden ? (
                           <span

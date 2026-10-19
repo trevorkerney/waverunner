@@ -4,7 +4,7 @@
  *  under "Show MusicBrainz outside this page" off (pass null). */
 const DOT: Record<string, { className: string; title: string }> = {
   matched: { className: "bg-emerald-400", title: "Matched to MusicBrainz" },
-  partial: { className: "bg-amber-400", title: "Partly matched — something still unresolved" },
+  partial: { className: "bg-primary", title: "Partly matched — something still unresolved" },
   unmatched: { className: "bg-red-400", title: "Not matched to MusicBrainz" },
   ignored: { className: "bg-muted-foreground/50", title: "Ignored — not counted" },
 };

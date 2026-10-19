@@ -110,7 +110,14 @@ import { ArtistDetailPage } from "@/components/music/ArtistDetailPage";
 import { PlaylistTrackList } from "@/components/music/PlaylistTrackList";
 import { NoteBlock } from "@/components/NoteBlock";
 import { HomePage } from "@/components/HomePage";
-import { CombineSelectedDialog, type AlbumSelection, type DiscName } from "@/components/music/CombineSelectedDialog";
+import { CombineSelectedDialog, type AlbumSelection, type DiscName, type DiscStart } from "@/components/music/CombineSelectedDialog";
+import {
+  ShapeHintPill,
+  ShapeHintsBanner,
+  ShapeHintsDialog,
+  type ShapeHint,
+} from "@/components/music/ShapeHints";
+import type { ShapeHintLite } from "@/types";
 
 /** What the combine dialog holds while no selection is in progress. */
 const EMPTY_ALBUM_SELECTION: AlbumSelection = {
@@ -235,6 +242,9 @@ interface MainContentProps {
   /** Loose-track count for the Albums/Sounds header button — rides the grid
    *  payload/cache so the button renders in the same commit as the grid. */
   looseCount?: number | null;
+  /** Music Albums view: the shape hints from the grid payload (null while
+   *  the grid loads, or on any other view). */
+  shapeHints?: ShapeHintLite[] | null;
   selectedLibrary: Library | null;
   sortMode: string;
   onSortModeChange: (mode: string) => void;
@@ -332,6 +342,7 @@ export function MainContent({
   onSoundCollectionsChanged,
   onOpenLooseTracks,
   looseCount,
+  shapeHints,
   selectedLibrary,
   sortMode,
   onSortModeChange,
@@ -376,6 +387,80 @@ export function MainContent({
   // navigating; bulk actions live in the toolbar strip (no overlay panel).
   // Built generic so other bulk actions can join later.
   const [albumSelect, setAlbumSelect] = useState<AlbumSelection | null>(null);
+  // Shape hints — albums that look like one album (see ShapeHints.tsx).
+  // They ride the grid payload (`shapeHints` prop, null while it loads), so
+  // the banner and the card pills render in the grid's own commit and the
+  // page never shifts under a late arrival; the review list hydrates the
+  // members itself when opened.
+  const [shapeReviewOpen, setShapeReviewOpen] = useState(false);
+  // A card's pill opens the review list AT its hint (user's call,
+  // 2026-10-18 — it used to open the combine dialog straight away): the
+  // hint's key, which the list scrolls to and outlines; cleared on close.
+  const [shapeReviewFocus, setShapeReviewFocus] = useState<string | null>(null);
+  const openHintReview = useCallback((hint: ShapeHintLite) => {
+    setShapeReviewFocus(hint.key);
+    setShapeReviewOpen(true);
+  }, []);
+  // The Metadata guide's "Fix the library's shape" Go lands here and asks
+  // for the review list: remembered until this page IS that library's
+  // Albums page with its hints loaded, then opened once.
+  const [shapeReviewRequest, setShapeReviewRequest] = useState<string | null>(null);
+  useEffect(() => {
+    const on = (e: Event) => {
+      const id = (e as CustomEvent<{ libraryId: string }>).detail?.libraryId;
+      if (id) setShapeReviewRequest(id);
+    };
+    window.addEventListener("waverunner:open-shape-review", on);
+    return () => window.removeEventListener("waverunner:open-shape-review", on);
+  }, []);
+  const shapeLibraryId =
+    selectedLibrary?.format === "music" && activeView?.kind === "albums" && !selectedEntry
+      ? selectedLibrary.id
+      : null;
+  useEffect(() => {
+    if (shapeReviewRequest && shapeLibraryId === shapeReviewRequest && shapeHints != null) {
+      setShapeReviewRequest(null);
+      setShapeReviewOpen(true);
+    }
+  }, [shapeReviewRequest, shapeLibraryId, shapeHints]);
+  // An album can sit in two hints (a split pair inside a box): the pill
+  // shows the first — the list comes likely-first, then smaller groups.
+  const hintByAlbum = useMemo(() => {
+    const m = new Map<number, ShapeHintLite>();
+    for (const h of shapeHints ?? []) {
+      for (const id of h.member_ids) if (!m.has(id)) m.set(id, h);
+    }
+    return m;
+  }, [shapeHints]);
+  // A hint's Combine: selection mode with the group picked, the mode and the
+  // suggested artist set, and NO keeper chosen (user's call, 2026-10-17: a
+  // suggestion doesn't preselect one) — the dialog opens at once. The
+  // review list is NOT closed here: the combine dialog opens on top of it
+  // (the shell hides the one beneath) and the list comes back when the
+  // combine lands or is cancelled. Closing it first left a frame with no
+  // dialog open while the combine's info loaded — the shell played its
+  // exit and then its enter, a flash (2026-10-18).
+  const openHintCombine = useCallback(
+    (hint: ShapeHint) => {
+      if (!shapeLibraryId) return;
+      const picked = hint.members.map((m) => ({ id: m.album_id, title: m.title }));
+      setAlbumSelect({
+        libraryId: shapeLibraryId,
+        picked,
+        keeperId: null,
+        mode: hint.mode,
+        busy: false,
+        configuring: true,
+        suggestedArtist: hint.album_artist,
+        suggestedTitle: hint.title,
+        discBySource: hint.disc_map
+          ? Object.fromEntries(hint.disc_map.map((d) => [d.album_id, d.disc_no]))
+          : null,
+        hintReason: hint.reason,
+      });
+    },
+    [shapeLibraryId],
+  );
   const [gridMenuOpen, setGridMenuOpen] = useState(false);
   // ONE context menu for the whole grid. Cards don't carry their own menu
   // root (a menu root is a stack of floating-ui hooks — hundreds of them
@@ -434,6 +519,7 @@ export function MainContent({
     title: string | null,
     discs: DiscName[],
     albumArtist: string | null,
+    discStarts: DiscStart[],
   ) => {
     if (!albumSelect || albumSelect.keeperId == null || albumSelect.picked.length < 2) return;
     const { libraryId, picked, keeperId, mode } = albumSelect;
@@ -456,13 +542,14 @@ export function MainContent({
         targetReleaseFolder,
         albumArtist,
         discNames: discs.map((d) => ({ disc_no: d.discNo, title: d.title })),
+        // The dialog's disc numbers (a box tagged all disc 1, numbered by
+        // folder order or by hand): written with the combine, on the
+        // albums' own tracks.
+        discBySource: mode === "merge" && discStarts.length > 0 ? discStarts : null,
       });
       setAlbumSelect(null);
-      toast.success(
-        mode === "merge"
-          ? `Combined ${picked.length} albums into one track list. Undo from History on the Metadata page.`
-          : `Combined ${picked.length} albums as separate releases. Undo from History on the Metadata page.`,
-      );
+      // No toast (user's call, 2026-10-18): the cards folding into one is
+      // the confirmation; undo lives in History on the Metadata page.
       // Same recipe as a rescan landing: the grid drops the folded cards,
       // counts and open pages refetch.
       onMetadataChanged?.(libraryId);
@@ -1275,13 +1362,15 @@ export function MainContent({
         pendingRemoval={pendingRemovalId != null && pendingRemovalId === sortableIdFor(entry)}
         sortMode={sortMode}
         mbState={showMbDots ? entry.mb_state ?? null : null}
+        shapeHint={hintByAlbum.get(entry.id) ?? null}
+        onShapeHint={openHintReview}
       />
     ),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [
       Card, coverSize, onNavigate, onRenameEntry, renamingId, endRename, watchOverrides,
       albumSelect, selectedLibrary, toggleAlbumSelect, deletingId, getCoverUrl, getCoverAspect,
-      dragId, pendingRemovalId, sortMode, showMbDots,
+      dragId, pendingRemovalId, sortMode, showMbDots, hintByAlbum, openHintReview,
     ],
   );
   const captureMenuTarget = (e: ReactMouseEvent) => {
@@ -2170,6 +2259,12 @@ export function MainContent({
         {/* The count arrives IN the grid payload (and its cache), so this
             renders in the exact same commit as the grid — no separate fetch,
             no pop-in either direction. */}
+        {/* Shape hints: albums that look like one album, found at the last
+            scan. A count and a way in; the pills on the cards are the
+            other way in. */}
+        {shapeLibraryId && !searchResults && (shapeHints?.length ?? 0) > 0 && (
+          <ShapeHintsBanner count={shapeHints!.length} onReview={() => setShapeReviewOpen(true)} />
+        )}
         {(activeView?.kind === "albums" || activeView?.kind === "sounds") && !searchResults && selectedLibrary && (
           <LooseTracksSection
             count={looseCount ?? 0}
@@ -2370,13 +2465,44 @@ export function MainContent({
       {/* Always mounted (a closed selection is an empty, non-configuring
           one) so the shell can play its exit when the combine lands and
           the selection clears. */}
+      <ShapeHintsDialog
+        open={shapeReviewOpen}
+        onOpenChange={(o) => {
+          setShapeReviewOpen(o);
+          if (!o) setShapeReviewFocus(null);
+        }}
+        libraryId={shapeLibraryId}
+        focusKey={shapeReviewFocus}
+        onCombine={openHintCombine}
+        // A dismiss / restore / recompute changes what the grid payload
+        // carries — the same refresh a metadata change gets.
+        onChanged={() => shapeLibraryId && onMetadataChanged?.(shapeLibraryId)}
+        onOpenAlbum={(id, title) => {
+          setShapeReviewOpen(false);
+          setShapeReviewFocus(null);
+          onOpenMusicAlbum?.(id, title);
+        }}
+        onOpenArtist={(id, name) => {
+          setShapeReviewOpen(false);
+          setShapeReviewFocus(null);
+          onOpenMusicArtist?.(id, name);
+        }}
+      />
+
       <CombineSelectedDialog
         selection={albumSelect ?? EMPTY_ALBUM_SELECTION}
         onKeeper={(id) => setAlbumSelect((s) => (s ? { ...s, keeperId: id } : s))}
         onMode={(mode) => setAlbumSelect((s) => (s ? { ...s, mode } : s))}
-        onOpenChange={(o) => setAlbumSelect((s) => (s ? { ...s, configuring: o } : s))}
-        onConfirm={(targetReleaseFolder, title, discs, albumArtist) =>
-          void combineSelected(targetReleaseFolder, title, discs, albumArtist)
+        // Cancelling a combine that a shape hint opened drops the whole
+        // selection (nothing was picked by hand); a hand-made selection
+        // keeps its picks and returns to the grid's selection mode.
+        onOpenChange={(o) =>
+          setAlbumSelect((s) =>
+            s ? (o ? { ...s, configuring: true } : s.hintReason != null ? null : { ...s, configuring: false }) : s,
+          )
+        }
+        onConfirm={(targetReleaseFolder, title, discs, albumArtist, discStarts) =>
+          void combineSelected(targetReleaseFolder, title, discs, albumArtist, discStarts)
         }
       />
 
@@ -2511,6 +2637,10 @@ interface CoverCardProps {
   /** MusicBrainz match-state dot after the title (music grids, when shown
    *  outside the metadata page); null = none. */
   mbState?: string | null;
+  /** Albums page: this card is one of a group that looks like one album
+   *  (a pill after the title opens the combine on the group). */
+  shapeHint?: ShapeHintLite | null;
+  onShapeHint?: (hint: ShapeHintLite) => void;
   /** Present when the grid can drag (SortableCoverCard wires it); a static
    *  grid renders the same card with none of dnd-kit's per-card cost. */
   drag?: {
@@ -2596,6 +2726,8 @@ const CoverCard = memo(function CoverCard({
   deletingId,
   pendingRemoval,
   mbState,
+  shapeHint,
+  onShapeHint,
   drag,
 }: CoverCardProps) {
   const isCollection = entry.entry_type === "collection";
@@ -2816,7 +2948,9 @@ const CoverCard = memo(function CoverCard({
             />
           ) : (
             <>
-              <p className="text-sm font-medium"><CardTitle entry={entry} mbState={mbState} /></p>
+              <p className="text-sm font-medium">
+                <CardTitle entry={entry} mbState={mbState} shapeHint={shapeHint} onShapeHint={onShapeHint} />
+              </p>
               {/* Person-page filmography shows the character ("as …") instead of the usual subtitle */}
               {entry.role_display ? (
                 <p className="text-xs text-muted-foreground">{entry.role_display}</p>
@@ -2875,9 +3009,19 @@ function MoveUpDropZone({ isActive }: { isActive: boolean }) {
  *  icon + the count, and (music, "Show MusicBrainz outside" on) the match
  *  dot — both glued to the title's last word so they wrap WITH it instead
  *  of dangling alone on a line. `mbState` null = no dot. */
-function CardTitle({ entry, mbState }: { entry: MediaEntry; mbState?: string | null }) {
+function CardTitle({
+  entry,
+  mbState,
+  shapeHint,
+  onShapeHint,
+}: {
+  entry: MediaEntry;
+  mbState?: string | null;
+  shapeHint?: ShapeHintLite | null;
+  onShapeHint?: (hint: ShapeHintLite) => void;
+}) {
   const n = entry.entry_type === "album" ? (entry.release_count ?? 0) : 0;
-  const trailing = n > 1 || !!mbState;
+  const trailing = n > 1 || !!mbState || !!shapeHint;
   if (!trailing) return <>{entry.title}</>;
   const cut = entry.title.lastIndexOf(" ");
   const head = cut === -1 ? "" : entry.title.slice(0, cut + 1);
@@ -2899,6 +3043,13 @@ function CardTitle({ entry, mbState }: { entry: MediaEntry; mbState?: string | n
           </span>
         )}
         {mbState && <MbDot state={mbState} className="ml-1.5 -translate-y-px" />}
+        {shapeHint && onShapeHint && (
+          <ShapeHintPill
+            size={shapeHint.member_ids.length}
+            reason={shapeHint.reason}
+            onClick={() => onShapeHint(shapeHint)}
+          />
+        )}
       </span>
     </>
   );

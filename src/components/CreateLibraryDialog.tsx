@@ -323,7 +323,7 @@ export function CreateLibraryDialog({ open: isOpen, onOpenChange }: CreateLibrar
 
         <DialogFooter className="mx-0 -mb-4 items-center px-4">
           {!seenAll && (
-            <p className="mr-auto text-xs text-yellow-500">
+            <p className="mr-auto text-xs text-primary">
               Scroll to the bottom to enable Create.
             </p>
           )}
